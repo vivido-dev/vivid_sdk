@@ -1,0 +1,2257 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use vivid_protocol::anchor::{self, AnchorKey};
+use vivid_protocol::media::{self, VideoPacket};
+use vivid_protocol::messages::{
+    self, AudioSourceConfig, Credits, ImageSourceConfig, SceneNodeConfig, SourceReady,
+    VideoSourceConfig,
+};
+use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoint, Record};
+
+const SYNTHETIC_CREDITS: u64 = u64::MAX / 4;
+const MAX_PENDING_CONTROL_RECORDS: usize = 4096;
+const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
+
+pub use vivid_protocol::messages::DisplayChanged as DisplayState;
+
+/// Connection and feature policy for a Vivid producer. Token-bearing values deliberately do not
+/// implement `Debug` so an application cannot accidentally log the presenter capability.
+pub struct ProducerConfig {
+    pub endpoint: Option<String>,
+    pub bulk_endpoint: Option<String>,
+    pub token: Option<String>,
+    pub dry_run: bool,
+    pub trace_dir: Option<PathBuf>,
+    pub verbose: bool,
+    pub producer: String,
+    pub producer_version: String,
+    pub required_features: Vec<u64>,
+    pub optional_features: Vec<u64>,
+}
+
+impl ProducerConfig {
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run || self.trace_dir.is_some()
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if !self.is_dry_run() && self.endpoint.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "VIVID_ENDPOINT is not set",
+            ));
+        }
+        if !self.is_dry_run() && self.token.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "VIVID_TOKEN is not set",
+            ));
+        }
+        if self.producer.is_empty() || self.producer.len() > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vivid producer name must contain 1 to 64 bytes",
+            ));
+        }
+        if self.producer_version.is_empty() || self.producer_version.len() > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vivid producer version must contain 1 to 64 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Supplies a borrowed portable Vivid video configuration without coupling the producer to a
+/// particular demuxer or encoder crate.
+pub trait VideoConfig {
+    fn vivid_video_config(&self, source_id: u64) -> VideoSourceConfig<'_>;
+}
+
+/// Owned video configuration used by live encoders such as Veston.
+#[derive(Clone, Debug)]
+pub struct VideoSourceSpec {
+    pub codec: String,
+    pub packetization: String,
+    pub extradata: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub profile: i32,
+    pub level: i32,
+    pub bitrate: i64,
+    pub color_primaries: u64,
+    pub transfer: u64,
+    pub matrix: u64,
+    pub range: u64,
+    pub sar_num: u32,
+    pub sar_den: u32,
+    pub max_access_unit_bytes: u32,
+}
+
+impl VideoConfig for VideoSourceSpec {
+    fn vivid_video_config(&self, source_id: u64) -> VideoSourceConfig<'_> {
+        VideoSourceConfig {
+            source_id,
+            codec: &self.codec,
+            packetization: &self.packetization,
+            extradata: &self.extradata,
+            width: self.width,
+            height: self.height,
+            profile: self.profile,
+            level: self.level,
+            bitrate: self.bitrate,
+            color_primaries: self.color_primaries,
+            transfer: self.transfer,
+            matrix: self.matrix,
+            range: self.range,
+            sar_num: self.sar_num,
+            sar_den: self.sar_den,
+            max_access_unit_bytes: self.max_access_unit_bytes,
+        }
+    }
+}
+
+pub trait AudioConfig {
+    fn vivid_audio_config(
+        &self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+    ) -> AudioSourceConfig<'_>;
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioSourceSpec {
+    pub codec: String,
+    pub packetization: String,
+    pub extradata: Vec<u8>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub channel_mask: u64,
+    pub bitrate: i64,
+    pub max_access_unit_bytes: u32,
+}
+
+impl AudioConfig for AudioSourceSpec {
+    fn vivid_audio_config(
+        &self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+    ) -> AudioSourceConfig<'_> {
+        AudioSourceConfig {
+            source_id,
+            linked_video_source_id,
+            codec: &self.codec,
+            packetization: &self.packetization,
+            extradata: &self.extradata,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            channel_mask: self.channel_mask,
+            bitrate: self.bitrate,
+            max_access_unit_bytes: self.max_access_unit_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceEvent {
+    Visibility(bool),
+    NeedKeyframe(u32),
+    Lost(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneNode {
+    pub id: u64,
+    pub source_id: u64,
+}
+
+#[derive(Debug)]
+pub struct SourceHandle {
+    pub id: u64,
+    ticket: Vec<u8>,
+    record_limit: u64,
+    state: Arc<SourceSync>,
+    acknowledged_credit_returns: u64,
+    observed_visible: bool,
+    reported_lost: bool,
+}
+
+/// A cloneable local wake-up handle for a source-specific media worker. Cancelling a source does
+/// not write a protocol record; it only interrupts local credit waits so session shutdown cannot
+/// deadlock behind a presenter that has stopped granting credit.
+#[derive(Clone)]
+pub struct SourceCancellation {
+    state: Arc<SourceSync>,
+}
+
+impl SourceCancellation {
+    pub fn cancel(&self, reason: impl Into<String>) {
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.lost.is_none() {
+            state.lost = Some(reason.into());
+        }
+        self.state.changed.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct SourceRuntime {
+    credits: Credits,
+    visible: bool,
+    visible_reasons: u64,
+    need_keyframe_epoch: Option<u32>,
+    lost: Option<String>,
+    credit_returns: u64,
+}
+
+#[derive(Debug)]
+struct SourceSync {
+    state: Mutex<SourceRuntime>,
+    changed: Condvar,
+}
+
+struct DispatcherState {
+    replies: HashMap<u64, Record>,
+    pending_requests: HashSet<u64>,
+    sources: HashMap<u64, Arc<SourceSync>>,
+    pending_source_events: HashMap<u64, VecDeque<Record>>,
+    pending_source_event_count: usize,
+    anchors: HashSet<u64>,
+    display: DisplayState,
+    closed: Option<String>,
+    last_inbound: Instant,
+    last_probe_sent: Option<Instant>,
+    unanswered_probes: u8,
+    next_ping_id: u64,
+    pending_pings: HashMap<u64, Instant>,
+    rtt_us: Option<u64>,
+}
+
+struct DispatcherShared {
+    state: Mutex<DispatcherState>,
+    changed: Condvar,
+}
+
+struct ControlDispatcher {
+    writer: ConnectionWriter,
+    shared: Arc<DispatcherShared>,
+}
+
+enum ClientControl {
+    Direct(Connection),
+    Live(ControlDispatcher),
+}
+
+impl ControlDispatcher {
+    fn start(connection: Connection, display: DisplayState) -> io::Result<Self> {
+        let (mut reader, writer) = connection.split()?;
+        let shared = Arc::new(DispatcherShared {
+            state: Mutex::new(DispatcherState {
+                replies: HashMap::new(),
+                pending_requests: HashSet::new(),
+                sources: HashMap::new(),
+                pending_source_events: HashMap::new(),
+                pending_source_event_count: 0,
+                anchors: HashSet::new(),
+                display,
+                closed: None,
+                last_inbound: Instant::now(),
+                last_probe_sent: None,
+                unanswered_probes: 0,
+                next_ping_id: u64::MAX,
+                pending_pings: HashMap::new(),
+                rtt_us: None,
+            }),
+            changed: Condvar::new(),
+        });
+        let reader_shared = shared.clone();
+        let reader_writer = writer.clone();
+        thread::Builder::new()
+            .name("vivid-sdk-control".into())
+            .spawn(move || {
+                loop {
+                    let record = match reader.read_record() {
+                        Ok(record) => record,
+                        Err(error) => {
+                            close_dispatcher(&reader_shared, error.to_string());
+                            break;
+                        }
+                    };
+                    {
+                        let mut state = reader_shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.last_inbound = Instant::now();
+                        state.last_probe_sent = None;
+                        state.unanswered_probes = 0;
+                        if record.record_type != messages::PONG {
+                            state.pending_pings.clear();
+                        }
+                    }
+                    if record.record_type == messages::PING {
+                        let response =
+                            messages::decode_control(&record.body).and_then(|envelope| {
+                                if record.object_id != 0 || envelope.request_id == 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "Vivid PING is not a correlated session-level request",
+                                    ));
+                                }
+                                reader_writer.write_record(
+                                    messages::PONG,
+                                    0,
+                                    0,
+                                    &messages::ok(envelope.request_id),
+                                )
+                            });
+                        if let Err(error) = response {
+                            close_dispatcher(&reader_shared, error.to_string());
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let mut state = reader_shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let routed = match record.record_type {
+                        messages::CREDIT
+                        | messages::VISIBILITY
+                        | messages::NEED_KEYFRAME
+                        | messages::SOURCE_LOST => {
+                            if let Some(source) = state.sources.get(&record.object_id) {
+                                apply_source_record(source, &record)
+                            } else if state.pending_source_event_count
+                                >= MAX_PENDING_CONTROL_RECORDS
+                            {
+                                Err(io::Error::new(
+                                    io::ErrorKind::OutOfMemory,
+                                    "Vivid pending source-event queue exceeded its bound",
+                                ))
+                            } else {
+                                state
+                                    .pending_source_events
+                                    .entry(record.object_id)
+                                    .or_default()
+                                    .push_back(record);
+                                state.pending_source_event_count += 1;
+                                Ok(())
+                            }
+                        }
+                        messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
+                            .map(|display| state.display = display),
+                        messages::ANCHOR_READY => {
+                            messages::parse_anchor_event(&record.body).map(|anchor| {
+                                state.anchors.insert(anchor);
+                            })
+                        }
+                        messages::PONG => {
+                            messages::request_id(&record.body).and_then(|request_id| {
+                                if record.object_id != 0 || request_id == 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "Vivid PONG is not a correlated session-level reply",
+                                    ));
+                                }
+                                if let Some(sent) = state.pending_pings.remove(&request_id) {
+                                    let sample = u64::try_from(sent.elapsed().as_micros())
+                                        .unwrap_or(u64::MAX);
+                                    state.rtt_us = Some(state.rtt_us.map_or(sample, |current| {
+                                        current.saturating_mul(7).saturating_add(sample) / 8
+                                    }));
+                                }
+                                Ok(())
+                            })
+                        }
+                        _ => messages::request_id(&record.body).and_then(|request_id| {
+                            if request_id == 0 {
+                                return Ok(());
+                            }
+                            if !state.pending_requests.remove(&request_id) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Vivid received a reply for an unknown request",
+                                ));
+                            }
+                            if state.replies.len() >= MAX_PENDING_CONTROL_RECORDS
+                                || state.replies.insert(request_id, record).is_some()
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::OutOfMemory,
+                                    "Vivid reply queue exceeded its bound or received a duplicate",
+                                ));
+                            }
+                            Ok(())
+                        }),
+                    };
+                    if let Err(error) = routed {
+                        state.closed.get_or_insert_with(|| error.to_string());
+                    }
+                    reader_shared.changed.notify_all();
+                    if state.closed.is_some() {
+                        for source in state.sources.values() {
+                            source.changed.notify_all();
+                        }
+                        break;
+                    }
+                }
+            })?;
+        let heartbeat_shared = shared.clone();
+        let heartbeat_writer = writer.clone();
+        thread::Builder::new()
+            .name("vivid-sdk-heartbeat".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                    let request = {
+                        let mut state = heartbeat_shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if state.closed.is_some() {
+                            break;
+                        }
+                        let now = Instant::now();
+                        if now.duration_since(state.last_inbound) < Duration::from_secs(15)
+                            || state.last_probe_sent.is_some_and(|sent| {
+                                now.duration_since(sent) < Duration::from_secs(15)
+                            })
+                        {
+                            continue;
+                        }
+                        if state.unanswered_probes >= 3 {
+                            state.closed = Some("Vivid control heartbeat timed out".into());
+                            heartbeat_shared.changed.notify_all();
+                            for source in state.sources.values() {
+                                source
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .lost
+                                    .get_or_insert_with(|| {
+                                        "Vivid control heartbeat timed out".into()
+                                    });
+                                source.changed.notify_all();
+                            }
+                            break;
+                        }
+                        let request = state.next_ping_id;
+                        state.next_ping_id = state.next_ping_id.saturating_sub(1);
+                        state.last_probe_sent = Some(now);
+                        state.unanswered_probes = state.unanswered_probes.saturating_add(1);
+                        state.pending_pings.insert(request, now);
+                        request
+                    };
+                    if let Err(error) =
+                        heartbeat_writer.write_record(messages::PING, 0, 0, &messages::ok(request))
+                    {
+                        close_dispatcher(&heartbeat_shared, error.to_string());
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self { writer, shared })
+    }
+
+    fn write_record(
+        &self,
+        record_type: u16,
+        flags: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let request_id = messages::request_id(body)?;
+        if request_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outbound Vivid request has request ID zero",
+            ));
+        }
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.pending_requests.len() >= MAX_PENDING_CONTROL_RECORDS
+                || !state.pending_requests.insert(request_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Vivid pending request bound exceeded or request ID was reused",
+                ));
+            }
+        }
+        if let Err(error) = self
+            .writer
+            .write_record(record_type, flags, object_id, body)
+        {
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending_requests
+                .remove(&request_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn wait_reply(
+        &self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+    ) -> io::Result<Record> {
+        self.wait_reply_until(request_id, accepted, expected_object_id, None)
+    }
+
+    fn wait_reply_deadline(
+        &self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+        deadline: Instant,
+    ) -> io::Result<Record> {
+        self.wait_reply_until(request_id, accepted, expected_object_id, Some(deadline))
+    }
+
+    fn wait_reply_until(
+        &self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+        deadline: Option<Instant>,
+    ) -> io::Result<Record> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(record) = state.replies.remove(&request_id) {
+                if record.object_id != expected_object_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "reply {request_id} has object {}, expected {expected_object_id}",
+                            record.object_id
+                        ),
+                    ));
+                }
+                if record.record_type != messages::ERROR && !accepted.contains(&record.record_type)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "reply {request_id} was {}, expected one of {accepted:?}",
+                            messages::name(record.record_type)
+                        ),
+                    ));
+                }
+                return Ok(record);
+            }
+            if let Some(error) = &state.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+            }
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    state.pending_requests.remove(&request_id);
+                    state.closed = Some(format!("Vivid request {request_id} timed out"));
+                    self.shared.changed.notify_all();
+                    for source in state.sources.values() {
+                        let mut source_state = source
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        source_state
+                            .lost
+                            .get_or_insert_with(|| "Vivid control request timed out".into());
+                        source.changed.notify_all();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Vivid control reply deadline expired",
+                    ));
+                }
+                state = self
+                    .shared
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+            } else {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
+    fn register_source(&self, source_id: u64, credits: Credits) -> io::Result<Arc<SourceSync>> {
+        let source = Arc::new(SourceSync {
+            state: Mutex::new(SourceRuntime {
+                credits,
+                visible: true,
+                visible_reasons: 0,
+                need_keyframe_epoch: None,
+                lost: None,
+                credit_returns: 0,
+            }),
+            changed: Condvar::new(),
+        });
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.sources.insert(source_id, source.clone()).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Vivid source dispatcher state already exists",
+            ));
+        }
+        if let Some(mut pending) = state.pending_source_events.remove(&source_id) {
+            state.pending_source_event_count = state
+                .pending_source_event_count
+                .saturating_sub(pending.len());
+            while let Some(record) = pending.pop_front() {
+                apply_source_record(&source, &record)?;
+            }
+        }
+        Ok(source)
+    }
+
+    fn wait_anchor(&self, anchor_id: u64) -> io::Result<()> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.anchors.remove(&anchor_id) {
+                return Ok(());
+            }
+            if let Some(error) = &state.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+            }
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Wait for `ANCHOR_READY` until the deadline. Returns false when the presenter has not
+    /// confirmed the anchor in time.
+    fn wait_anchor_deadline(&self, anchor_id: u64, deadline: Instant) -> io::Result<bool> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.anchors.remove(&anchor_id) {
+                return Ok(true);
+            }
+            if let Some(error) = &state.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    fn display_generation(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .display
+            .display_generation
+    }
+
+    fn display_state(&self) -> DisplayState {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .display
+    }
+
+    fn adjusted_minimum_buffer(&self, requested_us: u64) -> u64 {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        messages::minimum_buffer_for_rtt(requested_us, state.rtt_us)
+    }
+}
+
+impl Drop for ControlDispatcher {
+    fn drop(&mut self) {
+        close_dispatcher(&self.shared, "Vivid control dispatcher closed".into());
+    }
+}
+
+fn close_dispatcher(shared: &DispatcherShared, message: String) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.closed.get_or_insert(message);
+    shared.changed.notify_all();
+    for source in state.sources.values() {
+        source
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lost
+            .get_or_insert_with(|| "Vivid control connection closed".into());
+        source.changed.notify_all();
+    }
+}
+
+fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
+    let mut state = source
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match record.record_type {
+        messages::CREDIT => {
+            let added = messages::parse_credit(&record.body)?;
+            state.credits.bytes =
+                state
+                    .credits
+                    .bytes
+                    .checked_add(added.bytes)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "byte credit overflow")
+                    })?;
+            state.credits.packets = state
+                .credits
+                .packets
+                .checked_add(added.packets)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "packet credit overflow")
+                })?;
+            state.credits.fragments = state
+                .credits
+                .fragments
+                .checked_add(added.fragments)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fragment credit overflow")
+                })?;
+            state.credit_returns = state.credit_returns.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "credit return counter overflow")
+            })?;
+        }
+        messages::VISIBILITY => {
+            let visibility = messages::parse_visibility(&record.body)?;
+            state.visible = visibility.visible;
+            state.visible_reasons = visibility.reasons;
+        }
+        messages::NEED_KEYFRAME => {
+            let request = messages::parse_need_keyframe(&record.body)?;
+            if request.source_id != record.object_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NEED_KEYFRAME source/object ID mismatch",
+                ));
+            }
+            state.need_keyframe_epoch = Some(request.minimum_epoch);
+        }
+        messages::SOURCE_LOST => {
+            state.lost = Some(source_lost_error(record)?.to_string());
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record is not a source event",
+            ));
+        }
+    }
+    source.changed.notify_all();
+    Ok(())
+}
+
+impl ClientControl {
+    fn write_record(
+        &mut self,
+        record_type: u16,
+        flags: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            Self::Direct(connection) => {
+                connection.write_record(record_type, flags, object_id, body)
+            }
+            Self::Live(dispatcher) => dispatcher.write_record(record_type, flags, object_id, body),
+        }
+    }
+
+    fn wait_reply(
+        &self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+    ) -> io::Result<Record> {
+        match self {
+            Self::Live(dispatcher) => {
+                dispatcher.wait_reply(request_id, accepted, expected_object_id)
+            }
+            Self::Direct(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "trace/dry-run control connections have no replies",
+            )),
+        }
+    }
+
+    fn wait_reply_deadline(
+        &self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+        deadline: Instant,
+    ) -> io::Result<Record> {
+        match self {
+            Self::Live(dispatcher) => {
+                dispatcher.wait_reply_deadline(request_id, accepted, expected_object_id, deadline)
+            }
+            Self::Direct(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "trace/dry-run control connections have no replies",
+            )),
+        }
+    }
+
+    fn register_source(&self, source_id: u64, credits: Credits) -> io::Result<Arc<SourceSync>> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.register_source(source_id, credits),
+            Self::Direct(_) => Ok(Arc::new(SourceSync {
+                state: Mutex::new(SourceRuntime {
+                    credits,
+                    visible: true,
+                    visible_reasons: 0,
+                    need_keyframe_epoch: None,
+                    lost: None,
+                    credit_returns: 0,
+                }),
+                changed: Condvar::new(),
+            })),
+        }
+    }
+
+    fn display_generation(&self, fallback: u64) -> u64 {
+        match self {
+            Self::Live(dispatcher) => dispatcher.display_generation(),
+            Self::Direct(_) => fallback,
+        }
+    }
+
+    fn display_state(&self, fallback: DisplayState) -> DisplayState {
+        match self {
+            Self::Live(dispatcher) => dispatcher.display_state(),
+            Self::Direct(_) => fallback,
+        }
+    }
+
+    fn adjusted_minimum_buffer(&self, requested_us: u64) -> u64 {
+        match self {
+            Self::Live(dispatcher) => dispatcher.adjusted_minimum_buffer(requested_us),
+            Self::Direct(_) => requested_us,
+        }
+    }
+
+    fn wait_anchor(&self, anchor_id: u64) -> io::Result<()> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.wait_anchor(anchor_id),
+            Self::Direct(_) => Ok(()),
+        }
+    }
+
+    fn wait_anchor_deadline(&self, anchor_id: u64, deadline: Instant) -> io::Result<bool> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.wait_anchor_deadline(anchor_id, deadline),
+            Self::Direct(_) => Ok(true),
+        }
+    }
+}
+
+pub struct MediaChannel {
+    connection: Connection,
+    source_id: u64,
+}
+
+/// A source-specific media writer. It owns no control-session lock, so independent audio and
+/// video writers can block on their own credits without blocking each other.
+pub struct MediaSender {
+    source: SourceHandle,
+    channel: MediaChannel,
+    dry_run: bool,
+}
+
+impl MediaSender {
+    pub fn source_id(&self) -> u64 {
+        self.source.id
+    }
+
+    pub fn source(&self) -> &SourceHandle {
+        &self.source
+    }
+
+    pub fn source_mut(&mut self) -> &mut SourceHandle {
+        &mut self.source
+    }
+
+    pub fn take_event(&mut self) -> Option<SourceEvent> {
+        self.source.take_event()
+    }
+
+    pub fn send_video(&mut self, packet: VideoPacket<'_>) -> io::Result<()> {
+        let body = media::video_packet_body(packet)?;
+        self.send_record(messages::VIDEO_PACKET, body, true)
+    }
+
+    pub fn send_audio(&mut self, packet: media::AudioPacket<'_>) -> io::Result<()> {
+        let body = media::audio_packet_body(packet)?;
+        // Audio sources have no scene node of their own. Linked audio therefore commonly reports
+        // false visibility even while its video is visible, and standalone audio is never placed
+        // in the scene at all. VISIBILITY is advisory, so it must not interrupt audio credit
+        // waits and turn the linked master clock into a packet-dropping loop.
+        self.send_record(messages::AUDIO_PACKET, body, false)
+    }
+
+    fn send_record(
+        &mut self,
+        record_type: u16,
+        body: Vec<u8>,
+        interrupt_for_events: bool,
+    ) -> io::Result<()> {
+        let bytes = u64::try_from(body.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "media body is too large"))?;
+        if bytes > self.source.record_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Vivid media record is {bytes} bytes, exceeding source {}'s {}-byte limit",
+                    self.source.id, self.source.record_limit
+                ),
+            ));
+        }
+        self.source
+            .consume_credits(bytes, self.dry_run, interrupt_for_events)?;
+        self.channel
+            .connection
+            .write_record(record_type, 0, self.channel.source_id, &body)
+    }
+}
+
+pub struct ProducerSession {
+    control: ClientControl,
+    endpoint: Option<Endpoint>,
+    bulk_endpoint: Option<Endpoint>,
+    trace_dir: Option<PathBuf>,
+    dry_run: bool,
+    verbose: bool,
+    next_request_id: u64,
+    next_object_id: u64,
+    root_context_id: u64,
+    display: DisplayState,
+    session_tag: [u8; 16],
+    anchor_key: AnchorKey,
+    accepted_features: Vec<u64>,
+    unconfirmed_anchors: Vec<u64>,
+    label: String,
+}
+
+impl ProducerSession {
+    pub fn connect(config: &ProducerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        config.validate()?;
+        let dry_run = config.is_dry_run();
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .map(Endpoint::parse)
+            .transpose()?;
+        let bulk_endpoint = config
+            .bulk_endpoint
+            .as_deref()
+            .map(Endpoint::parse)
+            .transpose()?;
+        let mut control = if let Some(trace_dir) = &config.trace_dir {
+            Connection::trace(&trace_dir.join("control.vivid"), ConnectionKind::Control)?
+        } else if dry_run {
+            Connection::sink(ConnectionKind::Control)?
+        } else {
+            Connection::open(
+                endpoint.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "missing Vivid endpoint")
+                })?,
+                ConnectionKind::Control,
+            )?
+        };
+
+        let dry_token = "00".repeat(32);
+        let token = config.token.as_deref().unwrap_or(&dry_token);
+        let token_bytes = anchor::decode_token(token)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        let hello_request = 1;
+        control.write_record(
+            messages::HELLO,
+            0,
+            0,
+            &messages::encode_hello(
+                hello_request,
+                &messages::HelloConfig {
+                    minimum_major: 1,
+                    minimum_minor: 1,
+                    maximum_major: 1,
+                    maximum_minor: 1,
+                    token,
+                    producer: &config.producer,
+                    producer_version: &config.producer_version,
+                    required_features: &config.required_features,
+                    optional_features: &config.optional_features,
+                    maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                },
+            ),
+        )?;
+
+        let (root_context_id, display, session_tag, accepted_features, control_limit) = if dry_run {
+            if config.verbose {
+                eprintln!("{}: dry-run HELLO (Vivid 1.1)", config.producer);
+            }
+            let mut accepted_features = config.required_features.clone();
+            accepted_features.extend_from_slice(&config.optional_features);
+            accepted_features.sort_unstable();
+            accepted_features.dedup();
+            (
+                1,
+                DisplayState {
+                    display_generation: 0,
+                    viewport_width: 800,
+                    viewport_height: 600,
+                    grid_columns: 80,
+                    grid_rows: 24,
+                    cell_width: 10,
+                    cell_height: 25,
+                },
+                [0; 16],
+                accepted_features,
+                vivid_protocol::CONTROL_MAX_RECORD_BODY,
+            )
+        } else {
+            let record = read_expected(&mut control, hello_request, &[messages::WELCOME], None)?;
+            let welcome = messages::parse_welcome(&record.body)?;
+            if (welcome.selected_major, welcome.selected_minor) != (1, 1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "presenter selected Vivid {}.{}, expected 1.1",
+                        welcome.selected_major, welcome.selected_minor
+                    ),
+                )
+                .into());
+            }
+            for required in &config.required_features {
+                if welcome.accepted_features.binary_search(required).is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("presenter did not accept required Vivid feature {required}"),
+                    )
+                    .into());
+                }
+            }
+            let session_tag: [u8; 16] =
+                welcome.session_tag.as_slice().try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WELCOME session tag is not 128 bits",
+                    )
+                })?;
+            if config.verbose {
+                eprintln!(
+                    "{}: session={} tag={} bytes root={} grid={}x{} generation={}",
+                    config.producer,
+                    welcome.session_id,
+                    welcome.session_tag.len(),
+                    welcome.root_context_id,
+                    welcome.grid_columns,
+                    welcome.grid_rows,
+                    welcome.display_generation
+                );
+            }
+            (
+                welcome.root_context_id,
+                DisplayState {
+                    display_generation: welcome.display_generation,
+                    viewport_width: welcome.viewport_width,
+                    viewport_height: welcome.viewport_height,
+                    grid_columns: u32::try_from(welcome.grid_columns).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "WELCOME grid width exceeds u32")
+                    })?,
+                    grid_rows: u32::try_from(welcome.grid_rows).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "WELCOME grid height exceeds u32",
+                        )
+                    })?,
+                    cell_width: welcome.cell_width,
+                    cell_height: welcome.cell_height,
+                },
+                session_tag,
+                welcome.accepted_features,
+                welcome.maximum_control_body,
+            )
+        };
+        control.set_send_body_limit(control_limit)?;
+        let control = if dry_run {
+            ClientControl::Direct(control)
+        } else {
+            ClientControl::Live(ControlDispatcher::start(control, display)?)
+        };
+        let anchor_key = anchor::derive_key(&token_bytes, &session_tag);
+
+        Ok(Self {
+            control,
+            endpoint,
+            bulk_endpoint,
+            trace_dir: config.trace_dir.clone(),
+            dry_run,
+            verbose: config.verbose,
+            next_request_id: hello_request,
+            next_object_id: 0,
+            root_context_id,
+            display,
+            session_tag,
+            anchor_key,
+            accepted_features,
+            unconfirmed_anchors: Vec::new(),
+            label: config.producer.clone(),
+        })
+    }
+
+    pub fn allocate_id(&mut self) -> io::Result<u64> {
+        self.next_object_id = self
+            .next_object_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Vivid object ID space exhausted"))?;
+        Ok(self.next_object_id)
+    }
+
+    pub fn create_raster_source(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+    ) -> io::Result<SourceHandle> {
+        let request_id = self.request_id()?;
+        let body = messages::create_raster_config(
+            request_id,
+            &messages::RasterSourceConfig {
+                source_id,
+                width,
+                height,
+                alpha_mode: messages::ALPHA_STRAIGHT,
+                compression_mode: if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
+                    messages::COMPRESSION_RAW_OR_ZSTD
+                } else {
+                    messages::COMPRESSION_NONE
+                },
+            },
+        );
+        self.control
+            .write_record(messages::CREATE_RASTER, 0, source_id, &body)?;
+        self.source_ready(request_id, source_id, "raster")
+    }
+
+    pub fn create_video_source<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+    ) -> io::Result<SourceHandle> {
+        let request_id = self.request_id()?;
+        let body = messages::create_video(request_id, &info.vivid_video_config(source_id));
+        self.control
+            .write_record(messages::CREATE_VIDEO, 0, source_id, &body)?;
+        self.source_ready(request_id, source_id, "video")
+    }
+
+    pub fn create_audio_source<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+    ) -> io::Result<SourceHandle> {
+        if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks audio-access-unit-v1",
+            ));
+        }
+        let config = info.vivid_audio_config(source_id, linked_video_source_id);
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::CREATE_AUDIO,
+            0,
+            source_id,
+            &messages::create_audio(request_id, &config),
+        )?;
+        self.source_ready(request_id, source_id, "audio")
+    }
+
+    /// Create a linked video/audio pair in one ordered control flight. The video result remains
+    /// usable when the presenter rejects the audio configuration.
+    pub fn create_linked_av_sources<V, A>(
+        &mut self,
+        video_source_id: u64,
+        video: &V,
+        audio_source_id: u64,
+        audio: &A,
+    ) -> io::Result<(SourceHandle, io::Result<SourceHandle>)>
+    where
+        V: VideoConfig + ?Sized,
+        A: AudioConfig + ?Sized,
+    {
+        if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks audio-access-unit-v1",
+            ));
+        }
+        let video_request = self.request_id()?;
+        let audio_request = self.request_id()?;
+        self.control.write_record(
+            messages::CREATE_VIDEO,
+            0,
+            video_source_id,
+            &messages::create_video(video_request, &video.vivid_video_config(video_source_id)),
+        )?;
+        self.control.write_record(
+            messages::CREATE_AUDIO,
+            0,
+            audio_source_id,
+            &messages::create_audio(
+                audio_request,
+                &audio.vivid_audio_config(audio_source_id, Some(video_source_id)),
+            ),
+        )?;
+        let video = self.source_ready(video_request, video_source_id, "video")?;
+        let audio = self.source_ready(audio_request, audio_source_id, "audio");
+        Ok((video, audio))
+    }
+
+    #[allow(dead_code)] // Explicit diagnostic/conformance API; normal playback creates directly.
+    pub fn probe_video_config<C: VideoConfig + ?Sized>(&mut self, info: &C) -> io::Result<bool> {
+        let request = self.request_id()?;
+        self.control.write_record(
+            messages::PROBE_VIDEO_CONFIG,
+            0,
+            0,
+            &messages::probe_video_config(request, &info.vivid_video_config(0)),
+        )?;
+        if self.dry_run {
+            Ok(true)
+        } else {
+            let reply = self.wait_for_reply(request, &[messages::VIDEO_SUPPORT], 0)?;
+            messages::parse_video_support(&reply.body)
+        }
+    }
+
+    #[allow(dead_code)] // Explicit diagnostic/conformance API; normal playback creates directly.
+    pub fn probe_audio_config<C: AudioConfig + ?Sized>(&mut self, info: &C) -> io::Result<bool> {
+        let request = self.request_id()?;
+        self.control.write_record(
+            messages::PROBE_AUDIO_CONFIG,
+            0,
+            0,
+            &messages::probe_audio_config(request, &info.vivid_audio_config(0, None)),
+        )?;
+        if self.dry_run {
+            Ok(true)
+        } else {
+            let reply = self.wait_for_reply(request, &[messages::AUDIO_SUPPORT], 0)?;
+            messages::parse_audio_support(&reply.body)
+        }
+    }
+
+    pub fn create_image_source(&mut self, config: &ImageSourceConfig) -> io::Result<SourceHandle> {
+        if !self.supports(messages::FEATURE_ENCODED_IMAGE_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks encoded-image-v1",
+            ));
+        }
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::CREATE_IMAGE,
+            0,
+            config.source_id,
+            &messages::create_image(request_id, config),
+        )?;
+        self.source_ready(request_id, config.source_id, "image")
+    }
+
+    pub fn place_source(
+        &mut self,
+        source_id: u64,
+        node_id: u64,
+        anchor_id: Option<u64>,
+        columns: u32,
+        rows: u32,
+    ) -> io::Result<()> {
+        let (x, y) = if anchor_id.is_none() && !self.dry_run {
+            crossterm::cursor::position()
+                .map(|(column, row)| (i64::from(column) << 32, i64::from(row) << 32))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        self.create_scene_node(&SceneNodeConfig {
+            node_id,
+            source_id,
+            context_id: self.root_context_id,
+            x,
+            y,
+            width: i64::from(columns) << 32,
+            height: i64::from(rows) << 32,
+            text_layer: messages::TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+            z_index: 0,
+            visible: true,
+            anchor_id,
+            clip: None,
+        })?;
+        if self.verbose {
+            eprintln!(
+                "{}: placed source {source_id} as node {node_id} in {columns}x{rows} cells",
+                self.label
+            );
+        }
+        Ok(())
+    }
+
+    pub fn root_context_id(&self) -> u64 {
+        self.root_context_id
+    }
+
+    pub fn display_state(&self) -> DisplayState {
+        self.control.display_state(self.display)
+    }
+
+    pub fn create_scene_node(&mut self, node: &SceneNodeConfig) -> io::Result<SceneNode> {
+        self.transact_scene_node(messages::CREATE_NODE, node)?;
+        Ok(SceneNode {
+            id: node.node_id,
+            source_id: node.source_id,
+        })
+    }
+
+    pub fn update_scene_node(&mut self, node: &SceneNodeConfig) -> io::Result<SceneNode> {
+        self.transact_scene_node(messages::UPDATE_NODE, node)?;
+        Ok(SceneNode {
+            id: node.node_id,
+            source_id: node.source_id,
+        })
+    }
+
+    pub fn delete_scene_node(&mut self, node_id: u64) -> io::Result<()> {
+        let transaction_id = self.allocate_id()?;
+        let begin_request = self.request_id()?;
+        self.control.write_record(
+            messages::BEGIN_TXN,
+            0,
+            0,
+            &messages::begin_transaction(begin_request, transaction_id),
+        )?;
+        let node_request = self.request_id()?;
+        self.control.write_record(
+            messages::DELETE_NODE,
+            0,
+            node_id,
+            &messages::delete_node(node_request, transaction_id, node_id),
+        )?;
+        self.commit_transaction(transaction_id, begin_request, node_request, node_id)
+    }
+
+    pub fn destroy_source(&mut self, source_id: u64) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::DESTROY_SOURCE,
+            0,
+            source_id,
+            &messages::destroy_source(request_id, source_id),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    fn transact_scene_node(&mut self, record_type: u16, node: &SceneNodeConfig) -> io::Result<()> {
+        let transaction_id = self.allocate_id()?;
+        let begin_request = self.request_id()?;
+        self.control.write_record(
+            messages::BEGIN_TXN,
+            0,
+            0,
+            &messages::begin_transaction(begin_request, transaction_id),
+        )?;
+        let node_request = self.request_id()?;
+        self.control.write_record(
+            record_type,
+            0,
+            node.node_id,
+            &messages::create_scene_node(node_request, transaction_id, node),
+        )?;
+        self.commit_transaction(transaction_id, begin_request, node_request, node.node_id)
+    }
+
+    fn commit_transaction(
+        &mut self,
+        transaction_id: u64,
+        begin_request: u64,
+        action_request: u64,
+        action_object_id: u64,
+    ) -> io::Result<()> {
+        let mut stale_retries = 0;
+        loop {
+            let commit_request = self.request_id()?;
+            self.control.write_record(
+                messages::COMMIT_TXN,
+                0,
+                0,
+                &messages::commit_transaction(
+                    commit_request,
+                    transaction_id,
+                    self.control
+                        .display_generation(self.display.display_generation),
+                ),
+            )?;
+            if self.dry_run {
+                return Ok(());
+            }
+            if stale_retries == 0 {
+                self.wait_for_reply(begin_request, &[messages::OK], 0)?;
+                self.wait_for_reply(action_request, &[messages::OK], action_object_id)?;
+            }
+            let record = self.wait_for_reply_raw(
+                commit_request,
+                &[messages::OK, messages::PRESENTED, messages::ERROR],
+                0,
+            )?;
+            if record.record_type != messages::ERROR {
+                return Ok(());
+            }
+            let error = messages::parse_error_reply(&record.body)?;
+            if error.code == messages::ERROR_STALE_DISPLAY_GENERATION && stale_retries < 3 {
+                stale_retries += 1;
+                continue;
+            }
+            return Err(io::Error::other(format!(
+                "presenter error {}: {}",
+                error.code, error.diagnostic
+            )));
+        }
+    }
+
+    /// Insert an authenticated marker at the current terminal cursor. APC transports wait for the
+    /// presenter to attach it before continuing. ConPTY uses a scanner-compatible envelope and
+    /// permits the node and marker to arrive in either order because it can defer terminal output
+    /// while the producer is blocked.
+    pub fn create_text_anchor(&mut self) -> io::Result<Option<u64>> {
+        if std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some() {
+            return Ok(None);
+        }
+        if self.dry_run {
+            return self.allocate_id().map(Some);
+        }
+        let mut bytes = [0_u8; 8];
+        getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+        let anchor_id = u64::from_be_bytes(bytes);
+        if anchor_id == 0 {
+            return self.create_text_anchor();
+        }
+
+        let marker = anchor::encode_marker(&self.anchor_key, &self.session_tag, anchor_id)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        let conpty_transport = uses_conpty_anchor_transport();
+        let marker = marker_for_transport(marker, conpty_transport);
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(marker.as_bytes())?;
+        stdout.flush()?;
+        drop(stdout);
+
+        if conpty_transport {
+            if self.verbose {
+                eprintln!(
+                    "{}: submitted asynchronous text anchor {anchor_id} over ConPTY transport",
+                    self.label
+                );
+            }
+            self.unconfirmed_anchors.push(anchor_id);
+            return Ok(Some(anchor_id));
+        }
+
+        self.control.wait_anchor(anchor_id)?;
+        Ok(Some(anchor_id))
+    }
+
+    pub fn open_media_channel(
+        &self,
+        source: &SourceHandle,
+        kind: ConnectionKind,
+    ) -> io::Result<MediaChannel> {
+        let mut connection = if let Some(trace_dir) = &self.trace_dir {
+            let label = match kind {
+                ConnectionKind::Video => "video",
+                ConnectionKind::Raster => "raster",
+                ConnectionKind::Blob => "blob",
+                ConnectionKind::Control => "control",
+                ConnectionKind::LocalBuffer => "buffer",
+                ConnectionKind::Audio => "audio",
+            };
+            Connection::trace(
+                &trace_dir.join(format!("{label}-{}.vivid", source.id)),
+                kind,
+            )?
+        } else if self.dry_run {
+            Connection::sink(kind)?
+        } else {
+            let primary = self
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing Vivid endpoint"))?;
+            if let Some(bulk) = &self.bulk_endpoint {
+                Connection::open(bulk, kind).or_else(|_| Connection::open(primary, kind))?
+            } else {
+                Connection::open(primary, kind)?
+            }
+        };
+        connection.write_record(
+            messages::ATTACH_CHANNEL,
+            0,
+            source.id,
+            &messages::attach_channel(&source.ticket),
+        )?;
+        connection.set_send_body_limit(u32::try_from(source.record_limit).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source body limit exceeds u32")
+        })?)?;
+        Ok(MediaChannel {
+            connection,
+            source_id: source.id,
+        })
+    }
+
+    pub fn open_media_sender(
+        &self,
+        source: SourceHandle,
+        kind: ConnectionKind,
+    ) -> io::Result<MediaSender> {
+        let channel = self.open_media_channel(&source, kind)?;
+        Ok(MediaSender {
+            source,
+            channel,
+            dry_run: self.dry_run,
+        })
+    }
+
+    pub fn send_raster_frame(
+        &mut self,
+        source: &mut SourceHandle,
+        channel: &mut MediaChannel,
+        epoch: u32,
+        frame_id: u64,
+        size: (u32, u32),
+        rgba: &[u8],
+    ) -> io::Result<()> {
+        let (width, height) = size;
+        let raw = media::raster_frame_body(epoch, frame_id, width, height, rgba)?;
+        let body = if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
+            let compressed = media::raster_frame_body_with_compression(
+                epoch, frame_id, width, height, rgba, true,
+            )?;
+            if compressed.len() < raw.len() {
+                compressed
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        self.validate_record_size(source, body.len() as u64)?;
+        self.consume_credits(source, body.len() as u64)?;
+        channel
+            .connection
+            .write_record(messages::RASTER_FRAME, 0, channel.source_id, &body)?;
+        self.wait_for_media_credit(source)
+    }
+
+    pub fn send_video_packet(
+        &mut self,
+        source: &mut SourceHandle,
+        channel: &mut MediaChannel,
+        packet: VideoPacket<'_>,
+    ) -> io::Result<()> {
+        let body = media::video_packet_body(packet)?;
+        self.validate_record_size(source, body.len() as u64)?;
+        self.consume_credits(source, body.len() as u64)?;
+        channel
+            .connection
+            .write_record(messages::VIDEO_PACKET, 0, channel.source_id, &body)
+    }
+
+    pub fn send_audio_packet(
+        &mut self,
+        source: &mut SourceHandle,
+        channel: &mut MediaChannel,
+        packet: media::AudioPacket<'_>,
+    ) -> io::Result<()> {
+        let body = media::audio_packet_body(packet)?;
+        self.validate_record_size(source, body.len() as u64)?;
+        self.consume_credits(source, body.len() as u64)?;
+        channel
+            .connection
+            .write_record(messages::AUDIO_PACKET, 0, channel.source_id, &body)
+    }
+
+    pub fn send_image_data(
+        &mut self,
+        source: &mut SourceHandle,
+        channel: &mut MediaChannel,
+        encoded: &[u8],
+    ) -> io::Result<()> {
+        self.validate_record_size(source, encoded.len() as u64)?;
+        self.consume_credits(source, encoded.len() as u64)?;
+        channel
+            .connection
+            .write_record(messages::IMAGE_DATA, 0, channel.source_id, encoded)?;
+        self.wait_for_media_credit(source)
+    }
+
+    pub fn supports(&self, feature: u64) -> bool {
+        self.accepted_features.binary_search(&feature).is_ok()
+    }
+
+    pub fn play_at(
+        &mut self,
+        source_id: u64,
+        start_pts_us: i64,
+        minimum_buffer_us: u64,
+    ) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        let minimum_buffer_us = self
+            .control
+            .adjusted_minimum_buffer(minimum_buffer_us)
+            .min(500_000);
+        let mut play = messages::PlayRequest::baseline(source_id, minimum_buffer_us);
+        play.start_pts_us = start_pts_us;
+        play.maximum_latency_us = play.maximum_latency_us.max(play.minimum_buffer_us);
+        self.control.write_record(
+            messages::PLAY,
+            0,
+            source_id,
+            &messages::play_request(request_id, &play),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn eos(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::EOS,
+            0,
+            source_id,
+            &messages::eos(request_id, source_id, epoch),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn drain(&mut self, source_id: u64) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::DRAIN,
+            0,
+            source_id,
+            &messages::drain(request_id, source_id),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn drain_with_timeout(&mut self, source_id: u64, timeout: Duration) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::DRAIN,
+            0,
+            source_id,
+            &messages::drain(request_id, source_id),
+        )?;
+        if self.dry_run {
+            return Ok(());
+        }
+        let record = self.control.wait_reply_deadline(
+            request_id,
+            &[messages::OK],
+            source_id,
+            Instant::now() + timeout,
+        )?;
+        if record.record_type == messages::ERROR {
+            return Err(io::Error::other(messages::parse_error(&record.body)?));
+        }
+        Ok(())
+    }
+
+    pub fn pause(&mut self, source_id: u64) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::PAUSE,
+            0,
+            source_id,
+            &messages::pause(request_id, source_id),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn flush(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::FLUSH,
+            0,
+            source_id,
+            &messages::flush(request_id, source_id, epoch),
+        )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn wait_until_visible(&mut self, source: &mut SourceHandle) -> io::Result<()> {
+        source.wait_until_visible()
+    }
+
+    pub fn apply_pending_source_events(&mut self, source: &mut SourceHandle) -> io::Result<()> {
+        source.check_lost()
+    }
+
+    pub fn goodbye(&mut self) -> io::Result<()> {
+        self.confirm_conpty_anchors();
+        let request_id = self.request_id()?;
+        self.control
+            .write_record(messages::GOODBYE, 0, 0, &messages::goodbye(request_id))?;
+        if !self.dry_run {
+            let _ = self.wait_for_reply(request_id, &[messages::OK], 0)?;
+        }
+        Ok(())
+    }
+
+    /// ConPTY anchor markers travel through the terminal text path while GOODBYE travels on
+    /// the control connection; nothing orders the two. A one-shot producer that disconnects
+    /// before its marker reaches the presenter loses the anchored node, so give the presenter
+    /// a bounded window to confirm outstanding anchors before saying goodbye.
+    fn confirm_conpty_anchors(&mut self) {
+        if self.dry_run || self.unconfirmed_anchors.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for anchor_id in std::mem::take(&mut self.unconfirmed_anchors) {
+            match self.control.wait_anchor_deadline(anchor_id, deadline) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "{}: warning: the presenter did not confirm text anchor {anchor_id}; \
+                     the display may have discarded this submission",
+                    self.label
+                ),
+                Err(_) => return,
+            }
+        }
+    }
+
+    pub fn verbose(&self, message: impl std::fmt::Display) {
+        if self.verbose {
+            eprintln!("{}: {message}", self.label);
+        }
+    }
+
+    fn source_ready(
+        &mut self,
+        request_id: u64,
+        source_id: u64,
+        kind: &str,
+    ) -> io::Result<SourceHandle> {
+        let ready = if self.dry_run {
+            let mut ticket = vec![0; 32];
+            ticket[24..].copy_from_slice(&source_id.to_be_bytes());
+            SourceReady {
+                source_id,
+                media_ticket: ticket,
+                byte_credits: SYNTHETIC_CREDITS,
+                packet_credits: SYNTHETIC_CREDITS,
+                fragment_credits: SYNTHETIC_CREDITS,
+                max_media_body: vivid_protocol::HARD_MAX_RECORD_BODY,
+            }
+        } else {
+            let record = self.wait_for_reply(request_id, &[messages::SOURCE_READY], source_id)?;
+            messages::parse_source_ready(&record.body)?
+        };
+        if ready.source_id != source_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SOURCE_READY is for {}, expected {source_id}",
+                    ready.source_id
+                ),
+            ));
+        }
+        if self.verbose {
+            eprintln!(
+                "{}: {kind} source {source_id} ready with {} byte / {} packet credits",
+                self.label, ready.byte_credits, ready.packet_credits
+            );
+        }
+        let credits = Credits {
+            bytes: ready.byte_credits,
+            packets: ready.packet_credits,
+            fragments: ready.fragment_credits,
+        };
+        let state = self.control.register_source(source_id, credits)?;
+        Ok(SourceHandle {
+            id: source_id,
+            ticket: ready.media_ticket,
+            record_limit: u64::from(ready.max_media_body),
+            state,
+            acknowledged_credit_returns: 0,
+            observed_visible: true,
+            reported_lost: false,
+        })
+    }
+
+    fn validate_record_size(&self, source: &SourceHandle, bytes: u64) -> io::Result<()> {
+        if bytes > source.record_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Vivid media record is {bytes} bytes, exceeding source {}'s {}-byte credit window; fragmentation is required",
+                    source.id, source.record_limit
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume_credits(&mut self, source: &mut SourceHandle, bytes: u64) -> io::Result<()> {
+        source.consume_credits(bytes, self.dry_run, false)
+    }
+
+    /// Wait until the presenter has consumed a one-shot image or raster record before the media
+    /// channel and control session are allowed to close.
+    fn wait_for_media_credit(&mut self, source: &mut SourceHandle) -> io::Result<()> {
+        if self.dry_run {
+            return Ok(());
+        }
+        source.wait_for_credit_return()
+    }
+
+    fn request_id(&mut self) -> io::Result<u64> {
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Vivid request ID space exhausted"))?;
+        Ok(self.next_request_id)
+    }
+
+    fn wait_for_reply(
+        &mut self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+    ) -> io::Result<Record> {
+        let record = self.wait_for_reply_raw(request_id, accepted, expected_object_id)?;
+        if record.record_type == messages::ERROR {
+            return Err(io::Error::other(messages::parse_error(&record.body)?));
+        }
+        Ok(record)
+    }
+
+    fn wait_for_ok(&mut self, request_id: u64, expected_object_id: u64) -> io::Result<()> {
+        if !self.dry_run {
+            self.wait_for_reply(request_id, &[messages::OK], expected_object_id)?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_reply_raw(
+        &mut self,
+        request_id: u64,
+        accepted: &[u16],
+        expected_object_id: u64,
+    ) -> io::Result<Record> {
+        self.control
+            .wait_reply(request_id, accepted, expected_object_id)
+    }
+}
+
+fn uses_conpty_anchor_transport() -> bool {
+    cfg!(windows)
+        || configured_anchor_transport_is_conpty(
+            std::env::var("VIVID_ANCHOR_TRANSPORT").ok().as_deref(),
+        )
+}
+
+fn configured_anchor_transport_is_conpty(transport: Option<&str>) -> bool {
+    transport == Some(CONPTY_ANCHOR_TRANSPORT)
+}
+
+fn marker_for_transport(marker: String, conpty_transport: bool) -> String {
+    if conpty_transport {
+        format!("{};VIVID-END", &marker[2..marker.len() - 2])
+    } else {
+        marker
+    }
+}
+
+impl SourceHandle {
+    pub fn cancellation(&self) -> SourceCancellation {
+        SourceCancellation {
+            state: self.state.clone(),
+        }
+    }
+
+    pub fn take_event(&mut self) -> Option<SourceEvent> {
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.reported_lost {
+            if let Some(error) = &state.lost {
+                self.reported_lost = true;
+                return Some(SourceEvent::Lost(error.clone()));
+            }
+        }
+        if let Some(epoch) = state.need_keyframe_epoch.take() {
+            return Some(SourceEvent::NeedKeyframe(epoch));
+        }
+        if state.visible != self.observed_visible {
+            self.observed_visible = state.visible;
+            return Some(SourceEvent::Visibility(state.visible));
+        }
+        None
+    }
+
+    pub fn take_keyframe_request(&mut self) -> Option<u32> {
+        self.state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .need_keyframe_epoch
+            .take()
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .visible
+    }
+
+    /// Bitmask from the presenter's last `VISIBILITY` record: bit 0 set means the source's scene
+    /// node does not intersect the viewport (off-screen geometry); bit 1 set means the presenter
+    /// surface is not renderable (e.g. occluded). Zero when visible or never reported.
+    pub fn visibility_reasons(&self) -> u64 {
+        self.state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .visible_reasons
+    }
+
+    fn check_lost(&self) -> io::Result<()> {
+        let state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = &state.lost {
+            Err(io::Error::other(error.clone()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn consume_credits(
+        &self,
+        bytes: u64,
+        dry_run: bool,
+        interrupt_for_events: bool,
+    ) -> io::Result<()> {
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(error) = &state.lost {
+                return Err(io::Error::other(error.clone()));
+            }
+            if interrupt_for_events && state.need_keyframe_epoch.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "presenter requested a fresh keyframe",
+                ));
+            }
+            if interrupt_for_events && !state.visible {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "source became invisible while waiting for media credit",
+                ));
+            }
+            if state.credits.bytes >= bytes && state.credits.packets > 0 {
+                state.credits.bytes -= bytes;
+                state.credits.packets -= 1;
+                return Ok(());
+            }
+            if dry_run {
+                return Err(io::Error::other("synthetic dry-run credits exhausted"));
+            }
+            state = self
+                .state
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_for_credit_return(&mut self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(error) = &state.lost {
+                return Err(io::Error::other(error.clone()));
+            }
+            if state.credit_returns > self.acknowledged_credit_returns {
+                self.acknowledged_credit_returns = state.credit_returns;
+                return Ok(());
+            }
+            state = self
+                .state
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_until_visible(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.visible {
+            if let Some(error) = &state.lost {
+                return Err(io::Error::other(error.clone()));
+            }
+            state = self
+                .state
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        Ok(())
+    }
+}
+
+fn read_expected(
+    connection: &mut Connection,
+    expected_request_id: u64,
+    accepted_types: &[u16],
+    mut display_generation: Option<&mut u64>,
+) -> io::Result<Record> {
+    loop {
+        let record = connection.read_record()?;
+        if record.record_type == messages::ERROR {
+            return Err(io::Error::other(messages::parse_error(&record.body)?));
+        }
+        if record.record_type == messages::DISPLAY_CHANGED {
+            if let Some(generation) = display_generation.as_deref_mut() {
+                *generation = messages::parse_display_changed(&record.body)?.display_generation;
+            }
+            continue;
+        }
+        if !accepted_types.contains(&record.record_type) {
+            continue;
+        }
+        if messages::request_id(&record.body)? == expected_request_id {
+            return Ok(record);
+        }
+    }
+}
+
+fn source_lost_error(record: &Record) -> io::Result<io::Error> {
+    let lost = messages::parse_source_lost(&record.body)?;
+    if lost.source_id != record.object_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SOURCE_LOST object ID mismatch",
+        ));
+    }
+    Ok(io::Error::other(format!(
+        "Vivid source {} was lost ({}): {}",
+        lost.source_id, lost.code, lost.diagnostic
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(id: u64, byte_credits: u64, packet_credits: u64) -> SourceHandle {
+        SourceHandle {
+            id,
+            ticket: vec![0; 32],
+            record_limit: 1024,
+            state: Arc::new(SourceSync {
+                state: Mutex::new(SourceRuntime {
+                    credits: Credits {
+                        bytes: byte_credits,
+                        packets: packet_credits,
+                        fragments: 0,
+                    },
+                    visible: true,
+                    visible_reasons: 0,
+                    need_keyframe_epoch: None,
+                    lost: None,
+                    credit_returns: 0,
+                }),
+                changed: Condvar::new(),
+            }),
+            acknowledged_credit_returns: 0,
+            observed_visible: true,
+            reported_lost: false,
+        }
+    }
+
+    #[test]
+    fn session_anchor_uses_v2_marker() {
+        let key = anchor::derive_key(&[0; 32], &[0; 16]);
+        let marker = anchor::encode_marker(&key, &[0; 16], 7).unwrap();
+        assert!(marker.starts_with("\x1b_VIVID;2;A;"));
+        assert!(marker.len() <= 128);
+    }
+
+    #[test]
+    fn remote_conpty_transport_selects_windows_marker_envelope() {
+        let key = anchor::derive_key(&[0; 32], &[0; 16]);
+        let marker = anchor::encode_marker(&key, &[0; 16], 7).unwrap();
+
+        assert!(configured_anchor_transport_is_conpty(Some("conpty")));
+        assert!(!configured_anchor_transport_is_conpty(None));
+        assert!(!configured_anchor_transport_is_conpty(Some("apc")));
+
+        let transported = marker_for_transport(marker.clone(), true);
+        assert!(transported.starts_with("VIVID;2;A;"));
+        assert!(transported.ends_with(";VIVID-END"));
+        assert!(!transported.contains('\x1b'));
+        assert_eq!(marker_for_transport(marker.clone(), false), marker);
+    }
+
+    #[test]
+    fn source_cancellation_wakes_a_blocked_credit_wait() {
+        let source = source(7, 0, 0);
+        let cancel = source.cancellation();
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            let error = source.consume_credits(1, false, true).unwrap_err();
+            done.send(error.to_string()).unwrap();
+        });
+        cancel.cancel("local shutdown");
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "local shutdown"
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn source_credit_waits_are_independent() {
+        let blocked = source(1, 0, 0);
+        let ready = source(2, 64, 1);
+        let cancel = blocked.cancellation();
+        let join = thread::spawn(move || blocked.consume_credits(1, false, true));
+        ready.consume_credits(32, false, true).unwrap();
+        cancel.cancel("test complete");
+        assert!(join.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn media_waits_interrupt_for_visibility_and_keyframe_events() {
+        let source = source(3, 64, 1);
+        {
+            let mut state = source.state.state.lock().unwrap();
+            state.visible = false;
+        }
+        assert_eq!(
+            source.consume_credits(1, false, true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        {
+            let mut state = source.state.state.lock().unwrap();
+            state.visible = true;
+            state.need_keyframe_epoch = Some(9);
+        }
+        assert_eq!(
+            source.consume_credits(1, false, true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn audio_send_ignores_advisory_false_visibility() {
+        let source = source(4, 1024, 1);
+        source.state.state.lock().unwrap().visible = false;
+        let mut sender = MediaSender {
+            source,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Audio).unwrap(),
+                source_id: 4,
+            },
+            dry_run: false,
+        };
+        sender
+            .send_audio(media::AudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 20_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0xf8, 0xff, 0xfe],
+            })
+            .unwrap();
+    }
+}
