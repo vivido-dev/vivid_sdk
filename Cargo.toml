@@ -1,0 +1,12 @@
+[package]
+name = "vivid_sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+description = "Reusable full-duplex Vivid Protocol producer client"
+
+[dependencies]
+crossterm = "0.29"
+getrandom = "0.3"
+vivid_protocol = { version = "1.2.1", path = "../vivid_protocol" }
