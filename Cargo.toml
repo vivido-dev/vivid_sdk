@@ -1,10 +1,12 @@
 [package]
 name = "vivid_sdk"
 version = "0.1.0"
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
 description = "Reusable full-duplex Vivid Protocol producer client"
+repository = "https://github.com/wensheng/vivid_sdk"
 
 [dependencies]
 crossterm = "0.29"
