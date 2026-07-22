@@ -1,6 +1,6 @@
 # vivid_sdk
 
-`vivid_sdk` is the reusable full-duplex Vivid 1.1 producer client shared by Vivi and Veston.
+`vivid_sdk` is the reusable full-duplex Vivid 1.0 producer client shared by Vivi, Vvrd, and Veston.
 It owns authentication, control dispatch, heartbeat handling, reply correlation, text anchors,
 scene transactions, source state, transport attachment, and credit-aware media senders.
 

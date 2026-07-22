@@ -1,14 +1,17 @@
 [package]
 name = "vivid_sdk"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
 description = "Reusable full-duplex Vivid Protocol producer client"
-repository = "https://github.com/wensheng/vivid_sdk"
+repository = "https://github.com/vivido-dev/vivid_sdk"
 
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.3"
-vivid_protocol = { version = "1.2.1", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.3", path = "../vivid_protocol" }
+
+[dev-dependencies]
+tempfile = "3"

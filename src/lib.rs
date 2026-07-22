@@ -12,9 +12,12 @@ use vivid_protocol::messages::{
     VideoSourceConfig,
 };
 use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoint, Record};
+use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 const SYNTHETIC_CREDITS: u64 = u64::MAX / 4;
 const MAX_PENDING_CONTROL_RECORDS: usize = 4096;
+/// Cadence for opportunistic RTT sampling probes while the control connection is active.
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
@@ -64,8 +67,30 @@ impl ProducerConfig {
                 "Vivid producer version must contain 1 to 64 bytes",
             ));
         }
+        validate_feature_ids("required", &self.required_features)?;
+        validate_feature_ids("optional", &self.optional_features)?;
+        if self
+            .required_features
+            .iter()
+            .any(|feature| self.optional_features.binary_search(feature).is_ok())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "required and optional Vivid feature sets overlap",
+            ));
+        }
         Ok(())
     }
+}
+
+fn validate_feature_ids(description: &str, features: &[u64]) -> io::Result<()> {
+    if features.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} Vivid feature IDs must be strictly increasing"),
+        ));
+    }
+    Ok(())
 }
 
 /// Supplies a borrowed portable Vivid video configuration without coupling the producer to a
@@ -92,6 +117,12 @@ pub struct VideoSourceSpec {
     pub sar_num: u32,
     pub sar_den: u32,
     pub max_access_unit_bytes: u32,
+    /// Optional RFC 6381 codec string (`decoder-description-v1`); the session scrubs it when the
+    /// presenter did not accept the feature.
+    pub codec_string: Option<String>,
+    /// Optional ISO-BMFF decoder configuration box body (avcC/hvcC/vpcC/av1C); scrubbed with
+    /// [`VideoSourceSpec::codec_string`].
+    pub decoder_config: Option<Vec<u8>>,
 }
 
 impl VideoConfig for VideoSourceSpec {
@@ -113,6 +144,8 @@ impl VideoConfig for VideoSourceSpec {
             sar_num: self.sar_num,
             sar_den: self.sar_den,
             max_access_unit_bytes: self.max_access_unit_bytes,
+            codec_string: self.codec_string.as_deref(),
+            decoder_config: self.decoder_config.as_deref(),
         }
     }
 }
@@ -135,6 +168,9 @@ pub struct AudioSourceSpec {
     pub channel_mask: u64,
     pub bitrate: i64,
     pub max_access_unit_bytes: u32,
+    /// Optional RFC 6381 codec string (`decoder-description-v1`); the session scrubs it when the
+    /// presenter did not accept the feature.
+    pub codec_string: Option<String>,
 }
 
 impl AudioConfig for AudioSourceSpec {
@@ -154,6 +190,7 @@ impl AudioConfig for AudioSourceSpec {
             channel_mask: self.channel_mask,
             bitrate: self.bitrate,
             max_access_unit_bytes: self.max_access_unit_bytes,
+            codec_string: self.codec_string.as_deref(),
         }
     }
 }
@@ -197,21 +234,28 @@ impl SourceCancellation {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.lost.is_none() {
-            state.lost = Some(reason.into());
-        }
+        state.mark_lost(reason);
         self.state.changed.notify_all();
     }
 }
 
 #[derive(Debug)]
 struct SourceRuntime {
-    credits: Credits,
+    credits: messages::CreditLedger,
     visible: bool,
     visible_reasons: u64,
     need_keyframe_epoch: Option<u32>,
     lost: Option<String>,
     credit_returns: u64,
+}
+
+impl SourceRuntime {
+    fn mark_lost(&mut self, reason: impl Into<String>) {
+        self.credits.mark_lost();
+        if self.lost.is_none() {
+            self.lost = Some(reason.into());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -234,6 +278,10 @@ struct DispatcherState {
     unanswered_probes: u8,
     next_ping_id: u64,
     pending_pings: HashMap<u64, Instant>,
+    /// Last RTT sampling probe. Sampling probes are independent of the idle liveness probes:
+    /// they never advance `unanswered_probes` or `last_probe_sent`, so they cannot change
+    /// disconnect detection.
+    last_rtt_probe: Option<Instant>,
     rtt_us: Option<u64>,
 }
 
@@ -270,6 +318,7 @@ impl ControlDispatcher {
                 unanswered_probes: 0,
                 next_ping_id: u64::MAX,
                 pending_pings: HashMap::new(),
+                last_rtt_probe: None,
                 rtt_us: None,
             }),
             changed: Condvar::new(),
@@ -429,6 +478,32 @@ impl ControlDispatcher {
                                 now.duration_since(sent) < Duration::from_secs(15)
                             })
                         {
+                            // Not idle: opportunistically sample RTT so `play_at`'s
+                            // RTT-derived minimum buffer works with a live estimate instead
+                            // of falling back to static prebuffer guesses. Sampling probes
+                            // stay out of the liveness accounting entirely, and at most one
+                            // is outstanding; intervening records still discard the sample
+                            // (the specification's clean-sample rule).
+                            if state.pending_pings.is_empty()
+                                && state.last_rtt_probe.is_none_or(|sent| {
+                                    now.duration_since(sent) >= RTT_SAMPLE_INTERVAL
+                                })
+                            {
+                                let request = state.next_ping_id;
+                                state.next_ping_id = state.next_ping_id.saturating_sub(1);
+                                state.last_rtt_probe = Some(now);
+                                state.pending_pings.insert(request, now);
+                                drop(state);
+                                if let Err(error) = heartbeat_writer.write_record(
+                                    messages::PING,
+                                    0,
+                                    0,
+                                    &messages::ok(request),
+                                ) {
+                                    close_dispatcher(&heartbeat_shared, error.to_string());
+                                    break;
+                                }
+                            }
                             continue;
                         }
                         if state.unanswered_probes >= 3 {
@@ -439,10 +514,7 @@ impl ControlDispatcher {
                                     .state
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .lost
-                                    .get_or_insert_with(|| {
-                                        "Vivid control heartbeat timed out".into()
-                                    });
+                                    .mark_lost("Vivid control heartbeat timed out");
                                 source.changed.notify_all();
                             }
                             break;
@@ -577,9 +649,7 @@ impl ControlDispatcher {
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        source_state
-                            .lost
-                            .get_or_insert_with(|| "Vivid control request timed out".into());
+                        source_state.mark_lost("Vivid control request timed out");
                         source.changed.notify_all();
                     }
                     return Err(io::Error::new(
@@ -606,7 +676,7 @@ impl ControlDispatcher {
     fn register_source(&self, source_id: u64, credits: Credits) -> io::Result<Arc<SourceSync>> {
         let source = Arc::new(SourceSync {
             state: Mutex::new(SourceRuntime {
-                credits,
+                credits: messages::CreditLedger::new(credits),
                 visible: true,
                 visible_reasons: 0,
                 need_keyframe_epoch: None,
@@ -731,8 +801,7 @@ fn close_dispatcher(shared: &DispatcherShared, message: String) {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lost
-            .get_or_insert_with(|| "Vivid control connection closed".into());
+            .mark_lost("Vivid control connection closed");
         source.changed.notify_all();
     }
 }
@@ -745,28 +814,7 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
     match record.record_type {
         messages::CREDIT => {
             let added = messages::parse_credit(&record.body)?;
-            state.credits.bytes =
-                state
-                    .credits
-                    .bytes
-                    .checked_add(added.bytes)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "byte credit overflow")
-                    })?;
-            state.credits.packets = state
-                .credits
-                .packets
-                .checked_add(added.packets)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "packet credit overflow")
-                })?;
-            state.credits.fragments = state
-                .credits
-                .fragments
-                .checked_add(added.fragments)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "fragment credit overflow")
-                })?;
+            state.credits.grant(added)?;
             state.credit_returns = state.credit_returns.checked_add(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "credit return counter overflow")
             })?;
@@ -787,7 +835,7 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
             state.need_keyframe_epoch = Some(request.minimum_epoch);
         }
         messages::SOURCE_LOST => {
-            state.lost = Some(source_lost_error(record)?.to_string());
+            state.mark_lost(source_lost_error(record)?.to_string());
         }
         _ => {
             return Err(io::Error::new(
@@ -856,7 +904,7 @@ impl ClientControl {
             Self::Live(dispatcher) => dispatcher.register_source(source_id, credits),
             Self::Direct(_) => Ok(Arc::new(SourceSync {
                 state: Mutex::new(SourceRuntime {
-                    credits,
+                    credits: messages::CreditLedger::new(credits),
                     visible: true,
                     visible_reasons: 0,
                     need_keyframe_epoch: None,
@@ -1030,10 +1078,10 @@ impl ProducerSession {
             &messages::encode_hello(
                 hello_request,
                 &messages::HelloConfig {
-                    minimum_major: 1,
-                    minimum_minor: 1,
-                    maximum_major: 1,
-                    maximum_minor: 1,
+                    minimum_major: u64::from(VIVID_MAJOR),
+                    minimum_minor: u64::from(VIVID_MINOR),
+                    maximum_major: u64::from(VIVID_MAJOR),
+                    maximum_minor: u64::from(VIVID_MINOR),
                     token,
                     producer: &config.producer,
                     producer_version: &config.producer_version,
@@ -1046,12 +1094,14 @@ impl ProducerSession {
 
         let (root_context_id, display, session_tag, accepted_features, control_limit) = if dry_run {
             if config.verbose {
-                eprintln!("{}: dry-run HELLO (Vivid 1.1)", config.producer);
+                eprintln!("{}: dry-run HELLO (Vivid 1.0)", config.producer);
             }
-            let mut accepted_features = config.required_features.clone();
-            accepted_features.extend_from_slice(&config.optional_features);
-            accepted_features.sort_unstable();
-            accepted_features.dedup();
+            let accepted_features = messages::negotiate_features(
+                &config.required_features,
+                &config.optional_features,
+                |_| true,
+            )
+            .expect("a universally supported feature set cannot fail negotiation");
             (
                 1,
                 DisplayState {
@@ -1070,24 +1120,35 @@ impl ProducerSession {
         } else {
             let record = read_expected(&mut control, hello_request, &[messages::WELCOME], None)?;
             let welcome = messages::parse_welcome(&record.body)?;
-            if (welcome.selected_major, welcome.selected_minor) != (1, 1) {
+            if (welcome.selected_major, welcome.selected_minor)
+                != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "presenter selected Vivid {}.{}, expected 1.1",
-                        welcome.selected_major, welcome.selected_minor
+                        "presenter selected Vivid {}.{}, expected {}.{}",
+                        welcome.selected_major, welcome.selected_minor, VIVID_MAJOR, VIVID_MINOR
                     ),
                 )
                 .into());
             }
-            for required in &config.required_features {
-                if welcome.accepted_features.binary_search(required).is_err() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("presenter did not accept required Vivid feature {required}"),
-                    )
-                    .into());
-                }
+            let accepted_features = messages::negotiate_features(
+                &config.required_features,
+                &config.optional_features,
+                |feature| welcome.accepted_features.contains(&feature),
+            )
+            .map_err(|required| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("presenter did not accept required Vivid feature {required}"),
+                )
+            })?;
+            if accepted_features != welcome.accepted_features {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WELCOME accepted features are unsorted, duplicated, or were not offered",
+                )
+                .into());
             }
             let session_tag: [u8; 16] =
                 welcome.session_tag.as_slice().try_into().map_err(|_| {
@@ -1127,7 +1188,7 @@ impl ProducerSession {
                     cell_height: welcome.cell_height,
                 },
                 session_tag,
-                welcome.accepted_features,
+                accepted_features,
                 welcome.maximum_control_body,
             )
         };
@@ -1198,10 +1259,34 @@ impl ProducerSession {
         info: &C,
     ) -> io::Result<SourceHandle> {
         let request_id = self.request_id()?;
-        let body = messages::create_video(request_id, &info.vivid_video_config(source_id));
+        let config = self.scrub_video_description(info.vivid_video_config(source_id));
+        let body = messages::create_video(request_id, &config);
         self.control
             .write_record(messages::CREATE_VIDEO, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "video")
+    }
+
+    /// Drop `decoder-description-v1` fields when the presenter did not accept the feature; the
+    /// specification forbids sending keys 21/22 (video) and 11 (audio) without acceptance.
+    fn scrub_video_description<'a>(
+        &self,
+        mut config: VideoSourceConfig<'a>,
+    ) -> VideoSourceConfig<'a> {
+        if !self.supports(messages::FEATURE_DECODER_DESCRIPTION_V1) {
+            config.codec_string = None;
+            config.decoder_config = None;
+        }
+        config
+    }
+
+    fn scrub_audio_description<'a>(
+        &self,
+        mut config: AudioSourceConfig<'a>,
+    ) -> AudioSourceConfig<'a> {
+        if !self.supports(messages::FEATURE_DECODER_DESCRIPTION_V1) {
+            config.codec_string = None;
+        }
+        config
     }
 
     pub fn create_audio_source<C: AudioConfig + ?Sized>(
@@ -1216,7 +1301,8 @@ impl ProducerSession {
                 "presenter lacks audio-access-unit-v1",
             ));
         }
-        let config = info.vivid_audio_config(source_id, linked_video_source_id);
+        let config = self
+            .scrub_audio_description(info.vivid_audio_config(source_id, linked_video_source_id));
         let request_id = self.request_id()?;
         self.control.write_record(
             messages::CREATE_AUDIO,
@@ -1252,7 +1338,10 @@ impl ProducerSession {
             messages::CREATE_VIDEO,
             0,
             video_source_id,
-            &messages::create_video(video_request, &video.vivid_video_config(video_source_id)),
+            &messages::create_video(
+                video_request,
+                &self.scrub_video_description(video.vivid_video_config(video_source_id)),
+            ),
         )?;
         self.control.write_record(
             messages::CREATE_AUDIO,
@@ -1260,7 +1349,9 @@ impl ProducerSession {
             audio_source_id,
             &messages::create_audio(
                 audio_request,
-                &audio.vivid_audio_config(audio_source_id, Some(video_source_id)),
+                &self.scrub_audio_description(
+                    audio.vivid_audio_config(audio_source_id, Some(video_source_id)),
+                ),
             ),
         )?;
         let video = self.source_ready(video_request, video_source_id, "video")?;
@@ -1275,7 +1366,10 @@ impl ProducerSession {
             messages::PROBE_VIDEO_CONFIG,
             0,
             0,
-            &messages::probe_video_config(request, &info.vivid_video_config(0)),
+            &messages::probe_video_config(
+                request,
+                &self.scrub_video_description(info.vivid_video_config(0)),
+            ),
         )?;
         if self.dry_run {
             Ok(true)
@@ -1292,7 +1386,10 @@ impl ProducerSession {
             messages::PROBE_AUDIO_CONFIG,
             0,
             0,
-            &messages::probe_audio_config(request, &info.vivid_audio_config(0, None)),
+            &messages::probe_audio_config(
+                request,
+                &self.scrub_audio_description(info.vivid_audio_config(0, None)),
+            ),
         )?;
         if self.dry_run {
             Ok(true)
@@ -2027,9 +2124,8 @@ impl SourceHandle {
                     "source became invisible while waiting for media credit",
                 ));
             }
-            if state.credits.bytes >= bytes && state.credits.packets > 0 {
-                state.credits.bytes -= bytes;
-                state.credits.packets -= 1;
+            if state.credits.can_consume(bytes) {
+                state.credits.consume(bytes)?;
                 return Ok(());
             }
             if dry_run {
@@ -2129,6 +2225,194 @@ fn source_lost_error(record: &Record) -> io::Result<io::Error> {
 mod tests {
     use super::*;
 
+    fn producer_config(required_features: Vec<u64>, optional_features: Vec<u64>) -> ProducerConfig {
+        ProducerConfig {
+            endpoint: None,
+            bulk_endpoint: None,
+            token: None,
+            dry_run: true,
+            trace_dir: None,
+            verbose: false,
+            producer: "test".to_owned(),
+            producer_version: "1".to_owned(),
+            required_features,
+            optional_features,
+        }
+    }
+
+    #[test]
+    fn producer_config_rejects_noncanonical_feature_sets() {
+        let error = producer_config(vec![1, 3], vec![8, 7])
+            .validate()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "optional Vivid feature IDs must be strictly increasing"
+        );
+
+        let error = producer_config(vec![1, 3], vec![3, 7])
+            .validate()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "required and optional Vivid feature sets overlap"
+        );
+    }
+
+    #[test]
+    fn decoder_description_is_emitted_only_when_negotiated() {
+        let without = ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
+        let with = ProducerSession::connect(&producer_config(
+            Vec::new(),
+            vec![messages::FEATURE_DECODER_DESCRIPTION_V1],
+        ))
+        .unwrap();
+        let avcc = [1, 0x64, 0, 0x1f, 0xff, 0xe1, 0];
+        let video = || VideoSourceConfig {
+            source_id: 1,
+            codec: "h264",
+            packetization: "h264-annexb-au-v1",
+            extradata: &[0, 0, 0, 1, 0x67],
+            width: 64,
+            height: 64,
+            profile: 100,
+            level: 31,
+            bitrate: 1,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 1024,
+            codec_string: Some("avc1.64001F"),
+            decoder_config: Some(&avcc),
+        };
+        let scrubbed = without.scrub_video_description(video());
+        assert_eq!(scrubbed.codec_string, None);
+        assert_eq!(scrubbed.decoder_config, None);
+
+        let retained = with.scrub_video_description(video());
+        assert_eq!(retained.codec_string, Some("avc1.64001F"));
+        assert_eq!(retained.decoder_config, Some(avcc.as_slice()));
+
+        let audio = || AudioSourceConfig {
+            source_id: 2,
+            linked_video_source_id: Some(1),
+            codec: "aac",
+            packetization: "aac-raw-au-v1",
+            extradata: &[0x11, 0x90],
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            bitrate: 1,
+            max_access_unit_bytes: 1024,
+            codec_string: Some("mp4a.40.2"),
+        };
+        assert_eq!(without.scrub_audio_description(audio()).codec_string, None);
+        assert_eq!(
+            with.scrub_audio_description(audio()).codec_string,
+            Some("mp4a.40.2")
+        );
+    }
+
+    /// A live control connection with routine traffic must produce an RTT estimate quickly, so
+    /// `play_at`'s RTT-derived minimum buffer works before streaming begins. The fake presenter
+    /// answers every `PING`; nothing here is idle for the 15-second liveness threshold, so only
+    /// the active sampling path can produce the estimate.
+    #[cfg(unix)]
+    #[test]
+    fn active_rtt_sampling_populates_estimate_during_traffic() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        use vivid_protocol::wire::{
+            Connection, ConnectionKind, Endpoint, HEADER_SIZE, PREFACE_SIZE, RecordHeader,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("rtt-sampling.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping RTT sampling socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake presenter bind failed: {error}"),
+        };
+        thread::spawn(move || -> io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            stream.read_exact(&mut preface)?;
+            let mut sequence = 0_u64;
+            loop {
+                let mut header = [0; HEADER_SIZE];
+                if stream.read_exact(&mut header).is_err() {
+                    return Ok(());
+                }
+                let header = RecordHeader::decode(header);
+                let mut body = vec![0; header.body_length as usize];
+                stream.read_exact(&mut body)?;
+                if header.record_type == messages::PING {
+                    let pong = messages::ok(messages::request_id(&body)?);
+                    sequence += 1;
+                    stream.write_all(
+                        &RecordHeader {
+                            body_length: pong.len() as u32,
+                            record_type: messages::PONG,
+                            flags: 0,
+                            object_id: 0,
+                            sequence,
+                        }
+                        .encode(),
+                    )?;
+                    stream.write_all(&pong)?;
+                    stream.flush()?;
+                }
+            }
+        });
+
+        let endpoint = Endpoint::parse(socket.to_str().unwrap()).unwrap();
+        let connection = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        let dispatcher = ControlDispatcher::start(
+            connection,
+            DisplayState {
+                display_generation: 1,
+                viewport_width: 800,
+                viewport_height: 600,
+                grid_columns: 80,
+                grid_rows: 24,
+                cell_width: 10,
+                cell_height: 25,
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let sampled = loop {
+            let rtt_us = dispatcher
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rtt_us;
+            if let Some(rtt_us) = rtt_us {
+                break rtt_us;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "active RTT sampling produced no estimate within 10 seconds"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(
+            dispatcher.adjusted_minimum_buffer(0),
+            messages::minimum_buffer_for_rtt(0, Some(sampled))
+        );
+    }
+
     fn source(id: u64, byte_credits: u64, packet_credits: u64) -> SourceHandle {
         SourceHandle {
             id,
@@ -2136,11 +2420,11 @@ mod tests {
             record_limit: 1024,
             state: Arc::new(SourceSync {
                 state: Mutex::new(SourceRuntime {
-                    credits: Credits {
+                    credits: messages::CreditLedger::new(Credits {
                         bytes: byte_credits,
                         packets: packet_credits,
                         fragments: 0,
-                    },
+                    }),
                     visible: true,
                     visible_reasons: 0,
                     need_keyframe_epoch: None,
