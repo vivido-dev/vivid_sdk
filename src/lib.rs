@@ -963,6 +963,7 @@ pub struct MediaSender {
     source: SourceHandle,
     channel: MediaChannel,
     dry_run: bool,
+    raster_zstd: bool,
 }
 
 impl MediaSender {
@@ -994,6 +995,48 @@ impl MediaSender {
         // in the scene at all. VISIBILITY is advisory, so it must not interrupt audio credit
         // waits and turn the linked master clock into a packet-dropping loop.
         self.send_record(messages::AUDIO_PACKET, body, false)
+    }
+
+    /// Send one complete RGBA8 raster frame and wait until the presenter returns media credit.
+    ///
+    /// This owned-sender form preserves source-scoped backpressure without requiring callers to
+    /// retain a mutable [`ProducerSession`] alongside the media worker.
+    pub fn send_raster(
+        &mut self,
+        epoch: u32,
+        frame_id: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> io::Result<()> {
+        let raw = media::raster_frame_body(epoch, frame_id, width, height, rgba)?;
+        let body = if self.raster_zstd {
+            let compressed = media::raster_frame_body_with_compression(
+                epoch, frame_id, width, height, rgba, true,
+            )?;
+            if compressed.len() < raw.len() {
+                compressed
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        self.send_one_shot(messages::RASTER_FRAME, body)
+    }
+
+    /// Send one complete encoded image and wait until the presenter returns media credit.
+    pub fn send_image(&mut self, encoded: &[u8]) -> io::Result<()> {
+        self.send_one_shot(messages::IMAGE_DATA, encoded.to_vec())
+    }
+
+    fn send_one_shot(&mut self, record_type: u16, body: Vec<u8>) -> io::Result<()> {
+        self.send_record(record_type, body, false)?;
+        if self.dry_run {
+            Ok(())
+        } else {
+            self.source.wait_for_credit_return()
+        }
     }
 
     fn send_record(
@@ -1673,6 +1716,7 @@ impl ProducerSession {
             source,
             channel,
             dry_run: self.dry_run,
+            raster_zstd: self.supports(messages::FEATURE_RASTER_ZSTD_V1),
         })
     }
 
@@ -2524,6 +2568,7 @@ mod tests {
                 source_id: 4,
             },
             dry_run: false,
+            raster_zstd: false,
         };
         sender
             .send_audio(media::AudioPacket {
@@ -2537,5 +2582,63 @@ mod tests {
                 data: &[0xf8, 0xff, 0xfe],
             })
             .unwrap();
+    }
+
+    #[test]
+    fn owned_sender_sends_raster_and_image_in_dry_run() {
+        let raster = source(5, 4096, 2);
+        let mut raster_sender = MediaSender {
+            source: raster,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Raster).unwrap(),
+                source_id: 5,
+            },
+            dry_run: true,
+            raster_zstd: true,
+        };
+        raster_sender
+            .send_raster(1, 1, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 255])
+            .unwrap();
+        assert_eq!(
+            raster_sender
+                .send_raster(1, 2, 2, 1, &[0, 0, 0, 255])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let image = source(6, 4096, 1);
+        let mut image_sender = MediaSender {
+            source: image,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Blob).unwrap(),
+                source_id: 6,
+            },
+            dry_run: true,
+            raster_zstd: false,
+        };
+        image_sender.send_image(b"encoded image").unwrap();
+    }
+
+    #[test]
+    fn owned_one_shot_sender_waits_for_credit_return() {
+        let source = source(7, 4096, 1);
+        let state = source.state.clone();
+        let mut sender = MediaSender {
+            source,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Blob).unwrap(),
+                source_id: 7,
+            },
+            dry_run: false,
+            raster_zstd: false,
+        };
+        let join = thread::spawn(move || sender.send_image(b"encoded image"));
+        {
+            let mut runtime = state.state.lock().unwrap();
+            runtime.credit_returns += 1;
+            state.changed.notify_all();
+        }
+        join.join().unwrap().unwrap();
     }
 }
