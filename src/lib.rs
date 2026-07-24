@@ -16,6 +16,7 @@ use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 const SYNTHETIC_CREDITS: u64 = u64::MAX / 4;
 const MAX_PENDING_CONTROL_RECORDS: usize = 4096;
+const MAX_PENDING_DESKTOP_INPUT: usize = 512;
 /// Cadence for opportunistic RTT sampling probes while the control connection is active.
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
@@ -203,6 +204,30 @@ pub enum SourceEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopInputEvent {
+    Key {
+        usage: u16,
+        pressed: bool,
+    },
+    PointerMotion {
+        source_id: u64,
+        x: u32,
+        y: u32,
+    },
+    PointerButton {
+        source_id: u64,
+        button: u8,
+        pressed: bool,
+    },
+    PointerAxis {
+        source_id: u64,
+        horizontal_120: i32,
+        vertical_120: i32,
+    },
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneNode {
     pub id: u64,
     pub source_id: u64,
@@ -270,6 +295,8 @@ struct DispatcherState {
     sources: HashMap<u64, Arc<SourceSync>>,
     pending_source_events: HashMap<u64, VecDeque<Record>>,
     pending_source_event_count: usize,
+    desktop_input_enabled: bool,
+    desktop_input: VecDeque<DesktopInputEvent>,
     anchors: HashSet<u64>,
     display: DisplayState,
     closed: Option<String>,
@@ -301,7 +328,11 @@ enum ClientControl {
 }
 
 impl ControlDispatcher {
-    fn start(connection: Connection, display: DisplayState) -> io::Result<Self> {
+    fn start(
+        connection: Connection,
+        display: DisplayState,
+        desktop_input_enabled: bool,
+    ) -> io::Result<Self> {
         let (mut reader, writer) = connection.split()?;
         let shared = Arc::new(DispatcherShared {
             state: Mutex::new(DispatcherState {
@@ -310,6 +341,8 @@ impl ControlDispatcher {
                 sources: HashMap::new(),
                 pending_source_events: HashMap::new(),
                 pending_source_event_count: 0,
+                desktop_input_enabled,
+                desktop_input: VecDeque::new(),
                 anchors: HashSet::new(),
                 display,
                 closed: None,
@@ -401,6 +434,11 @@ impl ControlDispatcher {
                         }
                         messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
                             .map(|display| state.display = display),
+                        messages::KEY_INPUT
+                        | messages::POINTER_MOTION
+                        | messages::POINTER_BUTTON
+                        | messages::POINTER_AXIS
+                        | messages::INPUT_RESET => apply_desktop_input_record(&mut state, &record),
                         messages::ANCHOR_READY => {
                             messages::parse_anchor_event(&record.body).map(|anchor| {
                                 state.anchors.insert(anchor);
@@ -781,6 +819,21 @@ impl ControlDispatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         messages::minimum_buffer_for_rtt(requested_us, state.rtt_us)
     }
+
+    fn take_desktop_input(&self) -> io::Result<Option<DesktopInputEvent>> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(state.desktop_input.front(), Some(DesktopInputEvent::Reset)) {
+            return Ok(state.desktop_input.pop_front());
+        }
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        Ok(state.desktop_input.pop_front())
+    }
 }
 
 impl Drop for ControlDispatcher {
@@ -794,6 +847,10 @@ fn close_dispatcher(shared: &DispatcherShared, message: String) {
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.desktop_input_enabled {
+        state.desktop_input.clear();
+        state.desktop_input.push_back(DesktopInputEvent::Reset);
+    }
     state.closed.get_or_insert(message);
     shared.changed.notify_all();
     for source in state.sources.values() {
@@ -845,6 +902,124 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
         }
     }
     source.changed.notify_all();
+    Ok(())
+}
+
+fn apply_desktop_input_record(state: &mut DispatcherState, record: &Record) -> io::Result<()> {
+    let event = decode_desktop_input_record(state.desktop_input_enabled, record)?;
+    push_desktop_input(&mut state.desktop_input, event)
+}
+
+fn decode_desktop_input_record(
+    desktop_input_enabled: bool,
+    record: &Record,
+) -> io::Result<DesktopInputEvent> {
+    if !desktop_input_enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop input was not negotiated",
+        ));
+    }
+    Ok(match record.record_type {
+        messages::KEY_INPUT => {
+            if record.object_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "KEY_INPUT is not session-level",
+                ));
+            }
+            let input = messages::parse_key_input(&record.body)?;
+            DesktopInputEvent::Key {
+                usage: input.usage,
+                pressed: input.pressed,
+            }
+        }
+        messages::POINTER_MOTION => {
+            let input = messages::parse_pointer_motion(&record.body)?;
+            if record.object_id != input.source_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "POINTER_MOTION source/object ID mismatch",
+                ));
+            }
+            DesktopInputEvent::PointerMotion {
+                source_id: input.source_id,
+                x: input.x,
+                y: input.y,
+            }
+        }
+        messages::POINTER_BUTTON => {
+            let input = messages::parse_pointer_button(&record.body)?;
+            if record.object_id != input.source_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "POINTER_BUTTON source/object ID mismatch",
+                ));
+            }
+            DesktopInputEvent::PointerButton {
+                source_id: input.source_id,
+                button: input.button,
+                pressed: input.pressed,
+            }
+        }
+        messages::POINTER_AXIS => {
+            let input = messages::parse_pointer_axis(&record.body)?;
+            if record.object_id != input.source_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "POINTER_AXIS source/object ID mismatch",
+                ));
+            }
+            DesktopInputEvent::PointerAxis {
+                source_id: input.source_id,
+                horizontal_120: input.horizontal_120,
+                vertical_120: input.vertical_120,
+            }
+        }
+        messages::INPUT_RESET => {
+            if record.object_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "INPUT_RESET is not session-level",
+                ));
+            }
+            messages::parse_input_reset(&record.body)?;
+            DesktopInputEvent::Reset
+        }
+        _ => unreachable!("caller routes only desktop input records"),
+    })
+}
+
+fn push_desktop_input(
+    queue: &mut VecDeque<DesktopInputEvent>,
+    event: DesktopInputEvent,
+) -> io::Result<()> {
+    if event == DesktopInputEvent::Reset {
+        queue.clear();
+        queue.push_back(event);
+        return Ok(());
+    }
+    if let DesktopInputEvent::PointerMotion { source_id, .. } = event
+        && matches!(
+            queue.back(),
+            Some(DesktopInputEvent::PointerMotion {
+                source_id: pending,
+                ..
+            }) if *pending == source_id
+        )
+    {
+        *queue.back_mut().expect("matched queue tail") = event;
+        return Ok(());
+    }
+    if queue.len() >= MAX_PENDING_DESKTOP_INPUT {
+        queue.clear();
+        queue.push_back(DesktopInputEvent::Reset);
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "desktop input queue exceeded its bound",
+        ));
+    }
+    queue.push_back(event);
     Ok(())
 }
 
@@ -1239,7 +1414,11 @@ impl ProducerSession {
         let control = if dry_run {
             ClientControl::Direct(control)
         } else {
-            ClientControl::Live(ControlDispatcher::start(control, display)?)
+            ClientControl::Live(ControlDispatcher::start(
+                control,
+                display,
+                accepted_features.contains(&messages::FEATURE_DESKTOP_INPUT_V1),
+            )?)
         };
         let anchor_key = anchor::derive_key(&token_bytes, &session_tag);
 
@@ -1795,6 +1974,13 @@ impl ProducerSession {
 
     pub fn supports(&self, feature: u64) -> bool {
         self.accepted_features.binary_search(&feature).is_ok()
+    }
+
+    pub fn take_desktop_input(&mut self) -> io::Result<Option<DesktopInputEvent>> {
+        match &self.control {
+            ClientControl::Live(dispatcher) => dispatcher.take_desktop_input(),
+            ClientControl::Direct(_) => Ok(None),
+        }
     }
 
     pub fn play_at(
@@ -2431,6 +2617,7 @@ mod tests {
                 cell_width: 10,
                 cell_height: 25,
             },
+            false,
         )
         .unwrap();
 
@@ -2640,5 +2827,142 @@ mod tests {
             state.changed.notify_all();
         }
         join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn desktop_input_queue_coalesces_motion_and_reset_is_authoritative() {
+        let mut queue = VecDeque::new();
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::PointerMotion {
+                source_id: 7,
+                x: 10,
+                y: 20,
+            },
+        )
+        .unwrap();
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::PointerMotion {
+                source_id: 7,
+                x: 30,
+                y: 40,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            queue.pop_front(),
+            Some(DesktopInputEvent::PointerMotion {
+                source_id: 7,
+                x: 30,
+                y: 40,
+            })
+        );
+
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::Key {
+                usage: 4,
+                pressed: true,
+            },
+        )
+        .unwrap();
+        push_desktop_input(&mut queue, DesktopInputEvent::Reset).unwrap();
+        assert_eq!(queue, VecDeque::from([DesktopInputEvent::Reset]));
+    }
+
+    #[test]
+    fn desktop_input_queue_preserves_order_and_overflow_fails_closed() {
+        let mut queue = VecDeque::new();
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::Key {
+                usage: 4,
+                pressed: true,
+            },
+        )
+        .unwrap();
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::PointerButton {
+                source_id: 7,
+                button: 0,
+                pressed: true,
+            },
+        )
+        .unwrap();
+        push_desktop_input(
+            &mut queue,
+            DesktopInputEvent::PointerAxis {
+                source_id: 7,
+                horizontal_120: -120,
+                vertical_120: 240,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            queue,
+            VecDeque::from([
+                DesktopInputEvent::Key {
+                    usage: 4,
+                    pressed: true,
+                },
+                DesktopInputEvent::PointerButton {
+                    source_id: 7,
+                    button: 0,
+                    pressed: true,
+                },
+                DesktopInputEvent::PointerAxis {
+                    source_id: 7,
+                    horizontal_120: -120,
+                    vertical_120: 240,
+                },
+            ])
+        );
+
+        while queue.len() < MAX_PENDING_DESKTOP_INPUT {
+            let usage = 4 + u16::try_from(queue.len() % 32).unwrap();
+            let pressed = queue.len() % 2 == 0;
+            push_desktop_input(&mut queue, DesktopInputEvent::Key { usage, pressed }).unwrap();
+        }
+        assert!(
+            push_desktop_input(
+                &mut queue,
+                DesktopInputEvent::Key {
+                    usage: 4,
+                    pressed: false,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(queue, VecDeque::from([DesktopInputEvent::Reset]));
+    }
+
+    #[test]
+    fn desktop_input_records_require_negotiation_and_matching_object_ids() {
+        let record = Record {
+            record_type: messages::KEY_INPUT,
+            flags: 0,
+            object_id: 0,
+            sequence: 1,
+            body: messages::key_input(4, true),
+        };
+        assert!(decode_desktop_input_record(false, &record).is_err());
+        assert_eq!(
+            decode_desktop_input_record(true, &record).unwrap(),
+            DesktopInputEvent::Key {
+                usage: 4,
+                pressed: true,
+            }
+        );
+
+        let mismatched = Record {
+            record_type: messages::POINTER_MOTION,
+            flags: 0,
+            object_id: 8,
+            sequence: 2,
+            body: messages::pointer_motion(7, 10, 20),
+        };
+        assert!(decode_desktop_input_record(true, &mismatched).is_err());
     }
 }
