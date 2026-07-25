@@ -178,6 +178,16 @@ pub struct HotPathCounters {
     pub desktop_input_queue_high_water: usize,
 }
 
+/// Presenter-advertised bounds for a producer-side media queue.
+///
+/// These values are sizing hints, not grants. Callers must still submit through `MediaSender`,
+/// which consumes only credit actually received from the presenter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaQueueLimits {
+    pub max_bytes: usize,
+    pub max_packets: usize,
+}
+
 #[derive(Debug, Default)]
 struct HotPathCounterState {
     media_records_sent: AtomicU64,
@@ -541,6 +551,8 @@ pub struct SourceHandle {
     trace: SharedTrace,
     last_record_sequence: u64,
     attachment_generation: u64,
+    rolling_byte_window: u64,
+    rolling_packet_window: u64,
     acknowledged_credit_returns: u64,
     observed_visible: bool,
     reported_lost: bool,
@@ -4241,6 +4253,8 @@ impl ProducerSession {
             trace: self.trace.clone(),
             last_record_sequence: 0,
             attachment_generation: 0,
+            rolling_byte_window: ready.rolling_byte_window,
+            rolling_packet_window: ready.rolling_packet_window,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -4332,6 +4346,26 @@ impl SourceHandle {
 
     pub fn attachment_generation(&self) -> u64 {
         self.attachment_generation
+    }
+
+    pub fn rolling_byte_window(&self) -> u64 {
+        self.rolling_byte_window
+    }
+
+    pub fn rolling_packet_window(&self) -> u64 {
+        self.rolling_packet_window
+    }
+
+    /// Convert the presenter's steady-state advertisement into local bounded-queue limits.
+    pub fn media_queue_limits(&self) -> MediaQueueLimits {
+        MediaQueueLimits {
+            max_bytes: usize::try_from(self.rolling_byte_window)
+                .unwrap_or(usize::MAX)
+                .max(1),
+            max_packets: usize::try_from(self.rolling_packet_window)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        }
     }
 
     pub fn hot_path_counters(&self) -> HotPathCounters {
@@ -5373,6 +5407,8 @@ mod tests {
             trace: Arc::new(Mutex::new(TraceState::default())),
             last_record_sequence: 0,
             attachment_generation: 0,
+            rolling_byte_window: byte_credits,
+            rolling_packet_window: packet_credits,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -5385,6 +5421,20 @@ mod tests {
         let marker = anchor::encode_marker(&key, &[0; 16], 7).unwrap();
         assert!(marker.starts_with("\x1b_VIVID;2;A;"));
         assert!(marker.len() <= 128);
+    }
+
+    #[test]
+    fn source_exposes_presenter_advertised_queue_limits() {
+        let source = source(7, 8 * 1024 * 1024, 96);
+        assert_eq!(source.rolling_byte_window(), 8 * 1024 * 1024);
+        assert_eq!(source.rolling_packet_window(), 96);
+        assert_eq!(
+            source.media_queue_limits(),
+            MediaQueueLimits {
+                max_bytes: 8 * 1024 * 1024,
+                max_packets: 96
+            }
+        );
     }
 
     #[test]
