@@ -3492,10 +3492,14 @@ impl ProducerSession {
 
     pub fn open_media_sender(
         &mut self,
-        source: SourceHandle,
+        mut source: SourceHandle,
         kind: ConnectionKind,
     ) -> io::Result<MediaSender> {
         let channel = self.open_media_channel(&source, kind)?;
+        source.attachment_generation = source
+            .attachment_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("attachment generation exhausted"))?;
         Ok(MediaSender {
             source,
             channel,
@@ -4006,6 +4010,43 @@ impl ProducerSession {
 
     pub fn eos(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
         self.eos_with_metadata(source_id, epoch, &RequestMetadata::default())
+    }
+
+    pub fn eos_sender(&mut self, sender: &MediaSender, epoch: u32) -> io::Result<()> {
+        let source = sender.source();
+        if self.supports(messages::FEATURE_MEDIA_ORDER_BARRIER_V1)
+            && source.attachment_generation() != 0
+            && source.last_record_sequence() != 0
+        {
+            self.eos_with_media_order(
+                source.id,
+                epoch,
+                source.attachment_generation(),
+                source.last_record_sequence(),
+            )
+        } else {
+            self.eos(source.id, epoch)
+        }
+    }
+
+    pub fn eos_with_media_order(
+        &mut self,
+        source_id: u64,
+        epoch: u32,
+        attachment_generation: u64,
+        final_record_sequence: u64,
+    ) -> io::Result<()> {
+        let request_id = self.request_id()?;
+        let body = messages::eos_with_barrier(
+            request_id,
+            source_id,
+            epoch,
+            attachment_generation,
+            final_record_sequence,
+        );
+        self.control
+            .write_record(messages::EOS, 0, source_id, &body)?;
+        self.wait_for_ok(request_id, source_id)
     }
 
     pub fn eos_with_metadata(
@@ -5520,6 +5561,32 @@ mod tests {
                 media_records_sent: 2,
                 ..HotPathCounters::default()
             }
+        );
+    }
+
+    #[test]
+    fn opened_sender_tracks_attachment_generation_and_barrier_sequence() {
+        let mut session =
+            ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
+        let mut sender = session
+            .open_media_sender(source(18, 4096, 1), ConnectionKind::Video)
+            .unwrap();
+        assert_eq!(sender.source().attachment_generation(), 1);
+        sender
+            .send_video(VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 16_667,
+                key: true,
+                data: &[0, 0, 1, 0x65],
+            })
+            .unwrap();
+        assert_eq!(
+            sender.source().last_record_sequence(),
+            2,
+            "ATTACH_CHANNEL is sequence 1 and the final media record is sequence 2"
         );
     }
 
