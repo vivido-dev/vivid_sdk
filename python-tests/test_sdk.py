@@ -40,6 +40,8 @@ def test_session_defaults_ids_and_secret_safe_repr(monkeypatch: pytest.MonkeyPat
         assert vivid.allocate_id(session) == 2
         assert vivid.supports(session, vivid.FEATURE_AUDIO_ACCESS_UNIT_V1)
         assert vivid.root_context_id(session) == 1
+        assert vivid.capability_generation(session) == 1
+        assert vivid.take_session_event(session) is None
         assert vivid.display_state(session) == vivid.DisplayState(
             display_generation=0,
             viewport_width=800,
@@ -55,6 +57,32 @@ def test_session_defaults_ids_and_secret_safe_repr(monkeypatch: pytest.MonkeyPat
         vivid.close(session)
         vivid.close(session)
     assert session.closed
+
+
+def test_typed_trace_callback_receives_only_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "de" * 32
+    monkeypatch.setenv("VIVID_TOKEN", secret)
+    events: list[vivid.TraceEvent] = []
+    session = vivid.connect(dry_run=True)
+    vivid.set_trace_callback(session, events.append)
+    source = vivid.create_raster_source(
+        session,
+        1,
+        1,
+        capture_policy=vivid.CAPTURE_POLICY_REDUCE_DIAGNOSTICS,
+    )
+    sender = vivid.open_sender(session, source)
+    vivid.send_raster(sender, bytes([0, 0, 0, 255]), width=1, height=1)
+    vivid.close(session)
+
+    assert events
+    assert all(isinstance(event, vivid.TraceEvent) for event in events)
+    assert all(event.component == "vivid_sdk" for event in events)
+    assert any(event.outcome == "restricted" and event.object_id is None for event in events)
+    assert secret not in repr(events)
+    assert "000000ff" not in repr(events)
 
 
 def test_observability_wait_api_and_secret_safe_handles(
