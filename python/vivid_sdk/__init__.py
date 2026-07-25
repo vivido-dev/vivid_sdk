@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import struct
 import sys
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Dict, Iterable, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Tuple, Union
 
 from . import _native
 from ._native import ClosedHandleError, MediaSender, Session, Source, VividError, Wait
@@ -45,6 +46,11 @@ CAPTURE_POLICY_DENY_POSTER_RETENTION = 1 << 2
 CAPTURE_POLICY_DENY_CACHE = 1 << 3
 CAPTURE_POLICY_REDUCE_DIAGNOSTICS = 1 << 4
 CAPTURE_POLICY_MASK = (1 << 5) - 1
+
+CAPS_CHANGE_DECODER_AVAILABILITY = 1 << 0
+CAPS_CHANGE_DEVICE_AVAILABILITY = 1 << 1
+CAPS_CHANGE_PRESENTER_POLICY = 1 << 2
+CAPS_CHANGE_RESOURCE_PRESSURE = 1 << 3
 
 SOURCE_ROLE_UNSPECIFIED = 0
 SOURCE_ROLE_DOCUMENT = 1
@@ -183,6 +189,31 @@ class SourceDescriptor:
     content_revision: int
     semantic_availability: int
     locator: str
+
+
+@dataclass(frozen=True)
+class CapabilityChangedEvent:
+    capability_generation: int
+    reason_mask: int
+
+
+@dataclass(frozen=True)
+class TraceEvent:
+    version: int
+    monotonic_ts_us: int
+    clock_domain: str
+    component: str
+    hop: str
+    direction: str
+    record_type: int
+    body_length: int
+    connection_sequence: int
+    object_kind: str
+    object_id: Optional[int]
+    request_id: Optional[int]
+    causation_id: Optional[str]
+    local_session_hint: str
+    outcome: str
 
 
 @dataclass(frozen=True)
@@ -738,6 +769,26 @@ def take_observation(session: Session) -> Optional[ObservationEvent]:
     if kind == "playback" and source is not None and playback is not None:
         return PlaybackStateEvent(source, revision, sequence, _playback(playback))
     raise VividError("native observation event is malformed")
+
+
+def capability_generation(session: Session) -> int:
+    return int(_native.capability_generation(session))
+
+
+def take_session_event(session: Session) -> Optional[CapabilityChangedEvent]:
+    value = _native.take_session_event(session)
+    if value is None:
+        return None
+    return CapabilityChangedEvent(int(value[0]), int(value[1]))
+
+
+def set_trace_callback(session: Session, callback: Callable[[TraceEvent], None]) -> None:
+    """Deliver bounded metadata-only trace records on the SDK trace worker."""
+
+    def decode(line: str) -> None:
+        callback(TraceEvent(**json.loads(line)))
+
+    _native.set_trace_callback(session, decode)
 
 
 def query_source(session: Session, source: SourceLike) -> SourceStatus:
@@ -1370,12 +1421,18 @@ __all__ = [
     "SourceChangedEvent",
     "SceneChangedEvent",
     "PlaybackStateEvent",
+    "CapabilityChangedEvent",
+    "TraceEvent",
     "CAPTURE_POLICY_DENY_CAPTURE",
     "CAPTURE_POLICY_DENY_SEMANTIC_EXPORT",
     "CAPTURE_POLICY_DENY_POSTER_RETENTION",
     "CAPTURE_POLICY_DENY_CACHE",
     "CAPTURE_POLICY_REDUCE_DIAGNOSTICS",
     "CAPTURE_POLICY_MASK",
+    "CAPS_CHANGE_DECODER_AVAILABILITY",
+    "CAPS_CHANGE_DEVICE_AVAILABILITY",
+    "CAPS_CHANGE_PRESENTER_POLICY",
+    "CAPS_CHANGE_RESOURCE_PRESSURE",
     "SOURCE_ROLE_UNSPECIFIED",
     "SOURCE_ROLE_DOCUMENT",
     "SOURCE_ROLE_DESKTOP",
@@ -1440,6 +1497,7 @@ __all__ = [
     "cancel_wait",
     "cancel_sender",
     "check_source",
+    "capability_generation",
     "close",
     "connect",
     "create_audio_source",
@@ -1479,6 +1537,8 @@ __all__ = [
     "query_anchor",
     "query_limits",
     "take_observation",
+    "take_session_event",
+    "set_trace_callback",
     "take_event",
     "update_scene_node",
     "update_source_descriptor",

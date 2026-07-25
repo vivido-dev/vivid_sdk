@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -11,6 +11,10 @@ use vivid_protocol::media::{self, VideoPacket};
 use vivid_protocol::messages::{
     self, AudioSourceConfig, Credits, ImageSourceConfig, SceneNodeConfig, SourceReady,
     VideoSourceConfig,
+};
+use vivid_protocol::trace::{
+    TraceComponent, TraceDirection, TraceEmitter, TraceGuard, TraceHop, TraceObjectKind,
+    TraceOutcome,
 };
 use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoint, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
@@ -29,6 +33,9 @@ pub use vivid_protocol::messages::{
     SourceStatus, WaitSatisfied, WaitSource,
 };
 pub use vivid_protocol::revision::{SceneRevision, SourceRevision};
+pub use vivid_protocol::trace::{
+    TraceComponent as DiagnosticTraceComponent, TraceRecord as DiagnosticTraceRecord,
+};
 
 /// An unsolicited, coalesced observability event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +43,12 @@ pub enum ObservationEvent {
     Source(messages::SourceChanged),
     Scene(messages::SceneChanged),
     Playback(messages::PlaybackState),
+}
+
+/// Typed unsolicited session state that is not tied to observability feature 18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    Capabilities(messages::CapsChanged),
 }
 
 /// The latest authoritative revisions observed on the control connection.
@@ -234,6 +247,33 @@ fn update_high_water(counter: &AtomicUsize, value: usize) {
 
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn random_trace_hint() -> io::Result<[u8; 16]> {
+    let mut hint = [0_u8; 16];
+    getrandom::fill(&mut hint)
+        .map_err(|error| io::Error::other(format!("trace hint generation failed: {error}")))?;
+    Ok(hint)
+}
+
+fn trace_component_for_producer(producer: &str) -> TraceComponent {
+    match producer {
+        "vivi" => TraceComponent::Vivi,
+        "vvrd" => TraceComponent::Vvrd,
+        "veston" => TraceComponent::Veston,
+        "vvsway" => TraceComponent::Vvsway,
+        _ => TraceComponent::Sdk,
+    }
+}
+
+fn trace_file_stem_for_producer(producer: &str) -> &'static str {
+    match producer {
+        "vivi" => "vivi",
+        "vvrd" => "vvrd",
+        "veston" => "veston",
+        "vvsway" => "vvsway",
+        _ => "vivid-sdk",
+    }
 }
 
 /// Connection and feature policy for a Vivid producer. Token-bearing values deliberately do not
@@ -498,6 +538,7 @@ pub struct SourceHandle {
     record_limit: u64,
     state: Arc<SourceSync>,
     counters: Arc<HotPathCounterState>,
+    trace: SharedTrace,
     last_record_sequence: u64,
     attachment_generation: u64,
     acknowledged_credit_returns: u64,
@@ -564,6 +605,8 @@ struct DispatcherState {
     scene_revision: SceneRevision,
     source_revisions: HashMap<u64, SourceRevision>,
     observations: VecDeque<ObservationEvent>,
+    session_events: VecDeque<SessionEvent>,
+    capability_generation: u64,
     closed: Option<String>,
     last_inbound: Instant,
     last_probe_sent: Option<Instant>,
@@ -581,6 +624,90 @@ struct DispatcherShared {
     state: Mutex<DispatcherState>,
     changed: Condvar,
     counters: Arc<HotPathCounterState>,
+    trace: SharedTrace,
+}
+
+#[derive(Default)]
+struct TraceState {
+    emitter: Option<TraceEmitter>,
+    restricted_sources: HashSet<u64>,
+}
+
+impl std::fmt::Debug for TraceState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TraceState")
+            .field("enabled", &self.emitter.is_some())
+            .field("restricted_source_count", &self.restricted_sources.len())
+            .finish()
+    }
+}
+
+type SharedTrace = Arc<Mutex<TraceState>>;
+
+fn emit_control_trace(
+    trace: &SharedTrace,
+    direction: TraceDirection,
+    record_type: u16,
+    object_id: u64,
+    sequence: u64,
+    body: &[u8],
+    outcome: TraceOutcome,
+) {
+    let state = trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(emitter) = &state.emitter else {
+        return;
+    };
+    if object_id != 0 && state.restricted_sources.contains(&object_id) {
+        emitter.emit_restricted_source(
+            direction,
+            record_type,
+            u64::try_from(body.len()).unwrap_or(u64::MAX),
+            sequence,
+        );
+    } else {
+        emitter.emit_control(
+            direction,
+            record_type,
+            body,
+            sequence,
+            vivid_protocol::trace::object_kind(record_type, object_id),
+            (object_id != 0).then_some(object_id),
+            outcome,
+        );
+    }
+}
+
+fn emit_media_trace(
+    trace: &SharedTrace,
+    record_type: u16,
+    object_id: u64,
+    sequence: u64,
+    body_length: u64,
+) {
+    let state = trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(emitter) = &state.emitter else {
+        return;
+    };
+    if state.restricted_sources.contains(&object_id) {
+        emitter.emit_restricted_source(TraceDirection::Send, record_type, body_length, sequence);
+    } else {
+        emitter.emit(
+            TraceDirection::Send,
+            record_type,
+            body_length,
+            sequence,
+            TraceObjectKind::Source,
+            Some(object_id),
+            None,
+            None,
+            TraceOutcome::Ok,
+        );
+    }
 }
 
 struct ControlDispatcher {
@@ -595,7 +722,7 @@ struct WaitDispatcher {
 }
 
 enum ClientControl {
-    Direct(Connection),
+    Direct(Connection, SharedTrace),
     Live(ControlDispatcher),
 }
 
@@ -715,8 +842,10 @@ impl ControlDispatcher {
         connection: Connection,
         display: DisplayState,
         scene_revision: SceneRevision,
+        capability_generation: u64,
         desktop_input_enabled: bool,
         counters: Arc<HotPathCounterState>,
+        trace: SharedTrace,
     ) -> io::Result<Self> {
         let (mut reader, writer) = connection.split()?;
         let shared = Arc::new(DispatcherShared {
@@ -734,6 +863,8 @@ impl ControlDispatcher {
                 scene_revision,
                 source_revisions: HashMap::new(),
                 observations: VecDeque::new(),
+                session_events: VecDeque::new(),
+                capability_generation,
                 closed: None,
                 last_inbound: Instant::now(),
                 last_probe_sent: None,
@@ -745,6 +876,7 @@ impl ControlDispatcher {
             }),
             changed: Condvar::new(),
             counters,
+            trace,
         });
         let reader_shared = shared.clone();
         let reader_writer = writer.clone();
@@ -759,6 +891,15 @@ impl ControlDispatcher {
                             break;
                         }
                     };
+                    emit_control_trace(
+                        &reader_shared.trace,
+                        TraceDirection::Receive,
+                        record.record_type,
+                        record.object_id,
+                        record.sequence,
+                        &record.body,
+                        TraceOutcome::Ok,
+                    );
                     {
                         let mut state = reader_shared
                             .state
@@ -798,6 +939,7 @@ impl ControlDispatcher {
                         .state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let state = &mut *state;
                     let routed = match record.record_type {
                         messages::CREDIT
                         | messages::VISIBILITY
@@ -828,6 +970,14 @@ impl ControlDispatcher {
                         }
                         messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
                             .map(|display| state.display = display),
+                        messages::CAPS_CHANGED => messages::parse_caps_changed(&record.body)
+                            .and_then(|event| {
+                                apply_caps_changed(
+                                    &mut state.capability_generation,
+                                    &mut state.session_events,
+                                    event,
+                                )
+                            }),
                         messages::SOURCE_CHANGED => messages::parse_source_changed(&record.body)
                             .and_then(|event| {
                                 state
@@ -861,7 +1011,11 @@ impl ControlDispatcher {
                         | messages::POINTER_BUTTON
                         | messages::POINTER_AXIS
                         | messages::INPUT_RESET => {
-                            apply_desktop_input_record(&mut state, &record, &reader_shared.counters)
+                            apply_desktop_input_record(
+                                &mut *state,
+                                &record,
+                                &reader_shared.counters,
+                            )
                         }
                         messages::ANCHOR_READY => {
                             messages::parse_anchor_event(&record.body).map(|anchor| {
@@ -1078,18 +1232,30 @@ impl ControlDispatcher {
                 state.pending_requests.len(),
             );
         }
-        if let Err(error) = self
+        let sequence = match self
             .writer
             .write_record(record_type, flags, object_id, body)
         {
-            self.shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pending_requests
-                .remove(&request_id);
-            return Err(error);
-        }
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pending_requests
+                    .remove(&request_id);
+                return Err(error);
+            }
+        };
+        emit_control_trace(
+            &self.shared.trace,
+            TraceDirection::Send,
+            record_type,
+            object_id,
+            sequence,
+            body,
+            TraceOutcome::Ok,
+        );
         Ok(())
     }
 
@@ -1238,6 +1404,29 @@ impl ControlDispatcher {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
         }
         Ok(None)
+    }
+
+    fn take_session_event(&self) -> io::Result<Option<SessionEvent>> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(event) = state.session_events.pop_front() {
+            return Ok(Some(event));
+        }
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        Ok(None)
+    }
+
+    fn capability_generation(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capability_generation
     }
 
     fn revisions(&self) -> RevisionState {
@@ -1504,6 +1693,35 @@ fn push_observation(
     Ok(())
 }
 
+fn push_session_event(queue: &mut VecDeque<SessionEvent>, event: SessionEvent) -> io::Result<()> {
+    if matches!(event, SessionEvent::Capabilities(_)) {
+        queue.retain(|pending| !matches!(pending, SessionEvent::Capabilities(_)));
+    }
+    if queue.len() >= MAX_PENDING_CONTROL_RECORDS {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "Vivid session-event queue exceeded its bound",
+        ));
+    }
+    queue.push_back(event);
+    Ok(())
+}
+
+fn apply_caps_changed(
+    capability_generation: &mut u64,
+    queue: &mut VecDeque<SessionEvent>,
+    event: messages::CapsChanged,
+) -> io::Result<()> {
+    if event.capability_generation <= *capability_generation {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Vivid capability generation did not advance",
+        ));
+    }
+    *capability_generation = event.capability_generation;
+    push_session_event(queue, SessionEvent::Capabilities(event))
+}
+
 fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
     let mut state = source
         .state
@@ -1682,9 +1900,19 @@ impl ClientControl {
         body: &[u8],
     ) -> io::Result<()> {
         match self {
-            Self::Direct(connection) => connection
-                .write_record(record_type, flags, object_id, body)
-                .map(|_| ()),
+            Self::Direct(connection, trace) => {
+                let sequence = connection.write_record(record_type, flags, object_id, body)?;
+                emit_control_trace(
+                    trace,
+                    TraceDirection::Send,
+                    record_type,
+                    object_id,
+                    sequence,
+                    body,
+                    TraceOutcome::Ok,
+                );
+                Ok(())
+            }
             Self::Live(dispatcher) => dispatcher.write_record(record_type, flags, object_id, body),
         }
     }
@@ -1699,7 +1927,7 @@ impl ClientControl {
             Self::Live(dispatcher) => {
                 dispatcher.wait_reply(request_id, accepted, expected_object_id)
             }
-            Self::Direct(_) => Err(io::Error::new(
+            Self::Direct(_, _) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "trace/dry-run control connections have no replies",
             )),
@@ -1717,7 +1945,7 @@ impl ClientControl {
             Self::Live(dispatcher) => {
                 dispatcher.wait_reply_deadline(request_id, accepted, expected_object_id, deadline)
             }
-            Self::Direct(_) => Err(io::Error::new(
+            Self::Direct(_, _) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "trace/dry-run control connections have no replies",
             )),
@@ -1732,7 +1960,7 @@ impl ClientControl {
     ) -> io::Result<Arc<SourceSync>> {
         match self {
             Self::Live(dispatcher) => dispatcher.register_source(source_id, credits, revision),
-            Self::Direct(_) => Ok(Arc::new(SourceSync {
+            Self::Direct(_, _) => Ok(Arc::new(SourceSync {
                 state: Mutex::new(SourceRuntime {
                     credits: messages::CreditLedger::new(credits),
                     visible: true,
@@ -1749,35 +1977,35 @@ impl ClientControl {
     fn display_generation(&self, fallback: u64) -> u64 {
         match self {
             Self::Live(dispatcher) => dispatcher.display_generation(),
-            Self::Direct(_) => fallback,
+            Self::Direct(_, _) => fallback,
         }
     }
 
     fn display_state(&self, fallback: DisplayState) -> DisplayState {
         match self {
             Self::Live(dispatcher) => dispatcher.display_state(),
-            Self::Direct(_) => fallback,
+            Self::Direct(_, _) => fallback,
         }
     }
 
     fn adjusted_minimum_buffer(&self, requested_us: u64) -> u64 {
         match self {
             Self::Live(dispatcher) => dispatcher.adjusted_minimum_buffer(requested_us),
-            Self::Direct(_) => requested_us,
+            Self::Direct(_, _) => requested_us,
         }
     }
 
     fn wait_anchor(&self, anchor_id: u64) -> io::Result<()> {
         match self {
             Self::Live(dispatcher) => dispatcher.wait_anchor(anchor_id),
-            Self::Direct(_) => Ok(()),
+            Self::Direct(_, _) => Ok(()),
         }
     }
 
     fn wait_anchor_deadline(&self, anchor_id: u64, deadline: Instant) -> io::Result<bool> {
         match self {
             Self::Live(dispatcher) => dispatcher.wait_anchor_deadline(anchor_id, deadline),
-            Self::Direct(_) => Ok(true),
+            Self::Direct(_, _) => Ok(true),
         }
     }
 
@@ -1787,14 +2015,28 @@ impl ClientControl {
                 writer: dispatcher.writer.clone(),
                 shared: dispatcher.shared.clone(),
             }),
-            Self::Direct(_) => None,
+            Self::Direct(_, _) => None,
         }
     }
 
     fn take_observation(&self) -> io::Result<Option<ObservationEvent>> {
         match self {
             Self::Live(dispatcher) => dispatcher.take_observation(),
-            Self::Direct(_) => Ok(None),
+            Self::Direct(_, _) => Ok(None),
+        }
+    }
+
+    fn take_session_event(&self) -> io::Result<Option<SessionEvent>> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.take_session_event(),
+            Self::Direct(_, _) => Ok(None),
+        }
+    }
+
+    fn capability_generation(&self, fallback: u64) -> u64 {
+        match self {
+            Self::Live(dispatcher) => dispatcher.capability_generation(),
+            Self::Direct(_, _) => fallback,
         }
     }
 
@@ -1805,7 +2047,7 @@ impl ClientControl {
     ) -> RevisionState {
         match self {
             Self::Live(dispatcher) => dispatcher.revisions(),
-            Self::Direct(_) => RevisionState {
+            Self::Direct(_, _) => RevisionState {
                 scene,
                 sources: sources.clone(),
             },
@@ -1855,6 +2097,7 @@ impl MediaChannel {
             .write_record_parts(record_type, 0, self.source_id, parts)?;
         source.last_record_sequence = sequence;
         source.counters.record_media_sent();
+        emit_media_trace(&source.trace, record_type, self.source_id, sequence, bytes);
         Ok(sequence)
     }
 }
@@ -1984,6 +2227,8 @@ impl MediaSender {
 pub struct ProducerSession {
     control: ClientControl,
     counters: Arc<HotPathCounterState>,
+    trace: SharedTrace,
+    trace_guard: Option<TraceGuard>,
     endpoint: Option<Endpoint>,
     bulk_endpoint: Option<Endpoint>,
     trace_dir: Option<PathBuf>,
@@ -1996,6 +2241,7 @@ pub struct ProducerSession {
     session_tag: [u8; 16],
     anchor_key: AnchorKey,
     accepted_features: Vec<u64>,
+    capability_generation: u64,
     scene_revision: SceneRevision,
     source_revisions: HashMap<u64, SourceRevision>,
     unconfirmed_anchors: Vec<u64>,
@@ -2018,6 +2264,7 @@ impl ProducerSession {
     pub fn connect(config: &ProducerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         config.validate()?;
         let counters = Arc::new(HotPathCounterState::default());
+        let trace = Arc::new(Mutex::new(TraceState::default()));
         let dry_run = config.is_dry_run();
         let endpoint = config
             .endpoint
@@ -2055,6 +2302,7 @@ impl ProducerSession {
             accepted_features,
             control_limit,
             initial_scene_revision,
+            capability_generation,
         ) = if dry_run {
             send_hello(
                 &mut control,
@@ -2091,6 +2339,7 @@ impl ProducerSession {
                 accepted_features,
                 vivid_protocol::CONTROL_MAX_RECORD_BODY,
                 SceneRevision::ZERO,
+                1,
             )
         } else {
             let mut version = (VIVID_MAJOR, VIVID_MINOR);
@@ -2207,25 +2456,30 @@ impl ProducerSession {
                 accepted_features,
                 welcome.maximum_control_body,
                 welcome.initial_scene_revision,
+                welcome.capability_generation,
             )
         };
         control.set_send_body_limit(control_limit)?;
         let control = if dry_run {
-            ClientControl::Direct(control)
+            ClientControl::Direct(control, trace.clone())
         } else {
             ClientControl::Live(ControlDispatcher::start(
                 control,
                 display,
                 initial_scene_revision,
+                capability_generation,
                 accepted_features.contains(&messages::FEATURE_DESKTOP_INPUT_V1),
                 counters.clone(),
+                trace.clone(),
             )?)
         };
         let anchor_key = anchor::derive_key(&token_bytes, &session_tag);
 
-        Ok(Self {
+        let mut session = Self {
             control,
             counters,
+            trace,
+            trace_guard: None,
             endpoint,
             bulk_endpoint,
             trace_dir: config.trace_dir.clone(),
@@ -2238,15 +2492,81 @@ impl ProducerSession {
             session_tag,
             anchor_key,
             accepted_features,
+            capability_generation,
             scene_revision: initial_scene_revision,
             source_revisions: HashMap::new(),
             unconfirmed_anchors: Vec::new(),
             label: config.producer.clone(),
-        })
+        };
+        if let Some(trace_dir) = &config.trace_dir {
+            session.enable_trace_file(
+                &trace_dir.join("events.ndjson"),
+                trace_component_for_producer(&config.producer),
+            )?;
+        } else if let Some(trace_dir) = std::env::var_os("VIVID_DIAGNOSTIC_TRACE_DIR") {
+            let trace_path = PathBuf::from(trace_dir).join(format!(
+                "{}-{}.ndjson",
+                trace_file_stem_for_producer(&config.producer),
+                std::process::id()
+            ));
+            session
+                .enable_trace_file(&trace_path, trace_component_for_producer(&config.producer))?;
+        }
+        Ok(session)
     }
 
     pub fn hot_path_counters(&self) -> HotPathCounters {
         self.counters.snapshot()
+    }
+
+    pub fn set_trace_callback(
+        &mut self,
+        component: DiagnosticTraceComponent,
+        callback: impl Fn(DiagnosticTraceRecord) + Send + 'static,
+    ) -> io::Result<()> {
+        let hint = random_trace_hint()?;
+        let guard = TraceGuard::callback(component, TraceHop::Producer, hint, move |record| {
+            callback(record)
+        })?;
+        self.install_trace_guard(guard);
+        Ok(())
+    }
+
+    pub fn enable_trace_file(
+        &mut self,
+        path: &Path,
+        component: DiagnosticTraceComponent,
+    ) -> io::Result<()> {
+        let guard = TraceGuard::file(path, component, TraceHop::Producer, random_trace_hint()?)?;
+        self.install_trace_guard(guard);
+        Ok(())
+    }
+
+    fn install_trace_guard(&mut self, guard: TraceGuard) {
+        self.trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .emitter = Some(guard.emitter());
+        self.trace_guard = Some(guard);
+    }
+
+    fn mark_trace_policy(&self, source_id: u64, capture_policy: u64) {
+        let mut trace = self
+            .trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if capture_policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0 {
+            trace.restricted_sources.insert(source_id);
+        }
+    }
+
+    pub fn capability_generation(&self) -> u64 {
+        self.control
+            .capability_generation(self.capability_generation)
+    }
+
+    pub fn take_session_event(&self) -> io::Result<Option<SessionEvent>> {
+        self.control.take_session_event()
     }
 
     pub fn allocate_id(&mut self) -> io::Result<u64> {
@@ -2343,6 +2663,7 @@ impl ProducerSession {
     ) -> io::Result<SourceHandle> {
         self.ensure_capture_policy(capture_policy)?;
         self.ensure_source_descriptor(descriptor)?;
+        self.mark_trace_policy(source_id, capture_policy);
         let request_id = self.request_id()?;
         let body = self.atomic_body(
             &messages::create_raster_with_extensions(
@@ -2434,6 +2755,7 @@ impl ProducerSession {
     ) -> io::Result<SourceHandle> {
         self.ensure_capture_policy(capture_policy)?;
         self.ensure_source_descriptor(descriptor)?;
+        self.mark_trace_policy(source_id, capture_policy);
         let request_id = self.request_id()?;
         let config = self.scrub_video_description(info.vivid_video_config(source_id));
         let body = self.atomic_body(
@@ -2571,6 +2893,7 @@ impl ProducerSession {
         }
         self.ensure_capture_policy(capture_policy)?;
         self.ensure_source_descriptor(descriptor)?;
+        self.mark_trace_policy(source_id, capture_policy);
         let config = self
             .scrub_audio_description(info.vivid_audio_config(source_id, linked_video_source_id));
         let request_id = self.request_id()?;
@@ -2662,6 +2985,8 @@ impl ProducerSession {
         self.ensure_capture_policy(audio_capture_policy)?;
         self.ensure_source_descriptor(video_descriptor)?;
         self.ensure_source_descriptor(audio_descriptor)?;
+        self.mark_trace_policy(video_source_id, video_capture_policy);
+        self.mark_trace_policy(audio_source_id, audio_capture_policy);
         let video_request = self.request_id()?;
         let audio_request = self.request_id()?;
         self.control.write_record(
@@ -2695,42 +3020,78 @@ impl ProducerSession {
 
     #[allow(dead_code)] // Explicit diagnostic/conformance API; normal playback creates directly.
     pub fn probe_video_config<C: VideoConfig + ?Sized>(&mut self, info: &C) -> io::Result<bool> {
-        let request = self.request_id()?;
-        self.control.write_record(
-            messages::PROBE_VIDEO_CONFIG,
-            0,
-            0,
-            &messages::probe_video_config(
-                request,
-                &self.scrub_video_description(info.vivid_video_config(0)),
-            ),
-        )?;
-        if self.dry_run {
-            Ok(true)
-        } else {
-            let reply = self.wait_for_reply(request, &[messages::VIDEO_SUPPORT], 0)?;
-            messages::parse_video_support(&reply.body)
+        Ok(self.probe_video_support(info)?.supported)
+    }
+
+    pub fn probe_video_support<C: VideoConfig + ?Sized>(
+        &mut self,
+        info: &C,
+    ) -> io::Result<messages::CapabilitySupport> {
+        let config = self.scrub_video_description(info.vivid_video_config(0));
+        for _ in 0..3 {
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::PROBE_VIDEO_CONFIG,
+                0,
+                0,
+                &messages::probe_video_config(request, &config),
+            )?;
+            let support = if self.dry_run {
+                messages::CapabilitySupport {
+                    supported: true,
+                    decoder: config.codec.to_owned(),
+                    capability_generation: self.capability_generation(),
+                }
+            } else {
+                let reply = self.wait_for_reply(request, &[messages::VIDEO_SUPPORT], 0)?;
+                messages::parse_capability_support(&reply.body)?
+            };
+            if support.capability_generation >= self.capability_generation() {
+                return Ok(support);
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Vivid video capabilities changed repeatedly during the probe",
+        ))
     }
 
     #[allow(dead_code)] // Explicit diagnostic/conformance API; normal playback creates directly.
     pub fn probe_audio_config<C: AudioConfig + ?Sized>(&mut self, info: &C) -> io::Result<bool> {
-        let request = self.request_id()?;
-        self.control.write_record(
-            messages::PROBE_AUDIO_CONFIG,
-            0,
-            0,
-            &messages::probe_audio_config(
-                request,
-                &self.scrub_audio_description(info.vivid_audio_config(0, None)),
-            ),
-        )?;
-        if self.dry_run {
-            Ok(true)
-        } else {
-            let reply = self.wait_for_reply(request, &[messages::AUDIO_SUPPORT], 0)?;
-            messages::parse_audio_support(&reply.body)
+        Ok(self.probe_audio_support(info)?.supported)
+    }
+
+    pub fn probe_audio_support<C: AudioConfig + ?Sized>(
+        &mut self,
+        info: &C,
+    ) -> io::Result<messages::CapabilitySupport> {
+        let config = self.scrub_audio_description(info.vivid_audio_config(0, None));
+        for _ in 0..3 {
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::PROBE_AUDIO_CONFIG,
+                0,
+                0,
+                &messages::probe_audio_config(request, &config),
+            )?;
+            let support = if self.dry_run {
+                messages::CapabilitySupport {
+                    supported: true,
+                    decoder: config.codec.to_owned(),
+                    capability_generation: self.capability_generation(),
+                }
+            } else {
+                let reply = self.wait_for_reply(request, &[messages::AUDIO_SUPPORT], 0)?;
+                messages::parse_capability_support(&reply.body)?
+            };
+            if support.capability_generation >= self.capability_generation() {
+                return Ok(support);
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Vivid audio capabilities changed repeatedly during the probe",
+        ))
     }
 
     pub fn create_image_source(&mut self, config: &ImageSourceConfig) -> io::Result<SourceHandle> {
@@ -2794,6 +3155,7 @@ impl ProducerSession {
         }
         self.ensure_capture_policy(capture_policy)?;
         self.ensure_source_descriptor(descriptor)?;
+        self.mark_trace_policy(config.source_id, capture_policy);
         let request_id = self.request_id()?;
         let body = self.atomic_body(
             &messages::create_image_with_extensions(request_id, config, capture_policy, descriptor),
@@ -2903,6 +3265,7 @@ impl ProducerSession {
 
     pub fn set_source_policy(&mut self, source_id: u64, capture_policy: u64) -> io::Result<()> {
         self.ensure_capture_policy(capture_policy)?;
+        self.mark_trace_policy(source_id, capture_policy);
         let request_id = self.request_id()?;
         self.control.write_record(
             messages::SET_SOURCE_POLICY,
@@ -3301,7 +3664,7 @@ impl ProducerSession {
     pub fn take_desktop_input(&mut self) -> io::Result<Option<DesktopInputEvent>> {
         match &self.control {
             ClientControl::Live(dispatcher) => dispatcher.take_desktop_input(),
-            ClientControl::Direct(_) => Ok(None),
+            ClientControl::Direct(_, _) => Ok(None),
         }
     }
 
@@ -3834,6 +4197,7 @@ impl ProducerSession {
             record_limit: u64::from(ready.max_media_body),
             state,
             counters: self.counters.clone(),
+            trace: self.trace.clone(),
             last_record_sequence: 0,
             attachment_generation: 0,
             acknowledged_credit_returns: 0,
@@ -4243,6 +4607,115 @@ mod tests {
     }
 
     #[test]
+    fn capability_session_events_coalesce_to_the_newest_generation() {
+        let mut events = VecDeque::new();
+        let mut generation = 1;
+        apply_caps_changed(
+            &mut generation,
+            &mut events,
+            messages::CapsChanged {
+                capability_generation: 2,
+                reason_mask: messages::CAPS_CHANGE_DECODER_AVAILABILITY,
+            },
+        )
+        .unwrap();
+        apply_caps_changed(
+            &mut generation,
+            &mut events,
+            messages::CapsChanged {
+                capability_generation: 4,
+                reason_mask: messages::CAPS_CHANGE_RESOURCE_PRESSURE,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            VecDeque::from([SessionEvent::Capabilities(messages::CapsChanged {
+                capability_generation: 4,
+                reason_mask: messages::CAPS_CHANGE_RESOURCE_PRESSURE,
+            })])
+        );
+        assert!(
+            apply_caps_changed(
+                &mut generation,
+                &mut events,
+                messages::CapsChanged {
+                    capability_generation: 4,
+                    reason_mask: messages::CAPS_CHANGE_DEVICE_AVAILABILITY,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(generation, 4);
+        assert_eq!(trace_file_stem_for_producer("../../outside"), "vivid-sdk");
+    }
+
+    #[test]
+    fn sdk_trace_callback_is_secret_free_and_restricts_source_ids() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let output = records.clone();
+        let guard = TraceGuard::callback(
+            TraceComponent::Sdk,
+            TraceHop::Producer,
+            [0x44; 16],
+            move |record| output.lock().unwrap().push(record),
+        )
+        .unwrap();
+        let trace = Arc::new(Mutex::new(TraceState {
+            emitter: Some(guard.emitter()),
+            restricted_sources: HashSet::from([55]),
+        }));
+        let token = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+        let hello = messages::encode_hello(
+            9,
+            &messages::HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token,
+                producer: "private sdk producer",
+                producer_version: "1",
+                required_features: &[],
+                optional_features: &[],
+                maximum_record_body: 4096,
+                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &[],
+            },
+        );
+        emit_control_trace(
+            &trace,
+            TraceDirection::Send,
+            messages::HELLO,
+            0,
+            1,
+            &hello,
+            TraceOutcome::Ok,
+        );
+        emit_media_trace(&trace, messages::VIDEO_PACKET, 55, 2, 32);
+        drop(trace);
+        drop(guard);
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].outcome, TraceOutcome::Restricted);
+        assert_eq!(records[1].object_id, None);
+        let trace = records
+            .iter()
+            .map(|record| record.ndjson_line())
+            .collect::<String>();
+        for forbidden in [
+            token,
+            "private sdk producer",
+            "\"object_id\":55",
+            "endpoint",
+            "descriptor",
+        ] {
+            assert!(!trace.contains(forbidden), "trace leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn presenter_error_exposes_structured_detail_without_parsing_diagnostic() {
         let detail = messages::ErrorDetail::limit(messages::LIMIT_SOURCES, 64, 64);
         let body = messages::error_with_detail(
@@ -4548,8 +5021,10 @@ mod tests {
                 settled: true,
             },
             SceneRevision::ZERO,
+            1,
             false,
             Arc::new(HotPathCounterState::default()),
+            Arc::new(Mutex::new(TraceState::default())),
         )
         .unwrap();
         let wait = WaitSource {
@@ -4742,8 +5217,10 @@ mod tests {
                 settled: true,
             },
             SceneRevision::ZERO,
+            1,
             false,
             counters.clone(),
+            Arc::new(Mutex::new(TraceState::default())),
         )
         .unwrap();
 
@@ -4800,6 +5277,7 @@ mod tests {
                 changed: Condvar::new(),
             }),
             counters: Arc::new(HotPathCounterState::default()),
+            trace: Arc::new(Mutex::new(TraceState::default())),
             last_record_sequence: 0,
             attachment_generation: 0,
             acknowledged_credit_returns: 0,

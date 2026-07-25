@@ -20,9 +20,9 @@ use vivid_protocol::messages::{
 };
 use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
-    AudioSourceSpec, MediaSender as RustMediaSender, ObservationEvent, ProducerConfig,
-    ProducerSession, RequestMetadata, SourceCancellation, SourceEvent, SourceHandle,
-    SourceWaitCancellation, SourceWaitHandle, VideoSourceSpec,
+    AudioSourceSpec, DiagnosticTraceComponent, MediaSender as RustMediaSender, ObservationEvent,
+    ProducerConfig, ProducerSession, RequestMetadata, SessionEvent, SourceCancellation,
+    SourceEvent, SourceHandle, SourceWaitCancellation, SourceWaitHandle, VideoSourceSpec,
 };
 
 create_exception!(_native, VividError, PyOSError);
@@ -1189,6 +1189,37 @@ fn take_observation(session: PyRef<'_, PySession>) -> PyResult<Option<Observatio
 }
 
 #[pyfunction]
+fn capability_generation(session: PyRef<'_, PySession>) -> PyResult<u64> {
+    let mut guard = lock(&session.inner, "session")?;
+    Ok(open_mut(&mut guard, "session")?.capability_generation())
+}
+
+#[pyfunction]
+fn take_session_event(session: PyRef<'_, PySession>) -> PyResult<Option<(u64, u64)>> {
+    let mut guard = lock(&session.inner, "session")?;
+    Ok(open_mut(&mut guard, "session")?
+        .take_session_event()
+        .map_err(io_error)?
+        .map(|event| match event {
+            SessionEvent::Capabilities(changed) => {
+                (changed.capability_generation, changed.reason_mask)
+            }
+        }))
+}
+
+#[pyfunction]
+fn set_trace_callback(session: PyRef<'_, PySession>, callback: Py<PyAny>) -> PyResult<()> {
+    let mut guard = lock(&session.inner, "session")?;
+    open_mut(&mut guard, "session")?
+        .set_trace_callback(DiagnosticTraceComponent::Sdk, move |record| {
+            Python::attach(|py| {
+                let _ = callback.call1(py, (record.ndjson_line(),));
+            });
+        })
+        .map_err(io_error)
+}
+
+#[pyfunction]
 fn query_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -1546,6 +1577,9 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(delegate_context, module)?)?;
     module.add_function(wrap_pyfunction!(revoke_context, module)?)?;
     module.add_function(wrap_pyfunction!(take_observation, module)?)?;
+    module.add_function(wrap_pyfunction!(capability_generation, module)?)?;
+    module.add_function(wrap_pyfunction!(take_session_event, module)?)?;
+    module.add_function(wrap_pyfunction!(set_trace_callback, module)?)?;
     module.add_function(wrap_pyfunction!(query_source, module)?)?;
     module.add_function(wrap_pyfunction!(query_scene, module)?)?;
     module.add_function(wrap_pyfunction!(query_anchor, module)?)?;
