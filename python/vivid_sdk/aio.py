@@ -17,6 +17,8 @@ from vivid_sdk import (
     AudioSourceConfig,
     AnchorStatus,
     BytesLike,
+    ContextQuotas,
+    ContextReady,
     DisplayState,
     ImageSourceConfig,
     MediaSender,
@@ -82,6 +84,7 @@ async def connect(
     producer_version: str = _sync.__version__,
     required_features: Iterable[int] = _sync.DEFAULT_REQUIRED_FEATURES,
     optional_features: Iterable[int] = _sync.DEFAULT_OPTIONAL_FEATURES,
+    authentication_kind: int = _sync.AUTHENTICATION_WINDOW_ROOT,
 ) -> Session:
     return await _call(
         _sync.connect,
@@ -95,6 +98,7 @@ async def connect(
         producer_version=producer_version,
         required_features=required_features,
         optional_features=optional_features,
+        authentication_kind=authentication_kind,
         cleanup=_sync.close,
     )
 
@@ -125,6 +129,36 @@ async def revision_state(session: Session) -> RevisionState:
 
 async def set_observation(session: Session, class_mask: int) -> None:
     await _call(_sync.set_observation, session, class_mask)
+
+
+async def create_context(
+    session: Session,
+    *,
+    context_id: int,
+    parent_context_id: int,
+    class_mask: int,
+    label: str,
+    expiry_us: int,
+    quotas: ContextQuotas,
+) -> ContextReady:
+    return await _call(
+        _sync.create_context,
+        session,
+        context_id=context_id,
+        parent_context_id=parent_context_id,
+        class_mask=class_mask,
+        label=label,
+        expiry_us=expiry_us,
+        quotas=quotas,
+    )
+
+
+async def delegate_context(session: Session, context_id: int) -> bytes:
+    return await _call(_sync.delegate_context, session, context_id)
+
+
+async def revoke_context(session: Session, context_id: int) -> None:
+    await _call(_sync.revoke_context, session, context_id)
 
 
 async def take_observation(session: Session) -> Optional[ObservationEvent]:

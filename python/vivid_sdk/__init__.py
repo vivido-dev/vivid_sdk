@@ -35,6 +35,17 @@ FEATURE_NODE_CLIP_RECT_V1 = 15
 FEATURE_DECODER_DESCRIPTION_V1 = 16
 FEATURE_OBSERVABILITY_CORE_V1 = 18
 FEATURE_ATOMIC_CONTROL_V1 = 19
+FEATURE_DELEGATED_CONTEXT_V1 = 21
+
+AUTHENTICATION_WINDOW_ROOT = 0
+AUTHENTICATION_DELEGATED_CONTEXT = 1
+
+CONTEXT_CLASS_OBSERVE = 1 << 0
+CONTEXT_CLASS_CREATE_SOURCE = 1 << 1
+CONTEXT_CLASS_MUTATE_SCENE = 1 << 2
+CONTEXT_CLASS_CREATE_ANCHOR = 1 << 3
+CONTEXT_CLASS_DESKTOP_INPUT = 1 << 4
+CONTEXT_CLASS_ADMINISTER = 1 << 5
 
 OBSERVE_SOURCE_TRANSITIONS = 1 << 0
 OBSERVE_SCENE_CHANGES = 1 << 1
@@ -78,6 +89,7 @@ DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
     FEATURE_DECODER_DESCRIPTION_V1,
     FEATURE_OBSERVABILITY_CORE_V1,
     FEATURE_ATOMIC_CONTROL_V1,
+    FEATURE_DELEGATED_CONTEXT_V1,
 )
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -110,6 +122,23 @@ class DisplayState:
 class RevisionState:
     scene_revision: int
     source_revisions: Dict[int, int]
+
+
+@dataclass(frozen=True)
+class ContextQuotas:
+    maximum_sources: int
+    maximum_nodes: int
+    maximum_retained_pixels: int
+    maximum_media_bytes: int
+    maximum_media_connections: int
+
+
+@dataclass(frozen=True)
+class ContextReady:
+    context_id: int
+    class_mask: int
+    expiry_us: int
+    quotas: ContextQuotas
 
 
 @dataclass(frozen=True)
@@ -546,6 +575,7 @@ def connect(
     producer_version: str = __version__,
     required_features: Iterable[int] = DEFAULT_REQUIRED_FEATURES,
     optional_features: Iterable[int] = DEFAULT_OPTIONAL_FEATURES,
+    authentication_kind: int = AUTHENTICATION_WINDOW_ROOT,
 ) -> Session:
     """Connect to a Vivid presenter or create a dry-run/trace session."""
 
@@ -565,6 +595,7 @@ def connect(
         producer_version,
         list(required_features),
         list(optional_features),
+        authentication_kind,
     )
 
 
@@ -597,6 +628,42 @@ def revision_state(session: Session) -> RevisionState:
 
 def set_observation(session: Session, class_mask: int) -> None:
     _native.set_observation(session, class_mask)
+
+
+def create_context(
+    session: Session,
+    *,
+    context_id: int,
+    parent_context_id: int,
+    class_mask: int,
+    label: str,
+    expiry_us: int,
+    quotas: ContextQuotas,
+) -> ContextReady:
+    values = _native.create_context(
+        session,
+        context_id,
+        parent_context_id,
+        class_mask,
+        label,
+        expiry_us,
+        quotas.maximum_sources,
+        quotas.maximum_nodes,
+        quotas.maximum_retained_pixels,
+        quotas.maximum_media_bytes,
+        quotas.maximum_media_connections,
+    )
+    return ContextReady(values[0], values[1], values[2], ContextQuotas(*values[3:]))
+
+
+def delegate_context(session: Session, context_id: int) -> bytes:
+    """Mint an opaque capability; keep the returned bytes out of logs and traces."""
+
+    return bytes(_native.delegate_context(session, context_id))
+
+
+def revoke_context(session: Session, context_id: int) -> None:
+    _native.revoke_context(session, context_id)
 
 
 def _playback(value: Tuple[int, int, int, int, int, int, int]) -> PlaybackSnapshot:

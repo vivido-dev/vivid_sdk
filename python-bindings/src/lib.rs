@@ -15,7 +15,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::messages::{
-    ClipRect, ImageSourceConfig, PlaybackSnapshot, SceneNodeConfig, SourceStatus, WaitSource,
+    ClipRect, ContextQuotas, CreateContextRequest, ImageSourceConfig, PlaybackSnapshot,
+    SceneNodeConfig, SourceStatus, WaitSource,
 };
 use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
@@ -28,6 +29,7 @@ create_exception!(_native, VividError, PyOSError);
 create_exception!(_native, ClosedHandleError, VividError);
 
 type DisplayStateTuple = (u64, u32, u32, u32, u32, u32, u32, bool);
+type ContextReadyTuple = (u64, u64, u64, u64, u64, u64, u64, u64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
@@ -334,7 +336,7 @@ fn parse_scene(config: &Bound<'_, PyDict>) -> PyResult<SceneNodeConfig> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (endpoint, bulk_endpoint, token, dry_run, trace_dir, verbose, producer, producer_version, required_features, optional_features))]
+#[pyo3(signature = (endpoint, bulk_endpoint, token, dry_run, trace_dir, verbose, producer, producer_version, required_features, optional_features, authentication_kind=0))]
 fn connect(
     py: Python<'_>,
     endpoint: Option<String>,
@@ -347,6 +349,7 @@ fn connect(
     producer_version: String,
     required_features: Vec<u64>,
     optional_features: Vec<u64>,
+    authentication_kind: u64,
 ) -> PyResult<PySession> {
     let config = ProducerConfig {
         endpoint,
@@ -359,6 +362,7 @@ fn connect(
         producer_version,
         required_features,
         optional_features,
+        authentication_kind,
         allow_version_retry: false,
     };
     config.validate().map_err(io_error)?;
@@ -1003,6 +1007,91 @@ fn set_observation(py: Python<'_>, session: PyRef<'_, PySession>, class_mask: u6
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    session,
+    context_id,
+    parent_context_id,
+    class_mask,
+    label,
+    expiry_us,
+    maximum_sources,
+    maximum_nodes,
+    maximum_retained_pixels,
+    maximum_media_bytes,
+    maximum_media_connections
+))]
+#[allow(clippy::too_many_arguments)]
+fn create_context(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    context_id: u64,
+    parent_context_id: u64,
+    class_mask: u64,
+    label: String,
+    expiry_us: u64,
+    maximum_sources: u64,
+    maximum_nodes: u64,
+    maximum_retained_pixels: u64,
+    maximum_media_bytes: u64,
+    maximum_media_connections: u64,
+) -> PyResult<ContextReadyTuple> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let ready = py
+        .detach(|| {
+            inner.create_context(&CreateContextRequest {
+                context_id,
+                parent_context_id,
+                class_mask,
+                label,
+                expiry_us,
+                quotas: ContextQuotas {
+                    maximum_sources,
+                    maximum_nodes,
+                    maximum_retained_pixels,
+                    maximum_media_bytes,
+                    maximum_media_connections,
+                },
+            })
+        })
+        .map_err(io_error)?;
+    Ok((
+        ready.context_id,
+        ready.class_mask,
+        ready.expiry_us,
+        ready.quotas.maximum_sources,
+        ready.quotas.maximum_nodes,
+        ready.quotas.maximum_retained_pixels,
+        ready.quotas.maximum_media_bytes,
+        ready.quotas.maximum_media_connections,
+    ))
+}
+
+#[pyfunction]
+fn delegate_context(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    context_id: u64,
+) -> PyResult<Vec<u8>> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    py.detach(|| {
+        inner
+            .delegate_context(context_id)
+            .map(|capability| capability.expose_bytes().to_vec())
+    })
+    .map_err(io_error)
+}
+
+#[pyfunction]
+fn revoke_context(py: Python<'_>, session: PyRef<'_, PySession>, context_id: u64) -> PyResult<()> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    py.detach(|| inner.revoke_context(context_id))
+        .map_err(io_error)
+}
+
+#[pyfunction]
 fn take_observation(session: PyRef<'_, PySession>) -> PyResult<Option<ObservationTuple>> {
     let mut guard = lock(&session.inner, "session")?;
     Ok(open_mut(&mut guard, "session")?
@@ -1363,6 +1452,9 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sender_visibility_reasons, module)?)?;
     module.add_function(wrap_pyfunction!(revision_state, module)?)?;
     module.add_function(wrap_pyfunction!(set_observation, module)?)?;
+    module.add_function(wrap_pyfunction!(create_context, module)?)?;
+    module.add_function(wrap_pyfunction!(delegate_context, module)?)?;
+    module.add_function(wrap_pyfunction!(revoke_context, module)?)?;
     module.add_function(wrap_pyfunction!(take_observation, module)?)?;
     module.add_function(wrap_pyfunction!(query_source, module)?)?;
     module.add_function(wrap_pyfunction!(query_scene, module)?)?;
