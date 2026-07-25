@@ -248,11 +248,42 @@ pub struct ProducerConfig {
     pub producer_version: String,
     pub required_features: Vec<u64>,
     pub optional_features: Vec<u64>,
+    /// HELLO authentication kind. Use `AUTHENTICATION_DELEGATED_CONTEXT` with a capability
+    /// supplied out of band in `token` to bind this connection to a delegated context.
+    pub authentication_kind: u64,
     /// Permit one explicit retry on a fresh connection after a typed version rejection.
     ///
     /// Disabled by default by all SDK integrations. The SDK retries only versions for which it
     /// retains a complete negotiation implementation.
     pub allow_version_retry: bool,
+}
+
+/// An opaque bearer capability for one delegated context.
+///
+/// This type deliberately does not implement `Debug` or `Display`. Callers should expose the
+/// bytes only while transferring the capability through a protected channel.
+pub struct DelegatedCapability([u8; messages::CONTEXT_CAPABILITY_BYTES]);
+
+impl DelegatedCapability {
+    pub fn expose_bytes(&self) -> &[u8; messages::CONTEXT_CAPABILITY_BYTES] {
+        &self.0
+    }
+
+    pub fn expose_hex(&self) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(self.0.len() * 2);
+        for byte in self.0 {
+            encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+impl Drop for DelegatedCapability {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
 }
 
 impl ProducerConfig {
@@ -261,6 +292,15 @@ impl ProducerConfig {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if !matches!(
+            self.authentication_kind,
+            messages::AUTHENTICATION_WINDOW_ROOT | messages::AUTHENTICATION_DELEGATED_CONTEXT
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported Vivid authentication kind",
+            ));
+        }
         if !self.is_dry_run() && self.endpoint.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -845,6 +885,41 @@ impl ControlDispatcher {
                                 Ok(())
                             })
                         }
+                        messages::ERROR => messages::parse_error_reply(&record.body).and_then(
+                            |error| {
+                                if error.code == messages::ERROR_CONTEXT_REVOKED
+                                    && error.request_id == 0
+                                    && error.fatal
+                                {
+                                    state.closed = Some("delegated Vivid context was revoked".into());
+                                    return Ok(());
+                                }
+                                let request_id = error.request_id;
+                                let Some(sent) = state.pending_requests.remove(&request_id) else {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "Vivid received an ERROR for an unknown request",
+                                    ));
+                                };
+                                reader_shared.counters.record_control_reply(sent.elapsed());
+                                if state.discard_replies.remove(&request_id) {
+                                    return Ok(());
+                                }
+                                if state.replies.len() >= MAX_PENDING_CONTROL_RECORDS
+                                    || state.replies.insert(request_id, record).is_some()
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::OutOfMemory,
+                                        "Vivid reply queue exceeded its bound or received a duplicate",
+                                    ));
+                                }
+                                update_high_water(
+                                    &reader_shared.counters.reply_queue_high_water,
+                                    state.replies.len(),
+                                );
+                                Ok(())
+                            },
+                        ),
                         _ => messages::request_id(&record.body).and_then(|request_id| {
                             if request_id == 0 {
                                 return Ok(());
@@ -2868,6 +2943,70 @@ impl ProducerSession {
         self.wait_for_ok(request_id, 0)
     }
 
+    pub fn create_context(
+        &mut self,
+        request: &messages::CreateContextRequest,
+    ) -> io::Result<messages::ContextReady> {
+        if !self.supports(messages::FEATURE_DELEGATED_CONTEXT_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks delegated-context-v1",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::create_context(request_id, request)?;
+        self.control
+            .write_record(messages::CREATE_CONTEXT, 0, request.context_id, &body)?;
+        let record =
+            self.wait_for_reply(request_id, &[messages::CONTEXT_READY], request.context_id)?;
+        let (reply_request_id, ready) = messages::parse_context_ready(&record.body)?;
+        if reply_request_id != request_id || ready.context_id != request.context_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CONTEXT_READY correlation mismatch",
+            ));
+        }
+        Ok(ready)
+    }
+
+    pub fn delegate_context(&mut self, context_id: u64) -> io::Result<DelegatedCapability> {
+        if !self.supports(messages::FEATURE_DELEGATED_CONTEXT_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks delegated-context-v1",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::delegate_context(request_id, context_id);
+        self.control
+            .write_record(messages::DELEGATE_CONTEXT, 0, context_id, &body)?;
+        let record =
+            self.wait_for_reply(request_id, &[messages::CONTEXT_CAPABILITY], context_id)?;
+        let (reply_request_id, reply_context_id, capability) =
+            messages::parse_context_capability(&record.body)?;
+        if reply_request_id != request_id || reply_context_id != context_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CONTEXT_CAPABILITY correlation mismatch",
+            ));
+        }
+        Ok(DelegatedCapability(capability))
+    }
+
+    pub fn revoke_context(&mut self, context_id: u64) -> io::Result<()> {
+        if !self.supports(messages::FEATURE_DELEGATED_CONTEXT_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks delegated-context-v1",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::revoke_context(request_id, context_id);
+        self.control
+            .write_record(messages::REVOKE_CONTEXT, 0, context_id, &body)?;
+        self.wait_for_ok(request_id, context_id)
+    }
+
     pub fn query_source(&mut self, source_id: u64) -> io::Result<SourceStatus> {
         self.ensure_observability()?;
         if self.dry_run {
@@ -3597,7 +3736,7 @@ fn send_hello(
             required_features: &config.required_features,
             optional_features: &config.optional_features,
             maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
-            authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+            authentication_kind: config.authentication_kind,
             preserved_fields: &[],
         },
         u64::from(version.0),
@@ -3695,6 +3834,7 @@ mod tests {
             producer_version: "1".to_owned(),
             required_features,
             optional_features,
+            authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
             allow_version_retry: false,
         }
     }
