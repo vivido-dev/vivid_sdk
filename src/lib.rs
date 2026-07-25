@@ -4693,11 +4693,59 @@ mod tests {
             TraceOutcome::Ok,
         );
         emit_media_trace(&trace, messages::VIDEO_PACKET, 55, 2, 32);
+        let capability = [b'K'; messages::CONTEXT_CAPABILITY_BYTES];
+        let capability_reply = messages::context_capability(10, 5, &capability);
+        emit_control_trace(
+            &trace,
+            TraceDirection::Receive,
+            messages::CONTEXT_CAPABILITY,
+            5,
+            3,
+            &capability_reply,
+            TraceOutcome::Ok,
+        );
+        let ticket = [b'T'; 32];
+        let ready = messages::source_ready(
+            11,
+            56,
+            &ticket,
+            messages::Credits {
+                bytes: 4096,
+                packets: 1,
+                fragments: 0,
+            },
+            4096,
+        );
+        emit_control_trace(
+            &trace,
+            TraceDirection::Receive,
+            messages::SOURCE_READY,
+            56,
+            4,
+            &ready,
+            TraceOutcome::Ok,
+        );
+        let cookie = "vvbridge_session=COOKIE-SENTINEL";
+        let marker = "\u{1b}_GVIVID1;MARKER-SENTINEL\u{1b}\\";
+        let diagnostic = messages::error(
+            12,
+            messages::ERROR_BAD_MESSAGE,
+            &format!("{cookie} {marker}"),
+        );
+        emit_control_trace(
+            &trace,
+            TraceDirection::Receive,
+            messages::ERROR,
+            0,
+            5,
+            &diagnostic,
+            TraceOutcome::Error,
+        );
         drop(trace);
         drop(guard);
 
         let records = records.lock().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 5);
         assert_eq!(records[1].outcome, TraceOutcome::Restricted);
         assert_eq!(records[1].object_id, None);
         let trace = records
@@ -4710,6 +4758,10 @@ mod tests {
             "\"object_id\":55",
             "endpoint",
             "descriptor",
+            "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+            cookie,
+            "MARKER-SENTINEL",
         ] {
             assert!(!trace.contains(forbidden), "trace leaked {forbidden}");
         }
