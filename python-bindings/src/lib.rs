@@ -11,13 +11,16 @@ use pyo3::exceptions::{
     PyInterruptedError, PyKeyError, PyOSError, PyOverflowError, PyTimeoutError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
 use vivid_protocol::media::{AudioPacket, VideoPacket};
-use vivid_protocol::messages::{ClipRect, ImageSourceConfig, SceneNodeConfig};
+use vivid_protocol::messages::{
+    ClipRect, ImageSourceConfig, PlaybackSnapshot, SceneNodeConfig, SourceStatus, WaitSource,
+};
 use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
-    AudioSourceSpec, MediaSender as RustMediaSender, ProducerConfig, ProducerSession,
-    SourceCancellation, SourceEvent, SourceHandle, VideoSourceSpec,
+    AudioSourceSpec, MediaSender as RustMediaSender, ObservationEvent, ProducerConfig,
+    ProducerSession, SourceCancellation, SourceEvent, SourceHandle, SourceWaitCancellation,
+    SourceWaitHandle, VideoSourceSpec,
 };
 
 create_exception!(_native, VividError, PyOSError);
@@ -111,6 +114,41 @@ struct PyMediaSender {
     cancellation: SourceCancellation,
     id: u64,
     kind: SourceKind,
+}
+
+#[pyclass(name = "Wait", module = "vivid_sdk._native")]
+struct PyWait {
+    inner: Mutex<Option<SourceWaitHandle>>,
+    cancellation: SourceWaitCancellation,
+    request_id: u64,
+    source_id: u64,
+}
+
+#[pymethods]
+impl PyWait {
+    #[getter]
+    fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    #[getter]
+    fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    #[getter]
+    fn closed(&self) -> PyResult<bool> {
+        Ok(lock(&self.inner, "wait")?.is_none())
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!(
+            "<vivid_sdk.Wait request_id={} source_id={} closed={}>",
+            self.request_id,
+            self.source_id,
+            lock(&self.inner, "wait")?.is_none()
+        ))
+    }
 }
 
 #[pymethods]
@@ -319,7 +357,9 @@ fn root_context_id(session: PyRef<'_, PySession>) -> PyResult<u64> {
 }
 
 #[pyfunction]
-fn display_state(session: PyRef<'_, PySession>) -> PyResult<(u64, u32, u32, u32, u32, u32, u32)> {
+fn display_state(
+    session: PyRef<'_, PySession>,
+) -> PyResult<(u64, u32, u32, u32, u32, u32, u32, bool)> {
     let mut guard = lock(&session.inner, "session")?;
     let state = open_mut(&mut guard, "session")?.display_state();
     Ok((
@@ -330,6 +370,7 @@ fn display_state(session: PyRef<'_, PySession>) -> PyResult<(u64, u32, u32, u32,
         state.grid_rows,
         state.cell_width,
         state.cell_height,
+        state.settled,
     ))
 }
 
@@ -577,6 +618,123 @@ fn event_tuple(event: SourceEvent) -> EventTuple {
     }
 }
 
+fn playback_tuple(snapshot: PlaybackSnapshot) -> (u64, i64, u32, u64, u64, u64, u64) {
+    (
+        snapshot.state,
+        snapshot.clock_pts_us,
+        snapshot.epoch,
+        snapshot.buffered_ahead_us,
+        snapshot.underrun_count,
+        snapshot.late_drop_count,
+        snapshot.eos_state,
+    )
+}
+
+fn cbor_to_python(py: Python<'_>, value: &vivid_protocol::cbor::Value) -> PyResult<Py<PyAny>> {
+    use vivid_protocol::cbor::Value;
+    Ok(match value {
+        Value::Unsigned(value) => value.into_pyobject(py)?.into_any().unbind(),
+        Value::Negative(value) => value.into_pyobject(py)?.into_any().unbind(),
+        Value::Bytes(value) => PyBytes::new(py, value).into_any().unbind(),
+        Value::Text(value) => value.into_pyobject(py)?.into_any().unbind(),
+        Value::Bool(value) => value.into_pyobject(py)?.to_owned().into_any().unbind(),
+        Value::Null => py.None(),
+        Value::Array(values) => {
+            let output = PyList::empty(py);
+            for value in values {
+                output.append(cbor_to_python(py, value)?)?;
+            }
+            output.into_any().unbind()
+        }
+        Value::Map(values) => {
+            let output = PyDict::new(py);
+            for (key, value) in values {
+                output.set_item(key, cbor_to_python(py, value)?)?;
+            }
+            output.into_any().unbind()
+        }
+    })
+}
+
+fn source_status_dict(py: Python<'_>, status: SourceStatus) -> PyResult<Py<PyDict>> {
+    let output = PyDict::new(py);
+    output.set_item("source_id", status.source_id)?;
+    output.set_item("source_revision", status.source_revision.get())?;
+    output.set_item("kind", status.kind)?;
+    output.set_item("lifecycle", status.lifecycle)?;
+    output.set_item("epoch", status.epoch)?;
+    output.set_item("attachment_state", status.attachment_state)?;
+    output.set_item("attachment_generation", status.attachment_generation)?;
+    output.set_item("last_media_id", status.last_media_id)?;
+    output.set_item("last_media_sequence", status.last_media_sequence)?;
+    output.set_item("last_decoded_pts_us", status.last_decoded_pts_us)?;
+    output.set_item("last_presented_pts_us", status.last_presented_pts_us)?;
+    output.set_item("last_presentation_id", status.last_presentation_id)?;
+    output.set_item("visible", status.visible)?;
+    output.set_item("capture_policy", status.capture_policy)?;
+    output.set_item("linked_source_id", status.linked_source_id)?;
+    output.set_item("milestones", status.milestones)?;
+    output.set_item("outstanding_byte_credit", status.outstanding_byte_credit)?;
+    output.set_item(
+        "outstanding_packet_credit",
+        status.outstanding_packet_credit,
+    )?;
+    output.set_item("ingress_queue_depth", status.ingress_queue_depth)?;
+    output.set_item(
+        "descriptor",
+        status
+            .descriptor
+            .as_ref()
+            .map(|value| cbor_to_python(py, value))
+            .transpose()?,
+    )?;
+    output.set_item("playback", status.playback.map(playback_tuple))?;
+    output.set_item("terminal_loss_code", status.terminal_loss_code)?;
+    Ok(output.unbind())
+}
+
+type ObservationTuple = (
+    String,
+    Option<u64>,
+    u64,
+    u64,
+    u64,
+    Option<u64>,
+    Option<(u64, i64, u32, u64, u64, u64, u64)>,
+);
+
+fn observation_tuple(event: ObservationEvent) -> ObservationTuple {
+    match event {
+        ObservationEvent::Source(event) => (
+            "source".into(),
+            Some(event.source_id),
+            event.source_revision.get(),
+            event.changed_fields,
+            event.observation_sequence.get(),
+            event.first_lost_sequence.map(|sequence| sequence.get()),
+            None,
+        ),
+        ObservationEvent::Scene(event) => (
+            "scene".into(),
+            None,
+            event.scene_revision.get(),
+            event.reason_mask,
+            event.observation_sequence.get(),
+            event.first_lost_sequence.map(|sequence| sequence.get()),
+            None,
+        ),
+        ObservationEvent::Playback(event) => (
+            "playback".into(),
+            Some(event.source_id),
+            event.source_revision.get(),
+            event.snapshot.state,
+            event.observation_sequence.get(),
+            None,
+            Some(playback_tuple(event.snapshot)),
+        ),
+    }
+}
+
 #[pyfunction]
 fn take_source_event(source: PyRef<'_, PySource>) -> PyResult<Option<EventTuple>> {
     let mut guard = lock(&source.inner, "source")?;
@@ -750,6 +908,244 @@ fn sender_visibility_reasons(sender: PyRef<'_, PyMediaSender>) -> PyResult<u64> 
 }
 
 #[pyfunction]
+fn revision_state(session: PyRef<'_, PySession>) -> PyResult<(u64, Vec<(u64, u64)>)> {
+    let mut guard = lock(&session.inner, "session")?;
+    let state = open_mut(&mut guard, "session")?.revision_state();
+    let mut sources = state
+        .sources
+        .into_iter()
+        .map(|(source_id, revision)| (source_id, revision.get()))
+        .collect::<Vec<_>>();
+    sources.sort_unstable_by_key(|(source_id, _)| *source_id);
+    Ok((state.scene.get(), sources))
+}
+
+#[pyfunction]
+fn set_observation(py: Python<'_>, session: PyRef<'_, PySession>, class_mask: u64) -> PyResult<()> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    py.detach(|| inner.set_observation(class_mask))
+        .map_err(io_error)
+}
+
+#[pyfunction]
+fn take_observation(session: PyRef<'_, PySession>) -> PyResult<Option<ObservationTuple>> {
+    let mut guard = lock(&session.inner, "session")?;
+    Ok(open_mut(&mut guard, "session")?
+        .take_observation()
+        .map_err(io_error)?
+        .map(observation_tuple))
+}
+
+#[pyfunction]
+fn query_source(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+) -> PyResult<Py<PyDict>> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let status = py
+        .detach(|| inner.query_source(source_id))
+        .map_err(io_error)?;
+    source_status_dict(py, status)
+}
+
+#[pyfunction]
+#[pyo3(signature = (session, maximum_nodes_per_page=256, maximum_pages=16))]
+fn query_scene(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    maximum_nodes_per_page: u64,
+    maximum_pages: usize,
+) -> PyResult<Py<PyDict>> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let status = py
+        .detach(|| inner.query_scene(maximum_nodes_per_page, maximum_pages))
+        .map_err(io_error)?;
+    let output = PyDict::new(py);
+    output.set_item("scene_revision", status.scene_revision.get())?;
+    output.set_item("total_nodes", status.total_nodes)?;
+    let nodes = PyList::empty(py);
+    for parsed in status.nodes {
+        let node = PyDict::new(py);
+        node.set_item("node_id", parsed.node.node_id)?;
+        node.set_item("source_id", parsed.node.source_id)?;
+        node.set_item("context_id", parsed.node.context_id)?;
+        node.set_item("x", parsed.node.x)?;
+        node.set_item("y", parsed.node.y)?;
+        node.set_item("width", parsed.node.width)?;
+        node.set_item("height", parsed.node.height)?;
+        node.set_item("text_layer", parsed.node.text_layer)?;
+        node.set_item("z_index", parsed.node.z_index)?;
+        node.set_item("visible", parsed.node.visible)?;
+        node.set_item("anchor_id", parsed.node.anchor_id)?;
+        node.set_item(
+            "clip",
+            parsed
+                .clip
+                .map(|clip| (clip.x, clip.y, clip.width, clip.height)),
+        )?;
+        nodes.append(node)?;
+    }
+    output.set_item("nodes", nodes)?;
+    Ok(output.unbind())
+}
+
+#[pyfunction]
+fn query_anchor(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    anchor_id: u64,
+) -> PyResult<(u64, u64, u64, u64, bool, u64)> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let status = py
+        .detach(|| inner.query_anchor(anchor_id))
+        .map_err(io_error)?;
+    Ok((
+        status.anchor_id,
+        status.state,
+        status.column,
+        status.row,
+        status.visible,
+        status.display_generation,
+    ))
+}
+
+#[pyfunction]
+fn query_limits(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<Py<PyDict>> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let status = py.detach(|| inner.query_limits()).map_err(io_error)?;
+    let output = PyDict::new(py);
+    output.set_item("maximum_sources", status.maximum_sources)?;
+    output.set_item("maximum_nodes", status.maximum_nodes)?;
+    output.set_item("maximum_transactions", status.maximum_transactions)?;
+    output.set_item("maximum_anchors", status.maximum_anchors)?;
+    output.set_item("maximum_control_body", status.maximum_control_body)?;
+    output.set_item("maximum_media_body", status.maximum_media_body)?;
+    output.set_item("maximum_waits", status.maximum_waits)?;
+    output.set_item("maximum_pending_requests", status.maximum_pending_requests)?;
+    output.set_item("rolling_byte_window", status.rolling_byte_window)?;
+    output.set_item("rolling_packet_window", status.rolling_packet_window)?;
+    output.set_item("retained_pixel_budget", status.retained_pixel_budget)?;
+    output.set_item("current_sources", status.current_sources)?;
+    output.set_item("current_nodes", status.current_nodes)?;
+    output.set_item("current_retained_pixels", status.current_retained_pixels)?;
+    output.set_item("image_cache_budget", status.image_cache_budget)?;
+    Ok(output.unbind())
+}
+
+fn timeout_duration(seconds: f64) -> PyResult<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(PyValueError::new_err(
+            "timeout must be finite and greater than zero",
+        ));
+    }
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|error| PyOverflowError::new_err(error.to_string()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (session, source_id, condition, value, timeout))]
+fn begin_wait_source(
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    condition: u64,
+    value: Option<u64>,
+    timeout: f64,
+) -> PyResult<PyWait> {
+    let timeout_us = u64::try_from(timeout_duration(timeout)?.as_micros())
+        .map_err(|_| PyOverflowError::new_err("wait timeout is too large"))?;
+    let mut guard = lock(&session.inner, "session")?;
+    let handle = open_mut(&mut guard, "session")?
+        .begin_wait_source(WaitSource {
+            source_id,
+            condition,
+            value,
+            timeout_us,
+        })
+        .map_err(io_error)?;
+    let request_id = handle.request_id();
+    let cancellation = handle.cancellation();
+    Ok(PyWait {
+        inner: Mutex::new(Some(handle)),
+        cancellation,
+        request_id,
+        source_id,
+    })
+}
+
+#[pyfunction]
+fn wait_source(py: Python<'_>, wait: PyRef<'_, PyWait>) -> PyResult<(u64, u64, u64, Option<u64>)> {
+    let mut handle = lock(&wait.inner, "wait")?
+        .take()
+        .ok_or_else(|| ClosedHandleError::new_err("wait is closed or consumed"))?;
+    let satisfied = py.detach(|| handle.wait()).map_err(io_error)?;
+    Ok((
+        satisfied.source_id,
+        satisfied.source_revision.get(),
+        satisfied.condition,
+        satisfied.observed_value,
+    ))
+}
+
+#[pyfunction]
+fn cancel_wait(wait: PyRef<'_, PyWait>) -> PyResult<()> {
+    wait.cancellation.cancel().map_err(io_error)?;
+    lock(&wait.inner, "wait")?.take();
+    Ok(())
+}
+
+#[pyfunction]
+fn wait_until_playing(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    timeout: f64,
+) -> PyResult<(u64, u64, u64, Option<u64>)> {
+    let timeout = timeout_duration(timeout)?;
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let satisfied = py
+        .detach(|| inner.wait_until_playing(source_id, timeout))
+        .map_err(io_error)?;
+    Ok((
+        satisfied.source_id,
+        satisfied.source_revision.get(),
+        satisfied.condition,
+        satisfied.observed_value,
+    ))
+}
+
+#[pyfunction]
+fn play_and_wait_until_playing(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    start_pts_us: i64,
+    minimum_buffer_us: u64,
+    timeout: f64,
+) -> PyResult<(u64, u64, u64, Option<u64>)> {
+    let timeout = timeout_duration(timeout)?;
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    let satisfied = py
+        .detach(|| {
+            inner.play_and_wait_until_playing(source_id, start_pts_us, minimum_buffer_us, timeout)
+        })
+        .map_err(io_error)?;
+    Ok((
+        satisfied.source_id,
+        satisfied.source_revision.get(),
+        satisfied.condition,
+        satisfied.observed_value,
+    ))
+}
+
+#[pyfunction]
 fn play(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -825,6 +1221,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySession>()?;
     module.add_class::<PySource>()?;
     module.add_class::<PyMediaSender>()?;
+    module.add_class::<PyWait>()?;
 
     module.add_function(wrap_pyfunction!(connect, module)?)?;
     module.add_function(wrap_pyfunction!(close, module)?)?;
@@ -859,6 +1256,18 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(take_sender_event, module)?)?;
     module.add_function(wrap_pyfunction!(sender_is_visible, module)?)?;
     module.add_function(wrap_pyfunction!(sender_visibility_reasons, module)?)?;
+    module.add_function(wrap_pyfunction!(revision_state, module)?)?;
+    module.add_function(wrap_pyfunction!(set_observation, module)?)?;
+    module.add_function(wrap_pyfunction!(take_observation, module)?)?;
+    module.add_function(wrap_pyfunction!(query_source, module)?)?;
+    module.add_function(wrap_pyfunction!(query_scene, module)?)?;
+    module.add_function(wrap_pyfunction!(query_anchor, module)?)?;
+    module.add_function(wrap_pyfunction!(query_limits, module)?)?;
+    module.add_function(wrap_pyfunction!(begin_wait_source, module)?)?;
+    module.add_function(wrap_pyfunction!(wait_source, module)?)?;
+    module.add_function(wrap_pyfunction!(cancel_wait, module)?)?;
+    module.add_function(wrap_pyfunction!(wait_until_playing, module)?)?;
+    module.add_function(wrap_pyfunction!(play_and_wait_until_playing, module)?)?;
     module.add_function(wrap_pyfunction!(play, module)?)?;
     module.add_function(wrap_pyfunction!(pause, module)?)?;
     module.add_function(wrap_pyfunction!(flush, module)?)?;

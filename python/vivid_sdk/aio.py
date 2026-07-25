@@ -15,17 +15,25 @@ from typing import Any, Callable, Iterable, Optional, Tuple, TypeVar, Union
 import vivid_sdk as _sync
 from vivid_sdk import (
     AudioSourceConfig,
+    AnchorStatus,
     BytesLike,
     DisplayState,
     ImageSourceConfig,
     MediaSender,
+    LimitsStatus,
+    ObservationEvent,
+    RevisionState,
+    SceneStatus,
     SceneNode,
     SceneNodeConfig,
     Session,
     Source,
     SourceEvent,
     SourceLike,
+    SourceStatus,
     VideoSourceConfig,
+    Wait,
+    WaitSatisfied,
 )
 
 T = TypeVar("T")
@@ -36,6 +44,7 @@ async def _call(
     *args: Any,
     cleanup: Optional[Callable[[T], None]] = None,
     cancel_media: Optional[MediaSender] = None,
+    cancel_wait: Optional[Wait] = None,
     **kwargs: Any,
 ) -> T:
     worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -49,6 +58,9 @@ async def _call(
                     cancel_media,
                     "asyncio media operation cancelled",
                 )
+        if cancel_wait is not None:
+            with suppress(Exception):
+                await asyncio.to_thread(_sync.cancel_wait, cancel_wait)
         result: Optional[T] = None
         with suppress(Exception):
             result = await asyncio.shield(worker)
@@ -105,6 +117,85 @@ async def root_context_id(session: Session) -> int:
 
 async def display_state(session: Session) -> DisplayState:
     return await _call(_sync.display_state, session)
+
+
+async def revision_state(session: Session) -> RevisionState:
+    return await _call(_sync.revision_state, session)
+
+
+async def set_observation(session: Session, class_mask: int) -> None:
+    await _call(_sync.set_observation, session, class_mask)
+
+
+async def take_observation(session: Session) -> Optional[ObservationEvent]:
+    return await _call(_sync.take_observation, session)
+
+
+async def query_source(session: Session, source: SourceLike) -> SourceStatus:
+    return await _call(_sync.query_source, session, source)
+
+
+async def query_scene(
+    session: Session,
+    *,
+    maximum_nodes_per_page: int = 256,
+    maximum_pages: int = 16,
+) -> SceneStatus:
+    return await _call(
+        _sync.query_scene,
+        session,
+        maximum_nodes_per_page=maximum_nodes_per_page,
+        maximum_pages=maximum_pages,
+    )
+
+
+async def query_anchor(session: Session, anchor_id: int) -> AnchorStatus:
+    return await _call(_sync.query_anchor, session, anchor_id)
+
+
+async def query_limits(session: Session) -> LimitsStatus:
+    return await _call(_sync.query_limits, session)
+
+
+async def begin_wait_source(
+    session: Session,
+    source: SourceLike,
+    condition: int,
+    *,
+    value: Optional[int] = None,
+    timeout: float = 30.0,
+) -> Wait:
+    return await _call(
+        _sync.begin_wait_source,
+        session,
+        source,
+        condition,
+        value=value,
+        timeout=timeout,
+        cleanup=_sync.cancel_wait,
+    )
+
+
+async def wait(wait_handle: Wait) -> WaitSatisfied:
+    return await _call(_sync.wait, wait_handle, cancel_wait=wait_handle)
+
+
+async def cancel_wait(wait_handle: Wait) -> None:
+    await _call(_sync.cancel_wait, wait_handle)
+
+
+async def wait_source(
+    session: Session,
+    source: SourceLike,
+    condition: int,
+    *,
+    value: Optional[int] = None,
+    timeout: float = 30.0,
+) -> WaitSatisfied:
+    handle = await begin_wait_source(
+        session, source, condition, value=value, timeout=timeout
+    )
+    return await wait(handle)
 
 
 async def create_text_anchor(session: Session) -> Optional[int]:
@@ -389,6 +480,32 @@ async def play(
     )
 
 
+async def wait_until_playing(
+    session: Session, source: SourceLike, *, timeout: float = 30.0
+) -> WaitSatisfied:
+    return await _call(
+        _sync.wait_until_playing, session, source, timeout=timeout
+    )
+
+
+async def play_and_wait_until_playing(
+    session: Session,
+    source: SourceLike,
+    *,
+    start_pts_us: int = 0,
+    minimum_buffer_us: int = 0,
+    timeout: float = 30.0,
+) -> WaitSatisfied:
+    return await _call(
+        _sync.play_and_wait_until_playing,
+        session,
+        source,
+        start_pts_us=start_pts_us,
+        minimum_buffer_us=minimum_buffer_us,
+        timeout=timeout,
+    )
+
+
 async def pause(session: Session, source: SourceLike) -> None:
     await _call(_sync.pause, session, source)
 
@@ -436,6 +553,8 @@ async def display_image(
 
 __all__ = [
     "allocate_id",
+    "begin_wait_source",
+    "cancel_wait",
     "cancel_sender",
     "check_source",
     "close",
@@ -459,9 +578,17 @@ __all__ = [
     "pause",
     "place_source",
     "play",
+    "play_and_wait_until_playing",
     "probe_audio_config",
     "probe_video_config",
     "root_context_id",
+    "revision_state",
+    "set_observation",
+    "query_source",
+    "query_scene",
+    "query_anchor",
+    "query_limits",
+    "take_observation",
     "send_audio",
     "send_image",
     "send_raster",
@@ -471,4 +598,7 @@ __all__ = [
     "update_scene_node",
     "visibility_reasons",
     "wait_until_visible",
+    "wait",
+    "wait_source",
+    "wait_until_playing",
 ]

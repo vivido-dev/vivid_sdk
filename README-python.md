@@ -123,6 +123,7 @@ vivid.send_video(
     key=True,
 )
 vivid.play(session, sender, start_pts_us=0, minimum_buffer_us=100_000)
+vivid.wait_until_playing(session, sender, timeout=5.0)
 vivid.eos(session, sender, epoch=1)
 vivid.drain(session, sender, timeout=10.0)
 ```
@@ -157,3 +158,29 @@ Invalid values raise `ValueError` or `OverflowError`; expired deadlines raise `T
 transport and protocol failures raise `VividError`; and reuse of a consumed or closed handle raises
 `ClosedHandleError`. `take_event()` returns `VisibilityEvent`, `NeedKeyframeEvent`, or
 `SourceLostEvent` without exposing internal tickets or authentication material.
+
+## Observability and cancellation-safe waits
+
+When `FEATURE_OBSERVABILITY_CORE_V1` is accepted, queries return typed snapshots and revisions:
+
+```python
+vivid.set_observation(session, vivid.OBSERVATION_CLASS_MASK)
+status = vivid.query_source(session, sender)
+scene = vivid.query_scene(session, maximum_nodes_per_page=256, maximum_pages=16)
+
+wait = vivid.begin_wait_source(
+    session,
+    sender,
+    vivid.WAIT_FIRST_VISIBLE_PRESENTATION,
+    timeout=10.0,
+)
+try:
+    milestone = vivid.wait(wait)
+finally:
+    vivid.cancel_wait(wait)  # harmless after completion
+```
+
+Scene pagination is caller-bounded and revision-bound. Dropping a Rust wait handle, explicitly
+cancelling a Python `Wait`, or cancelling `await aio.wait(wait)` sends `CANCEL_WAIT`; it does not
+leave presenter wait state behind. `play()` reports admission only. Use `wait_until_playing()` or
+`play_and_wait_until_playing()` only when actual playback start is required.

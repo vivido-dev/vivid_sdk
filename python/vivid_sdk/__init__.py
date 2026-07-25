@@ -9,10 +9,10 @@ import struct
 import sys
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from typing import Iterable, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Literal, Optional, Tuple, Union
 
 from . import _native
-from ._native import ClosedHandleError, MediaSender, Session, Source, VividError
+from ._native import ClosedHandleError, MediaSender, Session, Source, VividError, Wait
 
 try:
     __version__ = version("vivid-sdk")
@@ -33,6 +33,26 @@ FEATURE_TEXT_ANCHORS_V2 = 13
 FEATURE_AUDIO_ACCESS_UNIT_V1 = 14
 FEATURE_NODE_CLIP_RECT_V1 = 15
 FEATURE_DECODER_DESCRIPTION_V1 = 16
+FEATURE_OBSERVABILITY_CORE_V1 = 18
+
+OBSERVE_SOURCE_TRANSITIONS = 1 << 0
+OBSERVE_SCENE_CHANGES = 1 << 1
+OBSERVE_PLAYBACK_TRANSITIONS = 1 << 2
+OBSERVATION_CLASS_MASK = (
+    OBSERVE_SOURCE_TRANSITIONS
+    | OBSERVE_SCENE_CHANGES
+    | OBSERVE_PLAYBACK_TRANSITIONS
+)
+
+WAIT_SOURCE_REVISION = 1
+WAIT_FIRST_VISIBLE_PRESENTATION = 2
+WAIT_RASTER_FRAME = 3
+WAIT_VIDEO_PTS = 4
+WAIT_PLAYBACK_STARTED = 5
+WAIT_PLAYBACK_ENDED = 6
+WAIT_MEDIA_ATTACHED = 7
+WAIT_MEDIA_CLOSED = 8
+WAIT_SOURCE_LOST = 9
 
 IMAGE_PNG = 1
 IMAGE_JPEG = 2
@@ -55,6 +75,7 @@ DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
     FEATURE_AUDIO_ACCESS_UNIT_V1,
     FEATURE_NODE_CLIP_RECT_V1,
     FEATURE_DECODER_DESCRIPTION_V1,
+    FEATURE_OBSERVABILITY_CORE_V1,
 )
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -80,6 +101,138 @@ class DisplayState:
     grid_rows: int
     cell_width: int
     cell_height: int
+    settled: bool = True
+
+
+@dataclass(frozen=True)
+class RevisionState:
+    scene_revision: int
+    source_revisions: Dict[int, int]
+
+
+@dataclass(frozen=True)
+class PlaybackSnapshot:
+    state: int
+    clock_pts_us: int
+    epoch: int
+    buffered_ahead_us: int
+    underrun_count: int
+    late_drop_count: int
+    eos_state: int
+
+
+@dataclass(frozen=True)
+class SourceStatus:
+    source_id: int
+    source_revision: int
+    kind: int
+    lifecycle: int
+    epoch: int
+    attachment_state: int
+    attachment_generation: int
+    last_media_id: int
+    last_media_sequence: int
+    last_decoded_pts_us: int
+    last_presented_pts_us: int
+    last_presentation_id: int
+    visible: bool
+    capture_policy: int
+    linked_source_id: int
+    milestones: int
+    outstanding_byte_credit: int
+    outstanding_packet_credit: int
+    ingress_queue_depth: int
+    descriptor: Optional[object]
+    playback: Optional[PlaybackSnapshot]
+    terminal_loss_code: Optional[int]
+
+
+@dataclass(frozen=True)
+class SceneNodeStatus:
+    node_id: int
+    source_id: int
+    context_id: int
+    x: int
+    y: int
+    width: int
+    height: int
+    text_layer: int
+    z_index: int
+    visible: bool
+    anchor_id: Optional[int]
+    clip: Optional["ClipRect"]
+
+
+@dataclass(frozen=True)
+class SceneStatus:
+    scene_revision: int
+    nodes: Tuple[SceneNodeStatus, ...]
+    total_nodes: int
+
+
+@dataclass(frozen=True)
+class AnchorStatus:
+    anchor_id: int
+    state: int
+    column: int
+    row: int
+    visible: bool
+    display_generation: int
+
+
+@dataclass(frozen=True)
+class LimitsStatus:
+    maximum_sources: int
+    maximum_nodes: int
+    maximum_transactions: int
+    maximum_anchors: int
+    maximum_control_body: int
+    maximum_media_body: int
+    maximum_waits: int
+    maximum_pending_requests: int
+    rolling_byte_window: int
+    rolling_packet_window: int
+    retained_pixel_budget: int
+    current_sources: int
+    current_nodes: int
+    current_retained_pixels: int
+    image_cache_budget: Optional[int]
+
+
+@dataclass(frozen=True)
+class WaitSatisfied:
+    source_id: int
+    source_revision: int
+    condition: int
+    observed_value: Optional[int]
+
+
+@dataclass(frozen=True)
+class SourceChangedEvent:
+    source_id: int
+    source_revision: int
+    changed_fields: int
+    observation_sequence: int
+    first_lost_sequence: Optional[int]
+
+
+@dataclass(frozen=True)
+class SceneChangedEvent:
+    scene_revision: int
+    reason_mask: int
+    observation_sequence: int
+    first_lost_sequence: Optional[int]
+
+
+@dataclass(frozen=True)
+class PlaybackStateEvent:
+    source_id: int
+    source_revision: int
+    observation_sequence: int
+    snapshot: PlaybackSnapshot
+
+
+ObservationEvent = Union[SourceChangedEvent, SceneChangedEvent, PlaybackStateEvent]
 
 
 @dataclass(frozen=True)
@@ -435,6 +588,106 @@ def display_state(session: Session) -> DisplayState:
     return DisplayState(*_native.display_state(session))
 
 
+def revision_state(session: Session) -> RevisionState:
+    scene_revision, source_revisions = _native.revision_state(session)
+    return RevisionState(scene_revision, dict(source_revisions))
+
+
+def set_observation(session: Session, class_mask: int) -> None:
+    _native.set_observation(session, class_mask)
+
+
+def _playback(value: Tuple[int, int, int, int, int, int, int]) -> PlaybackSnapshot:
+    return PlaybackSnapshot(*value)
+
+
+def take_observation(session: Session) -> Optional[ObservationEvent]:
+    value = _native.take_observation(session)
+    if value is None:
+        return None
+    kind, source, revision, detail, sequence, first_lost, playback = value
+    if kind == "source" and source is not None:
+        return SourceChangedEvent(source, revision, detail, sequence, first_lost)
+    if kind == "scene":
+        return SceneChangedEvent(revision, detail, sequence, first_lost)
+    if kind == "playback" and source is not None and playback is not None:
+        return PlaybackStateEvent(source, revision, sequence, _playback(playback))
+    raise VividError("native observation event is malformed")
+
+
+def query_source(session: Session, source: SourceLike) -> SourceStatus:
+    values: Dict[str, Any] = _native.query_source(session, _source_id(source))
+    playback = values.get("playback")
+    values["playback"] = None if playback is None else _playback(playback)
+    return SourceStatus(**values)
+
+
+def query_scene(
+    session: Session,
+    *,
+    maximum_nodes_per_page: int = 256,
+    maximum_pages: int = 16,
+) -> SceneStatus:
+    values: Dict[str, Any] = _native.query_scene(
+        session, maximum_nodes_per_page, maximum_pages
+    )
+    nodes = []
+    for raw in values["nodes"]:
+        clip = raw.get("clip")
+        raw["clip"] = None if clip is None else ClipRect(*clip)
+        nodes.append(SceneNodeStatus(**raw))
+    return SceneStatus(
+        scene_revision=values["scene_revision"],
+        nodes=tuple(nodes),
+        total_nodes=values["total_nodes"],
+    )
+
+
+def query_anchor(session: Session, anchor_id: int) -> AnchorStatus:
+    return AnchorStatus(*_native.query_anchor(session, anchor_id))
+
+
+def query_limits(session: Session) -> LimitsStatus:
+    values: Dict[str, Any] = _native.query_limits(session)
+    return LimitsStatus(**values)
+
+
+def begin_wait_source(
+    session: Session,
+    source: SourceLike,
+    condition: int,
+    *,
+    value: Optional[int] = None,
+    timeout: float = 30.0,
+) -> Wait:
+    return _native.begin_wait_source(
+        session, _source_id(source), condition, value, timeout
+    )
+
+
+def wait(wait_handle: Wait) -> WaitSatisfied:
+    return WaitSatisfied(*_native.wait_source(wait_handle))
+
+
+def cancel_wait(wait_handle: Wait) -> None:
+    _native.cancel_wait(wait_handle)
+
+
+def wait_source(
+    session: Session,
+    source: SourceLike,
+    condition: int,
+    *,
+    value: Optional[int] = None,
+    timeout: float = 30.0,
+) -> WaitSatisfied:
+    return wait(
+        begin_wait_source(
+            session, source, condition, value=value, timeout=timeout
+        )
+    )
+
+
 def create_text_anchor(session: Session) -> Optional[int]:
     return _native.create_text_anchor(session)
 
@@ -704,6 +957,33 @@ def play(
     _native.play(session, _source_id(source), start_pts_us, minimum_buffer_us)
 
 
+def wait_until_playing(
+    session: Session, source: SourceLike, *, timeout: float = 30.0
+) -> WaitSatisfied:
+    return WaitSatisfied(
+        *_native.wait_until_playing(session, _source_id(source), timeout)
+    )
+
+
+def play_and_wait_until_playing(
+    session: Session,
+    source: SourceLike,
+    *,
+    start_pts_us: int = 0,
+    minimum_buffer_us: int = 0,
+    timeout: float = 30.0,
+) -> WaitSatisfied:
+    return WaitSatisfied(
+        *_native.play_and_wait_until_playing(
+            session,
+            _source_id(source),
+            start_pts_us,
+            minimum_buffer_us,
+            timeout,
+        )
+    )
+
+
 def pause(session: Session, source: SourceLike) -> None:
     _native.pause(session, _source_id(source))
 
@@ -780,6 +1060,13 @@ def display_image(
             _reserve_terminal_rows(rows)
         sender = open_sender(session, source)
         send_image(sender, image.data)
+        if not offline and supports(session, FEATURE_OBSERVABILITY_CORE_V1):
+            wait_source(
+                session,
+                sender,
+                WAIT_FIRST_VISIBLE_PRESENTATION,
+                timeout=10.0,
+            )
     finally:
         close(session)
 
@@ -792,12 +1079,26 @@ __all__ = [
     "DEFAULT_OPTIONAL_FEATURES",
     "DEFAULT_REQUIRED_FEATURES",
     "DisplayState",
+    "RevisionState",
+    "PlaybackSnapshot",
+    "SourceStatus",
+    "SceneNodeStatus",
+    "SceneStatus",
+    "AnchorStatus",
+    "LimitsStatus",
+    "Wait",
+    "WaitSatisfied",
+    "ObservationEvent",
+    "SourceChangedEvent",
+    "SceneChangedEvent",
+    "PlaybackStateEvent",
     "FEATURE_AUDIO_ACCESS_UNIT_V1",
     "FEATURE_CREDIT_FLOW_CONTROL",
     "FEATURE_DECODER_DESCRIPTION_V1",
     "FEATURE_ENCODED_IMAGE_V1",
     "FEATURE_GRID_CELL_NODES",
     "FEATURE_NODE_CLIP_RECT_V1",
+    "FEATURE_OBSERVABILITY_CORE_V1",
     "FEATURE_RASTER_PREMULTIPLIED_ALPHA",
     "FEATURE_RASTER_RGBA8",
     "FEATURE_RASTER_ZSTD_V1",
@@ -806,6 +1107,19 @@ __all__ = [
     "FEATURE_VIDEO_ACCESS_UNIT_V1",
     "FEATURE_VIDEO_CONTROL_V1",
     "FEATURE_VISIBILITY_EVENTS_V1",
+    "OBSERVE_SOURCE_TRANSITIONS",
+    "OBSERVE_SCENE_CHANGES",
+    "OBSERVE_PLAYBACK_TRANSITIONS",
+    "OBSERVATION_CLASS_MASK",
+    "WAIT_SOURCE_REVISION",
+    "WAIT_FIRST_VISIBLE_PRESENTATION",
+    "WAIT_RASTER_FRAME",
+    "WAIT_VIDEO_PTS",
+    "WAIT_PLAYBACK_STARTED",
+    "WAIT_PLAYBACK_ENDED",
+    "WAIT_MEDIA_ATTACHED",
+    "WAIT_MEDIA_CLOSED",
+    "WAIT_SOURCE_LOST",
     "IMAGE_JPEG",
     "IMAGE_PNG",
     "ImageSourceConfig",
@@ -825,6 +1139,8 @@ __all__ = [
     "VividError",
     "__version__",
     "allocate_id",
+    "begin_wait_source",
+    "cancel_wait",
     "cancel_sender",
     "check_source",
     "close",
@@ -848,17 +1164,28 @@ __all__ = [
     "pause",
     "place_source",
     "play",
+    "play_and_wait_until_playing",
     "probe_audio_config",
     "probe_video_config",
     "root_context_id",
+    "revision_state",
     "send_audio",
     "send_image",
     "send_raster",
     "send_video",
     "source_id",
     "supports",
+    "set_observation",
+    "query_source",
+    "query_scene",
+    "query_anchor",
+    "query_limits",
+    "take_observation",
     "take_event",
     "update_scene_node",
     "visibility_reasons",
     "wait_until_visible",
+    "wait",
+    "wait_source",
+    "wait_until_playing",
 ]
