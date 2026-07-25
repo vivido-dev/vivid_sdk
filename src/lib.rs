@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +23,102 @@ const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
+
+/// Allocation-free snapshot of coarse producer hot-path measurements.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HotPathCounters {
+    /// Media records successfully written.
+    pub media_records_sent: u64,
+    /// Bytes copied into SDK-owned media bodies.
+    pub media_bytes_copied: u64,
+    /// SDK-owned allocations made while constructing media bodies.
+    pub media_allocations: u64,
+    /// Cumulative time spent blocked for source credit.
+    pub credit_wait_us: u64,
+    /// Cumulative request-to-reply latency for correlated control records.
+    pub control_reply_latency_us: u64,
+    /// Number of samples in `control_reply_latency_us`.
+    pub control_reply_samples: u64,
+    /// Maximum concurrently pending correlated control requests.
+    pub pending_request_high_water: usize,
+    /// Maximum correlated replies waiting for their caller.
+    pub reply_queue_high_water: usize,
+    /// Maximum source events queued before their source was registered.
+    pub source_event_queue_high_water: usize,
+    /// Maximum pending desktop-input events.
+    pub desktop_input_queue_high_water: usize,
+}
+
+#[derive(Debug, Default)]
+struct HotPathCounterState {
+    media_records_sent: AtomicU64,
+    media_bytes_copied: AtomicU64,
+    media_allocations: AtomicU64,
+    credit_wait_us: AtomicU64,
+    control_reply_latency_us: AtomicU64,
+    control_reply_samples: AtomicU64,
+    pending_request_high_water: AtomicUsize,
+    reply_queue_high_water: AtomicUsize,
+    source_event_queue_high_water: AtomicUsize,
+    desktop_input_queue_high_water: AtomicUsize,
+}
+
+impl HotPathCounterState {
+    fn snapshot(&self) -> HotPathCounters {
+        HotPathCounters {
+            media_records_sent: self.media_records_sent.load(Ordering::Relaxed),
+            media_bytes_copied: self.media_bytes_copied.load(Ordering::Relaxed),
+            media_allocations: self.media_allocations.load(Ordering::Relaxed),
+            credit_wait_us: self.credit_wait_us.load(Ordering::Relaxed),
+            control_reply_latency_us: self.control_reply_latency_us.load(Ordering::Relaxed),
+            control_reply_samples: self.control_reply_samples.load(Ordering::Relaxed),
+            pending_request_high_water: self.pending_request_high_water.load(Ordering::Relaxed),
+            reply_queue_high_water: self.reply_queue_high_water.load(Ordering::Relaxed),
+            source_event_queue_high_water: self
+                .source_event_queue_high_water
+                .load(Ordering::Relaxed),
+            desktop_input_queue_high_water: self
+                .desktop_input_queue_high_water
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_media_sent(&self) {
+        saturating_add(&self.media_records_sent, 1);
+    }
+
+    fn record_media_work(&self, allocations: u64, bytes_copied: u64) {
+        saturating_add(&self.media_allocations, allocations);
+        saturating_add(&self.media_bytes_copied, bytes_copied);
+    }
+
+    fn record_credit_wait(&self, started: Option<Instant>) {
+        if let Some(started) = started {
+            saturating_add(&self.credit_wait_us, duration_us(started.elapsed()));
+        }
+    }
+
+    fn record_control_reply(&self, elapsed: Duration) {
+        saturating_add(&self.control_reply_latency_us, duration_us(elapsed));
+        saturating_add(&self.control_reply_samples, 1);
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+fn update_high_water(counter: &AtomicUsize, value: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (value > current).then_some(value)
+    });
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 /// Connection and feature policy for a Vivid producer. Token-bearing values deliberately do not
 /// implement `Debug` so an application cannot accidentally log the presenter capability.
@@ -239,6 +336,9 @@ pub struct SourceHandle {
     ticket: Vec<u8>,
     record_limit: u64,
     state: Arc<SourceSync>,
+    counters: Arc<HotPathCounterState>,
+    last_record_sequence: u64,
+    attachment_generation: u64,
     acknowledged_credit_returns: u64,
     observed_visible: bool,
     reported_lost: bool,
@@ -291,7 +391,7 @@ struct SourceSync {
 
 struct DispatcherState {
     replies: HashMap<u64, Record>,
-    pending_requests: HashSet<u64>,
+    pending_requests: HashMap<u64, Instant>,
     sources: HashMap<u64, Arc<SourceSync>>,
     pending_source_events: HashMap<u64, VecDeque<Record>>,
     pending_source_event_count: usize,
@@ -315,6 +415,7 @@ struct DispatcherState {
 struct DispatcherShared {
     state: Mutex<DispatcherState>,
     changed: Condvar,
+    counters: Arc<HotPathCounterState>,
 }
 
 struct ControlDispatcher {
@@ -332,12 +433,13 @@ impl ControlDispatcher {
         connection: Connection,
         display: DisplayState,
         desktop_input_enabled: bool,
+        counters: Arc<HotPathCounterState>,
     ) -> io::Result<Self> {
         let (mut reader, writer) = connection.split()?;
         let shared = Arc::new(DispatcherShared {
             state: Mutex::new(DispatcherState {
                 replies: HashMap::new(),
-                pending_requests: HashSet::new(),
+                pending_requests: HashMap::new(),
                 sources: HashMap::new(),
                 pending_source_events: HashMap::new(),
                 pending_source_event_count: 0,
@@ -355,6 +457,7 @@ impl ControlDispatcher {
                 rtt_us: None,
             }),
             changed: Condvar::new(),
+            counters,
         });
         let reader_shared = shared.clone();
         let reader_writer = writer.clone();
@@ -429,6 +532,10 @@ impl ControlDispatcher {
                                     .or_default()
                                     .push_back(record);
                                 state.pending_source_event_count += 1;
+                                update_high_water(
+                                    &reader_shared.counters.source_event_queue_high_water,
+                                    state.pending_source_event_count,
+                                );
                                 Ok(())
                             }
                         }
@@ -438,7 +545,9 @@ impl ControlDispatcher {
                         | messages::POINTER_MOTION
                         | messages::POINTER_BUTTON
                         | messages::POINTER_AXIS
-                        | messages::INPUT_RESET => apply_desktop_input_record(&mut state, &record),
+                        | messages::INPUT_RESET => {
+                            apply_desktop_input_record(&mut state, &record, &reader_shared.counters)
+                        }
                         messages::ANCHOR_READY => {
                             messages::parse_anchor_event(&record.body).map(|anchor| {
                                 state.anchors.insert(anchor);
@@ -466,12 +575,13 @@ impl ControlDispatcher {
                             if request_id == 0 {
                                 return Ok(());
                             }
-                            if !state.pending_requests.remove(&request_id) {
+                            let Some(sent) = state.pending_requests.remove(&request_id) else {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "Vivid received a reply for an unknown request",
                                 ));
-                            }
+                            };
+                            reader_shared.counters.record_control_reply(sent.elapsed());
                             if state.replies.len() >= MAX_PENDING_CONTROL_RECORDS
                                 || state.replies.insert(request_id, record).is_some()
                             {
@@ -480,6 +590,10 @@ impl ControlDispatcher {
                                     "Vivid reply queue exceeded its bound or received a duplicate",
                                 ));
                             }
+                            update_high_water(
+                                &reader_shared.counters.reply_queue_high_water,
+                                state.replies.len(),
+                            );
                             Ok(())
                         }),
                     };
@@ -596,13 +710,18 @@ impl ControlDispatcher {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.pending_requests.len() >= MAX_PENDING_CONTROL_RECORDS
-                || !state.pending_requests.insert(request_id)
+                || state.pending_requests.contains_key(&request_id)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "Vivid pending request bound exceeded or request ID was reused",
                 ));
             }
+            state.pending_requests.insert(request_id, Instant::now());
+            update_high_water(
+                &self.shared.counters.pending_request_high_water,
+                state.pending_requests.len(),
+            );
         }
         if let Err(error) = self
             .writer
@@ -850,6 +969,7 @@ fn close_dispatcher(shared: &DispatcherShared, message: String) {
     if state.desktop_input_enabled {
         state.desktop_input.clear();
         state.desktop_input.push_back(DesktopInputEvent::Reset);
+        update_high_water(&shared.counters.desktop_input_queue_high_water, 1);
     }
     state.closed.get_or_insert(message);
     shared.changed.notify_all();
@@ -905,9 +1025,18 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
     Ok(())
 }
 
-fn apply_desktop_input_record(state: &mut DispatcherState, record: &Record) -> io::Result<()> {
+fn apply_desktop_input_record(
+    state: &mut DispatcherState,
+    record: &Record,
+    counters: &HotPathCounterState,
+) -> io::Result<()> {
     let event = decode_desktop_input_record(state.desktop_input_enabled, record)?;
-    push_desktop_input(&mut state.desktop_input, event)
+    let result = push_desktop_input(&mut state.desktop_input, event);
+    update_high_water(
+        &counters.desktop_input_queue_high_water,
+        state.desktop_input.len(),
+    );
+    result
 }
 
 fn decode_desktop_input_record(
@@ -1032,9 +1161,9 @@ impl ClientControl {
         body: &[u8],
     ) -> io::Result<()> {
         match self {
-            Self::Direct(connection) => {
-                connection.write_record(record_type, flags, object_id, body)
-            }
+            Self::Direct(connection) => connection
+                .write_record(record_type, flags, object_id, body)
+                .map(|_| ()),
             Self::Live(dispatcher) => dispatcher.write_record(record_type, flags, object_id, body),
         }
     }
@@ -1132,6 +1261,45 @@ pub struct MediaChannel {
     source_id: u64,
 }
 
+impl MediaChannel {
+    fn send_parts(
+        &mut self,
+        source: &mut SourceHandle,
+        dry_run: bool,
+        record_type: u16,
+        parts: &[&[u8]],
+        interrupt_for_events: bool,
+    ) -> io::Result<u64> {
+        let bytes = media_body_len(parts)?;
+        if bytes > source.record_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Vivid media record is {bytes} bytes, exceeding source {}'s {}-byte limit",
+                    source.id, source.record_limit
+                ),
+            ));
+        }
+        source.consume_credits(bytes, dry_run, interrupt_for_events)?;
+        let sequence = self
+            .connection
+            .write_record_parts(record_type, 0, self.source_id, parts)?;
+        source.last_record_sequence = sequence;
+        source.counters.record_media_sent();
+        Ok(sequence)
+    }
+}
+
+fn media_body_len(parts: &[&[u8]]) -> io::Result<u64> {
+    parts.iter().try_fold(0_u64, |length, part| {
+        let part_length = u64::try_from(part.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "media body is too large"))?;
+        length
+            .checked_add(part_length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "media body is too large"))
+    })
+}
+
 /// A source-specific media writer. It owns no control-session lock, so independent audio and
 /// video writers can block on their own credits without blocking each other.
 pub struct MediaSender {
@@ -1159,17 +1327,25 @@ impl MediaSender {
     }
 
     pub fn send_video(&mut self, packet: VideoPacket<'_>) -> io::Result<()> {
-        let body = media::video_packet_body(packet)?;
-        self.send_record(messages::VIDEO_PACKET, body, true)
+        let prefix = media::video_packet_prefix(&packet)?;
+        self.send_record_parts(
+            messages::VIDEO_PACKET,
+            &[prefix.as_slice(), packet.data],
+            true,
+        )
     }
 
     pub fn send_audio(&mut self, packet: media::AudioPacket<'_>) -> io::Result<()> {
-        let body = media::audio_packet_body(packet)?;
+        let prefix = media::audio_packet_prefix(&packet)?;
         // Audio sources have no scene node of their own. Linked audio therefore commonly reports
         // false visibility even while its video is visible, and standalone audio is never placed
         // in the scene at all. VISIBILITY is advisory, so it must not interrupt audio credit
         // waits and turn the linked master clock into a packet-dropping loop.
-        self.send_record(messages::AUDIO_PACKET, body, false)
+        self.send_record_parts(
+            messages::AUDIO_PACKET,
+            &[prefix.as_slice(), packet.data],
+            false,
+        )
     }
 
     /// Send one complete RGBA8 raster frame and wait until the presenter returns media credit.
@@ -1184,29 +1360,34 @@ impl MediaSender {
         height: u32,
         rgba: &[u8],
     ) -> io::Result<()> {
-        let raw = media::raster_frame_body(epoch, frame_id, width, height, rgba)?;
-        let body = if self.raster_zstd {
+        let raw_prefix =
+            media::raster_full_frame_prefix(epoch, frame_id, width, height, rgba.len())?;
+        let raw_parts = [raw_prefix.as_slice(), rgba];
+        let raw_length = media_body_len(&raw_parts)?;
+        if self.raster_zstd {
             let compressed = media::raster_frame_body_with_compression(
                 epoch, frame_id, width, height, rgba, true,
             )?;
-            if compressed.len() < raw.len() {
-                compressed
+            self.source
+                .counters
+                .record_media_work(2, u64::try_from(compressed.len()).unwrap_or(u64::MAX));
+            if u64::try_from(compressed.len()).unwrap_or(u64::MAX) < raw_length {
+                self.send_one_shot_parts(messages::RASTER_FRAME, &[compressed.as_slice()])
             } else {
-                raw
+                self.send_one_shot_parts(messages::RASTER_FRAME, &raw_parts)
             }
         } else {
-            raw
-        };
-        self.send_one_shot(messages::RASTER_FRAME, body)
+            self.send_one_shot_parts(messages::RASTER_FRAME, &raw_parts)
+        }
     }
 
     /// Send one complete encoded image and wait until the presenter returns media credit.
     pub fn send_image(&mut self, encoded: &[u8]) -> io::Result<()> {
-        self.send_one_shot(messages::IMAGE_DATA, encoded.to_vec())
+        self.send_one_shot_parts(messages::IMAGE_DATA, &[encoded])
     }
 
-    fn send_one_shot(&mut self, record_type: u16, body: Vec<u8>) -> io::Result<()> {
-        self.send_record(record_type, body, false)?;
+    fn send_one_shot_parts(&mut self, record_type: u16, parts: &[&[u8]]) -> io::Result<()> {
+        self.send_record_parts(record_type, parts, false)?;
         if self.dry_run {
             Ok(())
         } else {
@@ -1214,33 +1395,26 @@ impl MediaSender {
         }
     }
 
-    fn send_record(
+    fn send_record_parts(
         &mut self,
         record_type: u16,
-        body: Vec<u8>,
+        parts: &[&[u8]],
         interrupt_for_events: bool,
     ) -> io::Result<()> {
-        let bytes = u64::try_from(body.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "media body is too large"))?;
-        if bytes > self.source.record_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Vivid media record is {bytes} bytes, exceeding source {}'s {}-byte limit",
-                    self.source.id, self.source.record_limit
-                ),
-            ));
-        }
-        self.source
-            .consume_credits(bytes, self.dry_run, interrupt_for_events)?;
-        self.channel
-            .connection
-            .write_record(record_type, 0, self.channel.source_id, &body)
+        self.channel.send_parts(
+            &mut self.source,
+            self.dry_run,
+            record_type,
+            parts,
+            interrupt_for_events,
+        )?;
+        Ok(())
     }
 }
 
 pub struct ProducerSession {
     control: ClientControl,
+    counters: Arc<HotPathCounterState>,
     endpoint: Option<Endpoint>,
     bulk_endpoint: Option<Endpoint>,
     trace_dir: Option<PathBuf>,
@@ -1260,6 +1434,7 @@ pub struct ProducerSession {
 impl ProducerSession {
     pub fn connect(config: &ProducerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         config.validate()?;
+        let counters = Arc::new(HotPathCounterState::default());
         let dry_run = config.is_dry_run();
         let endpoint = config
             .endpoint
@@ -1418,12 +1593,14 @@ impl ProducerSession {
                 control,
                 display,
                 accepted_features.contains(&messages::FEATURE_DESKTOP_INPUT_V1),
+                counters.clone(),
             )?)
         };
         let anchor_key = anchor::derive_key(&token_bytes, &session_tag);
 
         Ok(Self {
             control,
+            counters,
             endpoint,
             bulk_endpoint,
             trace_dir: config.trace_dir.clone(),
@@ -1439,6 +1616,10 @@ impl ProducerSession {
             unconfirmed_anchors: Vec::new(),
             label: config.producer.clone(),
         })
+    }
+
+    pub fn hot_path_counters(&self) -> HotPathCounters {
+        self.counters.snapshot()
     }
 
     pub fn allocate_id(&mut self) -> io::Result<u64> {
@@ -1909,24 +2090,43 @@ impl ProducerSession {
         rgba: &[u8],
     ) -> io::Result<()> {
         let (width, height) = size;
-        let raw = media::raster_frame_body(epoch, frame_id, width, height, rgba)?;
-        let body = if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
+        let raw_prefix =
+            media::raster_full_frame_prefix(epoch, frame_id, width, height, rgba.len())?;
+        let raw_parts = [raw_prefix.as_slice(), rgba];
+        let raw_length = media_body_len(&raw_parts)?;
+        if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
             let compressed = media::raster_frame_body_with_compression(
                 epoch, frame_id, width, height, rgba, true,
             )?;
-            if compressed.len() < raw.len() {
-                compressed
+            source
+                .counters
+                .record_media_work(2, u64::try_from(compressed.len()).unwrap_or(u64::MAX));
+            if u64::try_from(compressed.len()).unwrap_or(u64::MAX) < raw_length {
+                channel.send_parts(
+                    source,
+                    self.dry_run,
+                    messages::RASTER_FRAME,
+                    &[compressed.as_slice()],
+                    false,
+                )?;
             } else {
-                raw
+                channel.send_parts(
+                    source,
+                    self.dry_run,
+                    messages::RASTER_FRAME,
+                    &raw_parts,
+                    false,
+                )?;
             }
         } else {
-            raw
-        };
-        self.validate_record_size(source, body.len() as u64)?;
-        self.consume_credits(source, body.len() as u64)?;
-        channel
-            .connection
-            .write_record(messages::RASTER_FRAME, 0, channel.source_id, &body)?;
+            channel.send_parts(
+                source,
+                self.dry_run,
+                messages::RASTER_FRAME,
+                &raw_parts,
+                false,
+            )?;
+        }
         self.wait_for_media_credit(source)
     }
 
@@ -1936,12 +2136,15 @@ impl ProducerSession {
         channel: &mut MediaChannel,
         packet: VideoPacket<'_>,
     ) -> io::Result<()> {
-        let body = media::video_packet_body(packet)?;
-        self.validate_record_size(source, body.len() as u64)?;
-        self.consume_credits(source, body.len() as u64)?;
-        channel
-            .connection
-            .write_record(messages::VIDEO_PACKET, 0, channel.source_id, &body)
+        let prefix = media::video_packet_prefix(&packet)?;
+        channel.send_parts(
+            source,
+            self.dry_run,
+            messages::VIDEO_PACKET,
+            &[prefix.as_slice(), packet.data],
+            false,
+        )?;
+        Ok(())
     }
 
     pub fn send_audio_packet(
@@ -1950,12 +2153,15 @@ impl ProducerSession {
         channel: &mut MediaChannel,
         packet: media::AudioPacket<'_>,
     ) -> io::Result<()> {
-        let body = media::audio_packet_body(packet)?;
-        self.validate_record_size(source, body.len() as u64)?;
-        self.consume_credits(source, body.len() as u64)?;
-        channel
-            .connection
-            .write_record(messages::AUDIO_PACKET, 0, channel.source_id, &body)
+        let prefix = media::audio_packet_prefix(&packet)?;
+        channel.send_parts(
+            source,
+            self.dry_run,
+            messages::AUDIO_PACKET,
+            &[prefix.as_slice(), packet.data],
+            false,
+        )?;
+        Ok(())
     }
 
     pub fn send_image_data(
@@ -1964,11 +2170,13 @@ impl ProducerSession {
         channel: &mut MediaChannel,
         encoded: &[u8],
     ) -> io::Result<()> {
-        self.validate_record_size(source, encoded.len() as u64)?;
-        self.consume_credits(source, encoded.len() as u64)?;
-        channel
-            .connection
-            .write_record(messages::IMAGE_DATA, 0, channel.source_id, encoded)?;
+        channel.send_parts(
+            source,
+            self.dry_run,
+            messages::IMAGE_DATA,
+            &[encoded],
+            false,
+        )?;
         self.wait_for_media_credit(source)
     }
 
@@ -2167,27 +2375,13 @@ impl ProducerSession {
             ticket: ready.media_ticket,
             record_limit: u64::from(ready.max_media_body),
             state,
+            counters: self.counters.clone(),
+            last_record_sequence: 0,
+            attachment_generation: 0,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
         })
-    }
-
-    fn validate_record_size(&self, source: &SourceHandle, bytes: u64) -> io::Result<()> {
-        if bytes > source.record_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Vivid media record is {bytes} bytes, exceeding source {}'s {}-byte credit window; fragmentation is required",
-                    source.id, source.record_limit
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn consume_credits(&mut self, source: &mut SourceHandle, bytes: u64) -> io::Result<()> {
-        source.consume_credits(bytes, self.dry_run, false)
     }
 
     /// Wait until the presenter has consumed a one-shot image or raster record before the media
@@ -2258,6 +2452,18 @@ fn marker_for_transport(marker: String, conpty_transport: bool) -> String {
 }
 
 impl SourceHandle {
+    pub fn last_record_sequence(&self) -> u64 {
+        self.last_record_sequence
+    }
+
+    pub fn attachment_generation(&self) -> u64 {
+        self.attachment_generation
+    }
+
+    pub fn hot_path_counters(&self) -> HotPathCounters {
+        self.counters.snapshot()
+    }
+
     pub fn cancellation(&self) -> SourceCancellation {
         SourceCancellation {
             state: self.state.clone(),
@@ -2338,17 +2544,21 @@ impl SourceHandle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut wait_started = None;
         loop {
             if let Some(error) = &state.lost {
+                self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::other(error.clone()));
             }
             if interrupt_for_events && state.need_keyframe_epoch.is_some() {
+                self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "presenter requested a fresh keyframe",
                 ));
             }
             if interrupt_for_events && !state.visible {
+                self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "source became invisible while waiting for media credit",
@@ -2356,11 +2566,14 @@ impl SourceHandle {
             }
             if state.credits.can_consume(bytes) {
                 state.credits.consume(bytes)?;
+                self.counters.record_credit_wait(wait_started);
                 return Ok(());
             }
             if dry_run {
+                self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::other("synthetic dry-run credits exhausted"));
             }
+            wait_started.get_or_insert_with(Instant::now);
             state = self
                 .state
                 .changed
@@ -2375,14 +2588,18 @@ impl SourceHandle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut wait_started = None;
         loop {
             if let Some(error) = &state.lost {
+                self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::other(error.clone()));
             }
             if state.credit_returns > self.acknowledged_credit_returns {
                 self.acknowledged_credit_returns = state.credit_returns;
+                self.counters.record_credit_wait(wait_started);
                 return Ok(());
             }
+            wait_started.get_or_insert_with(Instant::now);
             state = self
                 .state
                 .changed
@@ -2585,27 +2802,31 @@ mod tests {
                 let header = RecordHeader::decode(header);
                 let mut body = vec![0; header.body_length as usize];
                 stream.read_exact(&mut body)?;
-                if header.record_type == messages::PING {
-                    let pong = messages::ok(messages::request_id(&body)?);
-                    sequence += 1;
-                    stream.write_all(
-                        &RecordHeader {
-                            body_length: pong.len() as u32,
-                            record_type: messages::PONG,
-                            flags: 0,
-                            object_id: 0,
-                            sequence,
-                        }
-                        .encode(),
-                    )?;
-                    stream.write_all(&pong)?;
-                    stream.flush()?;
-                }
+                let request_id = messages::request_id(&body)?;
+                let (record_type, reply) = if header.record_type == messages::PING {
+                    (messages::PONG, messages::ok(request_id))
+                } else {
+                    (messages::OK, messages::ok(request_id))
+                };
+                sequence += 1;
+                stream.write_all(
+                    &RecordHeader {
+                        body_length: reply.len() as u32,
+                        record_type,
+                        flags: 0,
+                        object_id: 0,
+                        sequence,
+                    }
+                    .encode(),
+                )?;
+                stream.write_all(&reply)?;
+                stream.flush()?;
             }
         });
 
         let endpoint = Endpoint::parse(socket.to_str().unwrap()).unwrap();
         let connection = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        let counters = Arc::new(HotPathCounterState::default());
         let dispatcher = ControlDispatcher::start(
             connection,
             DisplayState {
@@ -2618,8 +2839,18 @@ mod tests {
                 cell_height: 25,
             },
             false,
+            counters.clone(),
         )
         .unwrap();
+
+        dispatcher
+            .write_record(messages::GOODBYE, 0, 0, &messages::goodbye(1))
+            .unwrap();
+        dispatcher.wait_reply(1, &[messages::OK], 0).unwrap();
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.control_reply_samples, 1);
+        assert_eq!(snapshot.pending_request_high_water, 1);
+        assert_eq!(snapshot.reply_queue_high_water, 1);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let sampled = loop {
@@ -2664,6 +2895,9 @@ mod tests {
                 }),
                 changed: Condvar::new(),
             }),
+            counters: Arc::new(HotPathCounterState::default()),
+            last_record_sequence: 0,
+            attachment_generation: 0,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -2786,6 +3020,10 @@ mod tests {
         raster_sender
             .send_raster(1, 1, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 255])
             .unwrap();
+        let raster_counters = raster_sender.source().hot_path_counters();
+        assert_eq!(raster_counters.media_records_sent, 1);
+        assert_eq!(raster_counters.media_allocations, 2);
+        assert!(raster_counters.media_bytes_copied > 0);
         assert_eq!(
             raster_sender
                 .send_raster(1, 2, 2, 1, &[0, 0, 0, 255])
@@ -2805,6 +3043,96 @@ mod tests {
             raster_zstd: false,
         };
         image_sender.send_image(b"encoded image").unwrap();
+        assert_eq!(
+            image_sender.source().hot_path_counters(),
+            HotPathCounters {
+                media_records_sent: 1,
+                ..HotPathCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn owned_sender_tracks_media_sequences_without_payload_copies() {
+        let source = source(8, 4096, 2);
+        let mut sender = MediaSender {
+            source,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Video).unwrap(),
+                source_id: 8,
+            },
+            dry_run: true,
+            raster_zstd: false,
+        };
+        assert_eq!(sender.source().last_record_sequence(), 0);
+        assert_eq!(sender.source().attachment_generation(), 0);
+        for packet_id in 1..=2 {
+            sender
+                .send_video(VideoPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 16_667,
+                    key: packet_id == 1,
+                    data: &[0, 0, 1, 0x65],
+                })
+                .unwrap();
+        }
+        assert_eq!(sender.source().last_record_sequence(), 2);
+        assert_eq!(
+            sender.source().hot_path_counters(),
+            HotPathCounters {
+                media_records_sent: 2,
+                ..HotPathCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn session_counter_accessor_observes_owned_raw_raster_sender() {
+        let mut session =
+            ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
+        let source = session.create_raster_source(1, 1, 1).unwrap();
+        let mut sender = session
+            .open_media_sender(source, ConnectionKind::Raster)
+            .unwrap();
+        sender.send_raster(1, 1, 1, 1, &[0, 0, 0, 255]).unwrap();
+        assert_eq!(
+            session.hot_path_counters(),
+            HotPathCounters {
+                media_records_sent: 1,
+                ..HotPathCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn counter_snapshot_reports_timings_and_queue_high_water_marks() {
+        let counters = HotPathCounterState::default();
+        counters.record_media_sent();
+        counters.record_media_work(2, 72);
+        counters.record_control_reply(Duration::from_micros(25));
+        update_high_water(&counters.pending_request_high_water, 3);
+        update_high_water(&counters.reply_queue_high_water, 2);
+        update_high_water(&counters.source_event_queue_high_water, 4);
+        update_high_water(&counters.desktop_input_queue_high_water, 5);
+
+        assert_eq!(
+            counters.snapshot(),
+            HotPathCounters {
+                media_records_sent: 1,
+                media_bytes_copied: 72,
+                media_allocations: 2,
+                control_reply_latency_us: 25,
+                control_reply_samples: 1,
+                pending_request_high_water: 3,
+                reply_queue_high_water: 2,
+                source_event_queue_high_water: 4,
+                desktop_input_queue_high_water: 5,
+                ..HotPathCounters::default()
+            }
+        );
     }
 
     #[test]
