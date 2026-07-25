@@ -1,4 +1,4 @@
-"""Function-oriented Python interface to the Vivid 1.0 producer SDK."""
+"""Function-oriented Python interface to the Vivid 1.1 producer SDK."""
 
 from __future__ import annotations
 
