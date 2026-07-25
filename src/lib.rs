@@ -48,6 +48,48 @@ impl std::fmt::Display for VersionRejectionError {
 
 impl std::error::Error for VersionRejectionError {}
 
+/// A machine-readable presenter rejection.
+///
+/// Callers should branch on `code` and `detail`; `diagnostic` is display-only protocol prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenterError {
+    pub code: u64,
+    pub request_id: u64,
+    pub fatal: bool,
+    pub detail: messages::ErrorDetail,
+    pub diagnostic: String,
+}
+
+impl std::fmt::Display for PresenterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "presenter error {}: {}",
+            self.code, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for PresenterError {}
+
+impl From<messages::ErrorReply> for PresenterError {
+    fn from(error: messages::ErrorReply) -> Self {
+        Self {
+            code: error.code,
+            request_id: error.request_id,
+            fatal: error.fatal,
+            detail: error.detail,
+            diagnostic: error.diagnostic,
+        }
+    }
+}
+
+fn presenter_error(body: &[u8]) -> io::Result<io::Error> {
+    Ok(io::Error::other(PresenterError::from(
+        messages::parse_error_reply(body)?,
+    )))
+}
+
 /// Allocation-free snapshot of coarse producer hot-path measurements.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HotPathCounters {
@@ -2030,10 +2072,7 @@ impl ProducerSession {
                 stale_retries += 1;
                 continue;
             }
-            return Err(io::Error::other(format!(
-                "presenter error {}: {}",
-                error.code, error.diagnostic
-            )));
+            return Err(io::Error::other(PresenterError::from(error)));
         }
     }
 
@@ -2313,7 +2352,7 @@ impl ProducerSession {
             Instant::now() + timeout,
         )?;
         if record.record_type == messages::ERROR {
-            return Err(io::Error::other(messages::parse_error(&record.body)?));
+            return Err(presenter_error(&record.body)?);
         }
         Ok(())
     }
@@ -2468,7 +2507,7 @@ impl ProducerSession {
     ) -> io::Result<Record> {
         let record = self.wait_for_reply_raw(request_id, accepted, expected_object_id)?;
         if record.record_type == messages::ERROR {
-            return Err(io::Error::other(messages::parse_error(&record.body)?));
+            return Err(presenter_error(&record.body)?);
         }
         Ok(record)
     }
@@ -2828,6 +2867,33 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "required and optional Vivid feature sets overlap"
+        );
+    }
+
+    #[test]
+    fn presenter_error_exposes_structured_detail_without_parsing_diagnostic() {
+        let detail = messages::ErrorDetail::limit(messages::LIMIT_SOURCES, 64, 64);
+        let body = messages::error_with_detail(
+            9,
+            messages::ERROR_LIMIT_EXCEEDED,
+            false,
+            &detail,
+            "display only",
+        )
+        .unwrap();
+        let error = presenter_error(&body).unwrap();
+        let structured = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<PresenterError>())
+            .unwrap();
+        assert_eq!(structured.code, messages::ERROR_LIMIT_EXCEEDED);
+        assert_eq!(
+            structured.detail.get_u64(messages::ERROR_DETAIL_LIMIT_ID),
+            Some(messages::LIMIT_SOURCES)
+        );
+        assert_eq!(
+            structured.detail.get_u64(messages::ERROR_DETAIL_MAXIMUM),
+            Some(64)
         );
     }
 
