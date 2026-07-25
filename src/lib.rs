@@ -24,8 +24,9 @@ const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
 pub use vivid_protocol::messages::{
-    AnchorStatus, LimitsStatus, PlaybackSnapshot, PlaybackState, RequestMetadata, SceneChanged,
-    SceneQuery, SceneStatus, SourceChanged, SourceStatus, WaitSatisfied, WaitSource,
+    AnchorStatus, LimitsStatus, PlaybackSnapshot, PlaybackState, ReportedSourceDescriptor,
+    RequestMetadata, SceneChanged, SceneQuery, SceneStatus, SourceChanged, SourceDescriptor,
+    SourceStatus, WaitSatisfied, WaitSource,
 };
 pub use vivid_protocol::revision::{SceneRevision, SourceRevision};
 
@@ -2304,10 +2305,47 @@ impl ProducerSession {
         capture_policy: u64,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_raster_source_with_options(
+            source_id,
+            width,
+            height,
+            capture_policy,
+            None,
+            metadata,
+        )
+    }
+
+    pub fn create_raster_source_with_descriptor(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        descriptor: &SourceDescriptor,
+    ) -> io::Result<SourceHandle> {
+        self.create_raster_source_with_options(
+            source_id,
+            width,
+            height,
+            0,
+            Some(descriptor),
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_raster_source_with_options(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         self.ensure_capture_policy(capture_policy)?;
+        self.ensure_source_descriptor(descriptor)?;
         let request_id = self.request_id()?;
         let body = self.atomic_body(
-            &messages::create_raster_with_policy(
+            &messages::create_raster_with_extensions(
                 request_id,
                 &messages::RasterSourceConfig {
                     source_id,
@@ -2321,6 +2359,7 @@ impl ProducerSession {
                     },
                 },
                 capture_policy,
+                descriptor,
             ),
             metadata,
         )?;
@@ -2367,11 +2406,43 @@ impl ProducerSession {
         capture_policy: u64,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_video_source_with_options(source_id, info, capture_policy, None, metadata)
+    }
+
+    pub fn create_video_source_with_descriptor<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+        descriptor: &SourceDescriptor,
+    ) -> io::Result<SourceHandle> {
+        self.create_video_source_with_options(
+            source_id,
+            info,
+            0,
+            Some(descriptor),
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_video_source_with_options<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         self.ensure_capture_policy(capture_policy)?;
+        self.ensure_source_descriptor(descriptor)?;
         let request_id = self.request_id()?;
         let config = self.scrub_video_description(info.vivid_video_config(source_id));
         let body = self.atomic_body(
-            &messages::create_video_with_policy(request_id, &config, capture_policy),
+            &messages::create_video_with_extensions(
+                request_id,
+                &config,
+                capture_policy,
+                descriptor,
+            ),
             metadata,
         )?;
         self.control
@@ -2456,6 +2527,42 @@ impl ProducerSession {
         capture_policy: u64,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_audio_source_with_options(
+            source_id,
+            linked_video_source_id,
+            info,
+            capture_policy,
+            None,
+            metadata,
+        )
+    }
+
+    pub fn create_audio_source_with_descriptor<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+        descriptor: &SourceDescriptor,
+    ) -> io::Result<SourceHandle> {
+        self.create_audio_source_with_options(
+            source_id,
+            linked_video_source_id,
+            info,
+            0,
+            Some(descriptor),
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_audio_source_with_options<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2463,11 +2570,17 @@ impl ProducerSession {
             ));
         }
         self.ensure_capture_policy(capture_policy)?;
+        self.ensure_source_descriptor(descriptor)?;
         let config = self
             .scrub_audio_description(info.vivid_audio_config(source_id, linked_video_source_id));
         let request_id = self.request_id()?;
         let body = self.atomic_body(
-            &messages::create_audio_with_policy(request_id, &config, capture_policy),
+            &messages::create_audio_with_extensions(
+                request_id,
+                &config,
+                capture_policy,
+                descriptor,
+            ),
             metadata,
         )?;
         self.control
@@ -2511,6 +2624,34 @@ impl ProducerSession {
         V: VideoConfig + ?Sized,
         A: AudioConfig + ?Sized,
     {
+        self.create_linked_av_sources_with_options(
+            video_source_id,
+            video,
+            video_capture_policy,
+            None,
+            audio_source_id,
+            audio,
+            audio_capture_policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_linked_av_sources_with_options<V, A>(
+        &mut self,
+        video_source_id: u64,
+        video: &V,
+        video_capture_policy: u64,
+        video_descriptor: Option<&SourceDescriptor>,
+        audio_source_id: u64,
+        audio: &A,
+        audio_capture_policy: u64,
+        audio_descriptor: Option<&SourceDescriptor>,
+    ) -> io::Result<(SourceHandle, io::Result<SourceHandle>)>
+    where
+        V: VideoConfig + ?Sized,
+        A: AudioConfig + ?Sized,
+    {
         if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2519,28 +2660,32 @@ impl ProducerSession {
         }
         self.ensure_capture_policy(video_capture_policy)?;
         self.ensure_capture_policy(audio_capture_policy)?;
+        self.ensure_source_descriptor(video_descriptor)?;
+        self.ensure_source_descriptor(audio_descriptor)?;
         let video_request = self.request_id()?;
         let audio_request = self.request_id()?;
         self.control.write_record(
             messages::CREATE_VIDEO,
             0,
             video_source_id,
-            &messages::create_video_with_policy(
+            &messages::create_video_with_extensions(
                 video_request,
                 &self.scrub_video_description(video.vivid_video_config(video_source_id)),
                 video_capture_policy,
+                video_descriptor,
             ),
         )?;
         self.control.write_record(
             messages::CREATE_AUDIO,
             0,
             audio_source_id,
-            &messages::create_audio_with_policy(
+            &messages::create_audio_with_extensions(
                 audio_request,
                 &self.scrub_audio_description(
                     audio.vivid_audio_config(audio_source_id, Some(video_source_id)),
                 ),
                 audio_capture_policy,
+                audio_descriptor,
             ),
         )?;
         let video = self.source_ready(video_request, video_source_id, "video")?;
@@ -2618,6 +2763,29 @@ impl ProducerSession {
         capture_policy: u64,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_options(config, capture_policy, None, metadata)
+    }
+
+    pub fn create_image_source_with_descriptor(
+        &mut self,
+        config: &ImageSourceConfig,
+        descriptor: &SourceDescriptor,
+    ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_options(
+            config,
+            0,
+            Some(descriptor),
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_image_source_with_options(
+        &mut self,
+        config: &ImageSourceConfig,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_ENCODED_IMAGE_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2625,9 +2793,10 @@ impl ProducerSession {
             ));
         }
         self.ensure_capture_policy(capture_policy)?;
+        self.ensure_source_descriptor(descriptor)?;
         let request_id = self.request_id()?;
         let body = self.atomic_body(
-            &messages::create_image_with_policy(request_id, config, capture_policy),
+            &messages::create_image_with_extensions(request_id, config, capture_policy, descriptor),
             metadata,
         )?;
         self.control
@@ -2741,6 +2910,35 @@ impl ProducerSession {
             source_id,
             &messages::set_source_policy(request_id, source_id, capture_policy),
         )?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn update_source_descriptor(
+        &mut self,
+        source_id: u64,
+        descriptor: &SourceDescriptor,
+    ) -> io::Result<()> {
+        self.update_source_descriptor_with_metadata(
+            source_id,
+            descriptor,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn update_source_descriptor_with_metadata(
+        &mut self,
+        source_id: u64,
+        descriptor: &SourceDescriptor,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
+        self.ensure_source_descriptor(Some(descriptor))?;
+        let request_id = self.request_id()?;
+        let body = self.atomic_body(
+            &messages::update_source_descriptor(request_id, source_id, descriptor),
+            metadata,
+        )?;
+        self.control
+            .write_record(messages::UPDATE_SOURCE_DESCRIPTOR, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
@@ -3081,6 +3279,20 @@ impl ProducerSession {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "presenter lacks source-capture-policy-v1",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_source_descriptor(&self, descriptor: Option<&SourceDescriptor>) -> io::Result<()> {
+        let Some(descriptor) = descriptor else {
+            return Ok(());
+        };
+        messages::validate_source_descriptor(descriptor)?;
+        if !self.supports(messages::FEATURE_SOURCE_DESCRIPTOR_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks source-descriptor-v1",
             ));
         }
         Ok(())
@@ -4796,6 +5008,55 @@ mod tests {
                 media_records_sent: 1,
                 ..HotPathCounters::default()
             }
+        );
+    }
+
+    #[test]
+    fn source_descriptor_creation_and_updates_require_negotiation_and_valid_bounds() {
+        let descriptor = SourceDescriptor {
+            role: messages::SOURCE_ROLE_DOCUMENT,
+            title: "guide.pdf".into(),
+            content_revision: 1,
+            semantic_availability: messages::SEMANTIC_AVAILABLE_TEXT,
+            locator: "vvrd+unix:///owner-only/control.sock".into(),
+        };
+        let mut session = ProducerSession::connect(&producer_config(
+            Vec::new(),
+            vec![messages::FEATURE_SOURCE_DESCRIPTOR_V1],
+        ))
+        .unwrap();
+        session
+            .create_raster_source_with_descriptor(1, 1, 1, &descriptor)
+            .unwrap();
+        session
+            .update_source_descriptor(
+                1,
+                &SourceDescriptor {
+                    content_revision: 2,
+                    ..descriptor.clone()
+                },
+            )
+            .unwrap();
+
+        let mut unsupported =
+            ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
+        assert_eq!(
+            unsupported
+                .create_raster_source_with_descriptor(1, 1, 1, &descriptor)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let oversized = SourceDescriptor {
+            title: "x".repeat(messages::MAX_SOURCE_DESCRIPTOR_TITLE_BYTES + 1),
+            ..descriptor
+        };
+        assert_eq!(
+            session
+                .update_source_descriptor(1, &oversized)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 

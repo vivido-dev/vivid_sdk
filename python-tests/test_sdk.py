@@ -153,6 +153,35 @@ def test_raster_scene_sender_and_handle_consumption() -> None:
         vivid.close(session)
 
 
+def test_source_descriptor_creation_and_update() -> None:
+    session = vivid.connect(dry_run=True)
+    try:
+        descriptor = vivid.SourceDescriptor(
+            role=vivid.SOURCE_ROLE_DOCUMENT,
+            title="guide.pdf",
+            content_revision=1,
+            semantic_availability=(
+                vivid.SEMANTIC_AVAILABLE_TEXT | vivid.SEMANTIC_AVAILABLE_LINKS
+            ),
+            locator="vvrd+unix:///owner-only/control.sock",
+        )
+        source = vivid.create_raster_source(
+            session,
+            1,
+            1,
+            descriptor=descriptor,
+        )
+        vivid.update_source_descriptor(
+            session,
+            source,
+            vivid.SourceDescriptor(
+                **{**descriptor.__dict__, "content_revision": 2}
+            ),
+        )
+    finally:
+        vivid.close(session)
+
+
 def test_encoded_image_and_raw_scene_transactions() -> None:
     encoded = b"\x89PNG\r\n\x1a\nexample"
     session = vivid.connect(dry_run=True)

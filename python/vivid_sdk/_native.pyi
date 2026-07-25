@@ -113,7 +113,7 @@ def create_raster_source(
     session: Session, source_id: int, width: int, height: int,
     preconditions: Optional[Dict[int, int]] = ...,
     idempotency_key: Optional[bytes] = ..., causation_id: Optional[bytes] = ...,
-    capture_policy: int = ...
+    capture_policy: int = ..., descriptor: Optional[Dict[str, object]] = ...
 ) -> Source: ...
 def create_image_source(
     session: Session,
@@ -127,12 +127,13 @@ def create_image_source(
     idempotency_key: Optional[bytes] = ...,
     causation_id: Optional[bytes] = ...,
     capture_policy: int = ...,
+    descriptor: Optional[Dict[str, object]] = ...,
 ) -> Source: ...
 def create_video_source(
     session: Session, source_id: int, config: Dict[str, object],
     preconditions: Optional[Dict[int, int]] = ...,
     idempotency_key: Optional[bytes] = ..., causation_id: Optional[bytes] = ...,
-    capture_policy: int = ...
+    capture_policy: int = ..., descriptor: Optional[Dict[str, object]] = ...
 ) -> Source: ...
 def create_audio_source(
     session: Session,
@@ -143,6 +144,7 @@ def create_audio_source(
     idempotency_key: Optional[bytes] = ...,
     causation_id: Optional[bytes] = ...,
     capture_policy: int = ...,
+    descriptor: Optional[Dict[str, object]] = ...,
 ) -> Source: ...
 def create_linked_av_sources(
     session: Session,
@@ -152,8 +154,18 @@ def create_linked_av_sources(
     audio_config: Dict[str, object],
     video_capture_policy: int = ...,
     audio_capture_policy: int = ...,
+    video_descriptor: Optional[Dict[str, object]] = ...,
+    audio_descriptor: Optional[Dict[str, object]] = ...,
 ) -> Tuple[Source, Optional[Source], Optional[str]]: ...
 def set_source_policy(session: Session, source_id: int, capture_policy: int) -> None: ...
+def update_source_descriptor(
+    session: Session,
+    source_id: int,
+    descriptor: Dict[str, object],
+    preconditions: Optional[Dict[int, int]] = ...,
+    idempotency_key: Optional[bytes] = ...,
+    causation_id: Optional[bytes] = ...,
+) -> None: ...
 def probe_video_config(session: Session, config: Dict[str, object]) -> bool: ...
 def probe_audio_config(session: Session, config: Dict[str, object]) -> bool: ...
 def place_source(
