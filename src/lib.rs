@@ -2442,6 +2442,11 @@ impl ProducerSession {
                 packet_credits: SYNTHETIC_CREDITS,
                 fragment_credits: SYNTHETIC_CREDITS,
                 max_media_body: vivid_protocol::HARD_MAX_RECORD_BODY,
+                rolling_byte_window: SYNTHETIC_CREDITS,
+                rolling_packet_window: SYNTHETIC_CREDITS,
+                initial_source_revision: vivid_protocol::revision::SourceRevision::ZERO,
+                media_connection_required: true,
+                delta_operation_limit: None,
             }
         } else {
             let record = self.wait_for_reply(request_id, &[messages::SOURCE_READY], source_id)?;
