@@ -35,6 +35,7 @@ FEATURE_NODE_CLIP_RECT_V1 = 15
 FEATURE_DECODER_DESCRIPTION_V1 = 16
 FEATURE_OBSERVABILITY_CORE_V1 = 18
 FEATURE_ATOMIC_CONTROL_V1 = 19
+FEATURE_SOURCE_DESCRIPTOR_V1 = 20
 FEATURE_DELEGATED_CONTEXT_V1 = 21
 FEATURE_SOURCE_CAPTURE_POLICY_V1 = 22
 
@@ -44,6 +45,19 @@ CAPTURE_POLICY_DENY_POSTER_RETENTION = 1 << 2
 CAPTURE_POLICY_DENY_CACHE = 1 << 3
 CAPTURE_POLICY_REDUCE_DIAGNOSTICS = 1 << 4
 CAPTURE_POLICY_MASK = (1 << 5) - 1
+
+SOURCE_ROLE_UNSPECIFIED = 0
+SOURCE_ROLE_DOCUMENT = 1
+SOURCE_ROLE_DESKTOP = 2
+SOURCE_ROLE_TIMED_MEDIA = 3
+SOURCE_ROLE_FIGURE = 4
+SOURCE_ROLE_TERMINAL = 5
+
+SEMANTIC_AVAILABLE_TEXT = 1 << 0
+SEMANTIC_AVAILABLE_STRUCTURE = 1 << 1
+SEMANTIC_AVAILABLE_LINKS = 1 << 2
+SEMANTIC_AVAILABLE_OUTLINE = 1 << 3
+SEMANTIC_AVAILABLE_ACTIONS = 1 << 4
 
 AUTHENTICATION_WINDOW_ROOT = 0
 AUTHENTICATION_DELEGATED_CONTEXT = 1
@@ -97,6 +111,7 @@ DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
     FEATURE_DECODER_DESCRIPTION_V1,
     FEATURE_OBSERVABILITY_CORE_V1,
     FEATURE_ATOMIC_CONTROL_V1,
+    FEATURE_SOURCE_DESCRIPTOR_V1,
     FEATURE_DELEGATED_CONTEXT_V1,
     FEATURE_SOURCE_CAPTURE_POLICY_V1,
 )
@@ -162,6 +177,24 @@ class PlaybackSnapshot:
 
 
 @dataclass(frozen=True)
+class SourceDescriptor:
+    role: int
+    title: str
+    content_revision: int
+    semantic_availability: int
+    locator: str
+
+
+@dataclass(frozen=True)
+class ReportedSourceDescriptor:
+    role: int
+    title: Optional[str] = None
+    content_revision: Optional[int] = None
+    semantic_availability: Optional[int] = None
+    locator: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class SourceStatus:
     source_id: int
     source_revision: int
@@ -182,7 +215,7 @@ class SourceStatus:
     outstanding_byte_credit: int
     outstanding_packet_credit: int
     ingress_queue_depth: int
-    descriptor: Optional[object]
+    descriptor: Optional[ReportedSourceDescriptor]
     playback: Optional[PlaybackSnapshot]
     terminal_loss_code: Optional[int]
 
@@ -483,6 +516,20 @@ def _owned_bytes(value: BytesLike) -> bytes:
     return bytes(value)
 
 
+def _descriptor_dict(
+    descriptor: Optional[SourceDescriptor],
+) -> Optional[dict[str, object]]:
+    if descriptor is None:
+        return None
+    return {
+        "role": descriptor.role,
+        "title": descriptor.title,
+        "content_revision": descriptor.content_revision,
+        "semantic_availability": descriptor.semantic_availability,
+        "locator": descriptor.locator,
+    }
+
+
 def _video_dict(config: VideoSourceConfig) -> dict[str, object]:
     return {
         "codec": config.codec,
@@ -697,6 +744,10 @@ def query_source(session: Session, source: SourceLike) -> SourceStatus:
     values: Dict[str, Any] = _native.query_source(session, _source_id(source))
     playback = values.get("playback")
     values["playback"] = None if playback is None else _playback(playback)
+    descriptor = values.get("descriptor")
+    values["descriptor"] = (
+        None if descriptor is None else ReportedSourceDescriptor(**descriptor)
+    )
     return SourceStatus(**values)
 
 
@@ -780,6 +831,7 @@ def create_raster_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return _native.create_raster_source(
         session,
@@ -790,6 +842,7 @@ def create_raster_source(
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
         capture_policy,
+        _descriptor_dict(descriptor),
     )
 
 
@@ -812,6 +865,7 @@ def create_image_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     digest = None if config.sha256 is None else _owned_bytes(config.sha256)
     return _native.create_image_source(
@@ -826,6 +880,7 @@ def create_image_source(
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
         capture_policy,
+        _descriptor_dict(descriptor),
     )
 
 
@@ -838,6 +893,7 @@ def create_video_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return _native.create_video_source(
         session,
@@ -847,6 +903,7 @@ def create_video_source(
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
         capture_policy,
+        _descriptor_dict(descriptor),
     )
 
 
@@ -860,6 +917,7 @@ def create_audio_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     linked_id = None if linked_video is None else _source_id(linked_video)
     return _native.create_audio_source(
@@ -871,6 +929,7 @@ def create_audio_source(
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
         capture_policy,
+        _descriptor_dict(descriptor),
     )
 
 
@@ -883,6 +942,8 @@ def create_linked_av_sources(
     audio_source_id: Optional[int] = None,
     video_capture_policy: int = 0,
     audio_capture_policy: int = 0,
+    video_descriptor: Optional[SourceDescriptor] = None,
+    audio_descriptor: Optional[SourceDescriptor] = None,
 ) -> Tuple[Source, Source]:
     video_handle, audio_handle, audio_error = _native.create_linked_av_sources(
         session,
@@ -892,6 +953,8 @@ def create_linked_av_sources(
         _audio_dict(audio),
         video_capture_policy,
         audio_capture_policy,
+        _descriptor_dict(video_descriptor),
+        _descriptor_dict(audio_descriptor),
     )
     if audio_error is not None or audio_handle is None:
         raise LinkedAudioError(audio_error or "linked audio source was rejected", video_handle)
@@ -902,6 +965,27 @@ def set_source_policy(
     session: Session, source: SourceLike, capture_policy: int
 ) -> None:
     _native.set_source_policy(session, _source_id(source), capture_policy)
+
+
+def update_source_descriptor(
+    session: Session,
+    source: SourceLike,
+    descriptor: SourceDescriptor,
+    *,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    encoded = _descriptor_dict(descriptor)
+    assert encoded is not None
+    _native.update_source_descriptor(
+        session,
+        _source_id(source),
+        encoded,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
 def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
@@ -1273,6 +1357,8 @@ __all__ = [
     "DisplayState",
     "RevisionState",
     "PlaybackSnapshot",
+    "SourceDescriptor",
+    "ReportedSourceDescriptor",
     "SourceStatus",
     "SceneNodeStatus",
     "SceneStatus",
@@ -1290,6 +1376,17 @@ __all__ = [
     "CAPTURE_POLICY_DENY_CACHE",
     "CAPTURE_POLICY_REDUCE_DIAGNOSTICS",
     "CAPTURE_POLICY_MASK",
+    "SOURCE_ROLE_UNSPECIFIED",
+    "SOURCE_ROLE_DOCUMENT",
+    "SOURCE_ROLE_DESKTOP",
+    "SOURCE_ROLE_TIMED_MEDIA",
+    "SOURCE_ROLE_FIGURE",
+    "SOURCE_ROLE_TERMINAL",
+    "SEMANTIC_AVAILABLE_TEXT",
+    "SEMANTIC_AVAILABLE_STRUCTURE",
+    "SEMANTIC_AVAILABLE_LINKS",
+    "SEMANTIC_AVAILABLE_OUTLINE",
+    "SEMANTIC_AVAILABLE_ACTIONS",
     "FEATURE_AUDIO_ACCESS_UNIT_V1",
     "FEATURE_CREDIT_FLOW_CONTROL",
     "FEATURE_DECODER_DESCRIPTION_V1",
@@ -1303,6 +1400,7 @@ __all__ = [
     "FEATURE_SCENE_TRANSACTIONS",
     "FEATURE_TEXT_ANCHORS_V2",
     "FEATURE_SOURCE_CAPTURE_POLICY_V1",
+    "FEATURE_SOURCE_DESCRIPTOR_V1",
     "FEATURE_VIDEO_ACCESS_UNIT_V1",
     "FEATURE_VIDEO_CONTROL_V1",
     "FEATURE_VISIBILITY_EVENTS_V1",
@@ -1383,6 +1481,7 @@ __all__ = [
     "take_observation",
     "take_event",
     "update_scene_node",
+    "update_source_descriptor",
     "visibility_reasons",
     "wait_until_visible",
     "wait",

@@ -12,11 +12,11 @@ use pyo3::exceptions::{
     PyInterruptedError, PyKeyError, PyOSError, PyOverflowError, PyTimeoutError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
+use pyo3::types::{PyAny, PyDict, PyList, PyModule};
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::messages::{
     ClipRect, ContextQuotas, CreateContextRequest, ImageSourceConfig, PlaybackSnapshot,
-    SceneNodeConfig, SourceStatus, WaitSource,
+    ReportedSourceDescriptor, SceneNodeConfig, SourceDescriptor, SourceStatus, WaitSource,
 };
 use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
@@ -76,6 +76,30 @@ fn parse_request_metadata(
         .validate()
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(metadata)
+}
+
+fn parse_source_descriptor(
+    value: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<SourceDescriptor>> {
+    value
+        .map(|value| {
+            let field = |name: &str| {
+                value
+                    .get_item(name)?
+                    .ok_or_else(|| PyKeyError::new_err(format!("missing descriptor field {name}")))
+            };
+            let descriptor = SourceDescriptor {
+                role: field("role")?.extract()?,
+                title: field("title")?.extract()?,
+                content_revision: field("content_revision")?.extract()?,
+                semantic_availability: field("semantic_availability")?.extract()?,
+                locator: field("locator")?.extract()?,
+            };
+            vivid_protocol::messages::validate_source_descriptor(&descriptor)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            Ok(descriptor)
+        })
+        .transpose()
 }
 
 impl SourceKind {
@@ -426,7 +450,7 @@ fn create_text_anchor(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
+#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
 fn create_raster_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -437,16 +461,19 @@ fn create_raster_source(
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
     capture_policy: u64,
+    descriptor: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
+    let descriptor = parse_source_descriptor(descriptor)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| {
-        inner.create_raster_source_with_policy_and_metadata(
+        inner.create_raster_source_with_options(
             source_id,
             width,
             height,
             capture_policy,
+            descriptor.as_ref(),
             &metadata,
         )
     })
@@ -455,7 +482,7 @@ fn create_raster_source(
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
+#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
 fn create_image_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -469,8 +496,10 @@ fn create_image_source(
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
     capture_policy: u64,
+    descriptor: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
+    let descriptor = parse_source_descriptor(descriptor)?;
     let sha256 = sha256
         .map(|value| {
             value
@@ -489,14 +518,19 @@ fn create_image_source(
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| {
-        inner.create_image_source_with_policy_and_metadata(&config, capture_policy, &metadata)
+        inner.create_image_source_with_options(
+            &config,
+            capture_policy,
+            descriptor.as_ref(),
+            &metadata,
+        )
     })
     .map(|handle| source(handle, SourceKind::Image))
     .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
+#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
 fn create_video_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -506,16 +540,19 @@ fn create_video_source(
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
     capture_policy: u64,
+    descriptor: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_video(config)?;
+    let descriptor = parse_source_descriptor(descriptor)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| {
-        inner.create_video_source_with_policy_and_metadata(
+        inner.create_video_source_with_options(
             source_id,
             &config,
             capture_policy,
+            descriptor.as_ref(),
             &metadata,
         )
     })
@@ -524,7 +561,7 @@ fn create_video_source(
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
+#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
 fn create_audio_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -535,17 +572,20 @@ fn create_audio_source(
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
     capture_policy: u64,
+    descriptor: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_audio(config)?;
+    let descriptor = parse_source_descriptor(descriptor)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| {
-        inner.create_audio_source_with_policy_and_metadata(
+        inner.create_audio_source_with_options(
             source_id,
             linked_video_source_id,
             &config,
             capture_policy,
+            descriptor.as_ref(),
             &metadata,
         )
     })
@@ -554,7 +594,7 @@ fn create_audio_source(
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, video_source_id, video_config, audio_source_id, audio_config, video_capture_policy=0, audio_capture_policy=0))]
+#[pyo3(signature = (session, video_source_id, video_config, audio_source_id, audio_config, video_capture_policy=0, audio_capture_policy=0, video_descriptor=None, audio_descriptor=None))]
 fn create_linked_av_sources(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -564,20 +604,26 @@ fn create_linked_av_sources(
     audio_config: &Bound<'_, PyDict>,
     video_capture_policy: u64,
     audio_capture_policy: u64,
+    video_descriptor: Option<&Bound<'_, PyDict>>,
+    audio_descriptor: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<(PySource, Option<PySource>, Option<String>)> {
     let video_config = parse_video(video_config)?;
     let audio_config = parse_audio(audio_config)?;
+    let video_descriptor = parse_source_descriptor(video_descriptor)?;
+    let audio_descriptor = parse_source_descriptor(audio_descriptor)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     let (video, audio) = py
         .detach(|| {
-            inner.create_linked_av_sources_with_policy(
+            inner.create_linked_av_sources_with_options(
                 video_source_id,
                 &video_config,
                 video_capture_policy,
+                video_descriptor.as_ref(),
                 audio_source_id,
                 &audio_config,
                 audio_capture_policy,
+                audio_descriptor.as_ref(),
             )
         })
         .map_err(io_error)?;
@@ -598,6 +644,25 @@ fn set_source_policy(
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| inner.set_source_policy(source_id, capture_policy))
+        .map_err(io_error)
+}
+
+#[pyfunction]
+fn update_source_descriptor(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    descriptor: &Bound<'_, PyDict>,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
+) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
+    let descriptor = parse_source_descriptor(Some(descriptor))?
+        .expect("a supplied descriptor always parses as Some");
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    py.detach(|| inner.update_source_descriptor_with_metadata(source_id, &descriptor, &metadata))
         .map_err(io_error)
 }
 
@@ -748,32 +813,6 @@ fn playback_tuple(snapshot: PlaybackSnapshot) -> (u64, i64, u32, u64, u64, u64, 
     )
 }
 
-fn cbor_to_python(py: Python<'_>, value: &vivid_protocol::cbor::Value) -> PyResult<Py<PyAny>> {
-    use vivid_protocol::cbor::Value;
-    Ok(match value {
-        Value::Unsigned(value) => value.into_pyobject(py)?.into_any().unbind(),
-        Value::Negative(value) => value.into_pyobject(py)?.into_any().unbind(),
-        Value::Bytes(value) => PyBytes::new(py, value).into_any().unbind(),
-        Value::Text(value) => value.into_pyobject(py)?.into_any().unbind(),
-        Value::Bool(value) => value.into_pyobject(py)?.to_owned().into_any().unbind(),
-        Value::Null => py.None(),
-        Value::Array(values) => {
-            let output = PyList::empty(py);
-            for value in values {
-                output.append(cbor_to_python(py, value)?)?;
-            }
-            output.into_any().unbind()
-        }
-        Value::Map(values) => {
-            let output = PyDict::new(py);
-            for (key, value) in values {
-                output.set_item(key, cbor_to_python(py, value)?)?;
-            }
-            output.into_any().unbind()
-        }
-    })
-}
-
 fn source_status_dict(py: Python<'_>, status: SourceStatus) -> PyResult<Py<PyDict>> {
     let output = PyDict::new(py);
     output.set_item("source_id", status.source_id)?;
@@ -798,14 +837,23 @@ fn source_status_dict(py: Python<'_>, status: SourceStatus) -> PyResult<Py<PyDic
         status.outstanding_packet_credit,
     )?;
     output.set_item("ingress_queue_depth", status.ingress_queue_depth)?;
-    output.set_item(
-        "descriptor",
-        status
-            .descriptor
-            .as_ref()
-            .map(|value| cbor_to_python(py, value))
-            .transpose()?,
-    )?;
+    let descriptor = status.descriptor.as_ref().map(|descriptor| {
+        let value = PyDict::new(py);
+        match descriptor {
+            ReportedSourceDescriptor::Full(descriptor) => {
+                value.set_item("role", descriptor.role)?;
+                value.set_item("title", &descriptor.title)?;
+                value.set_item("content_revision", descriptor.content_revision)?;
+                value.set_item("semantic_availability", descriptor.semantic_availability)?;
+                value.set_item("locator", &descriptor.locator)?;
+            }
+            ReportedSourceDescriptor::RoleOnly { role } => {
+                value.set_item("role", role)?;
+            }
+        }
+        Ok::<_, PyErr>(value.unbind())
+    });
+    output.set_item("descriptor", descriptor.transpose()?)?;
     output.set_item("playback", status.playback.map(playback_tuple))?;
     output.set_item("terminal_loss_code", status.terminal_loss_code)?;
     Ok(output.unbind())
@@ -1470,6 +1518,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_audio_source, module)?)?;
     module.add_function(wrap_pyfunction!(create_linked_av_sources, module)?)?;
     module.add_function(wrap_pyfunction!(set_source_policy, module)?)?;
+    module.add_function(wrap_pyfunction!(update_source_descriptor, module)?)?;
     module.add_function(wrap_pyfunction!(probe_video_config, module)?)?;
     module.add_function(wrap_pyfunction!(probe_audio_config, module)?)?;
     module.add_function(wrap_pyfunction!(place_source, module)?)?;

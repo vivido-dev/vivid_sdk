@@ -30,6 +30,7 @@ from vivid_sdk import (
     SceneNodeConfig,
     Session,
     Source,
+    SourceDescriptor,
     SourceEvent,
     SourceLike,
     SourceStatus,
@@ -250,6 +251,7 @@ async def create_raster_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return await _call(
         _sync.create_raster_source,
@@ -261,6 +263,7 @@ async def create_raster_source(
         idempotency_key=idempotency_key,
         causation_id=causation_id,
         capture_policy=capture_policy,
+        descriptor=descriptor,
         cleanup=_destroy(session),
     )
 
@@ -274,6 +277,7 @@ async def create_image_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return await _call(
         _sync.create_image_source,
@@ -284,6 +288,7 @@ async def create_image_source(
         idempotency_key=idempotency_key,
         causation_id=causation_id,
         capture_policy=capture_policy,
+        descriptor=descriptor,
         cleanup=_destroy(session),
     )
 
@@ -297,6 +302,7 @@ async def create_video_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return await _call(
         _sync.create_video_source,
@@ -307,6 +313,7 @@ async def create_video_source(
         idempotency_key=idempotency_key,
         causation_id=causation_id,
         capture_policy=capture_policy,
+        descriptor=descriptor,
         cleanup=_destroy(session),
     )
 
@@ -321,6 +328,7 @@ async def create_audio_source(
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
     capture_policy: int = 0,
+    descriptor: Optional[SourceDescriptor] = None,
 ) -> Source:
     return await _call(
         _sync.create_audio_source,
@@ -332,6 +340,7 @@ async def create_audio_source(
         idempotency_key=idempotency_key,
         causation_id=causation_id,
         capture_policy=capture_policy,
+        descriptor=descriptor,
         cleanup=_destroy(session),
     )
 
@@ -345,6 +354,8 @@ async def create_linked_av_sources(
     audio_source_id: Optional[int] = None,
     video_capture_policy: int = 0,
     audio_capture_policy: int = 0,
+    video_descriptor: Optional[SourceDescriptor] = None,
+    audio_descriptor: Optional[SourceDescriptor] = None,
 ) -> Tuple[Source, Source]:
     def cleanup(created: Tuple[Source, Source]) -> None:
         for handle in created:
@@ -359,6 +370,8 @@ async def create_linked_av_sources(
         audio_source_id=audio_source_id,
         video_capture_policy=video_capture_policy,
         audio_capture_policy=audio_capture_policy,
+        video_descriptor=video_descriptor,
+        audio_descriptor=audio_descriptor,
         cleanup=cleanup,
     )
 
@@ -367,6 +380,26 @@ async def set_source_policy(
     session: Session, source: SourceLike, capture_policy: int
 ) -> None:
     await _call(_sync.set_source_policy, session, source, capture_policy)
+
+
+async def update_source_descriptor(
+    session: Session,
+    source: SourceLike,
+    descriptor: SourceDescriptor,
+    *,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    await _call(
+        _sync.update_source_descriptor,
+        session,
+        source,
+        descriptor,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
+    )
 
 
 async def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
@@ -725,6 +758,7 @@ __all__ = [
     "supports",
     "take_event",
     "update_scene_node",
+    "update_source_descriptor",
     "visibility_reasons",
     "wait_until_visible",
     "wait",
