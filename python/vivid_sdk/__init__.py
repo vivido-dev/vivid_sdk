@@ -34,6 +34,7 @@ FEATURE_AUDIO_ACCESS_UNIT_V1 = 14
 FEATURE_NODE_CLIP_RECT_V1 = 15
 FEATURE_DECODER_DESCRIPTION_V1 = 16
 FEATURE_OBSERVABILITY_CORE_V1 = 18
+FEATURE_ATOMIC_CONTROL_V1 = 19
 
 OBSERVE_SOURCE_TRANSITIONS = 1 << 0
 OBSERVE_SCENE_CHANGES = 1 << 1
@@ -76,6 +77,7 @@ DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
     FEATURE_NODE_CLIP_RECT_V1,
     FEATURE_DECODER_DESCRIPTION_V1,
     FEATURE_OBSERVABILITY_CORE_V1,
+    FEATURE_ATOMIC_CONTROL_V1,
 )
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -698,9 +700,18 @@ def create_raster_source(
     height: int,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return _native.create_raster_source(
-        session, _allocated_id(session, source_id), width, height
+        session,
+        _allocated_id(session, source_id),
+        width,
+        height,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
     )
 
 
@@ -719,6 +730,9 @@ def create_image_source(
     config: ImageSourceConfig,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     digest = None if config.sha256 is None else _owned_bytes(config.sha256)
     return _native.create_image_source(
@@ -729,6 +743,9 @@ def create_image_source(
         config.height,
         config.encoded_length,
         digest,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
     )
 
 
@@ -737,9 +754,17 @@ def create_video_source(
     config: VideoSourceConfig,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return _native.create_video_source(
-        session, _allocated_id(session, source_id), _video_dict(config)
+        session,
+        _allocated_id(session, source_id),
+        _video_dict(config),
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
     )
 
 
@@ -749,6 +774,9 @@ def create_audio_source(
     *,
     source_id: Optional[int] = None,
     linked_video: Optional[SourceLike] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     linked_id = None if linked_video is None else _source_id(linked_video)
     return _native.create_audio_source(
@@ -756,6 +784,9 @@ def create_audio_source(
         _allocated_id(session, source_id),
         linked_id,
         _audio_dict(config),
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
     )
 
 
@@ -822,8 +853,21 @@ def delete_scene_node(session: Session, node_id: int) -> None:
     _native.delete_scene_node(session, node_id)
 
 
-def destroy_source(session: Session, source: SourceLike) -> None:
-    _native.destroy_source(session, _source_id(source))
+def destroy_source(
+    session: Session,
+    source: SourceLike,
+    *,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    _native.destroy_source(
+        session,
+        _source_id(source),
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
 def wait_until_visible(session: Session, source: Source) -> None:
@@ -953,8 +997,19 @@ def play(
     *,
     start_pts_us: int = 0,
     minimum_buffer_us: int = 0,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> None:
-    _native.play(session, _source_id(source), start_pts_us, minimum_buffer_us)
+    _native.play(
+        session,
+        _source_id(source),
+        start_pts_us,
+        minimum_buffer_us,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
 def wait_until_playing(
@@ -984,16 +1039,59 @@ def play_and_wait_until_playing(
     )
 
 
-def pause(session: Session, source: SourceLike) -> None:
-    _native.pause(session, _source_id(source))
+def pause(
+    session: Session,
+    source: SourceLike,
+    *,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    _native.pause(
+        session,
+        _source_id(source),
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
-def flush(session: Session, source: SourceLike, *, epoch: int) -> None:
-    _native.flush(session, _source_id(source), epoch)
+def flush(
+    session: Session,
+    source: SourceLike,
+    *,
+    epoch: int,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    _native.flush(
+        session,
+        _source_id(source),
+        epoch,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
-def eos(session: Session, source: SourceLike, *, epoch: int) -> None:
-    _native.eos(session, _source_id(source), epoch)
+def eos(
+    session: Session,
+    source: SourceLike,
+    *,
+    epoch: int,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    _native.eos(
+        session,
+        _source_id(source),
+        epoch,
+        preconditions,
+        None if idempotency_key is None else _owned_bytes(idempotency_key),
+        None if causation_id is None else _owned_bytes(causation_id),
+    )
 
 
 def drain(

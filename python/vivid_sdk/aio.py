@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import suppress
-from typing import Any, Callable, Iterable, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, TypeVar, Union
 
 import vivid_sdk as _sync
 from vivid_sdk import (
@@ -212,6 +212,9 @@ async def create_raster_source(
     height: int,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return await _call(
         _sync.create_raster_source,
@@ -219,6 +222,9 @@ async def create_raster_source(
         width,
         height,
         source_id=source_id,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
         cleanup=_destroy(session),
     )
 
@@ -228,12 +234,18 @@ async def create_image_source(
     config: ImageSourceConfig,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return await _call(
         _sync.create_image_source,
         session,
         config,
         source_id=source_id,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
         cleanup=_destroy(session),
     )
 
@@ -243,12 +255,18 @@ async def create_video_source(
     config: VideoSourceConfig,
     *,
     source_id: Optional[int] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return await _call(
         _sync.create_video_source,
         session,
         config,
         source_id=source_id,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
         cleanup=_destroy(session),
     )
 
@@ -259,6 +277,9 @@ async def create_audio_source(
     *,
     source_id: Optional[int] = None,
     linked_video: Optional[SourceLike] = None,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> Source:
     return await _call(
         _sync.create_audio_source,
@@ -266,6 +287,9 @@ async def create_audio_source(
         config,
         source_id=source_id,
         linked_video=linked_video,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
         cleanup=_destroy(session),
     )
 
@@ -470,6 +494,9 @@ async def play(
     *,
     start_pts_us: int = 0,
     minimum_buffer_us: int = 0,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
 ) -> None:
     await _call(
         _sync.play,
@@ -477,6 +504,9 @@ async def play(
         source,
         start_pts_us=start_pts_us,
         minimum_buffer_us=minimum_buffer_us,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
     )
 
 
@@ -506,16 +536,62 @@ async def play_and_wait_until_playing(
     )
 
 
-async def pause(session: Session, source: SourceLike) -> None:
-    await _call(_sync.pause, session, source)
+async def pause(
+    session: Session,
+    source: SourceLike,
+    *,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    await _call(
+        _sync.pause,
+        session,
+        source,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
+    )
 
 
-async def flush(session: Session, source: SourceLike, *, epoch: int) -> None:
-    await _call(_sync.flush, session, source, epoch=epoch)
+async def flush(
+    session: Session,
+    source: SourceLike,
+    *,
+    epoch: int,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    await _call(
+        _sync.flush,
+        session,
+        source,
+        epoch=epoch,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
+    )
 
 
-async def eos(session: Session, source: SourceLike, *, epoch: int) -> None:
-    await _call(_sync.eos, session, source, epoch=epoch)
+async def eos(
+    session: Session,
+    source: SourceLike,
+    *,
+    epoch: int,
+    preconditions: Optional[Dict[int, int]] = None,
+    idempotency_key: Optional[BytesLike] = None,
+    causation_id: Optional[BytesLike] = None,
+) -> None:
+    await _call(
+        _sync.eos,
+        session,
+        source,
+        epoch=epoch,
+        preconditions=preconditions,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
+    )
 
 
 async def drain(

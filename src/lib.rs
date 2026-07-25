@@ -24,8 +24,8 @@ const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
 pub use vivid_protocol::messages::{
-    AnchorStatus, LimitsStatus, PlaybackSnapshot, PlaybackState, SceneChanged, SceneQuery,
-    SceneStatus, SourceChanged, SourceStatus, WaitSatisfied, WaitSource,
+    AnchorStatus, LimitsStatus, PlaybackSnapshot, PlaybackState, RequestMetadata, SceneChanged,
+    SceneQuery, SceneStatus, SourceChanged, SourceStatus, WaitSatisfied, WaitSource,
 };
 pub use vivid_protocol::revision::{SceneRevision, SourceRevision};
 
@@ -1927,6 +1927,18 @@ pub struct ProducerSession {
 }
 
 impl ProducerSession {
+    fn atomic_body(&self, body: &[u8], metadata: &RequestMetadata) -> io::Result<Vec<u8>> {
+        if (!metadata.preconditions.is_empty() || metadata.idempotency_key.is_some())
+            && !self.supports(messages::FEATURE_ATOMIC_CONTROL_V1)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks atomic-control-v1",
+            ));
+        }
+        messages::with_request_metadata(body, metadata)
+    }
+
     pub fn connect(config: &ProducerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         config.validate()?;
         let counters = Arc::new(HotPathCounterState::default());
@@ -2175,21 +2187,39 @@ impl ProducerSession {
         width: u32,
         height: u32,
     ) -> io::Result<SourceHandle> {
+        self.create_raster_source_with_metadata(
+            source_id,
+            width,
+            height,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_raster_source_with_metadata(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         let request_id = self.request_id()?;
-        let body = messages::create_raster_config(
-            request_id,
-            &messages::RasterSourceConfig {
-                source_id,
-                width,
-                height,
-                alpha_mode: messages::ALPHA_STRAIGHT,
-                compression_mode: if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
-                    messages::COMPRESSION_RAW_OR_ZSTD
-                } else {
-                    messages::COMPRESSION_NONE
+        let body = self.atomic_body(
+            &messages::create_raster_config(
+                request_id,
+                &messages::RasterSourceConfig {
+                    source_id,
+                    width,
+                    height,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
+                        messages::COMPRESSION_RAW_OR_ZSTD
+                    } else {
+                        messages::COMPRESSION_NONE
+                    },
                 },
-            },
-        );
+            ),
+            metadata,
+        )?;
         self.control
             .write_record(messages::CREATE_RASTER, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "raster")
@@ -2200,9 +2230,18 @@ impl ProducerSession {
         source_id: u64,
         info: &C,
     ) -> io::Result<SourceHandle> {
+        self.create_video_source_with_metadata(source_id, info, &RequestMetadata::default())
+    }
+
+    pub fn create_video_source_with_metadata<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         let request_id = self.request_id()?;
         let config = self.scrub_video_description(info.vivid_video_config(source_id));
-        let body = messages::create_video(request_id, &config);
+        let body = self.atomic_body(&messages::create_video(request_id, &config), metadata)?;
         self.control
             .write_record(messages::CREATE_VIDEO, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "video")
@@ -2237,6 +2276,21 @@ impl ProducerSession {
         linked_video_source_id: Option<u64>,
         info: &C,
     ) -> io::Result<SourceHandle> {
+        self.create_audio_source_with_metadata(
+            source_id,
+            linked_video_source_id,
+            info,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_audio_source_with_metadata<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2246,12 +2300,9 @@ impl ProducerSession {
         let config = self
             .scrub_audio_description(info.vivid_audio_config(source_id, linked_video_source_id));
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::CREATE_AUDIO,
-            0,
-            source_id,
-            &messages::create_audio(request_id, &config),
-        )?;
+        let body = self.atomic_body(&messages::create_audio(request_id, &config), metadata)?;
+        self.control
+            .write_record(messages::CREATE_AUDIO, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "audio")
     }
 
@@ -2342,6 +2393,14 @@ impl ProducerSession {
     }
 
     pub fn create_image_source(&mut self, config: &ImageSourceConfig) -> io::Result<SourceHandle> {
+        self.create_image_source_with_metadata(config, &RequestMetadata::default())
+    }
+
+    pub fn create_image_source_with_metadata(
+        &mut self,
+        config: &ImageSourceConfig,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_ENCODED_IMAGE_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2349,12 +2408,9 @@ impl ProducerSession {
             ));
         }
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::CREATE_IMAGE,
-            0,
-            config.source_id,
-            &messages::create_image(request_id, config),
-        )?;
+        let body = self.atomic_body(&messages::create_image(request_id, config), metadata)?;
+        self.control
+            .write_record(messages::CREATE_IMAGE, 0, config.source_id, &body)?;
         self.source_ready(request_id, config.source_id, "image")
     }
 
@@ -2440,13 +2496,18 @@ impl ProducerSession {
     }
 
     pub fn destroy_source(&mut self, source_id: u64) -> io::Result<()> {
+        self.destroy_source_with_metadata(source_id, &RequestMetadata::default())
+    }
+
+    pub fn destroy_source_with_metadata(
+        &mut self,
+        source_id: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::DESTROY_SOURCE,
-            0,
-            source_id,
-            &messages::destroy_source(request_id, source_id),
-        )?;
+        let body = self.atomic_body(&messages::destroy_source(request_id, source_id), metadata)?;
+        self.control
+            .write_record(messages::DESTROY_SOURCE, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
@@ -3001,6 +3062,21 @@ impl ProducerSession {
         start_pts_us: i64,
         minimum_buffer_us: u64,
     ) -> io::Result<()> {
+        self.play_at_with_metadata(
+            source_id,
+            start_pts_us,
+            minimum_buffer_us,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn play_at_with_metadata(
+        &mut self,
+        source_id: u64,
+        start_pts_us: i64,
+        minimum_buffer_us: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
         let minimum_buffer_us = self
             .control
@@ -3009,12 +3085,9 @@ impl ProducerSession {
         let mut play = messages::PlayRequest::baseline(source_id, minimum_buffer_us);
         play.start_pts_us = start_pts_us;
         play.maximum_latency_us = play.maximum_latency_us.max(play.minimum_buffer_us);
-        self.control.write_record(
-            messages::PLAY,
-            0,
-            source_id,
-            &messages::play_request(request_id, &play),
-        )?;
+        let body = self.atomic_body(&messages::play_request(request_id, &play), metadata)?;
+        self.control
+            .write_record(messages::PLAY, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
@@ -3049,24 +3122,35 @@ impl ProducerSession {
     }
 
     pub fn eos(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
+        self.eos_with_metadata(source_id, epoch, &RequestMetadata::default())
+    }
+
+    pub fn eos_with_metadata(
+        &mut self,
+        source_id: u64,
+        epoch: u32,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::EOS,
-            0,
-            source_id,
-            &messages::eos(request_id, source_id, epoch),
-        )?;
+        let body = self.atomic_body(&messages::eos(request_id, source_id, epoch), metadata)?;
+        self.control
+            .write_record(messages::EOS, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
     pub fn drain(&mut self, source_id: u64) -> io::Result<()> {
+        self.drain_with_metadata(source_id, &RequestMetadata::default())
+    }
+
+    pub fn drain_with_metadata(
+        &mut self,
+        source_id: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::DRAIN,
-            0,
-            source_id,
-            &messages::drain(request_id, source_id),
-        )?;
+        let body = self.atomic_body(&messages::drain(request_id, source_id), metadata)?;
+        self.control
+            .write_record(messages::DRAIN, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
@@ -3094,24 +3178,35 @@ impl ProducerSession {
     }
 
     pub fn pause(&mut self, source_id: u64) -> io::Result<()> {
+        self.pause_with_metadata(source_id, &RequestMetadata::default())
+    }
+
+    pub fn pause_with_metadata(
+        &mut self,
+        source_id: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::PAUSE,
-            0,
-            source_id,
-            &messages::pause(request_id, source_id),
-        )?;
+        let body = self.atomic_body(&messages::pause(request_id, source_id), metadata)?;
+        self.control
+            .write_record(messages::PAUSE, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
     pub fn flush(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
+        self.flush_with_metadata(source_id, epoch, &RequestMetadata::default())
+    }
+
+    pub fn flush_with_metadata(
+        &mut self,
+        source_id: u64,
+        epoch: u32,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
         let request_id = self.request_id()?;
-        self.control.write_record(
-            messages::FLUSH,
-            0,
-            source_id,
-            &messages::flush(request_id, source_id, epoch),
-        )?;
+        let body = self.atomic_body(&messages::flush(request_id, source_id, epoch), metadata)?;
+        self.control
+            .write_record(messages::FLUSH, 0, source_id, &body)?;
         self.wait_for_ok(request_id, source_id)
     }
 
