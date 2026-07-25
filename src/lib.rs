@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +23,55 @@ const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
+pub use vivid_protocol::messages::{
+    AnchorStatus, LimitsStatus, PlaybackSnapshot, PlaybackState, SceneChanged, SceneQuery,
+    SceneStatus, SourceChanged, SourceStatus, WaitSatisfied, WaitSource,
+};
+pub use vivid_protocol::revision::{SceneRevision, SourceRevision};
+
+/// An unsolicited, coalesced observability event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationEvent {
+    Source(messages::SourceChanged),
+    Scene(messages::SceneChanged),
+    Playback(messages::PlaybackState),
+}
+
+/// The latest authoritative revisions observed on the control connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionState {
+    pub scene: SceneRevision,
+    pub sources: HashMap<u64, SourceRevision>,
+}
+
+/// Result of resolving an uncertain `ATTACH_CHANNEL` write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentResolution {
+    NotConsumed,
+    ConsumedAttached { generation: u64 },
+    ConsumedClosed { generation: u64 },
+    Indeterminate,
+    RecreateRequired,
+}
+
+#[derive(Debug)]
+pub struct AttachmentError {
+    pub source_id: u64,
+    pub resolution: AttachmentResolution,
+    diagnostic: String,
+}
+
+impl std::fmt::Display for AttachmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "media attachment for source {} could not be completed ({:?}): {}",
+            self.source_id, self.resolution, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for AttachmentError {}
 
 /// A presenter's structured response to a connection-preface version mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +512,7 @@ struct SourceSync {
 struct DispatcherState {
     replies: HashMap<u64, Record>,
     pending_requests: HashMap<u64, Instant>,
+    discard_replies: HashSet<u64>,
     sources: HashMap<u64, Arc<SourceSync>>,
     pending_source_events: HashMap<u64, VecDeque<Record>>,
     pending_source_event_count: usize,
@@ -470,11 +520,14 @@ struct DispatcherState {
     desktop_input: VecDeque<DesktopInputEvent>,
     anchors: HashSet<u64>,
     display: DisplayState,
+    scene_revision: SceneRevision,
+    source_revisions: HashMap<u64, SourceRevision>,
+    observations: VecDeque<ObservationEvent>,
     closed: Option<String>,
     last_inbound: Instant,
     last_probe_sent: Option<Instant>,
     unanswered_probes: u8,
-    next_ping_id: u64,
+    next_internal_request_id: u64,
     pending_pings: HashMap<u64, Instant>,
     /// Last RTT sampling probe. Sampling probes are independent of the idle liveness probes:
     /// they never advance `unanswered_probes` or `last_probe_sent`, so they cannot change
@@ -494,15 +547,133 @@ struct ControlDispatcher {
     shared: Arc<DispatcherShared>,
 }
 
+#[derive(Clone)]
+struct WaitDispatcher {
+    writer: ConnectionWriter,
+    shared: Arc<DispatcherShared>,
+}
+
 enum ClientControl {
     Direct(Connection),
     Live(ControlDispatcher),
+}
+
+/// A cancellation-safe in-flight source wait.
+///
+/// Dropping this handle before completion sends `CANCEL_WAIT`. Call [`Self::cancel`] when the
+/// cancellation result itself matters.
+pub struct SourceWaitHandle {
+    dispatcher: Option<WaitDispatcher>,
+    request_id: u64,
+    source_id: u64,
+    synthetic: Option<WaitSatisfied>,
+    completed: bool,
+    active: Arc<AtomicBool>,
+}
+
+impl SourceWaitHandle {
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub fn cancellation(&self) -> SourceWaitCancellation {
+        SourceWaitCancellation {
+            dispatcher: self.dispatcher.clone(),
+            request_id: self.request_id,
+            active: self.active.clone(),
+        }
+    }
+
+    pub fn wait(&mut self) -> io::Result<WaitSatisfied> {
+        if self.completed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vivid source wait has already completed or been cancelled",
+            ));
+        }
+        if let Some(satisfied) = self.synthetic.take() {
+            self.completed = true;
+            self.active.store(false, Ordering::Release);
+            return Ok(satisfied);
+        }
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Vivid source wait has no dispatcher"))?;
+        let record = wait_dispatcher_reply(
+            dispatcher,
+            self.request_id,
+            &[messages::WAIT_SATISFIED],
+            self.source_id,
+            &self.active,
+        )?;
+        self.completed = true;
+        self.active.store(false, Ordering::Release);
+        if record.record_type == messages::ERROR {
+            return Err(presenter_error(&record.body)?);
+        }
+        let (request_id, satisfied) = messages::parse_wait_satisfied(&record.body)?;
+        if request_id != self.request_id
+            || satisfied.source_id != self.source_id
+            || record.object_id != self.source_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAIT_SATISFIED correlation mismatch",
+            ));
+        }
+        Ok(satisfied)
+    }
+
+    pub fn cancel(&mut self) -> io::Result<()> {
+        if self.completed {
+            return Ok(());
+        }
+        self.completed = true;
+        if self.active.swap(false, Ordering::AcqRel)
+            && let Some(dispatcher) = &self.dispatcher
+        {
+            cancel_dispatched_wait(dispatcher, self.request_id)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SourceWaitHandle {
+    fn drop(&mut self) {
+        if !self.completed && self.active.swap(false, Ordering::AcqRel) {
+            if let Some(dispatcher) = &self.dispatcher {
+                let _ = cancel_dispatched_wait(dispatcher, self.request_id);
+            }
+            self.completed = true;
+        }
+    }
+}
+
+/// A cloneable cancellation token for an in-flight source wait.
+#[derive(Clone)]
+pub struct SourceWaitCancellation {
+    dispatcher: Option<WaitDispatcher>,
+    request_id: u64,
+    active: Arc<AtomicBool>,
+}
+
+impl SourceWaitCancellation {
+    pub fn cancel(&self) -> io::Result<()> {
+        if self.active.swap(false, Ordering::AcqRel)
+            && let Some(dispatcher) = &self.dispatcher
+        {
+            cancel_dispatched_wait(dispatcher, self.request_id)?;
+        }
+        Ok(())
+    }
 }
 
 impl ControlDispatcher {
     fn start(
         connection: Connection,
         display: DisplayState,
+        scene_revision: SceneRevision,
         desktop_input_enabled: bool,
         counters: Arc<HotPathCounterState>,
     ) -> io::Result<Self> {
@@ -511,6 +682,7 @@ impl ControlDispatcher {
             state: Mutex::new(DispatcherState {
                 replies: HashMap::new(),
                 pending_requests: HashMap::new(),
+                discard_replies: HashSet::new(),
                 sources: HashMap::new(),
                 pending_source_events: HashMap::new(),
                 pending_source_event_count: 0,
@@ -518,11 +690,14 @@ impl ControlDispatcher {
                 desktop_input: VecDeque::new(),
                 anchors: HashSet::new(),
                 display,
+                scene_revision,
+                source_revisions: HashMap::new(),
+                observations: VecDeque::new(),
                 closed: None,
                 last_inbound: Instant::now(),
                 last_probe_sent: None,
                 unanswered_probes: 0,
-                next_ping_id: u64::MAX,
+                next_internal_request_id: u64::MAX,
                 pending_pings: HashMap::new(),
                 last_rtt_probe: None,
                 rtt_us: None,
@@ -612,6 +787,34 @@ impl ControlDispatcher {
                         }
                         messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
                             .map(|display| state.display = display),
+                        messages::SOURCE_CHANGED => messages::parse_source_changed(&record.body)
+                            .and_then(|event| {
+                                state
+                                    .source_revisions
+                                    .insert(event.source_id, event.source_revision);
+                                push_observation(
+                                    &mut state.observations,
+                                    ObservationEvent::Source(event),
+                                )
+                            }),
+                        messages::SCENE_CHANGED => messages::parse_scene_changed(&record.body)
+                            .and_then(|event| {
+                                state.scene_revision = event.scene_revision;
+                                push_observation(
+                                    &mut state.observations,
+                                    ObservationEvent::Scene(event),
+                                )
+                            }),
+                        messages::PLAYBACK_STATE => messages::parse_playback_state(&record.body)
+                            .and_then(|event| {
+                                state
+                                    .source_revisions
+                                    .insert(event.source_id, event.source_revision);
+                                push_observation(
+                                    &mut state.observations,
+                                    ObservationEvent::Playback(event),
+                                )
+                            }),
                         messages::KEY_INPUT
                         | messages::POINTER_MOTION
                         | messages::POINTER_BUTTON
@@ -653,6 +856,9 @@ impl ControlDispatcher {
                                 ));
                             };
                             reader_shared.counters.record_control_reply(sent.elapsed());
+                            if state.discard_replies.remove(&request_id) {
+                                return Ok(());
+                            }
                             if state.replies.len() >= MAX_PENDING_CONTROL_RECORDS
                                 || state.replies.insert(request_id, record).is_some()
                             {
@@ -712,8 +918,9 @@ impl ControlDispatcher {
                                     now.duration_since(sent) >= RTT_SAMPLE_INTERVAL
                                 })
                             {
-                                let request = state.next_ping_id;
-                                state.next_ping_id = state.next_ping_id.saturating_sub(1);
+                                let request = state.next_internal_request_id;
+                                state.next_internal_request_id =
+                                    state.next_internal_request_id.saturating_sub(1);
                                 state.last_rtt_probe = Some(now);
                                 state.pending_pings.insert(request, now);
                                 drop(state);
@@ -742,8 +949,9 @@ impl ControlDispatcher {
                             }
                             break;
                         }
-                        let request = state.next_ping_id;
-                        state.next_ping_id = state.next_ping_id.saturating_sub(1);
+                        let request = state.next_internal_request_id;
+                        state.next_internal_request_id =
+                            state.next_internal_request_id.saturating_sub(1);
                         state.last_probe_sent = Some(now);
                         state.unanswered_probes = state.unanswered_probes.saturating_add(1);
                         state.pending_pings.insert(request, now);
@@ -901,7 +1109,12 @@ impl ControlDispatcher {
         }
     }
 
-    fn register_source(&self, source_id: u64, credits: Credits) -> io::Result<Arc<SourceSync>> {
+    fn register_source(
+        &self,
+        source_id: u64,
+        credits: Credits,
+        revision: SourceRevision,
+    ) -> io::Result<Arc<SourceSync>> {
         let source = Arc::new(SourceSync {
             state: Mutex::new(SourceRuntime {
                 credits: messages::CreditLedger::new(credits),
@@ -924,6 +1137,7 @@ impl ControlDispatcher {
                 "Vivid source dispatcher state already exists",
             ));
         }
+        state.source_revisions.insert(source_id, revision);
         if let Some(mut pending) = state.pending_source_events.remove(&source_id) {
             state.pending_source_event_count = state
                 .pending_source_event_count
@@ -933,6 +1147,50 @@ impl ControlDispatcher {
             }
         }
         Ok(source)
+    }
+
+    fn take_observation(&self) -> io::Result<Option<ObservationEvent>> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(event) = state.observations.pop_front() {
+            return Ok(Some(event));
+        }
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        Ok(None)
+    }
+
+    fn revisions(&self) -> RevisionState {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        RevisionState {
+            scene: state.scene_revision,
+            sources: state.source_revisions.clone(),
+        }
+    }
+
+    fn record_source_revision(&self, source_id: u64, revision: SourceRevision) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .source_revisions
+            .insert(source_id, revision);
+    }
+
+    fn record_scene_revision(&self, revision: SceneRevision) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scene_revision = revision;
     }
 
     fn wait_anchor(&self, anchor_id: u64) -> io::Result<()> {
@@ -1032,6 +1290,95 @@ impl Drop for ControlDispatcher {
     }
 }
 
+fn wait_dispatcher_reply(
+    dispatcher: &WaitDispatcher,
+    request_id: u64,
+    accepted: &[u16],
+    expected_object_id: u64,
+    active: &AtomicBool,
+) -> io::Result<Record> {
+    let mut state = dispatcher
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if !active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Vivid source wait was cancelled",
+            ));
+        }
+        if let Some(record) = state.replies.remove(&request_id) {
+            if record.object_id != expected_object_id
+                || (record.record_type != messages::ERROR
+                    && !accepted.contains(&record.record_type))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Vivid source wait received a mismatched reply",
+                ));
+            }
+            return Ok(record);
+        }
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        state = dispatcher
+            .shared
+            .changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+fn cancel_dispatched_wait(dispatcher: &WaitDispatcher, wait_request_id: u64) -> io::Result<()> {
+    let cancel_request_id = {
+        let mut state = dispatcher
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        state.replies.remove(&wait_request_id);
+        if state.pending_requests.contains_key(&wait_request_id) {
+            state.discard_replies.insert(wait_request_id);
+        }
+        if state.pending_requests.len() >= MAX_PENDING_CONTROL_RECORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "Vivid pending request bound exceeded while cancelling wait",
+            ));
+        }
+        let request_id = state.next_internal_request_id;
+        state.next_internal_request_id = state
+            .next_internal_request_id
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("Vivid internal request ID space exhausted"))?;
+        state.pending_requests.insert(request_id, Instant::now());
+        state.discard_replies.insert(request_id);
+        dispatcher.shared.changed.notify_all();
+        request_id
+    };
+    let body = messages::cancel_wait(cancel_request_id, wait_request_id)?;
+    if let Err(error) = dispatcher
+        .writer
+        .write_record(messages::CANCEL_WAIT, 0, 0, &body)
+    {
+        let mut state = dispatcher
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_requests.remove(&cancel_request_id);
+        state.discard_replies.remove(&cancel_request_id);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn close_dispatcher(shared: &DispatcherShared, message: String) {
     let mut state = shared
         .state
@@ -1052,6 +1399,33 @@ fn close_dispatcher(shared: &DispatcherShared, message: String) {
             .mark_lost("Vivid control connection closed");
         source.changed.notify_all();
     }
+}
+
+fn push_observation(
+    queue: &mut VecDeque<ObservationEvent>,
+    event: ObservationEvent,
+) -> io::Result<()> {
+    let same_subject = |pending: &ObservationEvent| match (pending, &event) {
+        (ObservationEvent::Source(left), ObservationEvent::Source(right)) => {
+            left.source_id == right.source_id
+        }
+        (ObservationEvent::Scene(_), ObservationEvent::Scene(_)) => true,
+        (ObservationEvent::Playback(left), ObservationEvent::Playback(right)) => {
+            left.source_id == right.source_id
+        }
+        _ => false,
+    };
+    if let Some(index) = queue.iter().position(same_subject) {
+        queue.remove(index);
+    }
+    if queue.len() >= MAX_PENDING_CONTROL_RECORDS {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "Vivid observation queue exceeded its bound",
+        ));
+    }
+    queue.push_back(event);
+    Ok(())
 }
 
 fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
@@ -1274,9 +1648,14 @@ impl ClientControl {
         }
     }
 
-    fn register_source(&self, source_id: u64, credits: Credits) -> io::Result<Arc<SourceSync>> {
+    fn register_source(
+        &self,
+        source_id: u64,
+        credits: Credits,
+        revision: SourceRevision,
+    ) -> io::Result<Arc<SourceSync>> {
         match self {
-            Self::Live(dispatcher) => dispatcher.register_source(source_id, credits),
+            Self::Live(dispatcher) => dispatcher.register_source(source_id, credits, revision),
             Self::Direct(_) => Ok(Arc::new(SourceSync {
                 state: Mutex::new(SourceRuntime {
                     credits: messages::CreditLedger::new(credits),
@@ -1323,6 +1702,49 @@ impl ClientControl {
         match self {
             Self::Live(dispatcher) => dispatcher.wait_anchor_deadline(anchor_id, deadline),
             Self::Direct(_) => Ok(true),
+        }
+    }
+
+    fn wait_dispatcher(&self) -> Option<WaitDispatcher> {
+        match self {
+            Self::Live(dispatcher) => Some(WaitDispatcher {
+                writer: dispatcher.writer.clone(),
+                shared: dispatcher.shared.clone(),
+            }),
+            Self::Direct(_) => None,
+        }
+    }
+
+    fn take_observation(&self) -> io::Result<Option<ObservationEvent>> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.take_observation(),
+            Self::Direct(_) => Ok(None),
+        }
+    }
+
+    fn revisions(
+        &self,
+        scene: SceneRevision,
+        sources: &HashMap<u64, SourceRevision>,
+    ) -> RevisionState {
+        match self {
+            Self::Live(dispatcher) => dispatcher.revisions(),
+            Self::Direct(_) => RevisionState {
+                scene,
+                sources: sources.clone(),
+            },
+        }
+    }
+
+    fn record_source_revision(&self, source_id: u64, revision: SourceRevision) {
+        if let Self::Live(dispatcher) = self {
+            dispatcher.record_source_revision(source_id, revision);
+        }
+    }
+
+    fn record_scene_revision(&self, revision: SceneRevision) {
+        if let Self::Live(dispatcher) = self {
+            dispatcher.record_scene_revision(revision);
         }
     }
 }
@@ -1498,6 +1920,8 @@ pub struct ProducerSession {
     session_tag: [u8; 16],
     anchor_key: AnchorKey,
     accepted_features: Vec<u64>,
+    scene_revision: SceneRevision,
+    source_revisions: HashMap<u64, SourceRevision>,
     unconfirmed_anchors: Vec<u64>,
     label: String,
 }
@@ -1536,7 +1960,14 @@ impl ProducerSession {
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let hello_request = 1;
 
-        let (root_context_id, display, session_tag, accepted_features, control_limit) = if dry_run {
+        let (
+            root_context_id,
+            display,
+            session_tag,
+            accepted_features,
+            control_limit,
+            initial_scene_revision,
+        ) = if dry_run {
             send_hello(
                 &mut control,
                 config,
@@ -1571,6 +2002,7 @@ impl ProducerSession {
                 [0; 16],
                 accepted_features,
                 vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                SceneRevision::ZERO,
             )
         } else {
             let mut version = (VIVID_MAJOR, VIVID_MINOR);
@@ -1686,6 +2118,7 @@ impl ProducerSession {
                 session_tag,
                 accepted_features,
                 welcome.maximum_control_body,
+                welcome.initial_scene_revision,
             )
         };
         control.set_send_body_limit(control_limit)?;
@@ -1695,6 +2128,7 @@ impl ProducerSession {
             ClientControl::Live(ControlDispatcher::start(
                 control,
                 display,
+                initial_scene_revision,
                 accepted_features.contains(&messages::FEATURE_DESKTOP_INPUT_V1),
                 counters.clone(),
             )?)
@@ -1716,6 +2150,8 @@ impl ProducerSession {
             session_tag,
             anchor_key,
             accepted_features,
+            scene_revision: initial_scene_revision,
+            source_revisions: HashMap::new(),
             unconfirmed_anchors: Vec::new(),
             label: config.producer.clone(),
         })
@@ -2121,7 +2557,7 @@ impl ProducerSession {
     }
 
     pub fn open_media_channel(
-        &self,
+        &mut self,
         source: &SourceHandle,
         kind: ConnectionKind,
     ) -> io::Result<MediaChannel> {
@@ -2151,12 +2587,45 @@ impl ProducerSession {
                 Connection::open(primary, kind)?
             }
         };
-        connection.write_record(
+        let attach = connection.write_record(
             messages::ATTACH_CHANNEL,
             0,
             source.id,
             &messages::attach_channel(&source.ticket),
-        )?;
+        );
+        if let Err(attach_error) = attach {
+            let resolution = self.resolve_attachment_failure(source.id);
+            match resolution {
+                Ok(AttachmentResolution::NotConsumed) => {
+                    let primary = self.endpoint.as_ref().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "missing Vivid endpoint")
+                    })?;
+                    connection = Connection::open(primary, kind)?;
+                    connection.write_record(
+                        messages::ATTACH_CHANNEL,
+                        0,
+                        source.id,
+                        &messages::attach_channel(&source.ticket),
+                    )?;
+                }
+                Ok(resolution) => {
+                    return Err(io::Error::other(AttachmentError {
+                        source_id: source.id,
+                        resolution,
+                        diagnostic: attach_error.to_string(),
+                    }));
+                }
+                Err(query_error) => {
+                    return Err(io::Error::other(AttachmentError {
+                        source_id: source.id,
+                        resolution: AttachmentResolution::Indeterminate,
+                        diagnostic: format!(
+                            "{attach_error}; attachment resolution failed: {query_error}"
+                        ),
+                    }));
+                }
+            }
+        }
         connection.set_send_body_limit(u32::try_from(source.record_limit).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "source body limit exceeds u32")
         })?)?;
@@ -2167,7 +2636,7 @@ impl ProducerSession {
     }
 
     pub fn open_media_sender(
-        &self,
+        &mut self,
         source: SourceHandle,
         kind: ConnectionKind,
     ) -> io::Result<MediaSender> {
@@ -2178,6 +2647,34 @@ impl ProducerSession {
             dry_run: self.dry_run,
             raster_zstd: self.supports(messages::FEATURE_RASTER_ZSTD_V1),
         })
+    }
+
+    /// Resolve whether a media ticket was consumed after an uncertain attachment write.
+    pub fn resolve_attachment_failure(
+        &mut self,
+        source_id: u64,
+    ) -> io::Result<AttachmentResolution> {
+        if !self.supports(messages::FEATURE_OBSERVABILITY_CORE_V1) {
+            return Ok(AttachmentResolution::RecreateRequired);
+        }
+        let status = self.query_source(source_id)?;
+        self.resolve_attachment_status(&status)
+    }
+
+    fn resolve_attachment_status(&self, status: &SourceStatus) -> io::Result<AttachmentResolution> {
+        match status.attachment_state {
+            messages::ATTACHMENT_NEVER => Ok(AttachmentResolution::NotConsumed),
+            messages::ATTACHMENT_ATTACHED => Ok(AttachmentResolution::ConsumedAttached {
+                generation: status.attachment_generation,
+            }),
+            messages::ATTACHMENT_CLOSED => Ok(AttachmentResolution::ConsumedClosed {
+                generation: status.attachment_generation,
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SOURCE_STATUS contains an unknown attachment state",
+            )),
+        }
     }
 
     pub fn send_raster_frame(
@@ -2291,6 +2788,213 @@ impl ProducerSession {
         }
     }
 
+    pub fn revision_state(&self) -> RevisionState {
+        self.control
+            .revisions(self.scene_revision, &self.source_revisions)
+    }
+
+    pub fn take_observation(&self) -> io::Result<Option<ObservationEvent>> {
+        self.ensure_observability()?;
+        self.control.take_observation()
+    }
+
+    pub fn set_observation(&mut self, class_mask: u64) -> io::Result<()> {
+        self.ensure_observability()?;
+        let request_id = self.request_id()?;
+        let body = messages::set_observation(request_id, class_mask)?;
+        self.control
+            .write_record(messages::SET_OBSERVATION, 0, 0, &body)?;
+        self.wait_for_ok(request_id, 0)
+    }
+
+    pub fn query_source(&mut self, source_id: u64) -> io::Result<SourceStatus> {
+        self.ensure_observability()?;
+        if self.dry_run {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "QUERY_SOURCE requires a live presenter",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::query_source(request_id, source_id)?;
+        self.control
+            .write_record(messages::QUERY_SOURCE, 0, source_id, &body)?;
+        let record = self.wait_for_reply(request_id, &[messages::SOURCE_STATUS], source_id)?;
+        let (reply_request_id, status) = messages::parse_source_status(&record.body)?;
+        if reply_request_id != request_id || status.source_id != source_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SOURCE_STATUS correlation mismatch",
+            ));
+        }
+        self.source_revisions
+            .insert(source_id, status.source_revision);
+        self.control
+            .record_source_revision(source_id, status.source_revision);
+        Ok(status)
+    }
+
+    pub fn query_scene_page(&mut self, query: SceneQuery) -> io::Result<SceneStatus> {
+        self.ensure_observability()?;
+        if self.dry_run {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "QUERY_SCENE requires a live presenter",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::query_scene(request_id, &query)?;
+        self.control
+            .write_record(messages::QUERY_SCENE, 0, 0, &body)?;
+        let record = self.wait_for_reply(request_id, &[messages::SCENE_STATUS], 0)?;
+        let (reply_request_id, status) = messages::parse_scene_status(&record.body)?;
+        if reply_request_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SCENE_STATUS correlation mismatch",
+            ));
+        }
+        self.scene_revision = status.scene_revision;
+        self.control.record_scene_revision(status.scene_revision);
+        Ok(status)
+    }
+
+    /// Fetch a scene through bounded pagination.
+    pub fn query_scene(
+        &mut self,
+        maximum_nodes_per_page: u64,
+        maximum_pages: usize,
+    ) -> io::Result<SceneStatus> {
+        if maximum_nodes_per_page == 0 || maximum_pages == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scene pagination bounds must be non-zero",
+            ));
+        }
+        let mut status = self.query_scene_page(SceneQuery {
+            expected_revision: None,
+            cursor: None,
+            maximum_nodes: Some(maximum_nodes_per_page),
+        })?;
+        let revision = status.scene_revision;
+        let total_nodes = status.total_nodes;
+        let mut nodes = std::mem::take(&mut status.nodes);
+        let mut cursor = status.cursor;
+        for _ in 1..maximum_pages {
+            let Some(next) = cursor else {
+                return Ok(SceneStatus {
+                    scene_revision: revision,
+                    nodes,
+                    cursor: None,
+                    total_nodes,
+                });
+            };
+            let mut page = self.query_scene_page(SceneQuery {
+                expected_revision: Some(revision),
+                cursor: Some(next),
+                maximum_nodes: Some(maximum_nodes_per_page),
+            })?;
+            if page.scene_revision != revision || page.total_nodes != total_nodes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "scene changed during bounded pagination",
+                ));
+            }
+            nodes.append(&mut page.nodes);
+            cursor = page.cursor;
+        }
+        if cursor.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "scene pagination exceeded the caller's page bound",
+            ));
+        }
+        Ok(SceneStatus {
+            scene_revision: revision,
+            nodes,
+            cursor: None,
+            total_nodes,
+        })
+    }
+
+    pub fn query_anchor(&mut self, anchor_id: u64) -> io::Result<AnchorStatus> {
+        self.ensure_observability()?;
+        if self.dry_run {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "QUERY_ANCHOR requires a live presenter",
+            ));
+        }
+        let request_id = self.request_id()?;
+        let body = messages::query_anchor(request_id, anchor_id)?;
+        self.control
+            .write_record(messages::QUERY_ANCHOR, 0, anchor_id, &body)?;
+        let record = self.wait_for_reply(request_id, &[messages::ANCHOR_STATUS], anchor_id)?;
+        let (reply_request_id, status) = messages::parse_anchor_status(&record.body)?;
+        if reply_request_id != request_id || status.anchor_id != anchor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ANCHOR_STATUS correlation mismatch",
+            ));
+        }
+        Ok(status)
+    }
+
+    pub fn query_limits(&mut self) -> io::Result<LimitsStatus> {
+        self.ensure_observability()?;
+        if self.dry_run {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "QUERY_LIMITS requires a live presenter",
+            ));
+        }
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::QUERY_LIMITS,
+            0,
+            0,
+            &messages::query_limits(request_id),
+        )?;
+        let record = self.wait_for_reply(request_id, &[messages::LIMITS_STATUS], 0)?;
+        let (reply_request_id, status) = messages::parse_limits_status(&record.body)?;
+        if reply_request_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LIMITS_STATUS correlation mismatch",
+            ));
+        }
+        Ok(status)
+    }
+
+    pub fn begin_wait_source(&mut self, wait: WaitSource) -> io::Result<SourceWaitHandle> {
+        self.ensure_observability()?;
+        let request_id = self.request_id()?;
+        let body = messages::wait_source(request_id, wait)?;
+        self.control
+            .write_record(messages::WAIT_SOURCE, 0, wait.source_id, &body)?;
+        Ok(SourceWaitHandle {
+            dispatcher: self.control.wait_dispatcher(),
+            request_id,
+            source_id: wait.source_id,
+            synthetic: self.dry_run.then_some(WaitSatisfied {
+                source_id: wait.source_id,
+                source_revision: self
+                    .source_revisions
+                    .get(&wait.source_id)
+                    .copied()
+                    .unwrap_or(SourceRevision::ZERO),
+                condition: wait.condition,
+                observed_value: wait.value,
+            }),
+            completed: false,
+            active: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
+    pub fn wait_source(&mut self, wait: WaitSource) -> io::Result<WaitSatisfied> {
+        self.begin_wait_source(wait)?.wait()
+    }
+
     pub fn play_at(
         &mut self,
         source_id: u64,
@@ -2312,6 +3016,36 @@ impl ProducerSession {
             &messages::play_request(request_id, &play),
         )?;
         self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn wait_until_playing(
+        &mut self,
+        source_id: u64,
+        timeout: Duration,
+    ) -> io::Result<WaitSatisfied> {
+        let timeout_us = u64::try_from(timeout.as_micros()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "playback wait timeout is too large",
+            )
+        })?;
+        self.wait_source(WaitSource {
+            source_id,
+            condition: messages::WAIT_PLAYBACK_STARTED,
+            value: None,
+            timeout_us,
+        })
+    }
+
+    pub fn play_and_wait_until_playing(
+        &mut self,
+        source_id: u64,
+        start_pts_us: i64,
+        minimum_buffer_us: u64,
+        timeout: Duration,
+    ) -> io::Result<WaitSatisfied> {
+        self.play_at(source_id, start_pts_us, minimum_buffer_us)?;
+        self.wait_until_playing(source_id, timeout)
     }
 
     pub fn eos(&mut self, source_id: u64, epoch: u32) -> io::Result<()> {
@@ -2474,7 +3208,11 @@ impl ProducerSession {
             packets: ready.packet_credits,
             fragments: ready.fragment_credits,
         };
-        let state = self.control.register_source(source_id, credits)?;
+        self.source_revisions
+            .insert(source_id, ready.initial_source_revision);
+        let state =
+            self.control
+                .register_source(source_id, credits, ready.initial_source_revision)?;
         Ok(SourceHandle {
             id: source_id,
             ticket: ready.media_ticket,
@@ -2504,6 +3242,17 @@ impl ProducerSession {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Vivid request ID space exhausted"))?;
         Ok(self.next_request_id)
+    }
+
+    fn ensure_observability(&self) -> io::Result<()> {
+        if self.supports(messages::FEATURE_OBSERVABILITY_CORE_V1) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter did not negotiate observability-core-v1",
+            ))
+        }
     }
 
     fn wait_for_reply(
@@ -3125,6 +3874,183 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dropping_source_wait_sends_cancel_wait() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        use vivid_protocol::wire::{HEADER_SIZE, PREFACE_SIZE, RecordHeader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("cancel-wait.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping wait cancellation socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            stream.read_exact(&mut preface)?;
+            let mut records = Vec::new();
+            for _ in 0..4 {
+                let mut header = [0; HEADER_SIZE];
+                stream.read_exact(&mut header)?;
+                let header = RecordHeader::decode(header);
+                let mut body = vec![0; header.body_length as usize];
+                stream.read_exact(&mut body)?;
+                records.push((header, body));
+            }
+            assert_eq!(records[0].0.record_type, messages::WAIT_SOURCE);
+            assert_eq!(records[1].0.record_type, messages::CANCEL_WAIT);
+            let (cancel, wait_request_id) = messages::parse_cancel_wait(&records[1].1)?;
+            assert_eq!(wait_request_id, 42);
+            assert_ne!(cancel.request_id, 0);
+            assert_eq!(records[2].0.record_type, messages::WAIT_SOURCE);
+            assert_eq!(records[3].0.record_type, messages::CANCEL_WAIT);
+            let (_, wait_request_id) = messages::parse_cancel_wait(&records[3].1)?;
+            assert_eq!(wait_request_id, 43);
+            Ok(())
+        });
+
+        let endpoint = Endpoint::parse(socket.to_str().unwrap()).unwrap();
+        let connection = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        let dispatcher = ControlDispatcher::start(
+            connection,
+            DisplayState {
+                display_generation: 1,
+                viewport_width: 800,
+                viewport_height: 600,
+                grid_columns: 80,
+                grid_rows: 24,
+                cell_width: 10,
+                cell_height: 25,
+                settled: true,
+            },
+            SceneRevision::ZERO,
+            false,
+            Arc::new(HotPathCounterState::default()),
+        )
+        .unwrap();
+        let wait = WaitSource {
+            source_id: 7,
+            condition: messages::WAIT_PLAYBACK_STARTED,
+            value: None,
+            timeout_us: 1_000_000,
+        };
+        dispatcher
+            .write_record(
+                messages::WAIT_SOURCE,
+                0,
+                wait.source_id,
+                &messages::wait_source(42, wait).unwrap(),
+            )
+            .unwrap();
+        drop(SourceWaitHandle {
+            dispatcher: Some(WaitDispatcher {
+                writer: dispatcher.writer.clone(),
+                shared: dispatcher.shared.clone(),
+            }),
+            request_id: 42,
+            source_id: 7,
+            synthetic: None,
+            completed: false,
+            active: Arc::new(AtomicBool::new(true)),
+        });
+        dispatcher
+            .write_record(
+                messages::WAIT_SOURCE,
+                0,
+                wait.source_id,
+                &messages::wait_source(43, wait).unwrap(),
+            )
+            .unwrap();
+        let mut cancellable = SourceWaitHandle {
+            dispatcher: Some(WaitDispatcher {
+                writer: dispatcher.writer.clone(),
+                shared: dispatcher.shared.clone(),
+            }),
+            request_id: 43,
+            source_id: 7,
+            synthetic: None,
+            completed: false,
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        let cancellation = cancellable.cancellation();
+        let waiter = thread::spawn(move || cancellable.wait());
+        cancellation.cancel().unwrap();
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn attachment_resolution_distinguishes_unconsumed_and_consumed_tickets() {
+        let session = ProducerSession::connect(&producer_config(
+            Vec::new(),
+            vec![messages::FEATURE_OBSERVABILITY_CORE_V1],
+        ))
+        .unwrap();
+        assert_eq!(
+            session
+                .resolve_attachment_status(&source_status_with_attachment(
+                    messages::ATTACHMENT_NEVER,
+                    0,
+                ))
+                .unwrap(),
+            AttachmentResolution::NotConsumed
+        );
+        assert_eq!(
+            session
+                .resolve_attachment_status(&source_status_with_attachment(
+                    messages::ATTACHMENT_ATTACHED,
+                    3,
+                ))
+                .unwrap(),
+            AttachmentResolution::ConsumedAttached { generation: 3 }
+        );
+        assert_eq!(
+            session
+                .resolve_attachment_status(&source_status_with_attachment(
+                    messages::ATTACHMENT_CLOSED,
+                    4,
+                ))
+                .unwrap(),
+            AttachmentResolution::ConsumedClosed { generation: 4 }
+        );
+    }
+
+    fn source_status_with_attachment(state: u64, generation: u64) -> SourceStatus {
+        SourceStatus {
+            source_id: 1,
+            source_revision: SourceRevision::ZERO,
+            kind: messages::SOURCE_KIND_RASTER,
+            lifecycle: messages::SOURCE_LIFECYCLE_CREATED,
+            epoch: 0,
+            attachment_state: state,
+            attachment_generation: generation,
+            last_media_id: 0,
+            last_media_sequence: 0,
+            last_decoded_pts_us: 0,
+            last_presented_pts_us: 0,
+            last_presentation_id: 0,
+            visible: true,
+            capture_policy: 0,
+            linked_source_id: 0,
+            milestones: 0,
+            outstanding_byte_credit: 0,
+            outstanding_packet_credit: 0,
+            ingress_queue_depth: 0,
+            descriptor: None,
+            playback: None,
+            terminal_loss_code: None,
+        }
+    }
+
     /// A live control connection with routine traffic must produce an RTT estimate quickly, so
     /// `play_at`'s RTT-derived minimum buffer works before streaming begins. The fake presenter
     /// answers every `PING`; nothing here is idle for the 15-second liveness threshold, so only
@@ -3199,6 +4125,7 @@ mod tests {
                 cell_height: 25,
                 settled: true,
             },
+            SceneRevision::ZERO,
             false,
             counters.clone(),
         )

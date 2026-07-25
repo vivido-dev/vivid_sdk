@@ -48,12 +48,57 @@ def test_session_defaults_ids_and_secret_safe_repr(monkeypatch: pytest.MonkeyPat
             grid_rows=24,
             cell_width=10,
             cell_height=25,
+            settled=True,
         )
         assert secret not in repr(session)
     finally:
         vivid.close(session)
         vivid.close(session)
     assert session.closed
+
+
+def test_observability_wait_api_and_secret_safe_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "cd" * 32
+    monkeypatch.setenv("VIVID_TOKEN", secret)
+    session = vivid.connect(dry_run=True)
+    try:
+        assert vivid.supports(session, vivid.FEATURE_OBSERVABILITY_CORE_V1)
+        assert vivid.revision_state(session) == vivid.RevisionState(0, {})
+        vivid.set_observation(session, vivid.OBSERVATION_CLASS_MASK)
+        assert vivid.take_observation(session) is None
+
+        source = vivid.create_raster_source(session, 1, 1)
+        assert vivid.revision_state(session).source_revisions == {source.id: 0}
+        handle = vivid.begin_wait_source(
+            session,
+            source,
+            vivid.WAIT_RASTER_FRAME,
+            value=1,
+            timeout=1.0,
+        )
+        assert secret not in repr(handle)
+        assert not handle.closed
+        satisfied = vivid.wait(handle)
+        assert satisfied == vivid.WaitSatisfied(
+            source.id, 0, vivid.WAIT_RASTER_FRAME, 1
+        )
+        assert handle.closed
+
+        cancelled = vivid.begin_wait_source(
+            session, source, vivid.WAIT_SOURCE_LOST, timeout=1.0
+        )
+        vivid.cancel_wait(cancelled)
+        assert cancelled.closed
+        vivid.cancel_wait(cancelled)
+
+        with pytest.raises(vivid.VividError, match="live presenter"):
+            vivid.query_source(session, source)
+        with pytest.raises(ValueError, match="non-zero"):
+            vivid.query_scene(session, maximum_pages=0)
+    finally:
+        vivid.close(session)
 
 
 def test_invalid_features_and_closed_handle_errors() -> None:
@@ -226,6 +271,18 @@ def test_asyncio_facade_parity_and_concurrent_senders() -> None:
             )
             assert await aio.is_visible(raster_sender)
             assert await aio.take_event(image_sender) is None
+            state = await aio.revision_state(session)
+            assert state.source_revisions == {raster_sender.id: 0, image_sender.id: 0}
+            wait = await aio.begin_wait_source(
+                session,
+                raster_sender,
+                vivid.WAIT_RASTER_FRAME,
+                value=1,
+                timeout=1.0,
+            )
+            assert await aio.wait(wait) == vivid.WaitSatisfied(
+                raster_sender.id, 0, vivid.WAIT_RASTER_FRAME, 1
+            )
             await aio.cancel_sender(image_sender)
             assert image_sender.closed
         finally:
@@ -254,6 +311,36 @@ def test_asyncio_cancellation_waits_for_cleanup() -> None:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert cleaned == ["finished"]
+
+    asyncio.run(scenario())
+
+
+def test_asyncio_wait_cancellation_invokes_protocol_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        started = threading.Event()
+        released = threading.Event()
+        cancelled: list[object] = []
+        handle = object()
+
+        def blocking_wait() -> None:
+            started.set()
+            released.wait(timeout=1)
+
+        def cancel_wait(value: object) -> None:
+            cancelled.append(value)
+            released.set()
+
+        monkeypatch.setattr(aio._sync, "cancel_wait", cancel_wait)  # type: ignore[attr-defined]
+        task = asyncio.create_task(
+            aio._call(blocking_wait, cancel_wait=handle)  # type: ignore[arg-type]
+        )
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled == [handle]
 
     asyncio.run(scenario())
 
