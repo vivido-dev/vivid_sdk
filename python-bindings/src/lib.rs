@@ -1,6 +1,7 @@
 // Python-facing functions intentionally retain explicit signatures for generated help and stubs.
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -19,12 +20,14 @@ use vivid_protocol::messages::{
 use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
     AudioSourceSpec, MediaSender as RustMediaSender, ObservationEvent, ProducerConfig,
-    ProducerSession, SourceCancellation, SourceEvent, SourceHandle, SourceWaitCancellation,
-    SourceWaitHandle, VideoSourceSpec,
+    ProducerSession, RequestMetadata, SourceCancellation, SourceEvent, SourceHandle,
+    SourceWaitCancellation, SourceWaitHandle, VideoSourceSpec,
 };
 
 create_exception!(_native, VividError, PyOSError);
 create_exception!(_native, ClosedHandleError, VividError);
+
+type DisplayStateTuple = (u64, u32, u32, u32, u32, u32, u32, bool);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
@@ -32,6 +35,45 @@ enum SourceKind {
     Image,
     Video,
     Audio,
+}
+
+fn parse_request_metadata(
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
+) -> PyResult<RequestMetadata> {
+    let preconditions = preconditions
+        .map(|values| {
+            values
+                .iter()
+                .map(|(kind, value)| Ok((kind.extract::<u64>()?, value.extract::<u64>()?)))
+                .collect::<PyResult<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let idempotency_key = idempotency_key
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| PyValueError::new_err("idempotency_key must contain exactly 16 bytes"))
+        })
+        .transpose()?;
+    let causation_id = causation_id
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| PyValueError::new_err("causation_id must contain exactly 16 bytes"))
+        })
+        .transpose()?;
+    let metadata = RequestMetadata {
+        preconditions,
+        idempotency_key,
+        causation_id,
+    };
+    metadata
+        .validate()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(metadata)
 }
 
 impl SourceKind {
@@ -357,9 +399,7 @@ fn root_context_id(session: PyRef<'_, PySession>) -> PyResult<u64> {
 }
 
 #[pyfunction]
-fn display_state(
-    session: PyRef<'_, PySession>,
-) -> PyResult<(u64, u32, u32, u32, u32, u32, u32, bool)> {
+fn display_state(session: PyRef<'_, PySession>) -> PyResult<DisplayStateTuple> {
     let mut guard = lock(&session.inner, "session")?;
     let state = open_mut(&mut guard, "session")?.display_state();
     Ok((
@@ -382,22 +422,27 @@ fn create_text_anchor(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult
 }
 
 #[pyfunction]
+#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None))]
 fn create_raster_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     source_id: u64,
     width: u32,
     height: u32,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<PySource> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_raster_source(source_id, width, height))
+    py.detach(|| inner.create_raster_source_with_metadata(source_id, width, height, &metadata))
         .map(|handle| source(handle, SourceKind::Raster))
         .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256))]
+#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None))]
 fn create_image_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -407,7 +452,11 @@ fn create_image_source(
     height: u32,
     encoded_length: u32,
     sha256: Option<Vec<u8>>,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<PySource> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let sha256 = sha256
         .map(|value| {
             value
@@ -425,41 +474,57 @@ fn create_image_source(
     };
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_image_source(&config))
+    py.detach(|| inner.create_image_source_with_metadata(&config, &metadata))
         .map(|handle| source(handle, SourceKind::Image))
         .map_err(io_error)
 }
 
 #[pyfunction]
+#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None))]
 fn create_video_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     source_id: u64,
     config: &Bound<'_, PyDict>,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<PySource> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_video(config)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_video_source(source_id, &config))
+    py.detach(|| inner.create_video_source_with_metadata(source_id, &config, &metadata))
         .map(|handle| source(handle, SourceKind::Video))
         .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, linked_video_source_id, config))]
+#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None))]
 fn create_audio_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     source_id: u64,
     linked_video_source_id: Option<u64>,
     config: &Bound<'_, PyDict>,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<PySource> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_audio(config)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_audio_source(source_id, linked_video_source_id, &config))
-        .map(|handle| source(handle, SourceKind::Audio))
-        .map_err(io_error)
+    py.detach(|| {
+        inner.create_audio_source_with_metadata(
+            source_id,
+            linked_video_source_id,
+            &config,
+            &metadata,
+        )
+    })
+    .map(|handle| source(handle, SourceKind::Audio))
+    .map_err(io_error)
 }
 
 #[pyfunction]
@@ -573,10 +638,19 @@ fn delete_scene_node(py: Python<'_>, session: PyRef<'_, PySession>, node_id: u64
 }
 
 #[pyfunction]
-fn destroy_source(py: Python<'_>, session: PyRef<'_, PySession>, source_id: u64) -> PyResult<()> {
+#[pyo3(signature = (session, source_id, preconditions=None, idempotency_key=None, causation_id=None))]
+fn destroy_source(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
+) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.destroy_source(source_id))
+    py.detach(|| inner.destroy_source_with_metadata(source_id, &metadata))
         .map_err(io_error)
 }
 
@@ -1146,44 +1220,75 @@ fn play_and_wait_until_playing(
 }
 
 #[pyfunction]
+#[pyo3(signature = (session, source_id, start_pts_us, minimum_buffer_us, preconditions=None, idempotency_key=None, causation_id=None))]
 fn play(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     source_id: u64,
     start_pts_us: i64,
     minimum_buffer_us: u64,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.play_at(source_id, start_pts_us, minimum_buffer_us))
+    py.detach(|| inner.play_at_with_metadata(source_id, start_pts_us, minimum_buffer_us, &metadata))
         .map_err(io_error)
 }
 
 #[pyfunction]
-fn pause(py: Python<'_>, session: PyRef<'_, PySession>, source_id: u64) -> PyResult<()> {
+#[pyo3(signature = (session, source_id, preconditions=None, idempotency_key=None, causation_id=None))]
+fn pause(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
+) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.pause(source_id)).map_err(io_error)
+    py.detach(|| inner.pause_with_metadata(source_id, &metadata))
+        .map_err(io_error)
 }
 
 #[pyfunction]
+#[pyo3(signature = (session, source_id, epoch, preconditions=None, idempotency_key=None, causation_id=None))]
 fn flush(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     source_id: u64,
     epoch: u32,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
 ) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.flush(source_id, epoch))
+    py.detach(|| inner.flush_with_metadata(source_id, epoch, &metadata))
         .map_err(io_error)
 }
 
 #[pyfunction]
-fn eos(py: Python<'_>, session: PyRef<'_, PySession>, source_id: u64, epoch: u32) -> PyResult<()> {
+#[pyo3(signature = (session, source_id, epoch, preconditions=None, idempotency_key=None, causation_id=None))]
+fn eos(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    epoch: u32,
+    preconditions: Option<&Bound<'_, PyDict>>,
+    idempotency_key: Option<Vec<u8>>,
+    causation_id: Option<Vec<u8>>,
+) -> PyResult<()> {
+    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.eos(source_id, epoch)).map_err(io_error)
+    py.detach(|| inner.eos_with_metadata(source_id, epoch, &metadata))
+        .map_err(io_error)
 }
 
 #[pyfunction]
