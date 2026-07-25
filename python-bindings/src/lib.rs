@@ -426,7 +426,7 @@ fn create_text_anchor(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None))]
+#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
 fn create_raster_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -436,17 +436,26 @@ fn create_raster_source(
     preconditions: Option<&Bound<'_, PyDict>>,
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
+    capture_policy: u64,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_raster_source_with_metadata(source_id, width, height, &metadata))
-        .map(|handle| source(handle, SourceKind::Raster))
-        .map_err(io_error)
+    py.detach(|| {
+        inner.create_raster_source_with_policy_and_metadata(
+            source_id,
+            width,
+            height,
+            capture_policy,
+            &metadata,
+        )
+    })
+    .map(|handle| source(handle, SourceKind::Raster))
+    .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None))]
+#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
 fn create_image_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -459,6 +468,7 @@ fn create_image_source(
     preconditions: Option<&Bound<'_, PyDict>>,
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
+    capture_policy: u64,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let sha256 = sha256
@@ -478,13 +488,15 @@ fn create_image_source(
     };
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_image_source_with_metadata(&config, &metadata))
-        .map(|handle| source(handle, SourceKind::Image))
-        .map_err(io_error)
+    py.detach(|| {
+        inner.create_image_source_with_policy_and_metadata(&config, capture_policy, &metadata)
+    })
+    .map(|handle| source(handle, SourceKind::Image))
+    .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None))]
+#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
 fn create_video_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -493,18 +505,26 @@ fn create_video_source(
     preconditions: Option<&Bound<'_, PyDict>>,
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
+    capture_policy: u64,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_video(config)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_video_source_with_metadata(source_id, &config, &metadata))
-        .map(|handle| source(handle, SourceKind::Video))
-        .map_err(io_error)
+    py.detach(|| {
+        inner.create_video_source_with_policy_and_metadata(
+            source_id,
+            &config,
+            capture_policy,
+            &metadata,
+        )
+    })
+    .map(|handle| source(handle, SourceKind::Video))
+    .map_err(io_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None))]
+#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0))]
 fn create_audio_source(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -514,16 +534,18 @@ fn create_audio_source(
     preconditions: Option<&Bound<'_, PyDict>>,
     idempotency_key: Option<Vec<u8>>,
     causation_id: Option<Vec<u8>>,
+    capture_policy: u64,
 ) -> PyResult<PySource> {
     let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
     let config = parse_audio(config)?;
     let mut guard = lock(&session.inner, "session")?;
     let inner = open_mut(&mut guard, "session")?;
     py.detach(|| {
-        inner.create_audio_source_with_metadata(
+        inner.create_audio_source_with_policy_and_metadata(
             source_id,
             linked_video_source_id,
             &config,
+            capture_policy,
             &metadata,
         )
     })
@@ -532,6 +554,7 @@ fn create_audio_source(
 }
 
 #[pyfunction]
+#[pyo3(signature = (session, video_source_id, video_config, audio_source_id, audio_config, video_capture_policy=0, audio_capture_policy=0))]
 fn create_linked_av_sources(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -539,6 +562,8 @@ fn create_linked_av_sources(
     video_config: &Bound<'_, PyDict>,
     audio_source_id: u64,
     audio_config: &Bound<'_, PyDict>,
+    video_capture_policy: u64,
+    audio_capture_policy: u64,
 ) -> PyResult<(PySource, Option<PySource>, Option<String>)> {
     let video_config = parse_video(video_config)?;
     let audio_config = parse_audio(audio_config)?;
@@ -546,11 +571,13 @@ fn create_linked_av_sources(
     let inner = open_mut(&mut guard, "session")?;
     let (video, audio) = py
         .detach(|| {
-            inner.create_linked_av_sources(
+            inner.create_linked_av_sources_with_policy(
                 video_source_id,
                 &video_config,
+                video_capture_policy,
                 audio_source_id,
                 &audio_config,
+                audio_capture_policy,
             )
         })
         .map_err(io_error)?;
@@ -559,6 +586,19 @@ fn create_linked_av_sources(
         Ok(audio) => Ok((video, Some(source(audio, SourceKind::Audio)), None)),
         Err(error) => Ok((video, None, Some(error.to_string()))),
     }
+}
+
+#[pyfunction]
+fn set_source_policy(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    source_id: u64,
+    capture_policy: u64,
+) -> PyResult<()> {
+    let mut guard = lock(&session.inner, "session")?;
+    let inner = open_mut(&mut guard, "session")?;
+    py.detach(|| inner.set_source_policy(source_id, capture_policy))
+        .map_err(io_error)
 }
 
 #[pyfunction]
@@ -1429,6 +1469,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_video_source, module)?)?;
     module.add_function(wrap_pyfunction!(create_audio_source, module)?)?;
     module.add_function(wrap_pyfunction!(create_linked_av_sources, module)?)?;
+    module.add_function(wrap_pyfunction!(set_source_policy, module)?)?;
     module.add_function(wrap_pyfunction!(probe_video_config, module)?)?;
     module.add_function(wrap_pyfunction!(probe_audio_config, module)?)?;
     module.add_function(wrap_pyfunction!(place_source, module)?)?;

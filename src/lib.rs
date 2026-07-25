@@ -2277,9 +2277,37 @@ impl ProducerSession {
         height: u32,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_raster_source_with_policy_and_metadata(source_id, width, height, 0, metadata)
+    }
+
+    pub fn create_raster_source_with_policy(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        capture_policy: u64,
+    ) -> io::Result<SourceHandle> {
+        self.create_raster_source_with_policy_and_metadata(
+            source_id,
+            width,
+            height,
+            capture_policy,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_raster_source_with_policy_and_metadata(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        capture_policy: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
+        self.ensure_capture_policy(capture_policy)?;
         let request_id = self.request_id()?;
         let body = self.atomic_body(
-            &messages::create_raster_config(
+            &messages::create_raster_with_policy(
                 request_id,
                 &messages::RasterSourceConfig {
                     source_id,
@@ -2292,6 +2320,7 @@ impl ProducerSession {
                         messages::COMPRESSION_NONE
                     },
                 },
+                capture_policy,
             ),
             metadata,
         )?;
@@ -2314,9 +2343,37 @@ impl ProducerSession {
         info: &C,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_video_source_with_policy_and_metadata(source_id, info, 0, metadata)
+    }
+
+    pub fn create_video_source_with_policy<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+        capture_policy: u64,
+    ) -> io::Result<SourceHandle> {
+        self.create_video_source_with_policy_and_metadata(
+            source_id,
+            info,
+            capture_policy,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_video_source_with_policy_and_metadata<C: VideoConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        info: &C,
+        capture_policy: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
+        self.ensure_capture_policy(capture_policy)?;
         let request_id = self.request_id()?;
         let config = self.scrub_video_description(info.vivid_video_config(source_id));
-        let body = self.atomic_body(&messages::create_video(request_id, &config), metadata)?;
+        let body = self.atomic_body(
+            &messages::create_video_with_policy(request_id, &config, capture_policy),
+            metadata,
+        )?;
         self.control
             .write_record(messages::CREATE_VIDEO, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "video")
@@ -2366,16 +2423,53 @@ impl ProducerSession {
         info: &C,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_audio_source_with_policy_and_metadata(
+            source_id,
+            linked_video_source_id,
+            info,
+            0,
+            metadata,
+        )
+    }
+
+    pub fn create_audio_source_with_policy<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+        capture_policy: u64,
+    ) -> io::Result<SourceHandle> {
+        self.create_audio_source_with_policy_and_metadata(
+            source_id,
+            linked_video_source_id,
+            info,
+            capture_policy,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_audio_source_with_policy_and_metadata<C: AudioConfig + ?Sized>(
+        &mut self,
+        source_id: u64,
+        linked_video_source_id: Option<u64>,
+        info: &C,
+        capture_policy: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "presenter lacks audio-access-unit-v1",
             ));
         }
+        self.ensure_capture_policy(capture_policy)?;
         let config = self
             .scrub_audio_description(info.vivid_audio_config(source_id, linked_video_source_id));
         let request_id = self.request_id()?;
-        let body = self.atomic_body(&messages::create_audio(request_id, &config), metadata)?;
+        let body = self.atomic_body(
+            &messages::create_audio_with_policy(request_id, &config, capture_policy),
+            metadata,
+        )?;
         self.control
             .write_record(messages::CREATE_AUDIO, 0, source_id, &body)?;
         self.source_ready(request_id, source_id, "audio")
@@ -2394,32 +2488,59 @@ impl ProducerSession {
         V: VideoConfig + ?Sized,
         A: AudioConfig + ?Sized,
     {
+        self.create_linked_av_sources_with_policy(
+            video_source_id,
+            video,
+            0,
+            audio_source_id,
+            audio,
+            0,
+        )
+    }
+
+    pub fn create_linked_av_sources_with_policy<V, A>(
+        &mut self,
+        video_source_id: u64,
+        video: &V,
+        video_capture_policy: u64,
+        audio_source_id: u64,
+        audio: &A,
+        audio_capture_policy: u64,
+    ) -> io::Result<(SourceHandle, io::Result<SourceHandle>)>
+    where
+        V: VideoConfig + ?Sized,
+        A: AudioConfig + ?Sized,
+    {
         if !self.supports(messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "presenter lacks audio-access-unit-v1",
             ));
         }
+        self.ensure_capture_policy(video_capture_policy)?;
+        self.ensure_capture_policy(audio_capture_policy)?;
         let video_request = self.request_id()?;
         let audio_request = self.request_id()?;
         self.control.write_record(
             messages::CREATE_VIDEO,
             0,
             video_source_id,
-            &messages::create_video(
+            &messages::create_video_with_policy(
                 video_request,
                 &self.scrub_video_description(video.vivid_video_config(video_source_id)),
+                video_capture_policy,
             ),
         )?;
         self.control.write_record(
             messages::CREATE_AUDIO,
             0,
             audio_source_id,
-            &messages::create_audio(
+            &messages::create_audio_with_policy(
                 audio_request,
                 &self.scrub_audio_description(
                     audio.vivid_audio_config(audio_source_id, Some(video_source_id)),
                 ),
+                audio_capture_policy,
             ),
         )?;
         let video = self.source_ready(video_request, video_source_id, "video")?;
@@ -2476,14 +2597,39 @@ impl ProducerSession {
         config: &ImageSourceConfig,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_policy_and_metadata(config, 0, metadata)
+    }
+
+    pub fn create_image_source_with_policy(
+        &mut self,
+        config: &ImageSourceConfig,
+        capture_policy: u64,
+    ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_policy_and_metadata(
+            config,
+            capture_policy,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_image_source_with_policy_and_metadata(
+        &mut self,
+        config: &ImageSourceConfig,
+        capture_policy: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_ENCODED_IMAGE_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "presenter lacks encoded-image-v1",
             ));
         }
+        self.ensure_capture_policy(capture_policy)?;
         let request_id = self.request_id()?;
-        let body = self.atomic_body(&messages::create_image(request_id, config), metadata)?;
+        let body = self.atomic_body(
+            &messages::create_image_with_policy(request_id, config, capture_policy),
+            metadata,
+        )?;
         self.control
             .write_record(messages::CREATE_IMAGE, 0, config.source_id, &body)?;
         self.source_ready(request_id, config.source_id, "image")
@@ -2583,6 +2729,18 @@ impl ProducerSession {
         let body = self.atomic_body(&messages::destroy_source(request_id, source_id), metadata)?;
         self.control
             .write_record(messages::DESTROY_SOURCE, 0, source_id, &body)?;
+        self.wait_for_ok(request_id, source_id)
+    }
+
+    pub fn set_source_policy(&mut self, source_id: u64, capture_policy: u64) -> io::Result<()> {
+        self.ensure_capture_policy(capture_policy)?;
+        let request_id = self.request_id()?;
+        self.control.write_record(
+            messages::SET_SOURCE_POLICY,
+            0,
+            source_id,
+            &messages::set_source_policy(request_id, source_id, capture_policy),
+        )?;
         self.wait_for_ok(request_id, source_id)
     }
 
@@ -2915,6 +3073,17 @@ impl ProducerSession {
 
     pub fn supports(&self, feature: u64) -> bool {
         self.accepted_features.binary_search(&feature).is_ok()
+    }
+
+    fn ensure_capture_policy(&self, capture_policy: u64) -> io::Result<()> {
+        messages::validate_capture_policy(capture_policy)?;
+        if capture_policy != 0 && !self.supports(messages::FEATURE_SOURCE_CAPTURE_POLICY_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks source-capture-policy-v1",
+            ));
+        }
+        Ok(())
     }
 
     pub fn take_desktop_input(&mut self) -> io::Result<Option<DesktopInputEvent>> {
