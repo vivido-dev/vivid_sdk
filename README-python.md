@@ -1,7 +1,7 @@
 # vivid-sdk for Python
 
 `vivid-sdk` is the typed Python interface to the Rust `vivid_sdk` producer library. It connects to
-a Vivid 1.0 presenter, manages scene sources, and submits raster, encoded image, video access-unit,
+a Vivid 1.1 presenter, manages scene sources, and submits raster, encoded image, video access-unit,
 and audio access-unit records. It does not decode media files; callers supply already-decoded RGBA
 pixels or codec access units.
 

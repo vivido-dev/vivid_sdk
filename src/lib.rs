@@ -24,6 +24,30 @@ const CONPTY_ANCHOR_TRANSPORT: &str = "conpty";
 
 pub use vivid_protocol::messages::DisplayChanged as DisplayState;
 
+/// A presenter's structured response to a connection-preface version mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionRejectionError {
+    pub attempted_version: (u8, u8),
+    pub supported_version: Option<(u64, u64)>,
+    pub fatal: bool,
+}
+
+impl std::fmt::Display for VersionRejectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "presenter rejected Vivid {}.{} (supported version: {})",
+            self.attempted_version.0,
+            self.attempted_version.1,
+            self.supported_version
+                .map(|(major, minor)| format!("{major}.{minor}"))
+                .unwrap_or_else(|| "not reported".to_owned())
+        )
+    }
+}
+
+impl std::error::Error for VersionRejectionError {}
+
 /// Allocation-free snapshot of coarse producer hot-path measurements.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HotPathCounters {
@@ -133,6 +157,11 @@ pub struct ProducerConfig {
     pub producer_version: String,
     pub required_features: Vec<u64>,
     pub optional_features: Vec<u64>,
+    /// Permit one explicit retry on a fresh connection after a typed version rejection.
+    ///
+    /// Disabled by default by all SDK integrations. The SDK retries only versions for which it
+    /// retains a complete negotiation implementation.
+    pub allow_version_retry: bool,
 }
 
 impl ProducerConfig {
@@ -1464,30 +1493,20 @@ impl ProducerSession {
         let token_bytes = anchor::decode_token(token)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let hello_request = 1;
-        control.write_record(
-            messages::HELLO,
-            0,
-            0,
-            &messages::encode_hello(
-                hello_request,
-                &messages::HelloConfig {
-                    minimum_major: u64::from(VIVID_MAJOR),
-                    minimum_minor: u64::from(VIVID_MINOR),
-                    maximum_major: u64::from(VIVID_MAJOR),
-                    maximum_minor: u64::from(VIVID_MINOR),
-                    token,
-                    producer: &config.producer,
-                    producer_version: &config.producer_version,
-                    required_features: &config.required_features,
-                    optional_features: &config.optional_features,
-                    maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
-                },
-            ),
-        )?;
 
         let (root_context_id, display, session_tag, accepted_features, control_limit) = if dry_run {
+            send_hello(
+                &mut control,
+                config,
+                token,
+                hello_request,
+                (VIVID_MAJOR, VIVID_MINOR),
+            )?;
             if config.verbose {
-                eprintln!("{}: dry-run HELLO (Vivid 1.0)", config.producer);
+                eprintln!(
+                    "{}: dry-run HELLO (Vivid {}.{})",
+                    config.producer, VIVID_MAJOR, VIVID_MINOR
+                );
             }
             let accepted_features = messages::negotiate_features(
                 &config.required_features,
@@ -1511,20 +1530,60 @@ impl ProducerSession {
                 vivid_protocol::CONTROL_MAX_RECORD_BODY,
             )
         } else {
-            let record = read_expected(&mut control, hello_request, &[messages::WELCOME], None)?;
-            let welcome = messages::parse_welcome(&record.body)?;
-            if (welcome.selected_major, welcome.selected_minor)
-                != (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "presenter selected Vivid {}.{}, expected {}.{}",
-                        welcome.selected_major, welcome.selected_minor, VIVID_MAJOR, VIVID_MINOR
-                    ),
-                )
+            let mut version = (VIVID_MAJOR, VIVID_MINOR);
+            let mut retried = false;
+            let welcome = loop {
+                send_hello(&mut control, config, token, hello_request, version)?;
+                let record = read_negotiation_reply(&mut control, hello_request)?;
+                if record.record_type == messages::WELCOME {
+                    break messages::parse_welcome_for_version(
+                        &record.body,
+                        u64::from(version.0),
+                        u64::from(version.1),
+                    )?;
+                }
+                let rejection = messages::parse_error_reply(&record.body)?;
+                let supported = rejection.supported_version.and_then(|(major, minor)| {
+                    Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
+                });
+                if config.allow_version_retry
+                    && !retried
+                    && rejection.code == messages::ERROR_UNSUPPORTED_VERSION
+                    && rejection.fatal
+                    && supported == Some((1, 0))
+                {
+                    let retry_version = supported.unwrap();
+                    eprintln!(
+                        "{}: presenter rejected Vivid {}.{}; retrying once on a fresh connection with reported Vivid {}.{}",
+                        config.producer, version.0, version.1, retry_version.0, retry_version.1
+                    );
+                    drop(control);
+                    control = Connection::open_version(
+                        endpoint.as_ref().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "missing Vivid endpoint")
+                        })?,
+                        ConnectionKind::Control,
+                        retry_version.0,
+                        retry_version.1,
+                    )?;
+                    version = retry_version;
+                    retried = true;
+                    continue;
+                }
+                if rejection.code == messages::ERROR_UNSUPPORTED_VERSION {
+                    return Err(VersionRejectionError {
+                        attempted_version: version,
+                        supported_version: rejection.supported_version,
+                        fatal: rejection.fatal,
+                    }
+                    .into());
+                }
+                return Err(io::Error::other(format!(
+                    "presenter rejected HELLO with error {}: {}",
+                    rejection.code, rejection.diagnostic
+                ))
                 .into());
-            }
+            };
             let accepted_features = messages::negotiate_features(
                 &config.required_features,
                 &config.optional_features,
@@ -2628,28 +2687,50 @@ impl SourceHandle {
     }
 }
 
-fn read_expected(
+fn send_hello(
+    connection: &mut Connection,
+    config: &ProducerConfig,
+    token: &str,
+    request_id: u64,
+    version: (u8, u8),
+) -> io::Result<()> {
+    let body = messages::try_encode_hello_for_version(
+        request_id,
+        &messages::HelloConfig {
+            minimum_major: u64::from(version.0),
+            minimum_minor: u64::from(version.1),
+            maximum_major: u64::from(version.0),
+            maximum_minor: u64::from(version.1),
+            token,
+            producer: &config.producer,
+            producer_version: &config.producer_version,
+            required_features: &config.required_features,
+            optional_features: &config.optional_features,
+            maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+            authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+            preserved_fields: &[],
+        },
+        u64::from(version.0),
+        u64::from(version.1),
+    )?;
+    connection
+        .write_record(messages::HELLO, 0, 0, &body)
+        .map(|_| ())
+}
+
+fn read_negotiation_reply(
     connection: &mut Connection,
     expected_request_id: u64,
-    accepted_types: &[u16],
-    mut display_generation: Option<&mut u64>,
 ) -> io::Result<Record> {
     loop {
         let record = connection.read_record()?;
-        if record.record_type == messages::ERROR {
-            return Err(io::Error::other(messages::parse_error(&record.body)?));
-        }
-        if record.record_type == messages::DISPLAY_CHANGED {
-            if let Some(generation) = display_generation.as_deref_mut() {
-                *generation = messages::parse_display_changed(&record.body)?.display_generation;
+        match record.record_type {
+            messages::ERROR => return Ok(record),
+            messages::DISPLAY_CHANGED => continue,
+            messages::WELCOME if messages::request_id(&record.body)? == expected_request_id => {
+                return Ok(record);
             }
-            continue;
-        }
-        if !accepted_types.contains(&record.record_type) {
-            continue;
-        }
-        if messages::request_id(&record.body)? == expected_request_id {
-            return Ok(record);
+            _ => continue,
         }
     }
 }
@@ -2672,6 +2753,46 @@ fn source_lost_error(record: &Record) -> io::Result<io::Error> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn version_rejection_record(major: u64, minor: u64) -> Vec<u8> {
+        use vivid_protocol::cbor::{self, Value};
+        use vivid_protocol::wire::{HEADER_SIZE, RecordHeader};
+
+        let body = cbor::encode(&Value::Map(vec![
+            (0, Value::Unsigned(0)),
+            (
+                3,
+                Value::Map(vec![
+                    (0, Value::Unsigned(messages::ERROR_UNSUPPORTED_VERSION)),
+                    (1, Value::Unsigned(0)),
+                    (
+                        2,
+                        Value::Map(vec![
+                            (11, Value::Unsigned(major)),
+                            (12, Value::Unsigned(minor)),
+                        ]),
+                    ),
+                    (4, Value::Bool(true)),
+                    (5, Value::Text("unsupported Vivid version".to_owned())),
+                ]),
+            ),
+        ]))
+        .unwrap();
+        let mut record = Vec::with_capacity(HEADER_SIZE + body.len());
+        record.extend_from_slice(
+            &RecordHeader {
+                body_length: body.len() as u32,
+                record_type: messages::ERROR,
+                flags: 0,
+                object_id: 0,
+                sequence: 1,
+            }
+            .encode(),
+        );
+        record.extend_from_slice(&body);
+        record
+    }
+
     fn producer_config(required_features: Vec<u64>, optional_features: Vec<u64>) -> ProducerConfig {
         ProducerConfig {
             endpoint: None,
@@ -2684,11 +2805,13 @@ mod tests {
             producer_version: "1".to_owned(),
             required_features,
             optional_features,
+            allow_version_retry: false,
         }
     }
 
     #[test]
     fn producer_config_rejects_noncanonical_feature_sets() {
+        assert!(!producer_config(Vec::new(), Vec::new()).allow_version_retry);
         let error = producer_config(vec![1, 3], vec![8, 7])
             .validate()
             .unwrap_err();
@@ -2706,6 +2829,169 @@ mod tests {
             error.to_string(),
             "required and optional Vivid feature sets overlap"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_retry_is_disabled_by_default_and_does_not_reconnect() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        use vivid_protocol::wire::PREFACE_SIZE;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("no-version-retry.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping version retry socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<usize> {
+            let (mut stream, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            stream.read_exact(&mut preface)?;
+            assert_eq!(&preface[4..6], &[VIVID_MAJOR, VIVID_MINOR]);
+            stream.write_all(&vivid_protocol::wire::unsupported_version_record())?;
+            stream.flush()?;
+            drop(stream);
+
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return Ok(2),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(1)
+        });
+
+        let mut config = producer_config(Vec::new(), Vec::new());
+        config.dry_run = false;
+        config.endpoint = Some(socket.to_string_lossy().into_owned());
+        config.token = Some("00".repeat(32));
+        let error = match ProducerSession::connect(&config) {
+            Ok(_) => panic!("default-disabled version retry unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("supported version: 1.1"));
+        assert_eq!(
+            error.downcast_ref::<VersionRejectionError>(),
+            Some(&VersionRejectionError {
+                attempted_version: (1, 1),
+                supported_version: Some((1, 1)),
+                fatal: true,
+            })
+        );
+        assert_eq!(server.join().unwrap().unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabled_version_retry_uses_one_fresh_legacy_connection() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        use vivid_protocol::wire::{HEADER_SIZE, PREFACE_SIZE, RecordHeader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("one-version-retry.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping version retry socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut first, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            first.read_exact(&mut preface)?;
+            assert_eq!(&preface[4..6], &[1, 1]);
+            first.write_all(&version_rejection_record(1, 0))?;
+            first.flush()?;
+            drop(first);
+
+            let (mut second, _) = listener.accept()?;
+            second.read_exact(&mut preface)?;
+            assert_eq!(&preface[4..6], &[1, 0]);
+            let mut header = [0; HEADER_SIZE];
+            second.read_exact(&mut header)?;
+            let header = RecordHeader::decode(header);
+            assert_eq!(header.record_type, messages::HELLO);
+            let mut hello = vec![0; header.body_length as usize];
+            second.read_exact(&mut hello)?;
+            let (_, parsed_hello) = messages::parse_hello(&hello)?;
+            assert_eq!(
+                (
+                    parsed_hello.minimum_major,
+                    parsed_hello.minimum_minor,
+                    parsed_hello.maximum_major,
+                    parsed_hello.maximum_minor,
+                ),
+                (1, 0, 1, 0)
+            );
+            assert_eq!(
+                parsed_hello.authentication_kind,
+                messages::AUTHENTICATION_WINDOW_ROOT
+            );
+
+            let welcome = messages::try_encode_welcome_for_version(
+                1,
+                &messages::WelcomeConfig {
+                    session_id: 1,
+                    session_tag: &[1; 16],
+                    root_context_id: 2,
+                    capability_generation: 1,
+                    display: DisplayState {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                    },
+                    maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                    accepted_profiles: &[],
+                    selected_major: 1,
+                    selected_minor: 0,
+                    accepted_features: &[],
+                    initial_scene_revision: 0,
+                    preserved_fields: &[],
+                },
+                1,
+                0,
+            )?;
+            second.write_all(
+                &RecordHeader {
+                    body_length: welcome.len() as u32,
+                    record_type: messages::WELCOME,
+                    flags: 0,
+                    object_id: 0,
+                    sequence: 1,
+                }
+                .encode(),
+            )?;
+            second.write_all(&welcome)?;
+            second.flush()
+        });
+
+        let mut config = producer_config(Vec::new(), Vec::new());
+        config.dry_run = false;
+        config.endpoint = Some(socket.to_string_lossy().into_owned());
+        config.token = Some("00".repeat(32));
+        config.allow_version_retry = true;
+        let session = ProducerSession::connect(&config).unwrap();
+        drop(session);
+        server.join().unwrap().unwrap();
     }
 
     #[test]

@@ -279,6 +279,7 @@ fn connect(
         producer_version,
         required_features,
         optional_features,
+        allow_version_retry: false,
     };
     config.validate().map_err(io_error)?;
     let session = py

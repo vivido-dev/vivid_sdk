@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "vivid-sdk"
 version = "0.1.1"
-description = "Typed Python bindings for the Vivid 1.0 producer SDK"
+description = "Typed Python bindings for the Vivid 1.1 producer SDK"
 readme = "README-python.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
