@@ -36,6 +36,14 @@ FEATURE_DECODER_DESCRIPTION_V1 = 16
 FEATURE_OBSERVABILITY_CORE_V1 = 18
 FEATURE_ATOMIC_CONTROL_V1 = 19
 FEATURE_DELEGATED_CONTEXT_V1 = 21
+FEATURE_SOURCE_CAPTURE_POLICY_V1 = 22
+
+CAPTURE_POLICY_DENY_CAPTURE = 1 << 0
+CAPTURE_POLICY_DENY_SEMANTIC_EXPORT = 1 << 1
+CAPTURE_POLICY_DENY_POSTER_RETENTION = 1 << 2
+CAPTURE_POLICY_DENY_CACHE = 1 << 3
+CAPTURE_POLICY_REDUCE_DIAGNOSTICS = 1 << 4
+CAPTURE_POLICY_MASK = (1 << 5) - 1
 
 AUTHENTICATION_WINDOW_ROOT = 0
 AUTHENTICATION_DELEGATED_CONTEXT = 1
@@ -90,6 +98,7 @@ DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
     FEATURE_OBSERVABILITY_CORE_V1,
     FEATURE_ATOMIC_CONTROL_V1,
     FEATURE_DELEGATED_CONTEXT_V1,
+    FEATURE_SOURCE_CAPTURE_POLICY_V1,
 )
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -770,6 +779,7 @@ def create_raster_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return _native.create_raster_source(
         session,
@@ -779,6 +789,7 @@ def create_raster_source(
         preconditions,
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
+        capture_policy,
     )
 
 
@@ -800,6 +811,7 @@ def create_image_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     digest = None if config.sha256 is None else _owned_bytes(config.sha256)
     return _native.create_image_source(
@@ -813,6 +825,7 @@ def create_image_source(
         preconditions,
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
+        capture_policy,
     )
 
 
@@ -824,6 +837,7 @@ def create_video_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return _native.create_video_source(
         session,
@@ -832,6 +846,7 @@ def create_video_source(
         preconditions,
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
+        capture_policy,
     )
 
 
@@ -844,6 +859,7 @@ def create_audio_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     linked_id = None if linked_video is None else _source_id(linked_video)
     return _native.create_audio_source(
@@ -854,6 +870,7 @@ def create_audio_source(
         preconditions,
         None if idempotency_key is None else _owned_bytes(idempotency_key),
         None if causation_id is None else _owned_bytes(causation_id),
+        capture_policy,
     )
 
 
@@ -864,6 +881,8 @@ def create_linked_av_sources(
     *,
     video_source_id: Optional[int] = None,
     audio_source_id: Optional[int] = None,
+    video_capture_policy: int = 0,
+    audio_capture_policy: int = 0,
 ) -> Tuple[Source, Source]:
     video_handle, audio_handle, audio_error = _native.create_linked_av_sources(
         session,
@@ -871,10 +890,18 @@ def create_linked_av_sources(
         _video_dict(video),
         _allocated_id(session, audio_source_id),
         _audio_dict(audio),
+        video_capture_policy,
+        audio_capture_policy,
     )
     if audio_error is not None or audio_handle is None:
         raise LinkedAudioError(audio_error or "linked audio source was rejected", video_handle)
     return video_handle, audio_handle
+
+
+def set_source_policy(
+    session: Session, source: SourceLike, capture_policy: int
+) -> None:
+    _native.set_source_policy(session, _source_id(source), capture_policy)
 
 
 def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
@@ -1257,6 +1284,12 @@ __all__ = [
     "SourceChangedEvent",
     "SceneChangedEvent",
     "PlaybackStateEvent",
+    "CAPTURE_POLICY_DENY_CAPTURE",
+    "CAPTURE_POLICY_DENY_SEMANTIC_EXPORT",
+    "CAPTURE_POLICY_DENY_POSTER_RETENTION",
+    "CAPTURE_POLICY_DENY_CACHE",
+    "CAPTURE_POLICY_REDUCE_DIAGNOSTICS",
+    "CAPTURE_POLICY_MASK",
     "FEATURE_AUDIO_ACCESS_UNIT_V1",
     "FEATURE_CREDIT_FLOW_CONTROL",
     "FEATURE_DECODER_DESCRIPTION_V1",
@@ -1269,6 +1302,7 @@ __all__ = [
     "FEATURE_RASTER_ZSTD_V1",
     "FEATURE_SCENE_TRANSACTIONS",
     "FEATURE_TEXT_ANCHORS_V2",
+    "FEATURE_SOURCE_CAPTURE_POLICY_V1",
     "FEATURE_VIDEO_ACCESS_UNIT_V1",
     "FEATURE_VIDEO_CONTROL_V1",
     "FEATURE_VISIBILITY_EVENTS_V1",
@@ -1341,6 +1375,7 @@ __all__ = [
     "source_id",
     "supports",
     "set_observation",
+    "set_source_policy",
     "query_source",
     "query_scene",
     "query_anchor",

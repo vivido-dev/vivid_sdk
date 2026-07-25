@@ -249,6 +249,7 @@ async def create_raster_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return await _call(
         _sync.create_raster_source,
@@ -259,6 +260,7 @@ async def create_raster_source(
         preconditions=preconditions,
         idempotency_key=idempotency_key,
         causation_id=causation_id,
+        capture_policy=capture_policy,
         cleanup=_destroy(session),
     )
 
@@ -271,6 +273,7 @@ async def create_image_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return await _call(
         _sync.create_image_source,
@@ -280,6 +283,7 @@ async def create_image_source(
         preconditions=preconditions,
         idempotency_key=idempotency_key,
         causation_id=causation_id,
+        capture_policy=capture_policy,
         cleanup=_destroy(session),
     )
 
@@ -292,6 +296,7 @@ async def create_video_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return await _call(
         _sync.create_video_source,
@@ -301,6 +306,7 @@ async def create_video_source(
         preconditions=preconditions,
         idempotency_key=idempotency_key,
         causation_id=causation_id,
+        capture_policy=capture_policy,
         cleanup=_destroy(session),
     )
 
@@ -314,6 +320,7 @@ async def create_audio_source(
     preconditions: Optional[Dict[int, int]] = None,
     idempotency_key: Optional[BytesLike] = None,
     causation_id: Optional[BytesLike] = None,
+    capture_policy: int = 0,
 ) -> Source:
     return await _call(
         _sync.create_audio_source,
@@ -324,6 +331,7 @@ async def create_audio_source(
         preconditions=preconditions,
         idempotency_key=idempotency_key,
         causation_id=causation_id,
+        capture_policy=capture_policy,
         cleanup=_destroy(session),
     )
 
@@ -335,6 +343,8 @@ async def create_linked_av_sources(
     *,
     video_source_id: Optional[int] = None,
     audio_source_id: Optional[int] = None,
+    video_capture_policy: int = 0,
+    audio_capture_policy: int = 0,
 ) -> Tuple[Source, Source]:
     def cleanup(created: Tuple[Source, Source]) -> None:
         for handle in created:
@@ -347,8 +357,16 @@ async def create_linked_av_sources(
         audio,
         video_source_id=video_source_id,
         audio_source_id=audio_source_id,
+        video_capture_policy=video_capture_policy,
+        audio_capture_policy=audio_capture_policy,
         cleanup=cleanup,
     )
+
+
+async def set_source_policy(
+    session: Session, source: SourceLike, capture_policy: int
+) -> None:
+    await _call(_sync.set_source_policy, session, source, capture_policy)
 
 
 async def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
@@ -694,6 +712,7 @@ __all__ = [
     "root_context_id",
     "revision_state",
     "set_observation",
+    "set_source_policy",
     "query_source",
     "query_scene",
     "query_anchor",
