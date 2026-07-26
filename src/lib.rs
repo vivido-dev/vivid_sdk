@@ -526,6 +526,23 @@ pub enum SourceEvent {
     Lost(String),
 }
 
+/// A source-scoped request to resume encoded video from a random-access packet.
+///
+/// [`SourceHandle::take_keyframe_request`] retains its epoch-only API for compatibility. Producers
+/// that distinguish transport loss from decoder loss use
+/// [`SourceHandle::take_keyframe_request_detailed`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyframeRequest {
+    pub minimum_epoch: u32,
+    pub reason: u64,
+}
+
+impl KeyframeRequest {
+    pub fn is_transport_loss(self) -> bool {
+        self.reason == messages::KEYFRAME_REASON_TRANSPORT_LOSS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopInputEvent {
     Key {
@@ -600,10 +617,39 @@ struct SourceRuntime {
     credits: messages::CreditLedger,
     visible: bool,
     visible_reasons: u64,
-    need_keyframe_epoch: Option<u32>,
+    keyframe_request: Option<KeyframeRequest>,
     need_full_frame_reason: Option<u64>,
     lost: Option<String>,
     credit_returns: u64,
+}
+
+fn normalize_keyframe_reason(reason: u64) -> u64 {
+    match reason {
+        messages::KEYFRAME_REASON_INITIAL
+        | messages::KEYFRAME_REASON_DECODER_ERROR
+        | messages::KEYFRAME_REASON_EPOCH_DISCONTINUITY
+        | messages::KEYFRAME_REASON_DEVICE_RESET
+        | messages::KEYFRAME_REASON_TRANSPORT_LOSS => reason,
+        _ => messages::KEYFRAME_REASON_DECODER_ERROR,
+    }
+}
+
+fn coalesce_keyframe_request(pending: &mut Option<KeyframeRequest>, mut incoming: KeyframeRequest) {
+    incoming.reason = normalize_keyframe_reason(incoming.reason);
+    *pending = Some(match pending.take() {
+        None => incoming,
+        Some(current) => KeyframeRequest {
+            minimum_epoch: current.minimum_epoch.max(incoming.minimum_epoch),
+            // Transport recovery is safe only when every coalesced request says decoder state is
+            // intact. Preserve a matching specific reason; otherwise fall back conservatively to
+            // decoder loss.
+            reason: if current.reason == incoming.reason {
+                current.reason
+            } else {
+                messages::KEYFRAME_REASON_DECODER_ERROR
+            },
+        },
+    });
 }
 
 impl SourceRuntime {
@@ -1513,7 +1559,7 @@ impl ControlDispatcher {
                 credits: messages::CreditLedger::new(credits),
                 visible: true,
                 visible_reasons: 0,
-                need_keyframe_epoch: None,
+                keyframe_request: None,
                 need_full_frame_reason: None,
                 lost: None,
                 credit_returns: 0,
@@ -1946,7 +1992,13 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
                     "NEED_KEYFRAME source/object ID mismatch",
                 ));
             }
-            state.need_keyframe_epoch = Some(request.minimum_epoch);
+            coalesce_keyframe_request(
+                &mut state.keyframe_request,
+                KeyframeRequest {
+                    minimum_epoch: request.minimum_epoch,
+                    reason: request.reason,
+                },
+            );
         }
         messages::NEED_FULL_FRAME => {
             let request = messages::parse_need_full_frame(&record.body)?;
@@ -2180,7 +2232,7 @@ impl ClientControl {
                     credits: messages::CreditLedger::new(credits),
                     visible: true,
                     visible_reasons: 0,
-                    need_keyframe_epoch: None,
+                    keyframe_request: None,
                     need_full_frame_reason: None,
                     lost: None,
                     credit_returns: 0,
@@ -4836,8 +4888,8 @@ impl SourceHandle {
                 return Some(SourceEvent::Lost(error.clone()));
             }
         }
-        if let Some(epoch) = state.need_keyframe_epoch.take() {
-            return Some(SourceEvent::NeedKeyframe(epoch));
+        if let Some(request) = state.keyframe_request.take() {
+            return Some(SourceEvent::NeedKeyframe(request.minimum_epoch));
         }
         if state.visible != self.observed_visible {
             self.observed_visible = state.visible;
@@ -4847,11 +4899,16 @@ impl SourceHandle {
     }
 
     pub fn take_keyframe_request(&mut self) -> Option<u32> {
+        self.take_keyframe_request_detailed()
+            .map(|request| request.minimum_epoch)
+    }
+
+    pub fn take_keyframe_request_detailed(&mut self) -> Option<KeyframeRequest> {
         self.state
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .need_keyframe_epoch
+            .keyframe_request
             .take()
     }
 
@@ -4913,7 +4970,7 @@ impl SourceHandle {
                 self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::other(error.clone()));
             }
-            if interrupt_for_events && state.need_keyframe_epoch.is_some() {
+            if interrupt_for_events && state.keyframe_request.is_some() {
                 self.counters.record_credit_wait(wait_started);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -5876,7 +5933,7 @@ mod tests {
                     }),
                     visible: true,
                     visible_reasons: 0,
-                    need_keyframe_epoch: None,
+                    keyframe_request: None,
                     need_full_frame_reason: None,
                     lost: None,
                     credit_returns: 0,
@@ -5992,11 +6049,56 @@ mod tests {
         {
             let mut state = source.state.state.lock().unwrap();
             state.visible = true;
-            state.need_keyframe_epoch = Some(9);
+            state.keyframe_request = Some(KeyframeRequest {
+                minimum_epoch: 9,
+                reason: messages::KEYFRAME_REASON_DECODER_ERROR,
+            });
         }
         assert_eq!(
             source.consume_credits(1, false, true).unwrap_err().kind(),
             io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn keyframe_requests_coalesce_without_weakening_recovery() {
+        let mut pending = None;
+        coalesce_keyframe_request(
+            &mut pending,
+            KeyframeRequest {
+                minimum_epoch: 7,
+                reason: messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+            },
+        );
+        coalesce_keyframe_request(
+            &mut pending,
+            KeyframeRequest {
+                minimum_epoch: 6,
+                reason: messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+            },
+        );
+        assert_eq!(
+            pending,
+            Some(KeyframeRequest {
+                minimum_epoch: 7,
+                reason: messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+            })
+        );
+
+        coalesce_keyframe_request(
+            &mut pending,
+            KeyframeRequest {
+                minimum_epoch: 9,
+                reason: 999,
+            },
+        );
+        assert_eq!(
+            pending,
+            Some(KeyframeRequest {
+                minimum_epoch: 9,
+                reason: messages::KEYFRAME_REASON_DECODER_ERROR,
+            }),
+            "an unknown or stronger coalesced request must use conservative decoder recovery"
         );
     }
 
