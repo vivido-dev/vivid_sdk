@@ -2728,10 +2728,12 @@ impl ProducerSession {
                     && supported == Some((1, 0))
                 {
                     let retry_version = supported.unwrap();
-                    eprintln!(
-                        "{}: presenter rejected Vivid {}.{}; retrying once on a fresh connection with reported Vivid {}.{}",
-                        config.producer, version.0, version.1, retry_version.0, retry_version.1
-                    );
+                    if config.verbose {
+                        eprintln!(
+                            "{}: presenter rejected Vivid {}.{}; retrying once on a fresh connection with reported Vivid {}.{}",
+                            config.producer, version.0, version.1, retry_version.0, retry_version.1
+                        );
+                    }
                     drop(control);
                     control = Connection::open_version(
                         endpoint.as_ref().ok_or_else(|| {
@@ -4640,11 +4642,10 @@ impl ProducerSession {
         for anchor_id in std::mem::take(&mut self.unconfirmed_anchors) {
             match self.control.wait_anchor_deadline(anchor_id, deadline) {
                 Ok(true) => {}
-                Ok(false) => eprintln!(
-                    "{}: warning: the presenter did not confirm text anchor {anchor_id}; \
-                     the display may have discarded this submission",
-                    self.label
-                ),
+                Ok(false) => self.verbose(format_args!(
+                    "the presenter did not confirm text anchor {anchor_id}; \
+                     the display may have discarded this submission"
+                )),
                 Err(_) => return,
             }
         }
