@@ -184,3 +184,19 @@ Scene pagination is caller-bounded and revision-bound. Dropping a Rust wait hand
 cancelling a Python `Wait`, or cancelling `await aio.wait(wait)` sends `CANCEL_WAIT`; it does not
 leave presenter wait state behind. `play()` reports admission only. Use `wait_until_playing()` or
 `play_and_wait_until_playing()` only when actual playback start is required.
+
+## Vivid 1.1 authority and metadata
+
+The synchronous and `vivid_sdk.aio` modules have parity for `root_context_id`, `create_context`,
+`delegate_context`, `revoke_context`, `set_source_policy`, and `update_source_descriptor`.
+Source-creation functions accept optional preconditions, idempotency and causation metadata,
+capture policy, and a bounded `SourceDescriptor`. Capability bytes, tokens, tickets, and payloads
+are omitted from `repr`, observations, statuses, and exceptions.
+
+Use these APIs only after checking the corresponding negotiated feature with `supports()`.
+`revision_state()` and query replies are authoritative protocol state; local process events are not
+a substitute. Clock estimates are diagnostic only.
+
+Ordered `eos(session, sender, ...)` uses the sender's actual attachment generation and last record
+sequence, preventing the final packet from racing EOS. Source-ready metadata exposes rolling
+byte/packet windows, raster-delta operation limits, and image-cache hits where applicable.
