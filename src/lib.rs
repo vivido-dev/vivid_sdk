@@ -188,6 +188,12 @@ pub struct MediaQueueLimits {
     pub max_packets: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterSendKind {
+    Full,
+    Delta,
+}
+
 #[derive(Debug, Default)]
 struct HotPathCounterState {
     media_records_sent: AtomicU64,
@@ -553,6 +559,7 @@ pub struct SourceHandle {
     attachment_generation: u64,
     rolling_byte_window: u64,
     rolling_packet_window: u64,
+    delta_operation_limit: Option<u32>,
     acknowledged_credit_returns: u64,
     observed_visible: bool,
     reported_lost: bool,
@@ -584,6 +591,7 @@ struct SourceRuntime {
     visible: bool,
     visible_reasons: u64,
     need_keyframe_epoch: Option<u32>,
+    need_full_frame_reason: Option<u64>,
     lost: Option<String>,
     credit_returns: u64,
 }
@@ -956,6 +964,7 @@ impl ControlDispatcher {
                         messages::CREDIT
                         | messages::VISIBILITY
                         | messages::NEED_KEYFRAME
+                        | messages::NEED_FULL_FRAME
                         | messages::SOURCE_LOST => {
                             if let Some(source) = state.sources.get(&record.object_id) {
                                 apply_source_record(source, &record)
@@ -1059,6 +1068,17 @@ impl ControlDispatcher {
                                     && error.fatal
                                 {
                                     state.closed = Some("delegated Vivid context was revoked".into());
+                                    return Ok(());
+                                }
+                                if error.request_id == 0
+                                    && !error.fatal
+                                    && record.object_id != 0
+                                {
+                                    if state.sources.contains_key(&record.object_id) {
+                                        // Source-scoped media rejections are followed by an
+                                        // actionable recovery event such as NEED_FULL_FRAME.
+                                        return Ok(());
+                                    }
                                     return Ok(());
                                 }
                                 let request_id = error.request_id;
@@ -1375,6 +1395,7 @@ impl ControlDispatcher {
                 visible: true,
                 visible_reasons: 0,
                 need_keyframe_epoch: None,
+                need_full_frame_reason: None,
                 lost: None,
                 credit_returns: 0,
             }),
@@ -1762,6 +1783,16 @@ fn apply_source_record(source: &SourceSync, record: &Record) -> io::Result<()> {
             }
             state.need_keyframe_epoch = Some(request.minimum_epoch);
         }
+        messages::NEED_FULL_FRAME => {
+            let request = messages::parse_need_full_frame(&record.body)?;
+            if request.source_id != record.object_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NEED_FULL_FRAME source/object ID mismatch",
+                ));
+            }
+            state.need_full_frame_reason = Some(request.reason);
+        }
         messages::SOURCE_LOST => {
             state.mark_lost(source_lost_error(record)?.to_string());
         }
@@ -1978,6 +2009,7 @@ impl ClientControl {
                     visible: true,
                     visible_reasons: 0,
                     need_keyframe_epoch: None,
+                    need_full_frame_reason: None,
                     lost: None,
                     credit_returns: 0,
                 }),
@@ -2150,6 +2182,10 @@ impl MediaSender {
         self.source.take_event()
     }
 
+    pub fn take_full_frame_request(&mut self) -> Option<u64> {
+        self.source.take_full_frame_request()
+    }
+
     pub fn send_video(&mut self, packet: VideoPacket<'_>) -> io::Result<()> {
         let prefix = media::video_packet_prefix(&packet)?;
         self.send_record_parts(
@@ -2202,6 +2238,97 @@ impl MediaSender {
             }
         } else {
             self.send_one_shot_parts(messages::RASTER_FRAME, &raw_parts)
+        }
+    }
+
+    /// Send a retained raster delta when its actual wire representation is smaller than the
+    /// equivalent full frame; otherwise send the full frame.
+    ///
+    /// The comparison includes negotiated zstd encoding. The caller supplies the complete
+    /// composed framebuffer so the SDK can satisfy the mandatory full-frame fallback without
+    /// reconstructing retained state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raster_delta_or_full(
+        &mut self,
+        epoch: u32,
+        frame_id: u64,
+        base_frame_id: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        operations: &[media::RasterDeltaOperation<'_>],
+    ) -> io::Result<RasterSendKind> {
+        let operation_limit = self.source.delta_operation_limit.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "raster source was not created in delta mode",
+            )
+        })?;
+        let raw_delta = media::raster_delta_frame_body(
+            epoch,
+            frame_id,
+            base_frame_id,
+            0,
+            0,
+            width,
+            height,
+            operation_limit,
+            operations,
+            false,
+        )?;
+        let mut allocations = 1_u64;
+        let mut copied = u64::try_from(raw_delta.len()).unwrap_or(u64::MAX);
+        let compressed_delta = if self.raster_zstd {
+            let body = media::raster_delta_frame_body(
+                epoch,
+                frame_id,
+                base_frame_id,
+                0,
+                0,
+                width,
+                height,
+                operation_limit,
+                operations,
+                true,
+            )?;
+            allocations = allocations.saturating_add(1);
+            copied = copied.saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
+            Some(body)
+        } else {
+            None
+        };
+        let delta = compressed_delta
+            .as_ref()
+            .filter(|body| body.len() < raw_delta.len())
+            .unwrap_or(&raw_delta);
+
+        let full_raw_prefix =
+            media::raster_full_frame_prefix(epoch, frame_id, width, height, rgba.len())?;
+        let full_raw_len = usize::try_from(media_body_len(&[full_raw_prefix.as_slice(), rgba])?)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "raster frame is too large")
+            })?;
+        let compressed_full_len = if self.raster_zstd {
+            let body = media::raster_frame_body_with_compression(
+                epoch, frame_id, width, height, rgba, true,
+            )?;
+            allocations = allocations.saturating_add(1);
+            copied = copied.saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
+            Some(body.len())
+        } else {
+            None
+        };
+        let full_len = compressed_full_len
+            .filter(|length| *length < full_raw_len)
+            .unwrap_or(full_raw_len);
+
+        self.source.counters.record_media_work(allocations, copied);
+        if delta.len() >= full_len {
+            self.send_raster(epoch, frame_id, width, height, rgba)?;
+            Ok(RasterSendKind::Full)
+        } else {
+            self.send_one_shot_parts(messages::RASTER_FRAME, &[delta.as_slice()])?;
+            Ok(RasterSendKind::Delta)
         }
     }
 
@@ -2698,7 +2825,61 @@ impl ProducerSession {
         )?;
         self.control
             .write_record(messages::CREATE_RASTER, 0, source_id, &body)?;
-        self.source_ready(request_id, source_id, "raster")
+        self.source_ready(request_id, source_id, "raster", None)
+    }
+
+    /// Create a raster source that may accept retained-frame delta updates.
+    ///
+    /// The returned source reports the presenter's effective operation limit. Callers must still
+    /// send a full frame first and after every request returned by
+    /// [`MediaSender::take_full_frame_request`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_raster_delta_source_with_options(
+        &mut self,
+        source_id: u64,
+        width: u32,
+        height: u32,
+        operation_limit: u32,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
+        if !self.supports(messages::FEATURE_RASTER_DELTA_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks raster-delta-v1",
+            ));
+        }
+        self.ensure_capture_policy(capture_policy)?;
+        self.ensure_source_descriptor(descriptor)?;
+        self.mark_trace_policy(source_id, capture_policy);
+        let request_id = self.request_id()?;
+        let body = self.atomic_body(
+            &messages::create_raster_with_update_extensions(
+                request_id,
+                &messages::RasterSourceConfig {
+                    source_id,
+                    width,
+                    height,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: if self.supports(messages::FEATURE_RASTER_ZSTD_V1) {
+                        messages::COMPRESSION_RAW_OR_ZSTD
+                    } else {
+                        messages::COMPRESSION_NONE
+                    },
+                },
+                messages::RasterUpdateConfig {
+                    mode: messages::RASTER_FULL_FRAME_AND_DELTA,
+                    operation_limit,
+                },
+                capture_policy,
+                descriptor,
+            )?,
+            metadata,
+        )?;
+        self.control
+            .write_record(messages::CREATE_RASTER, 0, source_id, &body)?;
+        self.source_ready(request_id, source_id, "raster delta", Some(operation_limit))
     }
 
     pub fn create_video_source<C: VideoConfig + ?Sized>(
@@ -2781,7 +2962,7 @@ impl ProducerSession {
         )?;
         self.control
             .write_record(messages::CREATE_VIDEO, 0, source_id, &body)?;
-        self.source_ready(request_id, source_id, "video")
+        self.source_ready(request_id, source_id, "video", None)
     }
 
     /// Drop `decoder-description-v1` fields when the presenter did not accept the feature; the
@@ -2920,7 +3101,7 @@ impl ProducerSession {
         )?;
         self.control
             .write_record(messages::CREATE_AUDIO, 0, source_id, &body)?;
-        self.source_ready(request_id, source_id, "audio")
+        self.source_ready(request_id, source_id, "audio", None)
     }
 
     /// Create a linked video/audio pair in one ordered control flight. The video result remains
@@ -3025,8 +3206,8 @@ impl ProducerSession {
                 audio_descriptor,
             ),
         )?;
-        let video = self.source_ready(video_request, video_source_id, "video")?;
-        let audio = self.source_ready(audio_request, audio_source_id, "audio");
+        let video = self.source_ready(video_request, video_source_id, "video", None)?;
+        let audio = self.source_ready(audio_request, audio_source_id, "audio", None);
         Ok((video, audio))
     }
 
@@ -3175,7 +3356,7 @@ impl ProducerSession {
         )?;
         self.control
             .write_record(messages::CREATE_IMAGE, 0, config.source_id, &body)?;
-        self.source_ready(request_id, config.source_id, "image")
+        self.source_ready(request_id, config.source_id, "image", None)
     }
 
     pub fn place_source(
@@ -4198,6 +4379,7 @@ impl ProducerSession {
         request_id: u64,
         source_id: u64,
         kind: &str,
+        requested_delta_operation_limit: Option<u32>,
     ) -> io::Result<SourceHandle> {
         let ready = if self.dry_run {
             let mut ticket = vec![0; 32];
@@ -4213,7 +4395,7 @@ impl ProducerSession {
                 rolling_packet_window: SYNTHETIC_CREDITS,
                 initial_source_revision: vivid_protocol::revision::SourceRevision::ZERO,
                 media_connection_required: true,
-                delta_operation_limit: None,
+                delta_operation_limit: requested_delta_operation_limit.map(u64::from),
             }
         } else {
             let record = self.wait_for_reply(request_id, &[messages::SOURCE_READY], source_id)?;
@@ -4227,6 +4409,17 @@ impl ProducerSession {
                     ready.source_id
                 ),
             ));
+        }
+        match (requested_delta_operation_limit, ready.delta_operation_limit) {
+            (None, None) => {}
+            (Some(requested), Some(effective))
+                if effective != 0 && effective <= u64::from(requested) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SOURCE_READY raster delta operation limit does not match the request",
+                ));
+            }
         }
         if self.verbose {
             eprintln!(
@@ -4255,6 +4448,16 @@ impl ProducerSession {
             attachment_generation: 0,
             rolling_byte_window: ready.rolling_byte_window,
             rolling_packet_window: ready.rolling_packet_window,
+            delta_operation_limit: ready
+                .delta_operation_limit
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SOURCE_READY raster delta operation limit exceeds u32",
+                    )
+                })?,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -4356,6 +4559,10 @@ impl SourceHandle {
         self.rolling_packet_window
     }
 
+    pub fn delta_operation_limit(&self) -> Option<u32> {
+        self.delta_operation_limit
+    }
+
     /// Convert the presenter's steady-state advertisement into local bounded-queue limits.
     pub fn media_queue_limits(&self) -> MediaQueueLimits {
         MediaQueueLimits {
@@ -4406,6 +4613,15 @@ impl SourceHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .need_keyframe_epoch
+            .take()
+    }
+
+    pub fn take_full_frame_request(&mut self) -> Option<u64> {
+        self.state
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .need_full_frame_reason
             .take()
     }
 
@@ -5398,6 +5614,7 @@ mod tests {
                     visible: true,
                     visible_reasons: 0,
                     need_keyframe_epoch: None,
+                    need_full_frame_reason: None,
                     lost: None,
                     credit_returns: 0,
                 }),
@@ -5409,6 +5626,7 @@ mod tests {
             attachment_generation: 0,
             rolling_byte_window: byte_credits,
             rolling_packet_window: packet_credits,
+            delta_operation_limit: None,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -5575,6 +5793,85 @@ mod tests {
                 ..HotPathCounters::default()
             }
         );
+    }
+
+    #[test]
+    fn owned_sender_chooses_smaller_delta_and_falls_back_to_full() {
+        let mut raster = source(7, 4096, 4);
+        raster.delta_operation_limit = Some(4);
+        let mut sender = MediaSender {
+            source: raster,
+            channel: MediaChannel {
+                connection: Connection::sink(ConnectionKind::Raster).unwrap(),
+                source_id: 7,
+            },
+            dry_run: true,
+            raster_zstd: false,
+        };
+        let frame = vec![0_u8; 4 * 4 * 4];
+        let pixel = [1, 2, 3, 255];
+        assert_eq!(
+            sender
+                .send_raster_delta_or_full(
+                    1,
+                    2,
+                    1,
+                    4,
+                    4,
+                    &frame,
+                    &[media::RasterDeltaOperation::Overwrite {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                        rgba: &pixel,
+                    }],
+                )
+                .unwrap(),
+            RasterSendKind::Delta
+        );
+        assert_eq!(
+            sender
+                .send_raster_delta_or_full(
+                    1,
+                    3,
+                    2,
+                    4,
+                    4,
+                    &frame,
+                    &[media::RasterDeltaOperation::Overwrite {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                        rgba: &frame,
+                    }],
+                )
+                .unwrap(),
+            RasterSendKind::Full
+        );
+    }
+
+    #[test]
+    fn need_full_frame_is_a_source_scoped_recovery_request() {
+        let mut source = source(9, 4096, 2);
+        apply_source_record(
+            &source.state,
+            &Record {
+                record_type: messages::NEED_FULL_FRAME,
+                flags: 0,
+                object_id: 9,
+                sequence: 2,
+                body: messages::need_full_frame(9, messages::NEED_FULL_FRAME_BASE_UNAVAILABLE)
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            source.take_full_frame_request(),
+            Some(messages::NEED_FULL_FRAME_BASE_UNAVAILABLE)
+        );
+        assert_eq!(source.take_full_frame_request(), None);
     }
 
     #[test]
