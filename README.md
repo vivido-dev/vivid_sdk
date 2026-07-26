@@ -18,6 +18,23 @@ transition, or use `play_and_wait_until_playing` when both steps are intentional
 event APIs maintain scene and source revisions beside `DisplayState`, and scene pagination is
 explicitly caller-bounded.
 
+The 1.1 API also exposes:
+
+- typed source/scene/anchor/limit status, revision state, coalesced observation events, milestones,
+  and cancellation-safe waits;
+- preconditions, idempotency keys, and causation IDs on mutating operations;
+- delegated-context creation/delegation/revocation with capability bytes exposed only through an
+  explicit accessor;
+- source descriptors and capture-policy creation/update helpers;
+- delta-capable raster sources with full-frame fallback and `NEED_FULL_FRAME` recovery;
+- context-local encoded-image cache hints and cache-hit state;
+- sender-derived ordered EOS using the actual attachment generation and last media record sequence;
+- advertised rolling byte/packet windows, delta operation limits, and diagnostic clock estimates.
+
+Every optional call remains feature-gated. Callers must not infer support from the protocol minor
+version alone, and diagnostic clock estimates must not drive playback, drop, epoch, or credit
+policy.
+
 Version fallback is disabled by default. Callers may explicitly enable one retry after a typed
 version rejection; the SDK then opens a fresh connection only for a fully implemented reported
 version and never carries a media ticket across attempts.
