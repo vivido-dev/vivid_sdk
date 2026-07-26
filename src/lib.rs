@@ -189,6 +189,15 @@ pub struct MediaQueueLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockEstimate {
+    pub offset_us: i64,
+    pub delay_us: u64,
+    pub responder_processing_us: u64,
+    pub accepted_samples: u64,
+    pub rejected_samples: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RasterSendKind {
     Full,
     Delta,
@@ -560,6 +569,7 @@ pub struct SourceHandle {
     rolling_byte_window: u64,
     rolling_packet_window: u64,
     delta_operation_limit: Option<u32>,
+    media_connection_required: bool,
     acknowledged_credit_returns: u64,
     observed_visible: bool,
     reported_lost: bool,
@@ -632,12 +642,14 @@ struct DispatcherState {
     last_probe_sent: Option<Instant>,
     unanswered_probes: u8,
     next_internal_request_id: u64,
-    pending_pings: HashMap<u64, Instant>,
+    pending_pings: HashMap<u64, PendingPing>,
     /// Last RTT sampling probe. Sampling probes are independent of the idle liveness probes:
     /// they never advance `unanswered_probes` or `last_probe_sent`, so they cannot change
     /// disconnect detection.
     last_rtt_probe: Option<Instant>,
     rtt_us: Option<u64>,
+    clock_estimate: Option<ClockEstimate>,
+    rejected_clock_samples: u64,
 }
 
 struct DispatcherShared {
@@ -645,6 +657,14 @@ struct DispatcherShared {
     changed: Condvar,
     counters: Arc<HotPathCounterState>,
     trace: SharedTrace,
+    clock_origin: Instant,
+    clock_sampling_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPing {
+    sent: Instant,
+    sender_transmit_us: Option<u64>,
 }
 
 #[derive(Default)]
@@ -858,12 +878,14 @@ impl SourceWaitCancellation {
 }
 
 impl ControlDispatcher {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         connection: Connection,
         display: DisplayState,
         scene_revision: SceneRevision,
         capability_generation: u64,
         desktop_input_enabled: bool,
+        clock_sampling_enabled: bool,
         counters: Arc<HotPathCounterState>,
         trace: SharedTrace,
     ) -> io::Result<Self> {
@@ -893,10 +915,14 @@ impl ControlDispatcher {
                 pending_pings: HashMap::new(),
                 last_rtt_probe: None,
                 rtt_us: None,
+                clock_estimate: None,
+                rejected_clock_samples: 0,
             }),
             changed: Condvar::new(),
             counters,
             trace,
+            clock_origin: Instant::now(),
+            clock_sampling_enabled,
         });
         let reader_shared = shared.clone();
         let reader_writer = writer.clone();
@@ -911,6 +937,7 @@ impl ControlDispatcher {
                             break;
                         }
                     };
+                    let received_at = Instant::now();
                     emit_control_trace(
                         &reader_shared.trace,
                         TraceDirection::Receive,
@@ -933,19 +960,40 @@ impl ControlDispatcher {
                         }
                     }
                     if record.record_type == messages::PING {
-                        let response =
-                            messages::decode_control(&record.body).and_then(|envelope| {
-                                if record.object_id != 0 || envelope.request_id == 0 {
+                        let response = messages::parse_clock_ping(&record.body).and_then(|ping| {
+                                if record.object_id != 0 {
                                     return Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
                                         "Vivid PING is not a correlated session-level request",
                                     ));
                                 }
+                                if ping.sender_transmit_us.is_some()
+                                    && !reader_shared.clock_sampling_enabled
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "timestamped PING was not negotiated",
+                                    ));
+                                }
+                                let timestamps = ping.sender_transmit_us.map(|echoed| {
+                                    let receive_us =
+                                        monotonic_us(reader_shared.clock_origin, received_at);
+                                    let transmit_us = monotonic_us(
+                                        reader_shared.clock_origin,
+                                        Instant::now(),
+                                    )
+                                    .max(receive_us);
+                                    messages::ClockPongTimestamps {
+                                        echoed_sender_transmit_us: echoed,
+                                        responder_receive_us: receive_us,
+                                        responder_transmit_us: transmit_us,
+                                    }
+                                });
                                 reader_writer.write_record(
                                     messages::PONG,
                                     0,
                                     0,
-                                    &messages::ok(envelope.request_id),
+                                    &messages::clock_pong(ping.request_id, timestamps)?,
                                 )
                             });
                         if let Err(error) = response {
@@ -1044,19 +1092,67 @@ impl ControlDispatcher {
                             })
                         }
                         messages::PONG => {
-                            messages::request_id(&record.body).and_then(|request_id| {
-                                if record.object_id != 0 || request_id == 0 {
+                            messages::parse_clock_pong(&record.body).and_then(|pong| {
+                                if record.object_id != 0 || pong.request_id == 0 {
                                     return Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
                                         "Vivid PONG is not a correlated session-level reply",
                                     ));
                                 }
-                                if let Some(sent) = state.pending_pings.remove(&request_id) {
-                                    let sample = u64::try_from(sent.elapsed().as_micros())
+                                if let Some(pending) = state.pending_pings.remove(&pong.request_id) {
+                                    let sample = u64::try_from(pending.sent.elapsed().as_micros())
                                         .unwrap_or(u64::MAX);
                                     state.rtt_us = Some(state.rtt_us.map_or(sample, |current| {
                                         current.saturating_mul(7).saturating_add(sample) / 8
                                     }));
+                                    match (pending.sender_transmit_us, pong.timestamps) {
+                                        (None, None) => {}
+                                        (Some(sent_us), Some(timestamps))
+                                            if timestamps.echoed_sender_transmit_us == sent_us =>
+                                        {
+                                            let received_us = monotonic_us(
+                                                reader_shared.clock_origin,
+                                                received_at,
+                                            );
+                                            if let Some(sample) =
+                                                messages::calculate_clock_sample(
+                                                    sent_us,
+                                                    timestamps.responder_receive_us,
+                                                    timestamps.responder_transmit_us,
+                                                    received_us,
+                                                    messages::MAX_CLOCK_SAMPLE_PROCESSING_US,
+                                                )
+                                            {
+                                                update_clock_estimate(
+                                                    &mut state.clock_estimate,
+                                                    sample,
+                                                    state.rejected_clock_samples,
+                                                );
+                                            } else {
+                                                state.rejected_clock_samples = state
+                                                    .rejected_clock_samples
+                                                    .saturating_add(1);
+                                                if let Some(estimate) =
+                                                    &mut state.clock_estimate
+                                                {
+                                                    estimate.rejected_samples =
+                                                        state.rejected_clock_samples;
+                                                }
+                                            }
+                                        }
+                                        (Some(_), Some(_)) => {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                "PONG did not echo the PING timestamp",
+                                            ));
+                                        }
+                                        _ => {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                "PONG timestamp presence does not match PING",
+                                            ));
+                                        }
+                                    }
                                 }
                                 Ok(())
                             })
@@ -1184,13 +1280,23 @@ impl ControlDispatcher {
                                 state.next_internal_request_id =
                                     state.next_internal_request_id.saturating_sub(1);
                                 state.last_rtt_probe = Some(now);
-                                state.pending_pings.insert(request, now);
+                                let sender_transmit_us = heartbeat_shared
+                                    .clock_sampling_enabled
+                                    .then(|| monotonic_us(heartbeat_shared.clock_origin, now));
+                                state.pending_pings.insert(
+                                    request,
+                                    PendingPing {
+                                        sent: now,
+                                        sender_transmit_us,
+                                    },
+                                );
                                 drop(state);
                                 if let Err(error) = heartbeat_writer.write_record(
                                     messages::PING,
                                     0,
                                     0,
-                                    &messages::ok(request),
+                                    &messages::clock_ping(request, sender_transmit_us)
+                                        .expect("internal PING request IDs are nonzero"),
                                 ) {
                                     close_dispatcher(&heartbeat_shared, error.to_string());
                                     break;
@@ -1216,12 +1322,25 @@ impl ControlDispatcher {
                             state.next_internal_request_id.saturating_sub(1);
                         state.last_probe_sent = Some(now);
                         state.unanswered_probes = state.unanswered_probes.saturating_add(1);
-                        state.pending_pings.insert(request, now);
-                        request
+                        let sender_transmit_us = heartbeat_shared
+                            .clock_sampling_enabled
+                            .then(|| monotonic_us(heartbeat_shared.clock_origin, now));
+                        state.pending_pings.insert(
+                            request,
+                            PendingPing {
+                                sent: now,
+                                sender_transmit_us,
+                            },
+                        );
+                        (request, sender_transmit_us)
                     };
-                    if let Err(error) =
-                        heartbeat_writer.write_record(messages::PING, 0, 0, &messages::ok(request))
-                    {
+                    if let Err(error) = heartbeat_writer.write_record(
+                        messages::PING,
+                        0,
+                        0,
+                        &messages::clock_ping(request.0, request.1)
+                            .expect("internal PING request IDs are nonzero"),
+                    ) {
                         close_dispatcher(&heartbeat_shared, error.to_string());
                         break;
                     }
@@ -1566,6 +1685,14 @@ impl ControlDispatcher {
         messages::minimum_buffer_for_rtt(requested_us, state.rtt_us)
     }
 
+    fn clock_estimate(&self) -> Option<ClockEstimate> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clock_estimate
+    }
+
     fn take_desktop_input(&self) -> io::Result<Option<DesktopInputEvent>> {
         let mut state = self
             .shared
@@ -1580,6 +1707,44 @@ impl ControlDispatcher {
         }
         Ok(state.desktop_input.pop_front())
     }
+}
+
+fn monotonic_us(origin: Instant, timestamp: Instant) -> u64 {
+    u64::try_from(timestamp.saturating_duration_since(origin).as_micros()).unwrap_or(u64::MAX)
+}
+
+fn update_clock_estimate(
+    estimate: &mut Option<ClockEstimate>,
+    sample: messages::ClockSample,
+    rejected_samples: u64,
+) {
+    *estimate = Some(match *estimate {
+        None => ClockEstimate {
+            offset_us: sample.offset_us,
+            delay_us: sample.delay_us,
+            responder_processing_us: sample.responder_processing_us,
+            accepted_samples: 1,
+            rejected_samples,
+        },
+        Some(current) => ClockEstimate {
+            offset_us: i64::try_from(
+                (i128::from(current.offset_us) * 7 + i128::from(sample.offset_us)) / 8,
+            )
+            .unwrap_or(sample.offset_us),
+            delay_us: current
+                .delay_us
+                .saturating_mul(7)
+                .saturating_add(sample.delay_us)
+                / 8,
+            responder_processing_us: current
+                .responder_processing_us
+                .saturating_mul(7)
+                .saturating_add(sample.responder_processing_us)
+                / 8,
+            accepted_samples: current.accepted_samples.saturating_add(1),
+            rejected_samples,
+        },
+    });
 }
 
 impl Drop for ControlDispatcher {
@@ -1957,6 +2122,13 @@ impl ClientControl {
                 Ok(())
             }
             Self::Live(dispatcher) => dispatcher.write_record(record_type, flags, object_id, body),
+        }
+    }
+
+    fn clock_estimate(&self) -> Option<ClockEstimate> {
+        match self {
+            Self::Live(dispatcher) => dispatcher.clock_estimate(),
+            Self::Direct(_, _) => None,
         }
     }
 
@@ -2608,6 +2780,7 @@ impl ProducerSession {
                 initial_scene_revision,
                 capability_generation,
                 accepted_features.contains(&messages::FEATURE_DESKTOP_INPUT_V1),
+                accepted_features.contains(&messages::FEATURE_CLOCK_SAMPLING_V1),
                 counters.clone(),
                 trace.clone(),
             )?)
@@ -2656,6 +2829,15 @@ impl ProducerSession {
 
     pub fn hot_path_counters(&self) -> HotPathCounters {
         self.counters.snapshot()
+    }
+
+    /// Latest diagnostic four-timestamp clock estimate.
+    ///
+    /// This estimate is intentionally not consulted by playback, credit, drop, epoch, or queue
+    /// sizing code. Existing RTT-based minimum buffering continues to use the independent clean
+    /// round-trip estimator.
+    pub fn clock_estimate(&self) -> Option<ClockEstimate> {
+        self.control.clock_estimate()
     }
 
     pub fn set_trace_callback(
@@ -3340,10 +3522,46 @@ impl ProducerSession {
         descriptor: Option<&SourceDescriptor>,
         metadata: &RequestMetadata,
     ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_cache_options(
+            config,
+            false,
+            capture_policy,
+            descriptor,
+            metadata,
+        )
+    }
+
+    pub fn create_image_source_with_cache(
+        &mut self,
+        config: &ImageSourceConfig,
+    ) -> io::Result<SourceHandle> {
+        self.create_image_source_with_cache_options(
+            config,
+            true,
+            0,
+            None,
+            &RequestMetadata::default(),
+        )
+    }
+
+    pub fn create_image_source_with_cache_options(
+        &mut self,
+        config: &ImageSourceConfig,
+        cache_lookup: bool,
+        capture_policy: u64,
+        descriptor: Option<&SourceDescriptor>,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SourceHandle> {
         if !self.supports(messages::FEATURE_ENCODED_IMAGE_V1) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "presenter lacks encoded-image-v1",
+            ));
+        }
+        if cache_lookup && !self.supports(messages::FEATURE_IMAGE_CACHE_V1) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter lacks image-cache-v1",
             ));
         }
         self.ensure_capture_policy(capture_policy)?;
@@ -3351,7 +3569,13 @@ impl ProducerSession {
         self.mark_trace_policy(config.source_id, capture_policy);
         let request_id = self.request_id()?;
         let body = self.atomic_body(
-            &messages::create_image_with_extensions(request_id, config, capture_policy, descriptor),
+            &messages::create_image_with_cache_extensions(
+                request_id,
+                config,
+                cache_lookup,
+                capture_policy,
+                descriptor,
+            )?,
             metadata,
         )?;
         self.control
@@ -3609,6 +3833,12 @@ impl ProducerSession {
         source: &SourceHandle,
         kind: ConnectionKind,
     ) -> io::Result<MediaChannel> {
+        if !source.media_connection_required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache-hit image source does not require a media connection",
+            ));
+        }
         let mut connection = if let Some(trace_dir) = &self.trace_dir {
             let label = match kind {
                 ConnectionKind::Video => "video",
@@ -4458,6 +4688,7 @@ impl ProducerSession {
                         "SOURCE_READY raster delta operation limit exceeds u32",
                     )
                 })?,
+            media_connection_required: ready.media_connection_required,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -4561,6 +4792,14 @@ impl SourceHandle {
 
     pub fn delta_operation_limit(&self) -> Option<u32> {
         self.delta_operation_limit
+    }
+
+    pub fn media_connection_required(&self) -> bool {
+        self.media_connection_required
+    }
+
+    pub fn is_cache_hit(&self) -> bool {
+        !self.media_connection_required
     }
 
     /// Convert the presenter's steady-state advertisement into local bounded-queue limits.
@@ -5366,6 +5605,7 @@ mod tests {
             SceneRevision::ZERO,
             1,
             false,
+            false,
             Arc::new(HotPathCounterState::default()),
             Arc::new(Mutex::new(TraceState::default())),
         )
@@ -5485,10 +5725,9 @@ mod tests {
         }
     }
 
-    /// A live control connection with routine traffic must produce an RTT estimate quickly, so
-    /// `play_at`'s RTT-derived minimum buffer works before streaming begins. The fake presenter
-    /// answers every `PING`; nothing here is idle for the 15-second liveness threshold, so only
-    /// the active sampling path can produce the estimate.
+    /// A live control connection with routine traffic must produce RTT and diagnostic clock
+    /// estimates quickly. Nothing here is idle for the 15-second liveness threshold, so only the
+    /// active sampling path can produce either estimate.
     #[cfg(unix)]
     #[test]
     fn active_rtt_sampling_populates_estimate_during_traffic() {
@@ -5522,10 +5761,21 @@ mod tests {
                 let header = RecordHeader::decode(header);
                 let mut body = vec![0; header.body_length as usize];
                 stream.read_exact(&mut body)?;
-                let request_id = messages::request_id(&body)?;
                 let (record_type, reply) = if header.record_type == messages::PING {
-                    (messages::PONG, messages::ok(request_id))
+                    let ping = messages::parse_clock_ping(&body)?;
+                    let timestamps =
+                        ping.sender_transmit_us
+                            .map(|sent| messages::ClockPongTimestamps {
+                                echoed_sender_transmit_us: sent,
+                                responder_receive_us: sent.saturating_add(1_000),
+                                responder_transmit_us: sent.saturating_add(1_000),
+                            });
+                    (
+                        messages::PONG,
+                        messages::clock_pong(ping.request_id, timestamps)?,
+                    )
                 } else {
+                    let request_id = messages::request_id(&body)?;
                     (messages::OK, messages::ok(request_id))
                 };
                 sequence += 1;
@@ -5562,6 +5812,7 @@ mod tests {
             SceneRevision::ZERO,
             1,
             false,
+            true,
             counters.clone(),
             Arc::new(Mutex::new(TraceState::default())),
         )
@@ -5577,15 +5828,14 @@ mod tests {
         assert_eq!(snapshot.reply_queue_high_water, 1);
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        let sampled = loop {
-            let rtt_us = dispatcher
+        let (sampled, clock) = loop {
+            let state = dispatcher
                 .shared
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .rtt_us;
-            if let Some(rtt_us) = rtt_us {
-                break rtt_us;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let (Some(rtt_us), Some(clock)) = (state.rtt_us, state.clock_estimate) {
+                break (rtt_us, clock);
             }
             assert!(
                 Instant::now() < deadline,
@@ -5597,6 +5847,19 @@ mod tests {
             dispatcher.adjusted_minimum_buffer(0),
             messages::minimum_buffer_for_rtt(0, Some(sampled))
         );
+        assert_eq!(clock.accepted_samples, 1);
+        assert_eq!(clock.rejected_samples, 0);
+        assert_eq!(dispatcher.clock_estimate(), Some(clock));
+
+        let before = dispatcher.adjusted_minimum_buffer(10_000);
+        dispatcher.shared.state.lock().unwrap().clock_estimate = Some(ClockEstimate {
+            offset_us: i64::MAX,
+            delay_us: u64::MAX,
+            responder_processing_us: u64::MAX,
+            accepted_samples: u64::MAX,
+            rejected_samples: u64::MAX,
+        });
+        assert_eq!(dispatcher.adjusted_minimum_buffer(10_000), before);
     }
 
     fn source(id: u64, byte_credits: u64, packet_credits: u64) -> SourceHandle {
@@ -5627,6 +5890,7 @@ mod tests {
             rolling_byte_window: byte_credits,
             rolling_packet_window: packet_credits,
             delta_operation_limit: None,
+            media_connection_required: true,
             acknowledged_credit_returns: 0,
             observed_visible: true,
             reported_lost: false,
@@ -5653,6 +5917,21 @@ mod tests {
                 max_packets: 96
             }
         );
+    }
+
+    #[test]
+    fn cache_hit_source_cannot_open_a_ticketless_media_channel() {
+        let mut cached = source(17, 0, 0);
+        cached.media_connection_required = false;
+        assert!(cached.is_cache_hit());
+        assert!(!cached.media_connection_required());
+        let mut session =
+            ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
+        let error = session
+            .open_media_sender(cached, ConnectionKind::Blob)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
