@@ -1823,9 +1823,16 @@ fn wait_dispatcher_reply(
                 || (record.record_type != messages::ERROR
                     && !accepted.contains(&record.record_type))
             {
+                // Name the offending record. A bare "mismatched reply" gives a caller nothing to
+                // correlate against the presenter that sent it.
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Vivid source wait received a mismatched reply",
+                    format!(
+                        "Vivid source wait received a mismatched reply: request {request_id} \
+                         expected record type {accepted:?} for object {expected_object_id}, \
+                         received record type 0x{:04x} for object {}",
+                        record.record_type, record.object_id
+                    ),
                 ));
             }
             return Ok(record);
