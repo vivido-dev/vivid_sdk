@@ -2715,8 +2715,20 @@ impl ProducerSession {
             let mut version = (VIVID_MAJOR, VIVID_MINOR);
             let mut retried = false;
             let welcome = loop {
-                send_hello(&mut control, config, token, hello_request, version)?;
-                let record = read_negotiation_reply(&mut control, hello_request)?;
+                // A presenter classifies the preface before reading HELLO and, on a version
+                // mismatch, writes the typed rejection and closes at once (see
+                // `wire::accept_preface`). Our HELLO write can therefore lose a race with that
+                // close and fail with a peer-closed error even though the rejection is already
+                // buffered on the read side. Treat such a write failure as non-fatal and still
+                // read the negotiation reply, so the typed rejection (and version retry) survive
+                // instead of surfacing a raw broken-pipe error.
+                let record = match send_hello(&mut control, config, token, hello_request, version) {
+                    Ok(()) => read_negotiation_reply(&mut control, hello_request)?,
+                    Err(error) if is_peer_closed_during_negotiation(&error) => {
+                        read_negotiation_reply(&mut control, hello_request).map_err(|_| error)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if record.record_type == messages::WELCOME {
                     break messages::parse_welcome_for_version(
                         &record.body,
@@ -5087,6 +5099,23 @@ fn send_hello(
         .map(|_| ())
 }
 
+/// Whether a HELLO write failure reflects the presenter closing the connection (rather than a
+/// local encoding or configuration fault). A presenter that rejects the preface version closes
+/// immediately, so the HELLO write can fail this way while the typed rejection is already readable.
+fn is_peer_closed_during_negotiation(error: &io::Error) -> bool {
+    // The exact errno depends on the platform and how far the close had progressed: Linux tends to
+    // report EPIPE/ECONNRESET, macOS may additionally report ENOTCONN once the peer has torn the
+    // socket down. All mean the transport is gone rather than a local HELLO encoding fault.
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn read_negotiation_reply(
     connection: &mut Connection,
     expected_request_id: u64,
@@ -5553,6 +5582,92 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn negotiation_recovers_buffered_rejection_when_presenter_closes_after_preface() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        use vivid_protocol::wire::{Connection, ConnectionKind, PREFACE_SIZE};
+
+        // A presenter classifies the preface and, on a version mismatch, writes the typed
+        // rejection and closes at once without ever reading HELLO (see `wire::accept_preface`).
+        // The producer's HELLO write therefore races that close and may fail with a peer-closed
+        // error, yet the rejection is already buffered and must still drive negotiation rather
+        // than surfacing a raw transport error. Reproduce that ordering deterministically by
+        // closing the peer before the HELLO is sent.
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let server_thread = thread::spawn(move || -> io::Result<()> {
+            let mut preface = [0; PREFACE_SIZE];
+            server.read_exact(&mut preface)?;
+            assert_eq!(&preface[4..6], &[VIVID_MAJOR, VIVID_MINOR]);
+            server.write_all(&version_rejection_record(1, 0))?;
+            server.flush()?;
+            // Dropping `server` closes the producer's peer before its HELLO write.
+            Ok(())
+        });
+
+        let read_half = client.try_clone().unwrap();
+        // `from_streams` emits the preface, which the server reads above.
+        let mut connection = Connection::from_streams(
+            Box::new(read_half),
+            Box::new(client),
+            ConnectionKind::Control,
+        )
+        .unwrap();
+        server_thread.join().unwrap().unwrap();
+
+        let config = producer_config(Vec::new(), Vec::new());
+        let token = "00".repeat(32);
+        // The HELLO write may now fail because the peer has closed; when it does, it must be
+        // classified as a peer-close so negotiation recovers instead of aborting.
+        if let Err(error) = send_hello(
+            &mut connection,
+            &config,
+            &token,
+            1,
+            (VIVID_MAJOR, VIVID_MINOR),
+        ) {
+            assert!(
+                is_peer_closed_during_negotiation(&error),
+                "HELLO write failure was not recognized as a peer close: {error:?}"
+            );
+        }
+
+        // The buffered typed rejection remains readable and identifies the supported version,
+        // which is exactly what lets `connect` return `VersionRejectionError` or retry.
+        let record = read_negotiation_reply(&mut connection, 1).unwrap();
+        assert_eq!(record.record_type, messages::ERROR);
+        let rejection = messages::parse_error_reply(&record.body).unwrap();
+        assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
+        assert_eq!(rejection.supported_version, Some((1, 0)));
+        assert!(rejection.fatal);
+    }
+
+    #[test]
+    fn peer_closed_negotiation_errors_are_classified() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                is_peer_closed_during_negotiation(&io::Error::from(kind)),
+                "{kind:?} should be treated as a peer close during negotiation"
+            );
+        }
+        // A local encoding/configuration fault must stay fatal so it is never mistaken for a
+        // recoverable version rejection.
+        assert!(!is_peer_closed_during_negotiation(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
+        assert!(!is_peer_closed_during_negotiation(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
+    }
+
     #[test]
     fn decoder_description_is_emitted_only_when_negotiated() {
         let without = ProducerSession::connect(&producer_config(Vec::new(), Vec::new())).unwrap();
@@ -5894,12 +6009,18 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let (sampled, clock) = loop {
-            let state = dispatcher
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let (Some(rtt_us), Some(clock)) = (state.rtt_us, state.clock_estimate) {
+            // Release the state lock before sleeping. Holding the guard across the sleep would
+            // starve the dispatcher's heartbeat and reader threads, which need the same lock to
+            // emit the RTT probe and apply the PONG sample, and the estimate would never arrive.
+            let observed = {
+                let state = dispatcher
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.rtt_us.zip(state.clock_estimate)
+            };
+            if let Some((rtt_us, clock)) = observed {
                 break (rtt_us, clock);
             }
             assert!(
