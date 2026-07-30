@@ -24,8 +24,7 @@ use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::media::{self, AudioPacket, VideoPacket};
 use vivid_protocol::messages::{
-    self, ChannelOpen, Envelope, Hello, HelloAuthentication, LaneClass, LaneOpen, PayloadMap,
-    TrackKind,
+    self, ChannelOpen, Envelope, Hello, HelloAuthentication, LaneOpen, PayloadMap, TrackKind,
 };
 use vivid_protocol::resource::{
     ChannelFlow, Resource, ResourceContract, ResourceError, TokenBucket,
@@ -35,9 +34,10 @@ use vivid_protocol::revision::{
     SurfaceRevision, TargetGeneration, TrackRevision,
 };
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
-use vivid_protocol::wire::{
-    Connection, ConnectionKind, ConnectionReader, ConnectionWriter, Endpoint, Record,
-};
+use vivid_protocol::wire::{Connection, ConnectionReader, ConnectionWriter, Endpoint, Record};
+
+pub use vivid_protocol::messages::LaneClass;
+pub use vivid_protocol::wire::ConnectionKind;
 
 pub use vivid_protocol::context::{
     ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE, OP_SCENE,
@@ -171,6 +171,14 @@ pub enum ProducerAuthentication {
         attempt_id: [u8; auth::ATTEMPT_ID_BYTES],
         prior_resume_key: Secret32,
     },
+}
+
+/// Opens one fresh Vivid transport for the requested 1.5 connection kind.
+///
+/// The carrier remains byte-transparent: the SDK still performs the Vivid handshake, derives
+/// session and channel keys, authenticates track channels, and enforces sequencing and flow.
+pub trait ConnectionFactory: Send + Sync {
+    fn open(&self, kind: ConnectionKind, lane: Option<LaneClass>) -> io::Result<Connection>;
 }
 
 impl ProducerAuthentication {
@@ -797,9 +805,9 @@ impl InputLaneEvent {
 }
 
 struct Endpoints {
-    interactive: Endpoint,
-    realtime: Endpoint,
-    bulk: Endpoint,
+    interactive: Option<Endpoint>,
+    realtime: Option<Endpoint>,
+    bulk: Option<Endpoint>,
 }
 
 struct PendingControl {
@@ -973,6 +981,7 @@ pub struct Session {
     control: ControlPlane,
     lifecycle: Arc<SessionLifecycle>,
     endpoints: Endpoints,
+    connection_factory: Option<Arc<dyn ConnectionFactory>>,
     channel_key: Secret32,
     resume_key: Option<Secret32>,
     lease_identity: Option<(u64, u64)>,
@@ -1005,31 +1014,66 @@ impl Session {
         if config.is_offline() {
             return Self::connect_offline(config);
         }
-        Self::connect_live(config)
+        Self::connect_live(config, None)
     }
 
-    fn connect_live(config: ProducerConfig) -> io::Result<Self> {
-        let control_endpoint = endpoint(
-            config.endpoint_control.as_deref(),
-            vivid_protocol::discovery::ENDPOINT_CONTROL,
-        )?;
+    /// Connect through a caller-provided transport factory.
+    ///
+    /// This supports authenticated carriers such as a WebSocket route without weakening or
+    /// duplicating the Vivid 1.5 protocol handshake.
+    pub fn connect_with_factory(
+        config: ProducerConfig,
+        connection_factory: Arc<dyn ConnectionFactory>,
+    ) -> io::Result<Self> {
+        config.validate()?;
+        if config.is_offline() {
+            return Err(invalid_input(
+                "a connection factory cannot be combined with dry-run or trace mode",
+            ));
+        }
+        Self::connect_live(config, Some(connection_factory))
+    }
+
+    fn connect_live(
+        config: ProducerConfig,
+        connection_factory: Option<Arc<dyn ConnectionFactory>>,
+    ) -> io::Result<Self> {
+        let control_endpoint = if connection_factory.is_some() {
+            optional_endpoint(
+                config.endpoint_control.as_deref(),
+                vivid_protocol::discovery::ENDPOINT_CONTROL,
+            )?
+        } else {
+            Some(endpoint(
+                config.endpoint_control.as_deref(),
+                vivid_protocol::discovery::ENDPOINT_CONTROL,
+            )?)
+        };
         let interactive = optional_endpoint(
             config.endpoint_interactive.as_deref(),
             vivid_protocol::discovery::ENDPOINT_INTERACTIVE,
         )?
-        .unwrap_or_else(|| control_endpoint.clone());
+        .or_else(|| control_endpoint.clone());
         let bulk = optional_endpoint(
             config.endpoint_bulk.as_deref(),
             vivid_protocol::discovery::ENDPOINT_BULK,
         )?
-        .unwrap_or_else(|| control_endpoint.clone());
+        .or_else(|| control_endpoint.clone());
         let realtime = optional_endpoint(
             config.endpoint_realtime.as_deref(),
             vivid_protocol::discovery::ENDPOINT_REALTIME,
         )?
-        .unwrap_or_else(|| bulk.clone());
+        .or_else(|| bulk.clone());
 
-        let mut connection = Connection::open(&control_endpoint, ConnectionKind::Control)?;
+        let mut connection = match &connection_factory {
+            Some(factory) => factory.open(ConnectionKind::Control, None)?,
+            None => Connection::open(
+                control_endpoint
+                    .as_ref()
+                    .ok_or_else(|| invalid_input("missing Vivid control endpoint"))?,
+                ConnectionKind::Control,
+            )?,
+        };
         let preface = vivid_protocol::wire::encode_preface(
             ConnectionKind::Control,
             vivid_protocol::CONTROL_MAX_RECORD_BODY,
@@ -1165,6 +1209,7 @@ impl Session {
                 realtime,
                 bulk,
             },
+            connection_factory,
             channel_key,
             resume_key,
             lease_identity,
@@ -1245,10 +1290,11 @@ impl Session {
             },
             lifecycle: Arc::new(SessionLifecycle::new()),
             endpoints: Endpoints {
-                interactive: offline_endpoint()?,
-                realtime: offline_endpoint()?,
-                bulk: offline_endpoint()?,
+                interactive: Some(offline_endpoint()?),
+                realtime: Some(offline_endpoint()?),
+                bulk: Some(offline_endpoint()?),
             },
+            connection_factory: None,
             channel_key,
             resume_key,
             lease_identity,
@@ -1430,8 +1476,16 @@ impl Session {
             )?
         } else if offline {
             Connection::sink(ConnectionKind::Lane)?
+        } else if let Some(factory) = &self.connection_factory {
+            factory.open(ConnectionKind::Lane, Some(LaneClass::Interactive))?
         } else {
-            Connection::open(&self.endpoints.interactive, ConnectionKind::Lane)?
+            Connection::open(
+                self.endpoints
+                    .interactive
+                    .as_ref()
+                    .ok_or_else(|| invalid_input("missing Vivid interactive endpoint"))?,
+                ConnectionKind::Lane,
+            )?
         };
         connection.write_record(messages::LANE_OPEN, 0, 0, &body)?;
         let maximum_body = if offline {
@@ -2204,8 +2258,8 @@ impl Session {
             ));
         }
         let endpoint = match state.configuration.lane {
-            LaneClass::Realtime => &self.endpoints.realtime,
-            LaneClass::Bulk => &self.endpoints.bulk,
+            LaneClass::Realtime => self.endpoints.realtime.as_ref(),
+            LaneClass::Bulk => self.endpoints.bulk.as_ref(),
             _ => return Err(invalid_input("track lane must be realtime or bulk")),
         };
         let mut nonce = [0; 16];
@@ -2246,8 +2300,13 @@ impl Session {
             )?
         } else if matches!(self.control, ControlPlane::Offline { .. }) {
             Connection::sink(ConnectionKind::Track)?
+        } else if let Some(factory) = &self.connection_factory {
+            factory.open(ConnectionKind::Track, Some(state.configuration.lane))?
         } else {
-            Connection::open(endpoint, ConnectionKind::Track)?
+            Connection::open(
+                endpoint.ok_or_else(|| invalid_input("missing Vivid track endpoint"))?,
+                ConnectionKind::Track,
+            )?
         };
         TrackChannel::establish(
             connection,
@@ -2501,6 +2560,110 @@ impl Session {
                 let _ = self.abort_transaction(transaction_id);
                 return Err(error);
             }
+            let payload = decoded_payload(&record)?;
+            validate_exact_payload_keys("SCENE_PRESENTED", &payload, 0..=1)?;
+            SceneCommit {
+                scene_revision: SceneRevision::new(required_u64(&payload, 0)?),
+                target_generation: TargetGeneration::new(required_u64(&payload, 1)?),
+            }
+        } else {
+            SceneCommit {
+                scene_revision: self.info.scene_revision.advance()?,
+                target_generation: self.info.target_generation,
+            }
+        };
+        self.info.scene_revision = result.scene_revision;
+        Ok(result)
+    }
+
+    /// Replace one live scene node in a fresh atomic transaction.
+    pub fn update_node(&mut self, node: &SceneNode) -> io::Result<SceneCommit> {
+        node.validate()?;
+        self.mutate_scene_node(
+            messages::UPDATE_NODE,
+            node.owning_context_id,
+            node.node_id,
+            node.payload()?,
+        )
+    }
+
+    /// Delete one live scene node in a fresh atomic transaction.
+    pub fn destroy_node(
+        &mut self,
+        owning_context_id: u64,
+        node_id: u64,
+    ) -> io::Result<SceneCommit> {
+        if owning_context_id == 0 || node_id == 0 {
+            return Err(invalid_input("scene node identity must be nonzero"));
+        }
+        self.mutate_scene_node(
+            messages::DELETE_NODE,
+            owning_context_id,
+            node_id,
+            vec![
+                (0, Value::Unsigned(owning_context_id)),
+                (1, Value::Unsigned(node_id)),
+            ],
+        )
+    }
+
+    fn mutate_scene_node(
+        &mut self,
+        record_type: u16,
+        owning_context_id: u64,
+        node_id: u64,
+        payload: PayloadMap,
+    ) -> io::Result<SceneCommit> {
+        let transaction_id = self.allocate_id()?;
+        let begin_request = self.next_request()?;
+        let mut begin = Envelope::correlated(
+            begin_request,
+            vec![
+                (0, Value::Unsigned(owning_context_id)),
+                (1, Value::Unsigned(transaction_id)),
+            ],
+        )?;
+        begin.transaction_id = Some(transaction_id);
+        self.dispatch_ok(
+            begin_request,
+            messages::BEGIN_TXN,
+            transaction_id,
+            &begin.encode()?,
+        )?;
+
+        let mutation_request = self.next_request()?;
+        let mut mutation = Envelope::correlated(mutation_request, payload)?;
+        mutation.transaction_id = Some(transaction_id);
+        if let Err(error) =
+            self.dispatch_ok(mutation_request, record_type, node_id, &mutation.encode()?)
+        {
+            let _ = self.abort_transaction(transaction_id);
+            return Err(error);
+        }
+
+        let commit_request = self.next_request()?;
+        let mut commit = Envelope::correlated(commit_request, vec![(0, Value::Unsigned(0))])?;
+        commit.transaction_id = Some(transaction_id);
+        commit.expected_target_generation = Some(self.info.target_generation.get());
+        commit.preconditions = vec![(0, Value::Unsigned(self.info.scene_revision.get()))];
+        let reply = match self.control.request(
+            commit_request,
+            messages::COMMIT_TXN,
+            transaction_id,
+            &commit.encode()?,
+        ) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let _ = self.abort_transaction(transaction_id);
+                return Err(error);
+            }
+        };
+        let result = if let Some(record) = reply {
+            if record.record_type == messages::ERROR {
+                let _ = self.abort_transaction(transaction_id);
+                return Err(presenter_error(&record.body)?);
+            }
+            expect_record(&record, messages::SCENE_PRESENTED, transaction_id)?;
             let payload = decoded_payload(&record)?;
             validate_exact_payload_keys("SCENE_PRESENTED", &payload, 0..=1)?;
             SceneCommit {
