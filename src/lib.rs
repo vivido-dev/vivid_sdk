@@ -400,7 +400,7 @@ struct TrackLocal {
     destroyed: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TrackMediaSequence {
     last_id: u64,
     last_epoch: u32,
@@ -420,6 +420,21 @@ impl TrackMediaSequence {
         self.last_id = id;
         self.last_epoch = epoch;
         Ok(())
+    }
+
+    fn reconcile_status(&mut self, status: &TrackStatus, generation_changed: bool) {
+        // TRACK_STATUS travels on control while media travels on an independently ordered track
+        // connection. The presenter's accepted snapshot may therefore lag records already
+        // submitted by this producer. Preserve the producer's track-wide monotonic sequence and
+        // merge only progress that the presenter reports ahead of it.
+        self.last_id = self.last_id.max(status.last_media_id);
+        self.last_epoch = self.last_epoch.max(status.media_epoch);
+        self.last_record_sequence = if generation_changed {
+            status.last_media_record_sequence
+        } else {
+            self.last_record_sequence
+                .max(status.last_media_record_sequence)
+        };
     }
 }
 
@@ -2062,36 +2077,43 @@ impl Session {
         };
         status.revision.require_nonzero()?;
         status.channel_generation.require_nonzero()?;
-        let local_media = *lock(&snapshot.media_sequence, "track media sequence")?;
         if status.kind != snapshot.configuration.kind.kind()
             || status.mode != snapshot.configuration.mode
-            || status.last_media_id < local_media.last_id
-            || status.media_epoch < local_media.last_epoch
             || status.cumulative_body_bytes > status.maximum_body_bytes
             || status.cumulative_media_records > status.maximum_media_records
         {
             return Err(invalid_data(
-                "TRACK_STATUS changed immutable state or moved media progress backward",
+                "TRACK_STATUS changed immutable state or contains invalid flow progress",
             ));
         }
 
         let mut state = lock(&track.inner, "track")?;
-        if status.channel_generation != state.channel_generation {
+        let generation_changed = status.channel_generation != state.channel_generation;
+        if generation_changed {
             let active_flow = state.active_flow.take();
             state.active_media = None;
             close_track_flow(
                 active_flow.as_ref(),
                 "TRACK_STATUS reconciled a different channel generation",
             );
-            lock(&state.media_sequence, "track media sequence")?.last_record_sequence = 0;
+        }
+        if matches!(status.lifecycle, 6 | 7) {
+            let active_flow = state.active_flow.take();
+            state.active_media = None;
+            close_track_flow(
+                active_flow.as_ref(),
+                if status.lifecycle == 6 {
+                    "TRACK_STATUS reported a lost track"
+                } else {
+                    "TRACK_STATUS reported a track tombstone"
+                },
+            );
         }
         state.revision = status.revision;
         state.channel_generation = status.channel_generation;
-        state.destroyed = status.lifecycle == 7;
+        state.destroyed = matches!(status.lifecycle, 6 | 7);
         let mut sequence = lock(&state.media_sequence, "track media sequence")?;
-        sequence.last_id = status.last_media_id;
-        sequence.last_epoch = status.media_epoch;
-        sequence.last_record_sequence = status.last_media_record_sequence;
+        sequence.reconcile_status(&status, generation_changed);
         Ok(status)
     }
 
@@ -4469,6 +4491,63 @@ mod tests {
         assert_eq!(track.surface_id(), 7);
         assert_eq!(track.channel_generation(), ChannelGeneration::ONE);
         session.close().unwrap();
+    }
+
+    #[test]
+    fn track_status_may_lag_an_independently_ordered_media_connection() {
+        let mut submitted = TrackMediaSequence {
+            last_id: 12,
+            last_epoch: 3,
+            last_record_sequence: 14,
+        };
+        let mut status = TrackStatus {
+            context_id: 1,
+            surface_id: 2,
+            track_id: 3,
+            revision: TrackRevision::new(4),
+            kind: TrackKind::Video,
+            mode: TrackMode::Timed,
+            lifecycle: 2,
+            channel_generation: ChannelGeneration::ONE,
+            attachment_state: 1,
+            milestones: MILESTONE_OUTPUT_READY,
+            media_epoch: 2,
+            last_media_id: 9,
+            last_media_record_sequence: 11,
+            last_decoded_pts_us: 0,
+            last_presented_pts_us: 0,
+            last_presentation_id: 0,
+            cumulative_body_bytes: 100,
+            cumulative_media_records: 9,
+            maximum_body_bytes: 1_000,
+            maximum_media_records: 100,
+            ingress_depth_bucket: 0,
+            playback_state: None,
+            terminal_loss_code: None,
+        };
+
+        submitted.reconcile_status(&status, false);
+        assert_eq!(
+            submitted,
+            TrackMediaSequence {
+                last_id: 12,
+                last_epoch: 3,
+                last_record_sequence: 14,
+            }
+        );
+
+        status.last_media_id = 15;
+        status.media_epoch = 4;
+        status.last_media_record_sequence = 2;
+        submitted.reconcile_status(&status, true);
+        assert_eq!(
+            submitted,
+            TrackMediaSequence {
+                last_id: 15,
+                last_epoch: 4,
+                last_record_sequence: 2,
+            }
+        );
     }
 
     #[test]
