@@ -2125,8 +2125,10 @@ impl Session {
         timeout_us: u64,
     ) -> io::Result<TrackWaitSatisfied> {
         condition.validate_value(value)?;
-        if timeout_us == 0 {
-            return Err(invalid_input("track wait timeout must be nonzero"));
+        if timeout_us == 0 || timeout_us > vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US {
+            return Err(invalid_input(
+                "track wait timeout must be within 1..=30000000 microseconds",
+            ));
         }
         let snapshot = lock(&track.inner, "track")?.clone();
         ensure_live_track(&snapshot)?;
@@ -4839,6 +4841,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(waited.channel_generation, ChannelGeneration::ONE);
+        assert_eq!(
+            session
+                .wait_track(
+                    &track,
+                    TrackWaitCondition::PlaybackEnded,
+                    None,
+                    vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US + 1,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
 
         session.flush(&track, 1).unwrap();
         assert!(session.flush(&track, 1).is_err());
