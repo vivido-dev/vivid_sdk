@@ -1,694 +1,476 @@
-"""Function-oriented Python interface to the Vivid 1.1 producer SDK."""
+"""Typed Python producer SDK for Vivid Protocol 1.5.
+
+The API intentionally uses the 1.5 object model: stable surfaces own immutable
+tracks, and each track is fed through an authenticated channel generation.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import json
-import math
-import os
 import struct
-import sys
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Callable, Dict, Iterable, Literal, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from . import _native
-from ._native import ClosedHandleError, MediaSender, Session, Source, VividError, Wait
+from ._native import (
+    ClosedHandleError,
+    Session,
+    Surface,
+    Track,
+    TrackChannel,
+    VividError,
+)
 
 try:
     __version__ = version("vivid-sdk")
-except PackageNotFoundError:  # pragma: no cover - source tree without an installed distribution
-    __version__ = "0.1.0"
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "1.5.0"
 
-FEATURE_RASTER_RGBA8 = 1
-FEATURE_SCENE_TRANSACTIONS = 3
-FEATURE_GRID_CELL_NODES = 4
-FEATURE_CREDIT_FLOW_CONTROL = 5
-FEATURE_ENCODED_IMAGE_V1 = 7
-FEATURE_RASTER_ZSTD_V1 = 8
-FEATURE_RASTER_PREMULTIPLIED_ALPHA = 9
-FEATURE_VISIBILITY_EVENTS_V1 = 10
-FEATURE_VIDEO_ACCESS_UNIT_V1 = 11
-FEATURE_VIDEO_CONTROL_V1 = 12
-FEATURE_TEXT_ANCHORS_V2 = 13
-FEATURE_AUDIO_ACCESS_UNIT_V1 = 14
-FEATURE_NODE_CLIP_RECT_V1 = 15
-FEATURE_DECODER_DESCRIPTION_V1 = 16
-FEATURE_OBSERVABILITY_CORE_V1 = 18
-FEATURE_ATOMIC_CONTROL_V1 = 19
-FEATURE_SOURCE_DESCRIPTOR_V1 = 20
-FEATURE_DELEGATED_CONTEXT_V1 = 21
-FEATURE_SOURCE_CAPTURE_POLICY_V1 = 22
+# Negotiated profiles.
+PROFILE_CORE = "vivid-core-control-v1"
+PROFILE_TERMINAL_SURFACE = "terminal-surface-v1"
+PROFILE_DESKTOP_SURFACE = "desktop-surface-v1"
+PROFILE_CANVAS_SURFACE = "canvas-surface-v1"
+PROFILE_LIVE_MEDIA = "live-media-v1"
+PROFILE_TIMED_MEDIA = "timed-media-v1"
+PROFILE_DESKTOP_INPUT = "desktop-input-v1"
+PROFILE_OBSERVABILITY = "observability-v1"
 
-CAPTURE_POLICY_DENY_CAPTURE = 1 << 0
-CAPTURE_POLICY_DENY_SEMANTIC_EXPORT = 1 << 1
-CAPTURE_POLICY_DENY_POSTER_RETENTION = 1 << 2
-CAPTURE_POLICY_DENY_CACHE = 1 << 3
-CAPTURE_POLICY_REDUCE_DIAGNOSTICS = 1 << 4
-CAPTURE_POLICY_MASK = (1 << 5) - 1
+# Surface semantic profiles and coordinate models.
+SURFACE_GENERIC = "generic-content-v1"
+SURFACE_TERMINAL = "terminal-content-v1"
+SURFACE_DESKTOP = "desktop-content-v1"
+SURFACE_CANVAS = "canvas-content-v1"
+COORDINATE_DESKTOP_LOGICAL_PIXELS = 1
+COORDINATE_NORMALIZED = 2
+COORDINATE_CANVAS_LOGICAL_UNITS = 3
+COORDINATE_TERMINAL_CONTENT_CELLS = 4
 
-CAPS_CHANGE_DECODER_AVAILABILITY = 1 << 0
-CAPS_CHANGE_DEVICE_AVAILABILITY = 1 << 1
-CAPS_CHANGE_PRESENTER_POLICY = 1 << 2
-CAPS_CHANGE_RESOURCE_PRESSURE = 1 << 3
+# Descriptor roles.
+ROLE_UNSPECIFIED = 0
+ROLE_DOCUMENT = 1
+ROLE_DESKTOP = 2
+ROLE_TIMED_MEDIA = 3
+ROLE_FIGURE = 4
+ROLE_TERMINAL = 5
+ROLE_CANVAS = 6
 
-SOURCE_ROLE_UNSPECIFIED = 0
-SOURCE_ROLE_DOCUMENT = 1
-SOURCE_ROLE_DESKTOP = 2
-SOURCE_ROLE_TIMED_MEDIA = 3
-SOURCE_ROLE_FIGURE = 4
-SOURCE_ROLE_TERMINAL = 5
+# Capture/export policies.
+POLICY_DENY_CAPTURE = 1 << 0
+POLICY_DENY_DESCRIPTOR_EXPORT = 1 << 1
+POLICY_DENY_POSTER_RETENTION = 1 << 2
+POLICY_DENY_IMAGE_CACHE = 1 << 3
+POLICY_REDUCED_DIAGNOSTICS = 1 << 4
 
-SEMANTIC_AVAILABLE_TEXT = 1 << 0
-SEMANTIC_AVAILABLE_STRUCTURE = 1 << 1
-SEMANTIC_AVAILABLE_LINKS = 1 << 2
-SEMANTIC_AVAILABLE_OUTLINE = 1 << 3
-SEMANTIC_AVAILABLE_ACTIONS = 1 << 4
-
-AUTHENTICATION_WINDOW_ROOT = 0
-AUTHENTICATION_DELEGATED_CONTEXT = 1
-
-CONTEXT_CLASS_OBSERVE = 1 << 0
-CONTEXT_CLASS_CREATE_SOURCE = 1 << 1
-CONTEXT_CLASS_MUTATE_SCENE = 1 << 2
-CONTEXT_CLASS_CREATE_ANCHOR = 1 << 3
-CONTEXT_CLASS_DESKTOP_INPUT = 1 << 4
-CONTEXT_CLASS_ADMINISTER = 1 << 5
-
-OBSERVE_SOURCE_TRANSITIONS = 1 << 0
-OBSERVE_SCENE_CHANGES = 1 << 1
-OBSERVE_PLAYBACK_TRANSITIONS = 1 << 2
-OBSERVATION_CLASS_MASK = (
-    OBSERVE_SOURCE_TRANSITIONS
-    | OBSERVE_SCENE_CHANGES
-    | OBSERVE_PLAYBACK_TRANSITIONS
-)
-
-WAIT_SOURCE_REVISION = 1
-WAIT_FIRST_VISIBLE_PRESENTATION = 2
-WAIT_RASTER_FRAME = 3
-WAIT_VIDEO_PTS = 4
-WAIT_PLAYBACK_STARTED = 5
-WAIT_PLAYBACK_ENDED = 6
-WAIT_MEDIA_ATTACHED = 7
-WAIT_MEDIA_CLOSED = 8
-WAIT_SOURCE_LOST = 9
+# Track modes, lanes, and slots.
+TRACK_MODE_LIVE = 1
+TRACK_MODE_TIMED = 2
+LANE_REALTIME = 2
+LANE_BULK = 3
+SLOT_PRIMARY_VIDEO = 1
+SLOT_AUDIO = 2
+SLOT_RASTER = 3
+SLOT_POSTER = 4
 
 IMAGE_PNG = 1
 IMAGE_JPEG = 2
-TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH = 1
-
-DEFAULT_REQUIRED_FEATURES: Tuple[int, ...] = (
-    FEATURE_RASTER_RGBA8,
-    FEATURE_SCENE_TRANSACTIONS,
-    FEATURE_GRID_CELL_NODES,
-    FEATURE_CREDIT_FLOW_CONTROL,
-    FEATURE_TEXT_ANCHORS_V2,
-)
-DEFAULT_OPTIONAL_FEATURES: Tuple[int, ...] = (
-    FEATURE_ENCODED_IMAGE_V1,
-    FEATURE_RASTER_ZSTD_V1,
-    FEATURE_RASTER_PREMULTIPLIED_ALPHA,
-    FEATURE_VISIBILITY_EVENTS_V1,
-    FEATURE_VIDEO_ACCESS_UNIT_V1,
-    FEATURE_VIDEO_CONTROL_V1,
-    FEATURE_AUDIO_ACCESS_UNIT_V1,
-    FEATURE_NODE_CLIP_RECT_V1,
-    FEATURE_DECODER_DESCRIPTION_V1,
-    FEATURE_OBSERVABILITY_CORE_V1,
-    FEATURE_ATOMIC_CONTROL_V1,
-    FEATURE_SOURCE_DESCRIPTOR_V1,
-    FEATURE_DELEGATED_CONTEXT_V1,
-    FEATURE_SOURCE_CAPTURE_POLICY_V1,
-)
+MILESTONE_OUTPUT_READY = 1 << 4
+WAIT_REVISION_GREATER = 1
+WAIT_MILESTONE_SET = 2
+WAIT_RASTER_FRAME_PRESENTED = 3
+WAIT_VIDEO_PTS_PRESENTED = 4
+WAIT_PLAYBACK_STARTED = 5
+WAIT_PLAYBACK_ENDED = 6
+WAIT_CHANNEL_ACCEPTED = 7
+WAIT_CHANNEL_CLOSED = 8
+WAIT_TRACK_LOST = 9
 
 BytesLike = Union[bytes, bytearray, memoryview]
-SourceLike = Union[int, Source, MediaSender]
-
-
-class LinkedAudioError(VividError):
-    """Audio creation failed after the linked video source became usable."""
-
-    video_source: Source
-
-    def __init__(self, message: str, video_source: Source) -> None:
-        super().__init__(message)
-        self.video_source = video_source
 
 
 @dataclass(frozen=True)
-class DisplayState:
-    display_generation: int
-    viewport_width: int
-    viewport_height: int
-    grid_columns: int
-    grid_rows: int
-    cell_width: int
-    cell_height: int
-    settled: bool = True
-
-
-@dataclass(frozen=True)
-class RevisionState:
+class SessionInfo:
+    session_id: int
+    session_tag: bytes
+    root_context_id: int
+    target_generation: int
+    target_profile: str
+    accepted_profiles: Tuple[str, ...]
+    session_revision: int
     scene_revision: int
-    source_revisions: Dict[int, int]
-
-
-@dataclass(frozen=True)
-class ContextQuotas:
-    maximum_sources: int
-    maximum_nodes: int
-    maximum_retained_pixels: int
-    maximum_media_bytes: int
-    maximum_media_connections: int
-
-
-@dataclass(frozen=True)
-class ContextReady:
-    context_id: int
-    class_mask: int
-    expiry_us: int
-    quotas: ContextQuotas
-
-
-@dataclass(frozen=True)
-class PlaybackSnapshot:
-    state: int
-    clock_pts_us: int
-    epoch: int
-    buffered_ahead_us: int
-    underrun_count: int
-    late_drop_count: int
-    eos_state: int
-
-
-@dataclass(frozen=True)
-class SourceDescriptor:
-    role: int
-    title: str
-    content_revision: int
-    semantic_availability: int
-    locator: str
-
-
-@dataclass(frozen=True)
-class CapabilityChangedEvent:
-    capability_generation: int
-    reason_mask: int
-
-
-@dataclass(frozen=True)
-class TraceEvent:
-    version: int
-    monotonic_ts_us: int
-    clock_domain: str
-    component: str
-    hop: str
-    direction: str
-    record_type: int
-    body_length: int
-    connection_sequence: int
-    object_kind: str
-    object_id: Optional[int]
-    request_id: Optional[int]
-    causation_id: Optional[str]
-    local_session_hint: str
-    outcome: str
-
-
-@dataclass(frozen=True)
-class ReportedSourceDescriptor:
-    role: int
-    title: Optional[str] = None
-    content_revision: Optional[int] = None
-    semantic_availability: Optional[int] = None
-    locator: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class SourceStatus:
-    source_id: int
-    source_revision: int
-    kind: int
-    lifecycle: int
-    epoch: int
-    attachment_state: int
-    attachment_generation: int
-    last_media_id: int
-    last_media_sequence: int
-    last_decoded_pts_us: int
-    last_presented_pts_us: int
-    last_presentation_id: int
-    visible: bool
-    capture_policy: int
-    linked_source_id: int
-    milestones: int
-    outstanding_byte_credit: int
-    outstanding_packet_credit: int
-    ingress_queue_depth: int
-    descriptor: Optional[ReportedSourceDescriptor]
-    playback: Optional[PlaybackSnapshot]
-    terminal_loss_code: Optional[int]
-
-
-@dataclass(frozen=True)
-class SceneNodeStatus:
-    node_id: int
-    source_id: int
-    context_id: int
-    x: int
-    y: int
-    width: int
-    height: int
-    text_layer: int
-    z_index: int
-    visible: bool
-    anchor_id: Optional[int]
-    clip: Optional["ClipRect"]
-
-
-@dataclass(frozen=True)
-class SceneStatus:
-    scene_revision: int
-    nodes: Tuple[SceneNodeStatus, ...]
-    total_nodes: int
-
-
-@dataclass(frozen=True)
-class AnchorStatus:
-    anchor_id: int
-    state: int
-    column: int
-    row: int
-    visible: bool
-    display_generation: int
-
-
-@dataclass(frozen=True)
-class LimitsStatus:
-    maximum_sources: int
-    maximum_nodes: int
-    maximum_transactions: int
-    maximum_anchors: int
-    maximum_control_body: int
-    maximum_media_body: int
-    maximum_waits: int
-    maximum_pending_requests: int
-    rolling_byte_window: int
-    rolling_packet_window: int
-    retained_pixel_budget: int
-    current_sources: int
-    current_nodes: int
-    current_retained_pixels: int
-    image_cache_budget: Optional[int]
+    establishment_state: int
+    resume_generation: int
 
 
 @dataclass(frozen=True)
 class WaitSatisfied:
-    source_id: int
-    source_revision: int
+    context_id: int
+    surface_id: int
+    track_id: int
+    revision: int
+    channel_generation: int
     condition: int
     observed_value: Optional[int]
 
 
 @dataclass(frozen=True)
-class SourceChangedEvent:
-    source_id: int
-    source_revision: int
-    changed_fields: int
-    observation_sequence: int
-    first_lost_sequence: Optional[int]
+class SurfaceConfig:
+    logical_width: int
+    logical_height: int
+    semantic_profile: str = SURFACE_GENERIC
+    coordinate_model: int = COORDINATE_DESKTOP_LOGICAL_PIXELS
+    role: int = ROLE_UNSPECIFIED
+    title: str = ""
+    semantic_content_revision: int = 0
+    semantic_availability: int = 0
+    locator_hint: str = ""
+    policy: int = 0
+    scale_numerator: int = 1
+    scale_denominator: int = 1
+    rotation: int = 0
+    context_id: Optional[int] = None
+    surface_id: Optional[int] = None
+
+    def native(self, session: Session) -> Dict[str, object]:
+        return {
+            "context_id": (
+                self.context_id
+                if self.context_id is not None
+                else session_info(session).root_context_id
+            ),
+            "surface_id": (
+                self.surface_id
+                if self.surface_id is not None
+                else allocate_id(session)
+            ),
+            "semantic_profile": self.semantic_profile,
+            "coordinate_model": self.coordinate_model,
+            "logical_width": self.logical_width,
+            "logical_height": self.logical_height,
+            "scale_numerator": self.scale_numerator,
+            "scale_denominator": self.scale_denominator,
+            "rotation": self.rotation,
+            "role": self.role,
+            "title": self.title,
+            "semantic_content_revision": self.semantic_content_revision,
+            "semantic_availability": self.semantic_availability,
+            "locator_hint": self.locator_hint,
+            "policy": self.policy,
+        }
 
 
 @dataclass(frozen=True)
-class SceneChangedEvent:
-    scene_revision: int
-    reason_mask: int
-    observation_sequence: int
-    first_lost_sequence: Optional[int]
+class RasterTrackConfig:
+    width: int
+    height: int
+    maximum_rate_millihertz: int = 60_000
+    alpha_mode: int = 1
+    delta_enabled: bool = False
+    maximum_delta_operations: int = 1
+    zstd_enabled: bool = False
+    slot: int = SLOT_RASTER
+    mode: int = TRACK_MODE_LIVE
+    lane: int = LANE_BULK
+    maximum_encoded_bits_per_second: Optional[int] = None
+    maximum_records_per_second: int = 60
+    maximum_inflight_body_bytes: Optional[int] = None
+    target_latency_us: int = 16_000
+    maximum_latency_us: int = 100_000
+    retained_pixel_charge: Optional[int] = None
+    track_id: Optional[int] = None
+
+    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
+        body = _checked_add(72, _checked_mul(_checked_mul(self.width, self.height), 4))
+        return _track_common(
+            session,
+            surface,
+            self.track_id,
+            "raster",
+            self.slot,
+            self.mode,
+            self.lane,
+            body,
+            self.maximum_rate_millihertz,
+            (
+                self.maximum_encoded_bits_per_second
+                if self.maximum_encoded_bits_per_second is not None
+                else _checked_mul(body, 8 * self.maximum_records_per_second)
+            ),
+            self.maximum_records_per_second,
+            (
+                self.maximum_inflight_body_bytes
+                if self.maximum_inflight_body_bytes is not None
+                else _checked_mul(body, 2)
+            ),
+            self.target_latency_us,
+            self.maximum_latency_us,
+            (
+                self.retained_pixel_charge
+                if self.retained_pixel_charge is not None
+                else _checked_mul(self.width, self.height)
+            ),
+            width=self.width,
+            height=self.height,
+            alpha_mode=self.alpha_mode,
+            delta_enabled=self.delta_enabled,
+            maximum_delta_operations=self.maximum_delta_operations,
+            zstd_enabled=self.zstd_enabled,
+        )
 
 
 @dataclass(frozen=True)
-class PlaybackStateEvent:
-    source_id: int
-    source_revision: int
-    observation_sequence: int
-    snapshot: PlaybackSnapshot
+class ImageTrackConfig:
+    width: int
+    height: int
+    encoded_length: int
+    encoding: int
+    sha256: Optional[bytes] = None
+    cache_lookup: bool = False
+    slot: int = SLOT_POSTER
+    lane: int = LANE_BULK
+    track_id: Optional[int] = None
 
-
-ObservationEvent = Union[SourceChangedEvent, SceneChangedEvent, PlaybackStateEvent]
+    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
+        return _track_common(
+            session,
+            surface,
+            self.track_id,
+            "image",
+            self.slot,
+            TRACK_MODE_LIVE,
+            self.lane,
+            self.encoded_length,
+            1,
+            _checked_mul(self.encoded_length, 8),
+            1,
+            self.encoded_length,
+            0,
+            0,
+            _checked_mul(self.width, self.height),
+            width=self.width,
+            height=self.height,
+            encoding=self.encoding,
+            encoded_length=self.encoded_length,
+            sha256=self.sha256,
+            cache_lookup=self.cache_lookup,
+        )
 
 
 @dataclass(frozen=True)
-class VideoSourceConfig:
+class VideoTrackConfig:
     codec: str
     packetization: str
     width: int
     height: int
-    max_access_unit_bytes: int
-    extradata: BytesLike = b""
+    maximum_access_unit_bytes: int
+    maximum_rate_millihertz: int
+    maximum_encoded_bits_per_second: int
+    maximum_records_per_second: int
+    extradata: bytes = b""
     profile: int = 0
     level: int = 0
-    bitrate: int = 0
-    color_primaries: int = 2
-    transfer: int = 2
-    matrix: int = 2
-    range: int = 0
-    sar_num: int = 1
-    sar_den: int = 1
+    maximum_reorder_depth: int = 0
+    color_primaries: int = 1
+    transfer: int = 1
+    matrix: int = 1
+    signal_range: int = 2
+    aspect_numerator: int = 1
+    aspect_denominator: int = 1
     codec_string: Optional[str] = None
-    decoder_config: Optional[BytesLike] = None
+    decoder_configuration: Optional[bytes] = None
+    slot: int = SLOT_PRIMARY_VIDEO
+    mode: int = TRACK_MODE_LIVE
+    lane: int = LANE_BULK
+    maximum_inflight_body_bytes: Optional[int] = None
+    target_latency_us: int = 100_000
+    maximum_latency_us: int = 500_000
+    retained_pixel_charge: Optional[int] = None
+    track_id: Optional[int] = None
+
+    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
+        body = _checked_add(48, self.maximum_access_unit_bytes)
+        return _track_common(
+            session,
+            surface,
+            self.track_id,
+            "video",
+            self.slot,
+            self.mode,
+            self.lane,
+            body,
+            self.maximum_rate_millihertz,
+            self.maximum_encoded_bits_per_second,
+            self.maximum_records_per_second,
+            (
+                self.maximum_inflight_body_bytes
+                if self.maximum_inflight_body_bytes is not None
+                else _checked_mul(body, 4)
+            ),
+            self.target_latency_us,
+            self.maximum_latency_us,
+            (
+                self.retained_pixel_charge
+                if self.retained_pixel_charge is not None
+                else _checked_mul(self.width, self.height)
+            ),
+            codec=self.codec,
+            packetization=self.packetization,
+            extradata=self.extradata,
+            width=self.width,
+            height=self.height,
+            profile=self.profile,
+            level=self.level,
+            maximum_reorder_depth=self.maximum_reorder_depth,
+            color_primaries=self.color_primaries,
+            transfer=self.transfer,
+            matrix=self.matrix,
+            signal_range=self.signal_range,
+            aspect_numerator=self.aspect_numerator,
+            aspect_denominator=self.aspect_denominator,
+            maximum_access_unit_bytes=self.maximum_access_unit_bytes,
+            codec_string=self.codec_string,
+            decoder_configuration=self.decoder_configuration,
+        )
 
 
 @dataclass(frozen=True)
-class AudioSourceConfig:
+class AudioTrackConfig:
     codec: str
     packetization: str
     sample_rate: int
     channels: int
-    max_access_unit_bytes: int
-    extradata: BytesLike = b""
+    maximum_access_unit_bytes: int
+    maximum_encoded_bits_per_second: int
+    maximum_records_per_second: int
+    extradata: bytes = b""
     channel_mask: int = 0
-    bitrate: int = 0
     codec_string: Optional[str] = None
+    slot: int = SLOT_AUDIO
+    mode: int = TRACK_MODE_LIVE
+    lane: int = LANE_REALTIME
+    maximum_rate_millihertz: int = 50_000
+    maximum_inflight_body_bytes: Optional[int] = None
+    target_latency_us: int = 40_000
+    maximum_latency_us: int = 200_000
+    track_id: Optional[int] = None
+
+    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
+        body = _checked_add(48, self.maximum_access_unit_bytes)
+        return _track_common(
+            session,
+            surface,
+            self.track_id,
+            "audio",
+            self.slot,
+            self.mode,
+            self.lane,
+            body,
+            self.maximum_rate_millihertz,
+            self.maximum_encoded_bits_per_second,
+            self.maximum_records_per_second,
+            (
+                self.maximum_inflight_body_bytes
+                if self.maximum_inflight_body_bytes is not None
+                else _checked_mul(body, 8)
+            ),
+            self.target_latency_us,
+            self.maximum_latency_us,
+            0,
+            codec=self.codec,
+            packetization=self.packetization,
+            extradata=self.extradata,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            channel_mask=self.channel_mask,
+            maximum_access_unit_bytes=self.maximum_access_unit_bytes,
+            codec_string=self.codec_string,
+        )
 
 
-ImageEncoding = Union[Literal["png", "jpeg"], int]
+TrackConfig = Union[
+    RasterTrackConfig, ImageTrackConfig, VideoTrackConfig, AudioTrackConfig
+]
 
 
-@dataclass(frozen=True)
-class ImageSourceConfig:
-    encoding: ImageEncoding
-    width: int
-    height: int
-    encoded_length: int
-    sha256: Optional[BytesLike] = None
+@dataclass
+class ImagePresentation:
+    """Live handles for a retained image presentation.
 
+    Keep this object alive for as long as the image should remain in the scene.
+    """
 
-@dataclass(frozen=True)
-class ClipRect:
-    """A clip rectangle in signed 32.32 cell coordinates."""
+    session: Session
+    surface: Surface
+    track: Track
+    channel: TrackChannel
 
-    x: int
-    y: int
-    width: int
-    height: int
+    def close(self) -> None:
+        if not self.channel.closed:
+            close_channel(self.channel)
+        if not self.session.closed:
+            destroy_track(self.session, self.track)
+            destroy_surface(self.session, self.surface)
+            close(self.session)
 
+    def __enter__(self) -> "ImagePresentation":
+        return self
 
-@dataclass(frozen=True)
-class SceneNodeConfig:
-    """Complete scene-node state; geometry uses signed 32.32 cell coordinates."""
-
-    source_id: int
-    width: int
-    height: int
-    node_id: Optional[int] = None
-    context_id: Optional[int] = None
-    x: int = 0
-    y: int = 0
-    text_layer: int = TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH
-    z_index: int = 0
-    visible: bool = True
-    anchor_id: Optional[int] = None
-    clip: Optional[ClipRect] = None
-
-
-@dataclass(frozen=True)
-class SceneNode:
-    id: int
-    source_id: int
-
-
-@dataclass(frozen=True)
-class VisibilityEvent:
-    visible: bool
-
-
-@dataclass(frozen=True)
-class NeedKeyframeEvent:
-    epoch: int
-
-
-@dataclass(frozen=True)
-class SourceLostEvent:
-    message: str
-
-
-SourceEvent = Union[VisibilityEvent, NeedKeyframeEvent, SourceLostEvent]
-
-
-@dataclass(frozen=True)
-class _EncodedImage:
-    encoding: int
-    width: int
-    height: int
-    data: bytes
-
-
-def _jpeg_dimensions(data: bytes) -> Tuple[int, int]:
-    offset = 2
-    start_of_frame = {
-        0xC0,
-        0xC1,
-        0xC2,
-        0xC3,
-        0xC5,
-        0xC6,
-        0xC7,
-        0xC9,
-        0xCA,
-        0xCB,
-        0xCD,
-        0xCE,
-        0xCF,
-    }
-    while offset < len(data):
-        while offset < len(data) and data[offset] == 0xFF:
-            offset += 1
-        if offset >= len(data):
-            break
-        marker = data[offset]
-        offset += 1
-        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD7:
-            continue
-        if marker in (0xD9, 0xDA) or offset + 2 > len(data):
-            break
-        segment_length = struct.unpack(">H", data[offset : offset + 2])[0]
-        if segment_length < 2 or offset + segment_length > len(data):
-            raise ValueError("JPEG contains a truncated segment")
-        if marker in start_of_frame:
-            if segment_length < 7:
-                raise ValueError("JPEG frame header is too short")
-            height, width = struct.unpack(">HH", data[offset + 3 : offset + 7])
-            return width, height
-        offset += segment_length
-    raise ValueError("JPEG dimensions were not found")
-
-
-def _inspect_encoded_image(path: Union[str, os.PathLike[str]]) -> _EncodedImage:
-    image_path = os.fspath(path)
-    maximum_bytes = 64 * 1024 * 1024
-    size = os.stat(image_path).st_size
-    if size <= 0 or size > maximum_bytes:
-        raise ValueError("encoded image exceeds the Vivid media-record limit")
-    with open(image_path, "rb") as stream:
-        data = stream.read(maximum_bytes + 1)
-    if len(data) > maximum_bytes:
-        raise ValueError("encoded image exceeds the Vivid media-record limit")
-    if len(data) != size:
-        raise OSError("image changed while it was being read")
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        if len(data) < 24 or data[12:16] != b"IHDR":
-            raise ValueError("PNG is missing its IHDR header")
-        width, height = struct.unpack(">II", data[16:24])
-        encoding = IMAGE_PNG
-    elif data.startswith(b"\xff\xd8"):
-        width, height = _jpeg_dimensions(data)
-        encoding = IMAGE_JPEG
-    else:
-        raise ValueError("only PNG and JPEG encoded images are supported")
-    if width == 0 or height == 0 or width > 8192 or height > 8192:
-        raise ValueError(f"unsupported image dimensions: {width}x{height}")
-    return _EncodedImage(encoding, width, height, data)
-
-
-def _fitted_image_cells(
-    image: _EncodedImage, display: DisplayState, scale: float
-) -> Tuple[int, int]:
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("scale must be a positive finite number")
-    desired_width = image.width * scale
-    desired_height = image.height * scale
-    if not math.isfinite(desired_width) or not math.isfinite(desired_height):
-        raise ValueError("scaled image dimensions are too large")
-    maximum_width = max(1, display.grid_columns - 4) * display.cell_width
-    maximum_height = max(1, display.grid_rows - 2) * display.cell_height
-    fit = min(maximum_width / desired_width, maximum_height / desired_height, 1.0)
-    target_width = max(1, round(desired_width * fit))
-    target_height = max(1, round(desired_height * fit))
-    return (
-        math.ceil(target_width / display.cell_width),
-        math.ceil(target_height / display.cell_height),
-    )
-
-
-def _reserve_terminal_rows(rows: int) -> None:
-    raw = b"\r\n" * rows
-    stream = getattr(sys.stdout, "buffer", None)
-    if stream is not None:
-        stream.write(raw)
-        stream.flush()
-    else:  # pragma: no cover - text-only stdout implementations are uncommon
-        sys.stdout.write(raw.decode("ascii"))
-        sys.stdout.flush()
-
-
-def _owned_bytes(value: BytesLike) -> bytes:
-    return bytes(value)
-
-
-def _descriptor_dict(
-    descriptor: Optional[SourceDescriptor],
-) -> Optional[dict[str, object]]:
-    if descriptor is None:
-        return None
-    return {
-        "role": descriptor.role,
-        "title": descriptor.title,
-        "content_revision": descriptor.content_revision,
-        "semantic_availability": descriptor.semantic_availability,
-        "locator": descriptor.locator,
-    }
-
-
-def _video_dict(config: VideoSourceConfig) -> dict[str, object]:
-    return {
-        "codec": config.codec,
-        "packetization": config.packetization,
-        "extradata": _owned_bytes(config.extradata),
-        "width": config.width,
-        "height": config.height,
-        "profile": config.profile,
-        "level": config.level,
-        "bitrate": config.bitrate,
-        "color_primaries": config.color_primaries,
-        "transfer": config.transfer,
-        "matrix": config.matrix,
-        "range": config.range,
-        "sar_num": config.sar_num,
-        "sar_den": config.sar_den,
-        "max_access_unit_bytes": config.max_access_unit_bytes,
-        "codec_string": config.codec_string,
-        "decoder_config": (
-            None
-            if config.decoder_config is None
-            else _owned_bytes(config.decoder_config)
-        ),
-    }
-
-
-def _audio_dict(config: AudioSourceConfig) -> dict[str, object]:
-    return {
-        "codec": config.codec,
-        "packetization": config.packetization,
-        "extradata": _owned_bytes(config.extradata),
-        "sample_rate": config.sample_rate,
-        "channels": config.channels,
-        "channel_mask": config.channel_mask,
-        "bitrate": config.bitrate,
-        "max_access_unit_bytes": config.max_access_unit_bytes,
-        "codec_string": config.codec_string,
-    }
-
-
-def _scene_dict(session: Session, config: SceneNodeConfig, *, updating: bool) -> dict[str, object]:
-    if updating and config.node_id is None:
-        raise ValueError("an update requires an explicit node_id")
-    node_id = allocate_id(session) if config.node_id is None else config.node_id
-    context_id = root_context_id(session) if config.context_id is None else config.context_id
-    clip: Optional[dict[str, int]]
-    if config.clip is None:
-        clip = None
-    else:
-        clip = {
-            "x": config.clip.x,
-            "y": config.clip.y,
-            "width": config.clip.width,
-            "height": config.clip.height,
-        }
-    return {
-        "node_id": node_id,
-        "source_id": config.source_id,
-        "context_id": context_id,
-        "x": config.x,
-        "y": config.y,
-        "width": config.width,
-        "height": config.height,
-        "text_layer": config.text_layer,
-        "z_index": config.z_index,
-        "visible": config.visible,
-        "anchor_id": config.anchor_id,
-        "clip": clip,
-    }
-
-
-def _allocated_id(session: Session, value: Optional[int]) -> int:
-    return allocate_id(session) if value is None else value
-
-
-def _source_id(source: SourceLike) -> int:
-    if isinstance(source, int):
-        return source
-    if isinstance(source, (Source, MediaSender)):
-        return source.id
-    raise TypeError("expected a source ID, Source, or MediaSender")
-
-
-def source_id(source: SourceLike) -> int:
-    """Return the numeric protocol ID for a source, sender, or integer ID."""
-
-    return _source_id(source)
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def connect(
     *,
-    endpoint: Optional[str] = None,
-    bulk_endpoint: Optional[str] = None,
-    token: Optional[str] = None,
     dry_run: bool = False,
-    trace_dir: Optional[os.PathLike[str]] = None,
-    verbose: bool = False,
-    producer: str = "vivid-sdk-python",
+    trace_dir: Optional[Union[str, Path]] = None,
+    endpoint_control: Optional[str] = None,
+    endpoint_interactive: Optional[str] = None,
+    endpoint_realtime: Optional[str] = None,
+    endpoint_bulk: Optional[str] = None,
+    root_secret: Optional[str] = None,
+    producer_name: str = "vivid-sdk-python",
     producer_version: str = __version__,
-    required_features: Iterable[int] = DEFAULT_REQUIRED_FEATURES,
-    optional_features: Iterable[int] = DEFAULT_OPTIONAL_FEATURES,
-    authentication_kind: int = AUTHENTICATION_WINDOW_ROOT,
+    target_profile: str = PROFILE_TERMINAL_SURFACE,
+    required_profiles: Optional[Sequence[str]] = None,
+    optional_profiles: Optional[Sequence[str]] = None,
 ) -> Session:
-    """Connect to a Vivid presenter or create a dry-run/trace session."""
-
-    endpoint = os.environ.get("VIVID_ENDPOINT") if endpoint is None else endpoint
-    bulk_endpoint = (
-        os.environ.get("VIVID_ENDPOINT_BULK") if bulk_endpoint is None else bulk_endpoint
+    required = tuple(
+        sorted(
+            set(
+                required_profiles
+                if required_profiles is not None
+                else (PROFILE_CORE, target_profile)
+            )
+        )
     )
-    token = os.environ.get("VIVID_TOKEN") if token is None else token
+    optional = tuple(
+        sorted(
+            set(
+                optional_profiles
+                if optional_profiles is not None
+                else (PROFILE_LIVE_MEDIA, PROFILE_OBSERVABILITY, PROFILE_TIMED_MEDIA)
+            ).difference(required)
+        )
+    )
     return _native.connect(
-        endpoint,
-        bulk_endpoint,
-        token,
-        dry_run,
-        None if trace_dir is None else os.fspath(trace_dir),
-        verbose,
-        producer,
-        producer_version,
-        list(required_features),
-        list(optional_features),
-        authentication_kind,
+        dry_run=dry_run,
+        trace_dir=trace_dir,
+        endpoint_control=endpoint_control,
+        endpoint_interactive=endpoint_interactive,
+        endpoint_realtime=endpoint_realtime,
+        endpoint_bulk=endpoint_bulk,
+        root_secret=root_secret,
+        producer_name=producer_name,
+        producer_version=producer_version,
+        target_profile=target_profile,
+        required_profiles=required,
+        optional_profiles=optional,
     )
 
 
 def close(session: Session) -> None:
-    """Send GOODBYE and close a session. Repeated calls are harmless."""
-
     _native.close(session)
 
 
@@ -696,480 +478,70 @@ def allocate_id(session: Session) -> int:
     return _native.allocate_id(session)
 
 
-def supports(session: Session, feature: int) -> bool:
-    return _native.supports(session, feature)
+def supports(session: Session, profile: str) -> bool:
+    return _native.supports(session, profile)
 
 
-def root_context_id(session: Session) -> int:
-    return _native.root_context_id(session)
+def session_info(session: Session) -> SessionInfo:
+    return SessionInfo(**_native.session_info(session))
 
 
-def display_state(session: Session) -> DisplayState:
-    return DisplayState(*_native.display_state(session))
+def create_surface(session: Session, config: SurfaceConfig) -> Surface:
+    return _native.create_surface(session, config.native(session))
 
 
-def revision_state(session: Session) -> RevisionState:
-    scene_revision, source_revisions = _native.revision_state(session)
-    return RevisionState(scene_revision, dict(source_revisions))
-
-
-def set_observation(session: Session, class_mask: int) -> None:
-    _native.set_observation(session, class_mask)
-
-
-def create_context(
-    session: Session,
-    *,
-    context_id: int,
-    parent_context_id: int,
-    class_mask: int,
-    label: str,
-    expiry_us: int,
-    quotas: ContextQuotas,
-) -> ContextReady:
-    values = _native.create_context(
-        session,
-        context_id,
-        parent_context_id,
-        class_mask,
-        label,
-        expiry_us,
-        quotas.maximum_sources,
-        quotas.maximum_nodes,
-        quotas.maximum_retained_pixels,
-        quotas.maximum_media_bytes,
-        quotas.maximum_media_connections,
-    )
-    return ContextReady(values[0], values[1], values[2], ContextQuotas(*values[3:]))
-
-
-def delegate_context(session: Session, context_id: int) -> bytes:
-    """Mint an opaque capability; keep the returned bytes out of logs and traces."""
-
-    return bytes(_native.delegate_context(session, context_id))
-
-
-def revoke_context(session: Session, context_id: int) -> None:
-    _native.revoke_context(session, context_id)
-
-
-def _playback(value: Tuple[int, int, int, int, int, int, int]) -> PlaybackSnapshot:
-    return PlaybackSnapshot(*value)
-
-
-def take_observation(session: Session) -> Optional[ObservationEvent]:
-    value = _native.take_observation(session)
-    if value is None:
-        return None
-    kind, source, revision, detail, sequence, first_lost, playback = value
-    if kind == "source" and source is not None:
-        return SourceChangedEvent(source, revision, detail, sequence, first_lost)
-    if kind == "scene":
-        return SceneChangedEvent(revision, detail, sequence, first_lost)
-    if kind == "playback" and source is not None and playback is not None:
-        return PlaybackStateEvent(source, revision, sequence, _playback(playback))
-    raise VividError("native observation event is malformed")
-
-
-def capability_generation(session: Session) -> int:
-    return int(_native.capability_generation(session))
-
-
-def take_session_event(session: Session) -> Optional[CapabilityChangedEvent]:
-    value = _native.take_session_event(session)
-    if value is None:
-        return None
-    return CapabilityChangedEvent(int(value[0]), int(value[1]))
-
-
-def set_trace_callback(session: Session, callback: Callable[[TraceEvent], None]) -> None:
-    """Deliver bounded metadata-only trace records on the SDK trace worker."""
-
-    def decode(line: str) -> None:
-        callback(TraceEvent(**json.loads(line)))
-
-    _native.set_trace_callback(session, decode)
-
-
-def query_source(session: Session, source: SourceLike) -> SourceStatus:
-    values: Dict[str, Any] = _native.query_source(session, _source_id(source))
-    playback = values.get("playback")
-    values["playback"] = None if playback is None else _playback(playback)
-    descriptor = values.get("descriptor")
-    values["descriptor"] = (
-        None if descriptor is None else ReportedSourceDescriptor(**descriptor)
-    )
-    return SourceStatus(**values)
-
-
-def query_scene(
-    session: Session,
-    *,
-    maximum_nodes_per_page: int = 256,
-    maximum_pages: int = 16,
-) -> SceneStatus:
-    values: Dict[str, Any] = _native.query_scene(
-        session, maximum_nodes_per_page, maximum_pages
-    )
-    nodes = []
-    for raw in values["nodes"]:
-        clip = raw.get("clip")
-        raw["clip"] = None if clip is None else ClipRect(*clip)
-        nodes.append(SceneNodeStatus(**raw))
-    return SceneStatus(
-        scene_revision=values["scene_revision"],
-        nodes=tuple(nodes),
-        total_nodes=values["total_nodes"],
-    )
-
-
-def query_anchor(session: Session, anchor_id: int) -> AnchorStatus:
-    return AnchorStatus(*_native.query_anchor(session, anchor_id))
-
-
-def query_limits(session: Session) -> LimitsStatus:
-    values: Dict[str, Any] = _native.query_limits(session)
-    return LimitsStatus(**values)
-
-
-def begin_wait_source(
-    session: Session,
-    source: SourceLike,
-    condition: int,
-    *,
-    value: Optional[int] = None,
-    timeout: float = 30.0,
-) -> Wait:
-    return _native.begin_wait_source(
-        session, _source_id(source), condition, value, timeout
-    )
-
-
-def wait(wait_handle: Wait) -> WaitSatisfied:
-    return WaitSatisfied(*_native.wait_source(wait_handle))
-
-
-def cancel_wait(wait_handle: Wait) -> None:
-    _native.cancel_wait(wait_handle)
-
-
-def wait_source(
-    session: Session,
-    source: SourceLike,
-    condition: int,
-    *,
-    value: Optional[int] = None,
-    timeout: float = 30.0,
-) -> WaitSatisfied:
-    return wait(
-        begin_wait_source(
-            session, source, condition, value=value, timeout=timeout
-        )
-    )
-
-
-def create_text_anchor(session: Session) -> Optional[int]:
-    return _native.create_text_anchor(session)
-
-
-def create_raster_source(
-    session: Session,
-    width: int,
-    height: int,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return _native.create_raster_source(
-        session,
-        _allocated_id(session, source_id),
-        width,
-        height,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-        capture_policy,
-        _descriptor_dict(descriptor),
-    )
-
-
-def _image_encoding(encoding: ImageEncoding) -> int:
-    if encoding == "png":
-        return IMAGE_PNG
-    if encoding == "jpeg":
-        return IMAGE_JPEG
-    if isinstance(encoding, int):
-        return encoding
-    raise ValueError("image encoding must be 'png', 'jpeg', or a numeric registry value")
-
-
-def create_image_source(
-    session: Session,
-    config: ImageSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    digest = None if config.sha256 is None else _owned_bytes(config.sha256)
-    return _native.create_image_source(
-        session,
-        _allocated_id(session, source_id),
-        _image_encoding(config.encoding),
-        config.width,
-        config.height,
-        config.encoded_length,
-        digest,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-        capture_policy,
-        _descriptor_dict(descriptor),
-    )
-
-
-def create_video_source(
-    session: Session,
-    config: VideoSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return _native.create_video_source(
-        session,
-        _allocated_id(session, source_id),
-        _video_dict(config),
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-        capture_policy,
-        _descriptor_dict(descriptor),
-    )
-
-
-def create_audio_source(
-    session: Session,
-    config: AudioSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    linked_video: Optional[SourceLike] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    linked_id = None if linked_video is None else _source_id(linked_video)
-    return _native.create_audio_source(
-        session,
-        _allocated_id(session, source_id),
-        linked_id,
-        _audio_dict(config),
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-        capture_policy,
-        _descriptor_dict(descriptor),
-    )
-
-
-def create_linked_av_sources(
-    session: Session,
-    video: VideoSourceConfig,
-    audio: AudioSourceConfig,
-    *,
-    video_source_id: Optional[int] = None,
-    audio_source_id: Optional[int] = None,
-    video_capture_policy: int = 0,
-    audio_capture_policy: int = 0,
-    video_descriptor: Optional[SourceDescriptor] = None,
-    audio_descriptor: Optional[SourceDescriptor] = None,
-) -> Tuple[Source, Source]:
-    video_handle, audio_handle, audio_error = _native.create_linked_av_sources(
-        session,
-        _allocated_id(session, video_source_id),
-        _video_dict(video),
-        _allocated_id(session, audio_source_id),
-        _audio_dict(audio),
-        video_capture_policy,
-        audio_capture_policy,
-        _descriptor_dict(video_descriptor),
-        _descriptor_dict(audio_descriptor),
-    )
-    if audio_error is not None or audio_handle is None:
-        raise LinkedAudioError(audio_error or "linked audio source was rejected", video_handle)
-    return video_handle, audio_handle
-
-
-def set_source_policy(
-    session: Session, source: SourceLike, capture_policy: int
+def update_surface(
+    session: Session, surface: Surface, config: SurfaceConfig
 ) -> None:
-    _native.set_source_policy(session, _source_id(source), capture_policy)
+    native = config.native(session)
+    native["context_id"] = surface.context_id
+    native["surface_id"] = surface.id
+    _native.update_surface(session, surface, native)
 
 
-def update_source_descriptor(
-    session: Session,
-    source: SourceLike,
-    descriptor: SourceDescriptor,
-    *,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    encoded = _descriptor_dict(descriptor)
-    assert encoded is not None
-    _native.update_source_descriptor(
-        session,
-        _source_id(source),
-        encoded,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-    )
+def destroy_surface(session: Session, surface: Surface) -> None:
+    _native.destroy_surface(session, surface)
 
 
-def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
-    return _native.probe_video_config(session, _video_dict(config))
+def create_track(session: Session, surface: Surface, config: TrackConfig) -> Track:
+    return _native.create_track(session, config.native(session, surface))
 
 
-def probe_audio_config(session: Session, config: AudioSourceConfig) -> bool:
-    return _native.probe_audio_config(session, _audio_dict(config))
+def destroy_track(session: Session, track: Track) -> None:
+    _native.destroy_track(session, track)
 
 
-def place_source(
-    session: Session,
-    source: SourceLike,
-    columns: int,
-    rows: int,
-    *,
-    node_id: Optional[int] = None,
-    anchor: bool = True,
-    anchor_id: Optional[int] = None,
-) -> SceneNode:
-    if not anchor and anchor_id is not None:
-        raise ValueError("anchor_id cannot be supplied when anchor=False")
-    actual_node_id = _allocated_id(session, node_id)
-    actual_anchor_id = (
-        create_text_anchor(session) if anchor and anchor_id is None else anchor_id
-    )
-    actual_source_id = _source_id(source)
-    _native.place_source(
-        session, actual_source_id, actual_node_id, actual_anchor_id, columns, rows
-    )
-    return SceneNode(actual_node_id, actual_source_id)
+def open_track_channel(session: Session, track: Track) -> TrackChannel:
+    return _native.open_track_channel(session, track)
 
 
-def create_scene_node(session: Session, config: SceneNodeConfig) -> SceneNode:
-    return SceneNode(*_native.create_scene_node(session, _scene_dict(session, config, updating=False)))
-
-
-def update_scene_node(session: Session, config: SceneNodeConfig) -> SceneNode:
-    return SceneNode(*_native.update_scene_node(session, _scene_dict(session, config, updating=True)))
-
-
-def delete_scene_node(session: Session, node_id: int) -> None:
-    _native.delete_scene_node(session, node_id)
-
-
-def destroy_source(
-    session: Session,
-    source: SourceLike,
-    *,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    _native.destroy_source(
-        session,
-        _source_id(source),
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-    )
-
-
-def wait_until_visible(session: Session, source: Source) -> None:
-    _native.wait_until_visible(session, source)
-
-
-def check_source(session: Session, source: Source) -> None:
-    _native.check_source(session, source)
-
-
-def _event(value: Optional[Tuple[str, Optional[bool], Optional[int], Optional[str]]]) -> Optional[SourceEvent]:
-    if value is None:
-        return None
-    kind, visible, epoch, message = value
-    if kind == "visibility" and visible is not None:
-        return VisibilityEvent(visible)
-    if kind == "need_keyframe" and epoch is not None:
-        return NeedKeyframeEvent(epoch)
-    if kind == "lost" and message is not None:
-        return SourceLostEvent(message)
-    raise VividError("native source event is malformed")
-
-
-def take_event(handle: Union[Source, MediaSender]) -> Optional[SourceEvent]:
-    if isinstance(handle, Source):
-        return _event(_native.take_source_event(handle))
-    if isinstance(handle, MediaSender):
-        return _event(_native.take_sender_event(handle))
-    raise TypeError("expected a Source or MediaSender")
-
-
-def is_visible(handle: Union[Source, MediaSender]) -> bool:
-    if isinstance(handle, Source):
-        return _native.source_is_visible(handle)
-    if isinstance(handle, MediaSender):
-        return _native.sender_is_visible(handle)
-    raise TypeError("expected a Source or MediaSender")
-
-
-def visibility_reasons(handle: Union[Source, MediaSender]) -> int:
-    if isinstance(handle, Source):
-        return _native.source_visibility_reasons(handle)
-    if isinstance(handle, MediaSender):
-        return _native.sender_visibility_reasons(handle)
-    raise TypeError("expected a Source or MediaSender")
-
-
-def open_sender(session: Session, source: Source) -> MediaSender:
-    """Consume a source handle and open its independently synchronized media sender."""
-
-    return _native.open_sender(session, source)
+def close_channel(channel: TrackChannel) -> None:
+    _native.close_channel(channel)
 
 
 def send_raster(
-    sender: MediaSender,
+    channel: TrackChannel,
     rgba: BytesLike,
     *,
-    width: int,
-    height: int,
-    epoch: int = 1,
+    epoch: int = 0,
     frame_id: int = 1,
-) -> None:
-    _native.send_raster(
-        sender, epoch, frame_id, width, height, _owned_bytes(rgba)
+    compress: bool = False,
+) -> int:
+    return _native.send_raster(
+        channel,
+        bytes(rgba),
+        epoch=epoch,
+        frame_id=frame_id,
+        compress=compress,
     )
 
 
-def send_image(sender: MediaSender, encoded: BytesLike) -> None:
-    _native.send_image(sender, _owned_bytes(encoded))
+def send_image(channel: TrackChannel, encoded: BytesLike) -> int:
+    return _native.send_image(channel, bytes(encoded))
 
 
 def send_video(
-    sender: MediaSender,
+    channel: TrackChannel,
     data: BytesLike,
     *,
     packet_id: int,
@@ -1177,374 +549,283 @@ def send_video(
     dts_us: int,
     duration_us: int,
     key: bool,
-    epoch: int = 1,
-) -> None:
-    _native.send_video(
-        sender,
-        epoch,
-        packet_id,
-        pts_us,
-        dts_us,
-        duration_us,
-        key,
-        _owned_bytes(data),
+    epoch: int = 0,
+) -> int:
+    return _native.send_video(
+        channel,
+        bytes(data),
+        packet_id=packet_id,
+        pts_us=pts_us,
+        dts_us=dts_us,
+        duration_us=duration_us,
+        key=key,
+        epoch=epoch,
     )
 
 
 def send_audio(
-    sender: MediaSender,
+    channel: TrackChannel,
     data: BytesLike,
     *,
     packet_id: int,
     pts_us: int,
     dts_us: int,
     duration_us: int,
+    epoch: int = 0,
     trim_start_samples: int = 0,
     trim_end_samples: int = 0,
-    epoch: int = 1,
-) -> None:
-    _native.send_audio(
-        sender,
-        epoch,
-        packet_id,
-        pts_us,
-        dts_us,
-        duration_us,
-        trim_start_samples,
-        trim_end_samples,
-        _owned_bytes(data),
+) -> int:
+    return _native.send_audio(
+        channel,
+        bytes(data),
+        packet_id=packet_id,
+        pts_us=pts_us,
+        dts_us=dts_us,
+        duration_us=duration_us,
+        epoch=epoch,
+        trim_start_samples=trim_start_samples,
+        trim_end_samples=trim_end_samples,
     )
 
 
-def cancel_sender(sender: MediaSender, reason: str = "Python media sender cancelled") -> None:
-    _native.cancel_sender(sender, reason)
+def channel_eos(channel: TrackChannel) -> int:
+    return _native.channel_eos(channel)
 
 
-def play(
+def activate_track(
     session: Session,
-    source: SourceLike,
+    surface: Surface,
+    track: Track,
     *,
-    start_pts_us: int = 0,
-    minimum_buffer_us: int = 0,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    _native.play(
+    required_milestone: int = MILESTONE_OUTPUT_READY,
+) -> int:
+    return _native.activate_track(
         session,
-        _source_id(source),
-        start_pts_us,
-        minimum_buffer_us,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
+        surface,
+        track,
+        required_milestone=required_milestone,
     )
 
 
-def wait_until_playing(
-    session: Session, source: SourceLike, *, timeout: float = 30.0
-) -> WaitSatisfied:
-    return WaitSatisfied(
-        *_native.wait_until_playing(session, _source_id(source), timeout)
-    )
-
-
-def play_and_wait_until_playing(
+def wait_track(
     session: Session,
-    source: SourceLike,
+    track: Track,
     *,
-    start_pts_us: int = 0,
-    minimum_buffer_us: int = 0,
-    timeout: float = 30.0,
+    condition: int,
+    value: Optional[int] = None,
+    timeout_us: int = 30_000_000,
 ) -> WaitSatisfied:
     return WaitSatisfied(
-        *_native.play_and_wait_until_playing(
+        **_native.wait_track(
             session,
-            _source_id(source),
-            start_pts_us,
-            minimum_buffer_us,
-            timeout,
+            track,
+            condition=condition,
+            value=value,
+            timeout_us=timeout_us,
         )
     )
 
 
-def pause(
+def place_terminal_surface(
     session: Session,
-    source: SourceLike,
+    surface: Surface,
     *,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    _native.pause(
+    node_id: Optional[int] = None,
+    x: int = 0,
+    y: int = 0,
+    width: int,
+    height: int,
+    text_layer: int = 1,
+) -> Tuple[int, int]:
+    return _native.place_terminal_surface(
         session,
-        _source_id(source),
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
+        surface,
+        node_id=(allocate_id(session) if node_id is None else node_id),
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        text_layer=text_layer,
     )
 
 
-def flush(
-    session: Session,
-    source: SourceLike,
-    *,
-    epoch: int,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    _native.flush(
+def anchor_marker(
+    session: Session, *, context_id: Optional[int] = None, anchor_id: Optional[int] = None
+) -> str:
+    info = session_info(session)
+    return _native.anchor_marker(
         session,
-        _source_id(source),
-        epoch,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
+        info.root_context_id if context_id is None else context_id,
+        allocate_id(session) if anchor_id is None else anchor_id,
     )
-
-
-def eos(
-    session: Session,
-    source: SourceLike,
-    *,
-    epoch: int,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    _native.eos(
-        session,
-        _source_id(source),
-        epoch,
-        preconditions,
-        None if idempotency_key is None else _owned_bytes(idempotency_key),
-        None if causation_id is None else _owned_bytes(causation_id),
-    )
-
-
-def drain(
-    session: Session,
-    source: SourceLike,
-    *,
-    timeout: Optional[float] = None,
-) -> None:
-    _native.drain(session, _source_id(source), timeout)
 
 
 def display_image(
-    path: Union[str, os.PathLike[str]],
-    scale: float = 1.0,
+    path: Union[str, Path],
     *,
-    endpoint: Optional[str] = None,
-    bulk_endpoint: Optional[str] = None,
-    token: Optional[str] = None,
-    dry_run: bool = False,
-    trace_dir: Optional[os.PathLike[str]] = None,
-    verbose: bool = False,
-) -> None:
-    """Display one retained PNG or JPEG, fitted to the current terminal viewport."""
+    columns: Optional[int] = None,
+    rows: Optional[int] = None,
+    **connect_options: Any,
+) -> ImagePresentation:
+    """Create and retain one PNG/JPEG presentation.
 
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("scale must be a positive finite number")
-    image = _inspect_encoded_image(path)
-    offline = dry_run or trace_dir is not None
-    if not offline and not sys.stdout.isatty():
-        raise VividError("stdout must be attached to the Vivido terminal")
-    required_features = tuple(
-        sorted(DEFAULT_REQUIRED_FEATURES + (FEATURE_ENCODED_IMAGE_V1,))
-    )
-    optional_features = tuple(
-        feature
-        for feature in DEFAULT_OPTIONAL_FEATURES
-        if feature != FEATURE_ENCODED_IMAGE_V1
-    )
-    session = connect(
-        endpoint=endpoint,
-        bulk_endpoint=bulk_endpoint,
-        token=token,
-        dry_run=dry_run,
-        trace_dir=trace_dir,
-        verbose=verbose,
-        producer="vivid-python-image",
-        required_features=required_features,
-        optional_features=optional_features,
-    )
+    The returned object owns the live session. Call ``close()`` when the image
+    should disappear.
+    """
+
+    encoded = Path(path).read_bytes()
+    encoding, width, height = _image_info(encoded)
+    session = connect(**connect_options)
     try:
-        columns, rows = _fitted_image_cells(image, display_state(session), scale)
-        source = create_image_source(
+        surface = create_surface(
             session,
-            ImageSourceConfig(
-                encoding=image.encoding,
-                width=image.width,
-                height=image.height,
-                encoded_length=len(image.data),
-                sha256=hashlib.sha256(image.data).digest(),
+            SurfaceConfig(
+                logical_width=width,
+                logical_height=height,
+                role=ROLE_FIGURE,
+                title=Path(path).name,
             ),
         )
-        place_source(session, source, columns, rows)
-        if not offline:
-            _reserve_terminal_rows(rows)
-        sender = open_sender(session, source)
-        send_image(sender, image.data)
-        if not offline and supports(session, FEATURE_OBSERVABILITY_CORE_V1):
-            wait_source(
-                session,
-                sender,
-                WAIT_FIRST_VISIBLE_PRESENTATION,
-                timeout=10.0,
-            )
-    finally:
+        place_terminal_surface(
+            session,
+            surface,
+            width=(columns if columns is not None else min(width, 80)) << 32,
+            height=(rows if rows is not None else min(height, 24)) << 32,
+        )
+        track = create_track(
+            session,
+            surface,
+            ImageTrackConfig(
+                width=width,
+                height=height,
+                encoded_length=len(encoded),
+                encoding=encoding,
+                sha256=hashlib.sha256(encoded).digest(),
+            ),
+        )
+        channel = open_track_channel(session, track)
+        send_image(channel, encoded)
+        return ImagePresentation(session, surface, track, channel)
+    except BaseException:
         close(session)
+        raise
 
+
+def _track_common(
+    session: Session,
+    surface: Surface,
+    track_id: Optional[int],
+    kind: str,
+    slot: int,
+    mode: int,
+    lane: int,
+    maximum_record_body: int,
+    maximum_rate_millihertz: int,
+    maximum_encoded_bits_per_second: int,
+    maximum_records_per_second: int,
+    maximum_inflight_body_bytes: int,
+    target_latency_us: int,
+    maximum_latency_us: int,
+    retained_pixel_charge: int,
+    **kind_values: object,
+) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "context_id": surface.context_id,
+        "surface_id": surface.id,
+        "track_id": allocate_id(session) if track_id is None else track_id,
+        "kind": kind,
+        "slot": slot,
+        "mode": mode,
+        "lane": lane,
+        "maximum_record_body": maximum_record_body,
+        "maximum_rate_millihertz": maximum_rate_millihertz,
+        "maximum_encoded_bits_per_second": maximum_encoded_bits_per_second,
+        "maximum_records_per_second": maximum_records_per_second,
+        "maximum_inflight_body_bytes": maximum_inflight_body_bytes,
+        "target_latency_us": target_latency_us,
+        "maximum_latency_us": maximum_latency_us,
+        "retained_pixel_charge": retained_pixel_charge,
+    }
+    result.update(kind_values)
+    return result
+
+
+def _checked_mul(left: int, right: int) -> int:
+    value = left * right
+    if left < 0 or right < 0 or value > (1 << 64) - 1:
+        raise ValueError("resource claim overflows u64")
+    return value
+
+
+def _checked_add(left: int, right: int) -> int:
+    value = left + right
+    if left < 0 or right < 0 or value > (1 << 64) - 1:
+        raise ValueError("resource claim overflows u64")
+    return value
+
+
+def _image_info(data: bytes) -> Tuple[int, int, int]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        width, height = struct.unpack(">II", data[16:24])
+        return IMAGE_PNG, width, height
+    if data.startswith(b"\xff\xd8"):
+        offset = 2
+        while offset + 4 <= len(data):
+            if data[offset] != 0xFF:
+                raise ValueError("invalid JPEG marker stream")
+            marker = data[offset + 1]
+            offset += 2
+            if marker in (0xD8, 0xD9):
+                continue
+            length = int.from_bytes(data[offset : offset + 2], "big")
+            if length < 2 or offset + length > len(data):
+                raise ValueError("truncated JPEG segment")
+            if marker in range(0xC0, 0xC4):
+                if length < 7:
+                    raise ValueError("invalid JPEG frame header")
+                height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+                width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+                return IMAGE_JPEG, width, height
+            offset += length
+    raise ValueError("only complete PNG and JPEG images are supported")
+
+
+from . import aio as aio  # noqa: E402
 
 __all__ = [
-    "AudioSourceConfig",
-    "BytesLike",
-    "ClipRect",
+    "AudioTrackConfig",
     "ClosedHandleError",
-    "DEFAULT_OPTIONAL_FEATURES",
-    "DEFAULT_REQUIRED_FEATURES",
-    "DisplayState",
-    "RevisionState",
-    "PlaybackSnapshot",
-    "SourceDescriptor",
-    "ReportedSourceDescriptor",
-    "SourceStatus",
-    "SceneNodeStatus",
-    "SceneStatus",
-    "AnchorStatus",
-    "LimitsStatus",
-    "Wait",
-    "WaitSatisfied",
-    "ObservationEvent",
-    "SourceChangedEvent",
-    "SceneChangedEvent",
-    "PlaybackStateEvent",
-    "CapabilityChangedEvent",
-    "TraceEvent",
-    "CAPTURE_POLICY_DENY_CAPTURE",
-    "CAPTURE_POLICY_DENY_SEMANTIC_EXPORT",
-    "CAPTURE_POLICY_DENY_POSTER_RETENTION",
-    "CAPTURE_POLICY_DENY_CACHE",
-    "CAPTURE_POLICY_REDUCE_DIAGNOSTICS",
-    "CAPTURE_POLICY_MASK",
-    "CAPS_CHANGE_DECODER_AVAILABILITY",
-    "CAPS_CHANGE_DEVICE_AVAILABILITY",
-    "CAPS_CHANGE_PRESENTER_POLICY",
-    "CAPS_CHANGE_RESOURCE_PRESSURE",
-    "SOURCE_ROLE_UNSPECIFIED",
-    "SOURCE_ROLE_DOCUMENT",
-    "SOURCE_ROLE_DESKTOP",
-    "SOURCE_ROLE_TIMED_MEDIA",
-    "SOURCE_ROLE_FIGURE",
-    "SOURCE_ROLE_TERMINAL",
-    "SEMANTIC_AVAILABLE_TEXT",
-    "SEMANTIC_AVAILABLE_STRUCTURE",
-    "SEMANTIC_AVAILABLE_LINKS",
-    "SEMANTIC_AVAILABLE_OUTLINE",
-    "SEMANTIC_AVAILABLE_ACTIONS",
-    "FEATURE_AUDIO_ACCESS_UNIT_V1",
-    "FEATURE_CREDIT_FLOW_CONTROL",
-    "FEATURE_DECODER_DESCRIPTION_V1",
-    "FEATURE_ENCODED_IMAGE_V1",
-    "FEATURE_GRID_CELL_NODES",
-    "FEATURE_NODE_CLIP_RECT_V1",
-    "FEATURE_OBSERVABILITY_CORE_V1",
-    "FEATURE_RASTER_PREMULTIPLIED_ALPHA",
-    "FEATURE_RASTER_RGBA8",
-    "FEATURE_RASTER_ZSTD_V1",
-    "FEATURE_SCENE_TRANSACTIONS",
-    "FEATURE_TEXT_ANCHORS_V2",
-    "FEATURE_SOURCE_CAPTURE_POLICY_V1",
-    "FEATURE_SOURCE_DESCRIPTOR_V1",
-    "FEATURE_VIDEO_ACCESS_UNIT_V1",
-    "FEATURE_VIDEO_CONTROL_V1",
-    "FEATURE_VISIBILITY_EVENTS_V1",
-    "OBSERVE_SOURCE_TRANSITIONS",
-    "OBSERVE_SCENE_CHANGES",
-    "OBSERVE_PLAYBACK_TRANSITIONS",
-    "OBSERVATION_CLASS_MASK",
-    "WAIT_SOURCE_REVISION",
-    "WAIT_FIRST_VISIBLE_PRESENTATION",
-    "WAIT_RASTER_FRAME",
-    "WAIT_VIDEO_PTS",
-    "WAIT_PLAYBACK_STARTED",
-    "WAIT_PLAYBACK_ENDED",
-    "WAIT_MEDIA_ATTACHED",
-    "WAIT_MEDIA_CLOSED",
-    "WAIT_SOURCE_LOST",
-    "IMAGE_JPEG",
-    "IMAGE_PNG",
-    "ImageSourceConfig",
-    "LinkedAudioError",
-    "MediaSender",
-    "NeedKeyframeEvent",
-    "SceneNode",
-    "SceneNodeConfig",
+    "ImagePresentation",
+    "ImageTrackConfig",
+    "RasterTrackConfig",
     "Session",
-    "Source",
-    "SourceEvent",
-    "SourceLike",
-    "SourceLostEvent",
-    "TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH",
-    "VideoSourceConfig",
-    "VisibilityEvent",
+    "SessionInfo",
+    "Surface",
+    "SurfaceConfig",
+    "Track",
+    "TrackChannel",
+    "VideoTrackConfig",
     "VividError",
-    "__version__",
+    "activate_track",
+    "aio",
     "allocate_id",
-    "begin_wait_source",
-    "cancel_wait",
-    "cancel_sender",
-    "check_source",
-    "capability_generation",
+    "anchor_marker",
+    "channel_eos",
     "close",
+    "close_channel",
     "connect",
-    "create_audio_source",
-    "create_image_source",
-    "create_linked_av_sources",
-    "create_raster_source",
-    "create_scene_node",
-    "create_text_anchor",
-    "create_video_source",
-    "delete_scene_node",
-    "destroy_source",
-    "display_state",
+    "create_surface",
+    "create_track",
+    "destroy_surface",
+    "destroy_track",
     "display_image",
-    "drain",
-    "eos",
-    "flush",
-    "is_visible",
-    "open_sender",
-    "pause",
-    "place_source",
-    "play",
-    "play_and_wait_until_playing",
-    "probe_audio_config",
-    "probe_video_config",
-    "root_context_id",
-    "revision_state",
+    "open_track_channel",
+    "place_terminal_surface",
     "send_audio",
     "send_image",
     "send_raster",
     "send_video",
-    "source_id",
+    "session_info",
     "supports",
-    "set_observation",
-    "set_source_policy",
-    "query_source",
-    "query_scene",
-    "query_anchor",
-    "query_limits",
-    "take_observation",
-    "take_session_event",
-    "set_trace_callback",
-    "take_event",
-    "update_scene_node",
-    "update_source_descriptor",
-    "visibility_reasons",
-    "wait_until_visible",
-    "wait",
-    "wait_source",
-    "wait_until_playing",
+    "update_surface",
 ]
