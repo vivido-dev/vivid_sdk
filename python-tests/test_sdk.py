@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import threading
 from pathlib import Path
 
 import pytest
@@ -11,416 +10,188 @@ import vivid_sdk as vivid
 from vivid_sdk import aio
 
 
-def video_config() -> vivid.VideoSourceConfig:
-    return vivid.VideoSourceConfig(
-        codec="h264",
-        packetization="annex-b",
-        width=16,
-        height=16,
-        max_access_unit_bytes=1024,
-    )
+def raster_config() -> vivid.RasterTrackConfig:
+    return vivid.RasterTrackConfig(width=2, height=2)
 
 
-def audio_config() -> vivid.AudioSourceConfig:
-    return vivid.AudioSourceConfig(
-        codec="opus",
-        packetization="opus-packet",
-        sample_rate=48_000,
-        channels=2,
-        max_access_unit_bytes=1024,
-    )
-
-
-def test_session_defaults_ids_and_secret_safe_repr(monkeypatch: pytest.MonkeyPatch) -> None:
-    secret = "ab" * 32
-    monkeypatch.setenv("VIVID_TOKEN", secret)
-    session = vivid.connect(dry_run=True)
+def test_session_profiles_and_redacted_repr() -> None:
+    secret = "11" * 32
+    session = vivid.connect(dry_run=True, root_secret=secret)
     try:
-        assert vivid.allocate_id(session) == 1
-        assert vivid.allocate_id(session) == 2
-        assert vivid.supports(session, vivid.FEATURE_AUDIO_ACCESS_UNIT_V1)
-        assert vivid.root_context_id(session) == 1
-        assert vivid.capability_generation(session) == 1
-        assert vivid.take_session_event(session) is None
-        assert vivid.display_state(session) == vivid.DisplayState(
-            display_generation=0,
-            viewport_width=800,
-            viewport_height=600,
-            grid_columns=80,
-            grid_rows=24,
-            cell_width=10,
-            cell_height=25,
-            settled=True,
-        )
+        info = vivid.session_info(session)
+        assert info.session_id == 1
+        assert info.root_context_id == 1
+        assert info.target_profile == vivid.PROFILE_TERMINAL_SURFACE
+        assert vivid.supports(session, vivid.PROFILE_CORE)
+        assert vivid.supports(session, vivid.PROFILE_LIVE_MEDIA)
         assert secret not in repr(session)
+        assert "ROOT_SECRET" not in repr(session)
     finally:
-        vivid.close(session)
         vivid.close(session)
     assert session.closed
 
 
-def test_typed_trace_callback_receives_only_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    secret = "de" * 32
-    monkeypatch.setenv("VIVID_TOKEN", secret)
-    events: list[vivid.TraceEvent] = []
-    session = vivid.connect(dry_run=True)
-    vivid.set_trace_callback(session, events.append)
-    source = vivid.create_raster_source(
-        session,
-        1,
-        1,
-        capture_policy=vivid.CAPTURE_POLICY_REDUCE_DIAGNOSTICS,
-    )
-    sender = vivid.open_sender(session, source)
-    vivid.send_raster(sender, bytes([0, 0, 0, 255]), width=1, height=1)
-    vivid.close(session)
-
-    assert events
-    assert all(isinstance(event, vivid.TraceEvent) for event in events)
-    assert all(event.component == "vivid_sdk" for event in events)
-    assert any(event.outcome == "restricted" and event.object_id is None for event in events)
-    assert secret not in repr(events)
-    assert "000000ff" not in repr(events)
-
-
-def test_observability_wait_api_and_secret_safe_handles(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    secret = "cd" * 32
-    monkeypatch.setenv("VIVID_TOKEN", secret)
+def test_surface_track_channel_and_ordered_eos() -> None:
     session = vivid.connect(dry_run=True)
     try:
-        assert vivid.supports(session, vivid.FEATURE_OBSERVABILITY_CORE_V1)
-        assert vivid.revision_state(session) == vivid.RevisionState(0, {})
-        vivid.set_observation(session, vivid.OBSERVATION_CLASS_MASK)
-        assert vivid.take_observation(session) is None
-
-        source = vivid.create_raster_source(session, 1, 1)
-        assert vivid.revision_state(session).source_revisions == {source.id: 0}
-        handle = vivid.begin_wait_source(
+        surface = vivid.create_surface(
             session,
-            source,
-            vivid.WAIT_RASTER_FRAME,
-            value=1,
-            timeout=1.0,
-        )
-        assert secret not in repr(handle)
-        assert not handle.closed
-        satisfied = vivid.wait(handle)
-        assert satisfied == vivid.WaitSatisfied(
-            source.id, 0, vivid.WAIT_RASTER_FRAME, 1
-        )
-        assert handle.closed
-
-        cancelled = vivid.begin_wait_source(
-            session, source, vivid.WAIT_SOURCE_LOST, timeout=1.0
-        )
-        vivid.cancel_wait(cancelled)
-        assert cancelled.closed
-        vivid.cancel_wait(cancelled)
-
-        with pytest.raises(vivid.VividError, match="live presenter"):
-            vivid.query_source(session, source)
-        with pytest.raises(ValueError, match="non-zero"):
-            vivid.query_scene(session, maximum_pages=0)
-    finally:
-        vivid.close(session)
-
-
-def test_invalid_features_and_closed_handle_errors() -> None:
-    with pytest.raises(ValueError, match="strictly increasing"):
-        vivid.connect(dry_run=True, required_features=(3, 1))
-
-    session = vivid.connect(dry_run=True)
-    vivid.close(session)
-    with pytest.raises(vivid.ClosedHandleError):
-        vivid.allocate_id(session)
-
-
-def test_raster_scene_sender_and_handle_consumption() -> None:
-    session = vivid.connect(dry_run=True)
-    try:
-        source = vivid.create_raster_source(session, 2, 2)
-        assert source.id == 1
-        assert source.kind == "raster"
-        assert vivid.is_visible(source)
-        assert vivid.visibility_reasons(source) == 0
-        assert vivid.take_event(source) is None
-        vivid.wait_until_visible(session, source)
-        vivid.check_source(session, source)
-
-        node = vivid.place_source(session, source, 2, 1)
-        assert node.source_id == source.id
-        sender = vivid.open_sender(session, source)
-        assert source.closed
-        assert sender.id == 1
-        assert sender.kind == "raster"
-        with pytest.raises(vivid.ClosedHandleError):
-            vivid.open_sender(session, source)
-
-        rgba = bytearray([255, 0, 0, 255] * 4)
-        vivid.send_raster(sender, memoryview(rgba), width=2, height=2)
-        with pytest.raises(ValueError, match="raster sender"):
-            vivid.send_video(
-                sender,
-                b"packet",
-                packet_id=1,
-                pts_us=0,
-                dts_us=0,
-                duration_us=1,
-                key=True,
-            )
-        vivid.destroy_source(session, sender)
-        vivid.cancel_sender(sender)
-        assert sender.closed
-        with pytest.raises(vivid.ClosedHandleError):
-            vivid.send_raster(sender, rgba, width=2, height=2)
-    finally:
-        vivid.close(session)
-
-
-def test_source_descriptor_creation_and_update() -> None:
-    session = vivid.connect(dry_run=True)
-    try:
-        descriptor = vivid.SourceDescriptor(
-            role=vivid.SOURCE_ROLE_DOCUMENT,
-            title="guide.pdf",
-            content_revision=1,
-            semantic_availability=(
-                vivid.SEMANTIC_AVAILABLE_TEXT | vivid.SEMANTIC_AVAILABLE_LINKS
-            ),
-            locator="vvrd+unix:///owner-only/control.sock",
-        )
-        source = vivid.create_raster_source(
-            session,
-            1,
-            1,
-            descriptor=descriptor,
-        )
-        vivid.update_source_descriptor(
-            session,
-            source,
-            vivid.SourceDescriptor(
-                **{**descriptor.__dict__, "content_revision": 2}
+            vivid.SurfaceConfig(
+                logical_width=2,
+                logical_height=2,
+                role=vivid.ROLE_FIGURE,
+                title="pixels",
             ),
         )
+        vivid.place_terminal_surface(
+            session,
+            surface,
+            width=2 << 32,
+            height=1 << 32,
+        )
+        track = vivid.create_track(session, surface, raster_config())
+        channel = vivid.open_track_channel(session, track)
+        assert surface.context_id == track.context_id
+        assert surface.id == track.surface_id
+        assert channel.track_id == track.id
+        assert channel.generation == track.channel_generation == 1
+        waited = vivid.wait_track(
+            session,
+            track,
+            condition=vivid.WAIT_CHANNEL_ACCEPTED,
+            timeout_us=1_000_000,
+        )
+        assert waited.track_id == track.id
+        assert waited.channel_generation == channel.generation
+        media_sequence = vivid.send_raster(
+            channel,
+            bytes([255, 0, 0, 255] * 4),
+            frame_id=1,
+        )
+        eos_sequence = vivid.channel_eos(channel)
+        assert eos_sequence > media_sequence
+        with pytest.raises(ValueError, match="CHANNEL_EOS"):
+            vivid.send_raster(channel, bytes([0, 0, 0, 255] * 4), frame_id=2)
+        vivid.close_channel(channel)
+        assert channel.closed
     finally:
         vivid.close(session)
 
 
-def test_encoded_image_and_raw_scene_transactions() -> None:
-    encoded = b"\x89PNG\r\n\x1a\nexample"
+def test_track_replacement_keeps_surface_generation() -> None:
     session = vivid.connect(dry_run=True)
     try:
-        source = vivid.create_image_source(
+        surface = vivid.create_surface(
+            session, vivid.SurfaceConfig(logical_width=2, logical_height=2)
+        )
+        generation = surface.generation
+        first = vivid.create_track(session, surface, raster_config())
+        second = vivid.create_track(session, surface, raster_config())
+        vivid.destroy_track(session, first)
+        assert surface.generation == generation
+        assert second.surface_id == surface.id
+
+        vivid.update_surface(
             session,
-            vivid.ImageSourceConfig(
-                encoding="png",
+            surface,
+            vivid.SurfaceConfig(logical_width=3, logical_height=2),
+        )
+        assert surface.generation == generation + 1
+    finally:
+        vivid.close(session)
+
+
+def test_encoded_image_track_is_immutable_and_one_shot() -> None:
+    encoded = b"\x89PNG\r\n\x1a\n" + b"example"
+    session = vivid.connect(dry_run=True)
+    try:
+        surface = vivid.create_surface(
+            session, vivid.SurfaceConfig(logical_width=1, logical_height=1)
+        )
+        track = vivid.create_track(
+            session,
+            surface,
+            vivid.ImageTrackConfig(
                 width=1,
                 height=1,
                 encoded_length=len(encoded),
+                encoding=vivid.IMAGE_PNG,
                 sha256=hashlib.sha256(encoded).digest(),
             ),
         )
-        node = vivid.create_scene_node(
-            session,
-            vivid.SceneNodeConfig(
-                source_id=source.id,
-                width=1 << 32,
-                height=1 << 32,
-                clip=vivid.ClipRect(0, 0, 1 << 32, 1 << 32),
-            ),
-        )
-        updated = vivid.update_scene_node(
-            session,
-            vivid.SceneNodeConfig(
-                node_id=node.id,
-                source_id=source.id,
-                width=2 << 32,
-                height=1 << 32,
-            ),
-        )
-        assert updated == node
-        sender = vivid.open_sender(session, source)
-        vivid.send_image(sender, bytearray(encoded))
-        vivid.delete_scene_node(session, node.id)
-
-        with pytest.raises(ValueError, match="32 bytes"):
-            vivid.create_image_source(
-                session,
-                vivid.ImageSourceConfig("png", 1, 1, 1, b"short"),
-            )
+        channel = vivid.open_track_channel(session, track)
+        vivid.send_image(channel, encoded)
+        with pytest.raises(ValueError, match="exactly one"):
+            vivid.send_image(channel, encoded)
     finally:
         vivid.close(session)
 
 
-def test_video_audio_linking_packets_and_playback_controls() -> None:
-    session = vivid.connect(dry_run=True)
-    try:
-        assert vivid.probe_video_config(session, video_config())
-        assert vivid.probe_audio_config(session, audio_config())
-        video, audio = vivid.create_linked_av_sources(
-            session, video_config(), audio_config()
-        )
-        vivid.place_source(session, video, 2, 2, anchor=False)
-        video_sender = vivid.open_sender(session, video)
-        audio_sender = vivid.open_sender(session, audio)
-
-        vivid.send_video(
-            video_sender,
-            b"\x00\x00\x00\x01\x65",
-            packet_id=1,
-            pts_us=0,
-            dts_us=0,
-            duration_us=33_333,
-            key=True,
-        )
-        vivid.send_audio(
-            audio_sender,
-            b"\xf8\xff\xfe",
-            packet_id=1,
-            pts_us=0,
-            dts_us=0,
-            duration_us=20_000,
-        )
-        vivid.play(session, video_sender, minimum_buffer_us=40_000)
-        vivid.pause(session, video_sender)
-        vivid.flush(session, video_sender, epoch=2)
-        vivid.play(session, video_sender, start_pts_us=33_333)
-        vivid.eos(session, video_sender, epoch=2)
-        vivid.eos(session, audio_sender, epoch=1)
-        vivid.drain(session, video_sender)
-        vivid.drain(session, audio_sender, timeout=0.01)
-    finally:
-        vivid.close(session)
-
-
-def test_trace_session_writes_protocol_files(tmp_path: Path) -> None:
+def test_trace_uses_1_5_control_and_track_prefaces(tmp_path: Path) -> None:
     session = vivid.connect(trace_dir=tmp_path)
-    source = vivid.create_raster_source(session, 1, 1)
-    sender = vivid.open_sender(session, source)
-    vivid.send_raster(sender, b"\x00\x00\x00\xff", width=1, height=1)
+    surface = vivid.create_surface(
+        session, vivid.SurfaceConfig(logical_width=2, logical_height=2)
+    )
+    track = vivid.create_track(session, surface, raster_config())
+    channel = vivid.open_track_channel(session, track)
+    vivid.send_raster(channel, bytes([0, 0, 0, 255] * 4))
+    marker = vivid.anchor_marker(session, anchor_id=7)
     vivid.close(session)
-    assert (tmp_path / "control.vivid").is_file()
-    assert (tmp_path / f"raster-{sender.id}.vivid").is_file()
+
+    control = (tmp_path / "control.vivid").read_bytes()
+    track_files = tuple(tmp_path.glob("track-*.vivid"))
+    assert control[:7] == b"VIVD\x01\x05\x00"
+    assert len(track_files) == 1
+    assert track_files[0].read_bytes()[:7] == b"VIVD\x01\x05\x02"
+    assert "VIVID;3;A;" in marker
+    assert ";0000000000000001;0000000000000007;" in marker
 
 
-def test_asyncio_facade_parity_and_concurrent_senders() -> None:
+def test_async_facade_preserves_owner_handles() -> None:
     async def scenario() -> None:
         session = await aio.connect(dry_run=True)
         try:
-            raster = await aio.create_raster_source(session, 1, 1)
-            image = await aio.create_image_source(
+            surface = await aio.create_surface(
+                session, vivid.SurfaceConfig(logical_width=1, logical_height=1)
+            )
+            track = await aio.create_track(
+                session, surface, vivid.RasterTrackConfig(width=1, height=1)
+            )
+            channel = await aio.open_track_channel(session, track)
+            waited = await aio.wait_track(
                 session,
-                vivid.ImageSourceConfig("jpeg", 1, 1, 3),
+                track,
+                condition=vivid.WAIT_CHANNEL_ACCEPTED,
+                timeout_us=1_000_000,
             )
-            raster_sender, image_sender = await asyncio.gather(
-                aio.open_sender(session, raster),
-                aio.open_sender(session, image),
-            )
-            await asyncio.gather(
-                aio.send_raster(
-                    raster_sender, b"\x00\x00\x00\xff", width=1, height=1
-                ),
-                aio.send_image(image_sender, b"jpg"),
-            )
-            assert await aio.is_visible(raster_sender)
-            assert await aio.take_event(image_sender) is None
-            state = await aio.revision_state(session)
-            assert state.source_revisions == {raster_sender.id: 0, image_sender.id: 0}
-            wait = await aio.begin_wait_source(
-                session,
-                raster_sender,
-                vivid.WAIT_RASTER_FRAME,
-                value=1,
-                timeout=1.0,
-            )
-            assert await aio.wait(wait) == vivid.WaitSatisfied(
-                raster_sender.id, 0, vivid.WAIT_RASTER_FRAME, 1
-            )
-            await aio.cancel_sender(image_sender)
-            assert image_sender.closed
+            assert waited.track_id == track.id
+            await aio.send_raster(channel, b"\x00\x00\x00\xff")
+            await aio.channel_eos(channel)
+            assert channel.surface_id == surface.id
         finally:
             await aio.close(session)
 
     asyncio.run(scenario())
 
 
-def test_asyncio_cancellation_waits_for_cleanup() -> None:
-    async def scenario() -> None:
-        started = threading.Event()
-        release = threading.Event()
-        cleaned: list[str] = []
-
-        def blocking_operation() -> str:
-            started.set()
-            release.wait(timeout=1)
-            return "finished"
-
-        task = asyncio.create_task(
-            aio._call(blocking_operation, cleanup=cleaned.append)
+def test_invalid_profile_order_rejected_by_native_boundary() -> None:
+    with pytest.raises(ValueError, match="sorted"):
+        vivid._native.connect(
+            dry_run=True,
+            required_profiles=(
+                vivid.PROFILE_CORE,
+                vivid.PROFILE_TERMINAL_SURFACE,
+            ),
         )
-        await asyncio.to_thread(started.wait, 1)
-        task.cancel()
-        asyncio.get_running_loop().call_later(0.01, release.set)
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert cleaned == ["finished"]
-
-    asyncio.run(scenario())
 
 
-def test_asyncio_wait_cancellation_invokes_protocol_cancel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def scenario() -> None:
-        started = threading.Event()
-        released = threading.Event()
-        cancelled: list[object] = []
-        handle = object()
-
-        def blocking_wait() -> None:
-            started.set()
-            released.wait(timeout=1)
-
-        def cancel_wait(value: object) -> None:
-            cancelled.append(value)
-            released.set()
-
-        monkeypatch.setattr(aio._sync, "cancel_wait", cancel_wait)  # type: ignore[attr-defined]
-        task = asyncio.create_task(
-            aio._call(blocking_wait, cancel_wait=handle)  # type: ignore[arg-type]
-        )
-        await asyncio.to_thread(started.wait, 1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert cancelled == [handle]
-
-    asyncio.run(scenario())
-
-
-def test_high_level_image_helper(tmp_path: Path) -> None:
-    image = tmp_path / "demo.png"
-    image.write_bytes(
-        b"\x89PNG\r\n\x1a\n"
-        + (13).to_bytes(4, "big")
-        + b"IHDR"
-        + (4).to_bytes(4, "big")
-        + (2).to_bytes(4, "big")
+def test_public_connect_removes_required_profiles_from_optional_set() -> None:
+    session = vivid.connect(
+        dry_run=True,
+        required_profiles=(
+            vivid.PROFILE_CORE,
+            vivid.PROFILE_LIVE_MEDIA,
+            vivid.PROFILE_TERMINAL_SURFACE,
+        ),
     )
-    trace_dir = tmp_path / "trace"
-    trace_dir.mkdir()
-    vivid.display_image(image, 0.5, trace_dir=trace_dir)
-    assert (trace_dir / "control.vivid").is_file()
-    assert list(trace_dir.glob("blob-*.vivid"))
-
-    with pytest.raises(ValueError, match="positive finite"):
-        vivid.display_image(image, 0, dry_run=True)
-
-    async def display_async() -> None:
-        await aio.display_image(image, dry_run=True)
-
-    asyncio.run(display_async())
+    vivid.close(session)
