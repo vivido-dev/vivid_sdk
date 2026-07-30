@@ -508,6 +508,15 @@ impl Track {
     pub fn connection_required(&self) -> io::Result<bool> {
         Ok(lock(&self.inner, "track")?.connection_required)
     }
+
+    /// Effective raster delta operation limit granted by `TRACK_READY`.
+    ///
+    /// Zero means this track accepts no delta frames, either because it is not a raster track or
+    /// because the presenter granted less than the requested configuration. A producer plans its
+    /// delta operations against this value, not against the limit it asked for.
+    pub fn delta_operation_limit(&self) -> io::Result<u32> {
+        Ok(lock(&self.inner, "track")?.delta_operation_limit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2441,12 +2450,78 @@ impl Session {
         metadata: &RequestMetadata,
     ) -> io::Result<SceneCommit> {
         node.validate()?;
+        self.scene_transaction(
+            node.owning_context_id,
+            messages::CREATE_NODE,
+            node.node_id,
+            node.payload()?,
+            metadata,
+        )
+    }
+
+    /// Replace one existing node's placement inside its own scene transaction.
+    ///
+    /// The node keeps its identity and its surface reference; only geometry, fit, ordering,
+    /// visibility, opacity, and clip change. Track replacement uses [`Session::activate_tracks`],
+    /// never a scene transaction.
+    pub fn update_node(
+        &mut self,
+        node: &SceneNode,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SceneCommit> {
+        node.validate()?;
+        self.scene_transaction(
+            node.owning_context_id,
+            messages::UPDATE_NODE,
+            node.node_id,
+            node.payload()?,
+            metadata,
+        )
+    }
+
+    /// Remove one node from the scene inside its own transaction.
+    ///
+    /// Deleting a node does not destroy the surface it referenced.
+    pub fn delete_node(
+        &mut self,
+        context_id: u64,
+        node_id: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SceneCommit> {
+        if context_id == 0 || node_id == 0 {
+            return Err(invalid_input("node deletion requires complete identity"));
+        }
+        self.scene_transaction(
+            context_id,
+            messages::DELETE_NODE,
+            node_id,
+            vec![
+                (0, Value::Unsigned(context_id)),
+                (1, Value::Unsigned(node_id)),
+            ],
+            metadata,
+        )
+    }
+
+    /// Apply one node mutation as a complete `BEGIN_TXN`/mutation/`COMMIT_TXN` transaction.
+    ///
+    /// The commit carries the cached expected target generation and scene-revision precondition,
+    /// so a target change that races the mutation is rejected rather than applied against stale
+    /// coordinate truth. Any failure aborts the open transaction.
+    fn scene_transaction(
+        &mut self,
+        owning_context_id: u64,
+        mutation_type: u16,
+        node_id: u64,
+        mutation_payload: PayloadMap,
+        metadata: &RequestMetadata,
+    ) -> io::Result<SceneCommit> {
         let transaction_id = self.allocate_id()?;
         let begin_request = self.next_request()?;
         let mut begin = Envelope::correlated(
             begin_request,
             vec![
-                (0, Value::Unsigned(node.owning_context_id)),
+                (0, Value::Unsigned(owning_context_id)),
                 (1, Value::Unsigned(transaction_id)),
             ],
         )?;
@@ -2460,13 +2535,13 @@ impl Session {
         )?;
 
         let mutation_request = self.next_request()?;
-        let mut mutation = Envelope::correlated(mutation_request, node.payload()?)?;
+        let mut mutation = Envelope::correlated(mutation_request, mutation_payload)?;
         mutation.transaction_id = Some(transaction_id);
         metadata.apply(&mut mutation)?;
         if let Err(error) = self.dispatch_ok(
             mutation_request,
-            messages::CREATE_NODE,
-            node.node_id,
+            mutation_type,
+            node_id,
             &mutation.encode()?,
         ) {
             let _ = self.abort_transaction(transaction_id);
@@ -4549,6 +4624,71 @@ mod tests {
                 last_epoch: 4,
                 last_record_sequence: 2,
             }
+        );
+    }
+
+    #[test]
+    fn node_mutations_advance_the_scene_revision_without_touching_the_surface() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let surface = session
+            .create_surface(surface(1, 7), &RequestMetadata::default())
+            .unwrap();
+        let node = SceneNode {
+            owning_context_id: 1,
+            node_id: 4,
+            surface_context_id: 1,
+            surface_id: 7,
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(0)),
+                (2, Value::Unsigned(0)),
+                (3, Value::Unsigned(4 << 32)),
+                (4, Value::Unsigned(2 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        };
+        let revision = surface.revision();
+        let generation = surface.generation();
+
+        let created = session
+            .create_node(&node, &RequestMetadata::default())
+            .unwrap();
+        let mut hidden = node.clone();
+        hidden.visible = false;
+        let updated = session
+            .update_node(&hidden, &RequestMetadata::default())
+            .unwrap();
+        let deleted = session
+            .delete_node(1, 4, &RequestMetadata::default())
+            .unwrap();
+
+        assert!(updated.scene_revision > created.scene_revision);
+        assert!(deleted.scene_revision > updated.scene_revision);
+        // Scene placement is not surface state: the surface keeps its identity, revision, and
+        // coordinate generation across every node mutation.
+        assert_eq!(surface.id(), 7);
+        assert_eq!(surface.revision(), revision);
+        assert_eq!(surface.generation(), generation);
+    }
+
+    #[test]
+    fn node_deletion_requires_complete_identity() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        assert!(
+            session
+                .delete_node(0, 4, &RequestMetadata::default())
+                .is_err()
+        );
+        assert!(
+            session
+                .delete_node(1, 0, &RequestMetadata::default())
+                .is_err()
         );
     }
 
