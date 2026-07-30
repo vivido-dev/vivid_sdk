@@ -1373,17 +1373,33 @@ impl Session {
         validate_exact_payload_keys("TARGET_CHANGED", payload, 0..=10)?;
         let generation = TargetGeneration::new(required_u64(payload, 9)?);
         generation.require_nonzero()?;
-        if generation <= self.info.target_generation {
-            return Err(invalid_data(
-                "TARGET_CHANGED did not advance the target generation",
-            ));
-        }
         let descriptor = payload
             .iter()
             .filter(|(key, _)| *key <= 8)
             .cloned()
             .collect();
         validate_terminal_target_descriptor(&descriptor)?;
+        if generation < self.info.target_generation {
+            return Err(invalid_data(
+                "TARGET_CHANGED moved the target generation backward",
+            ));
+        }
+        if generation == self.info.target_generation {
+            let current = &self.info.target_descriptor;
+            let current_settled = required_bool(current, 6)?;
+            let next_settled = required_bool(&descriptor, 6)?;
+            let same_geometry = current
+                .iter()
+                .filter(|(key, _)| *key != 6)
+                .eq(descriptor.iter().filter(|(key, _)| *key != 6));
+            if current_settled || !next_settled || !same_geometry {
+                return Err(invalid_data(
+                    "TARGET_CHANGED reused a generation without an identical final settle",
+                ));
+            }
+            self.info.target_descriptor = descriptor;
+            return Ok(generation);
+        }
         self.info.target_generation = generation;
         self.info.target_descriptor = descriptor;
         Ok(generation)
@@ -5177,6 +5193,7 @@ mod tests {
     fn terminal_target_changes_and_marker_transports_are_generation_safe() {
         let mut session = Session::connect(ProducerConfig::offline()).unwrap();
         let mut changed = session.info().target_descriptor.clone();
+        changed[6].1 = Value::Bool(false);
         changed.push((9, Value::Unsigned(2)));
         changed.push((10, Value::Unsigned(1)));
         assert_eq!(
@@ -5184,6 +5201,29 @@ mod tests {
             TargetGeneration::new(2)
         );
         assert_eq!(session.info().target_generation, TargetGeneration::new(2));
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(false));
+
+        let mut settled = changed.clone();
+        settled[6].1 = Value::Bool(true);
+        assert_eq!(
+            session.apply_target_changed(&settled).unwrap(),
+            TargetGeneration::new(2),
+            "the final settle keeps the last geometry generation"
+        );
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(true));
+        assert!(
+            session.apply_target_changed(&settled).is_err(),
+            "a duplicate settled event must not masquerade as new target truth"
+        );
+
+        let mut changed_without_generation = settled.clone();
+        changed_without_generation[3].1 = Value::Unsigned(25);
+        assert!(
+            session
+                .apply_target_changed(&changed_without_generation)
+                .is_err(),
+            "geometry cannot change without advancing the target generation"
+        );
 
         let context_id = session.info().root_context_id;
         let marker = session.conpty_anchor_marker(context_id, 77).unwrap();
