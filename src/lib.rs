@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
@@ -26,7 +27,9 @@ use vivid_protocol::messages::{
     self, ChannelOpen, Envelope, Hello, HelloAuthentication, LaneClass, LaneOpen, PayloadMap,
     TrackKind,
 };
-use vivid_protocol::resource::{ChannelFlow, Resource, ResourceContract, ResourceError};
+use vivid_protocol::resource::{
+    ChannelFlow, Resource, ResourceContract, ResourceError, TokenBucket,
+};
 use vivid_protocol::revision::{
     ChannelGeneration, GrantGeneration, InputEpoch, SceneRevision, SurfaceGeneration,
     SurfaceRevision, TargetGeneration, TrackRevision,
@@ -72,7 +75,8 @@ const MAX_CHANNEL_EVENTS: usize = 256;
 const DEFAULT_CONTROL_BODY: u32 = vivid_protocol::CONTROL_MAX_RECORD_BODY;
 const OFFLINE_SESSION_ID: u64 = 1;
 const OFFLINE_CONTEXT_ID: u64 = 1;
-const OFFLINE_FLOW_RECORDS: u64 = 1024;
+const OFFLINE_FLOW_BYTES: u64 = 1 << 60;
+const OFFLINE_FLOW_RECORDS: u64 = 1 << 40;
 const CARRIER_BINDING_NONE: [u8; 32] = [0; 32];
 
 type TrackRegistry = HashMap<(u64, u64, u64), Arc<Mutex<TrackLocal>>>;
@@ -646,6 +650,16 @@ pub struct SceneCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     TargetChanged(PayloadMap),
+    AnchorReady {
+        context_id: u64,
+        anchor_id: u64,
+        payload: PayloadMap,
+    },
+    AnchorGone {
+        context_id: u64,
+        anchor_id: u64,
+        payload: PayloadMap,
+    },
     TrackLost {
         object_id: u64,
         payload: PayloadMap,
@@ -663,6 +677,17 @@ pub enum SessionEvent {
     ConnectionClosed {
         diagnostic: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorStatus {
+    pub context_id: u64,
+    pub anchor_id: u64,
+    /// Unknown (`0`), ready (`1`), or gone (`2`).
+    pub state: u64,
+    pub target_generation: Option<TargetGeneration>,
+    /// Complete validated status payload, including optional cell/intersection fields.
+    pub payload: PayloadMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1271,6 +1296,27 @@ impl Session {
 
     pub fn take_event(&self) -> io::Result<Option<SessionEvent>> {
         self.control.take_event()
+    }
+
+    /// Validate and apply one terminal `TARGET_CHANGED` payload to the cached target snapshot.
+    pub fn apply_target_changed(&mut self, payload: &PayloadMap) -> io::Result<TargetGeneration> {
+        validate_exact_payload_keys("TARGET_CHANGED", payload, 0..=10)?;
+        let generation = TargetGeneration::new(required_u64(payload, 9)?);
+        generation.require_nonzero()?;
+        if generation <= self.info.target_generation {
+            return Err(invalid_data(
+                "TARGET_CHANGED did not advance the target generation",
+            ));
+        }
+        let descriptor = payload
+            .iter()
+            .filter(|(key, _)| *key <= 8)
+            .cloned()
+            .collect();
+        validate_terminal_target_descriptor(&descriptor)?;
+        self.info.target_generation = generation;
+        self.info.target_descriptor = descriptor;
+        Ok(generation)
     }
 
     /// Re-associate a retained surface handle after authenticated session resume.
@@ -2495,6 +2541,65 @@ impl Session {
         .map_err(|message| invalid_input(message.to_owned()))
     }
 
+    pub fn conpty_anchor_marker(&self, context_id: u64, anchor_id: u64) -> io::Result<String> {
+        anchor::encode_conpty_marker(
+            &self.anchor_key,
+            &self.info.session_tag,
+            context_id,
+            anchor_id,
+        )
+        .map_err(|message| invalid_input(message.to_owned()))
+    }
+
+    pub fn query_anchor(&self, context_id: u64, anchor_id: u64) -> io::Result<AnchorStatus> {
+        if context_id == 0 || anchor_id == 0 {
+            return Err(invalid_input("anchor identity must be nonzero"));
+        }
+        let reply = self.request(
+            messages::QUERY_ANCHOR,
+            anchor_id,
+            vec![
+                (0, Value::Unsigned(context_id)),
+                (1, Value::Unsigned(anchor_id)),
+            ],
+            &RequestMetadata::default(),
+            None,
+            None,
+        )?;
+        let payload = if let Some(record) = reply {
+            expect_record(&record, messages::ANCHOR_STATUS, anchor_id)?;
+            let payload = decoded_payload(&record)?;
+            validate_payload_keys("ANCHOR_STATUS", &payload, 0..=2, &[3, 4, 5, 6])?;
+            payload
+        } else {
+            vec![
+                (0, Value::Unsigned(context_id)),
+                (1, Value::Unsigned(anchor_id)),
+                (2, Value::Unsigned(0)),
+                (6, Value::Unsigned(self.info.target_generation.get())),
+            ]
+        };
+        if required_u64(&payload, 0)? != context_id || required_u64(&payload, 1)? != anchor_id {
+            return Err(invalid_data(
+                "ANCHOR_STATUS changed complete anchor identity",
+            ));
+        }
+        let state = required_u64(&payload, 2)?;
+        if state > 2 {
+            return Err(invalid_data("ANCHOR_STATUS has an unknown lifecycle state"));
+        }
+        let target_generation = optional_u64(&payload, 6)?
+            .map(TargetGeneration::new)
+            .filter(|generation| *generation != TargetGeneration::ZERO);
+        Ok(AnchorStatus {
+            context_id,
+            anchor_id,
+            state,
+            target_generation,
+            payload,
+        })
+    }
+
     pub fn emit_anchor<W: io::Write>(
         &self,
         output: &mut W,
@@ -2950,6 +3055,12 @@ struct ChannelMediaState {
     eos: bool,
 }
 
+struct ChannelRateState {
+    body_bytes: TokenBucket,
+    records: TokenBucket,
+    updated_at: Instant,
+}
+
 /// One accepted, authenticated track-channel generation.
 pub struct TrackChannel {
     track: Track,
@@ -2960,6 +3071,7 @@ pub struct TrackChannel {
     track_sequence: Arc<Mutex<TrackMediaSequence>>,
     media: Arc<Mutex<ChannelMediaState>>,
     events: Arc<Mutex<VecDeque<ChannelEvent>>>,
+    rate: Option<Mutex<ChannelRateState>>,
 }
 
 impl std::fmt::Debug for TrackChannel {
@@ -2991,7 +3103,8 @@ impl TrackChannel {
             let bytes = snapshot
                 .configuration
                 .maximum_inflight_body_bytes
-                .max(u64::from(snapshot.maximum_record_body));
+                .max(u64::from(snapshot.maximum_record_body))
+                .max(OFFLINE_FLOW_BYTES);
             (
                 bytes,
                 OFFLINE_FLOW_RECORDS,
@@ -3111,6 +3224,21 @@ impl TrackChannel {
             track_sequence: snapshot.media_sequence,
             media,
             events,
+            rate: (!offline).then(|| {
+                let byte_rate = snapshot
+                    .configuration
+                    .maximum_encoded_bits_per_second
+                    .saturating_add(7)
+                    / 8;
+                Mutex::new(ChannelRateState {
+                    body_bytes: TokenBucket::new(
+                        byte_rate,
+                        u64::from(snapshot.maximum_record_body),
+                    ),
+                    records: TokenBucket::new(snapshot.configuration.maximum_records_per_second, 1),
+                    updated_at: Instant::now(),
+                })
+            }),
         })
     }
 
@@ -3363,6 +3491,7 @@ impl TrackChannel {
         body_length: u32,
         body: &[u8],
     ) -> io::Result<u64> {
+        self.wait_for_rate(body_length)?;
         let mut state = lock(&self.flow.state, "channel flow state")?;
         loop {
             self.lifecycle.ensure_active()?;
@@ -3391,6 +3520,33 @@ impl TrackChannel {
                 }
                 Err(error) => return Err(io::Error::other(error)),
             }
+        }
+    }
+
+    fn wait_for_rate(&self, body_length: u32) -> io::Result<()> {
+        let Some(rate) = &self.rate else {
+            return Ok(());
+        };
+        loop {
+            self.lifecycle.ensure_active()?;
+            let mut state = lock(rate, "channel rate state")?;
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(state.updated_at);
+            state.updated_at = now;
+            state
+                .body_bytes
+                .replenish(elapsed)
+                .map_err(io::Error::other)?;
+            state.records.replenish(elapsed).map_err(io::Error::other)?;
+            let mut body_bytes = state.body_bytes.clone();
+            let mut records = state.records.clone();
+            if body_bytes.charge(u64::from(body_length)).is_ok() && records.charge(1).is_ok() {
+                state.body_bytes = body_bytes;
+                state.records = records;
+                return Ok(());
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -3885,6 +4041,24 @@ fn close_track_flow(flow: Option<&Weak<FlowSync>>, message: &str) {
 fn session_event(record_type: u16, object_id: u64, payload: PayloadMap) -> SessionEvent {
     match record_type {
         messages::TARGET_CHANGED => SessionEvent::TargetChanged(payload),
+        messages::ANCHOR_READY => SessionEvent::AnchorReady {
+            context_id: optional_u64(&payload, 0)
+                .unwrap_or(None)
+                .unwrap_or_default(),
+            anchor_id: optional_u64(&payload, 1)
+                .unwrap_or(None)
+                .unwrap_or(object_id),
+            payload,
+        },
+        messages::ANCHOR_GONE => SessionEvent::AnchorGone {
+            context_id: optional_u64(&payload, 0)
+                .unwrap_or(None)
+                .unwrap_or_default(),
+            anchor_id: optional_u64(&payload, 1)
+                .unwrap_or(None)
+                .unwrap_or(object_id),
+            payload,
+        },
         messages::TRACK_LOST => SessionEvent::TrackLost { object_id, payload },
         messages::CONTEXT_CHANGED => SessionEvent::ContextChanged { object_id, payload },
         _ => SessionEvent::Other {
@@ -4167,6 +4341,24 @@ fn offline_target_descriptor() -> PayloadMap {
         (7, Value::Unsigned(3)),
         (8, Value::Unsigned(256)),
     ]
+}
+
+fn validate_terminal_target_descriptor(descriptor: &PayloadMap) -> io::Result<()> {
+    validate_exact_payload_keys("terminal target descriptor", descriptor, 0..=8)?;
+    for key in 0..=5 {
+        if required_u64(descriptor, key)? == 0 {
+            return Err(invalid_data(
+                "terminal target descriptor contains a zero dimension",
+            ));
+        }
+    }
+    let _settled = required_bool(descriptor, 6)?;
+    if required_u64(descriptor, 7)? != 3 || required_u64(descriptor, 8)? == 0 {
+        return Err(invalid_data(
+            "terminal target descriptor has unsupported anchor capabilities",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_profiles(profiles: &[String]) -> io::Result<()> {
@@ -4687,5 +4879,26 @@ mod tests {
         second_channel
             .send_raster(0, 1, &[0, 0, 0, 255].repeat(4), false)
             .unwrap();
+    }
+
+    #[test]
+    fn terminal_target_changes_and_marker_transports_are_generation_safe() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let mut changed = session.info().target_descriptor.clone();
+        changed.push((9, Value::Unsigned(2)));
+        changed.push((10, Value::Unsigned(1)));
+        assert_eq!(
+            session.apply_target_changed(&changed).unwrap(),
+            TargetGeneration::new(2)
+        );
+        assert_eq!(session.info().target_generation, TargetGeneration::new(2));
+
+        let context_id = session.info().root_context_id;
+        let marker = session.conpty_anchor_marker(context_id, 77).unwrap();
+        let parsed = anchor::parse_conpty_marker(&marker).unwrap();
+        assert_eq!((parsed.context_id, parsed.anchor_id), (context_id, 77));
+        let status = session.query_anchor(context_id, 77).unwrap();
+        assert_eq!(status.state, 0);
+        assert_eq!(status.target_generation, Some(TargetGeneration::new(2)));
     }
 }
