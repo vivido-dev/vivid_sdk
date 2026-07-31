@@ -17,6 +17,7 @@
 mod channel;
 mod config;
 mod controller;
+mod guard;
 mod handshake;
 mod input;
 mod lease;
@@ -66,6 +67,7 @@ pub use controller::{
     LeaseGrant, LeaseHandle, LeaseRequest, MAX_ACTIVATION_TIMEOUT_US, PresenterAdmin,
     PresenterCapabilities, SessionLeaseBuilder, VividoAdmin, issue_handle, worker_context,
 };
+pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
 };
