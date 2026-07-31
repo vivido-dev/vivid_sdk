@@ -75,7 +75,10 @@ pub use input::{
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
-pub use pipeline::{BoundedQueue, EncodedPacket, LatestFrame, TrackSender, recover_channel};
+pub use pipeline::{
+    AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, TrackSender, VideoPacketData,
+    recover_channel,
+};
 pub use scene::{SceneCommit, SlotBinding};
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
