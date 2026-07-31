@@ -24,7 +24,10 @@ mod resume;
 mod scene;
 mod session;
 mod surface;
+
 mod target;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod track;
 mod wire;
 

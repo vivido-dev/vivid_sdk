@@ -8,6 +8,11 @@ license = "Apache-2.0"
 description = "Reusable full-duplex Vivid Protocol 1.5 producer SDK"
 repository = "https://github.com/vivido-dev/vivid_sdk"
 
+[features]
+# An in-process Vivid 1.5 presenter for producer tests. Off by default: it is only compiled into
+# crates that ask for it, and it never affects a production build of the SDK.
+testing = []
+
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.4"
