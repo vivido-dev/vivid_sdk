@@ -1825,6 +1825,53 @@ impl Session {
         Ok(())
     }
 
+    /// Revoke a lease this session issued.
+    ///
+    /// Security §8: cleanup is synchronous, so once this returns the child session, its objects,
+    /// and its reserved capacity are gone.
+    pub fn revoke_session_lease(
+        &self,
+        context_id: u64,
+        lease_id: u64,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
+        let reply = self.request(
+            messages::REVOKE_SESSION_LEASE,
+            lease_id,
+            vec![
+                (0, Value::Unsigned(context_id)),
+                (1, Value::Unsigned(lease_id)),
+            ],
+            metadata,
+            None,
+            None,
+        )?;
+        if let Some(record) = reply {
+            expect_record(&record, messages::OK, lease_id)?;
+        }
+        Ok(())
+    }
+
+    /// The session's reconciliation root, core §10.
+    ///
+    /// After an authenticated resume a producer compares these revisions against what it retained
+    /// rather than replaying requests, so the payload is returned unparsed for the caller to walk.
+    pub fn query_session(&self) -> io::Result<PayloadMap> {
+        let reply = self.request(
+            messages::QUERY_SESSION,
+            0,
+            Vec::new(),
+            &RequestMetadata::default(),
+            None,
+            None,
+        )?;
+        let Some(record) = reply else {
+            return Ok(Vec::new());
+        };
+        expect_record(&record, messages::SESSION_STATUS, 0)?;
+        decoded_payload(&record)
+    }
+
     pub fn query_surface(&self, surface: &Surface) -> io::Result<SurfaceStatus> {
         let snapshot = lock(&surface.inner, "surface")?.clone();
         let reply = self.request(
