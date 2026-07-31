@@ -21,6 +21,7 @@ mod handshake;
 mod input;
 mod lease;
 mod offline;
+mod orch;
 mod resume;
 mod scene;
 mod session;
@@ -68,6 +69,7 @@ pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
 };
 pub use lease::{ContextReady, SessionLeaseReady};
+pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
 pub use scene::{SceneCommit, SlotBinding};
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
