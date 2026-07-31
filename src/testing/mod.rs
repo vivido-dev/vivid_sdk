@@ -5,9 +5,11 @@
 //! different notions of correct, and the interoperability bugs that matter are exactly the ones a
 //! private fake agrees with.
 
+pub mod admin;
 pub mod presenter;
 pub mod script;
 
+pub use admin::FakeAdmin;
 pub use presenter::{
     DestroyObservation, Observed, ObservedBinding, ROOT_SECRET_HEX, TargetKind, TestPresenter,
     TrackChannelLog,
