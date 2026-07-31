@@ -3,8 +3,10 @@
 //! A dry-run session exercises the full object model and every validation path without a
 //! presenter, which is what makes producer logic testable in isolation.
 
-use std::path::PathBuf;
 use std::{env, io};
+
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use vivid_protocol::resource::{Resource, ResourceContract};
 use vivid_protocol::wire::Endpoint;
