@@ -1349,6 +1349,14 @@ impl Session {
         })
     }
 
+    /// The session channel key, which authenticates lane and track opens.
+    ///
+    /// Exposed for conformance harnesses that drive a lane or channel at the wire. It is session
+    /// key material: it must not be logged, serialized, or placed in a command argument.
+    pub fn channel_key(&self) -> Secret32 {
+        Secret32::new(*self.channel_key.expose())
+    }
+
     pub fn supports(&self, profile: &str) -> bool {
         self.info
             .accepted_profiles
