@@ -1860,6 +1860,26 @@ impl Session {
         Ok(())
     }
 
+    /// Replace the session observation mask, core §10.
+    ///
+    /// Observations are non-actionable: they may be coalesced latest-wins and dropped under
+    /// bounded writer pressure, and `OBSERVATION_GAP` names what was lost so current truth is
+    /// recovered by query rather than assumed.
+    pub fn set_observation(&self, mask: u64) -> io::Result<()> {
+        let reply = self.request(
+            messages::SET_OBSERVATION,
+            0,
+            vec![(0, Value::Unsigned(mask))],
+            &RequestMetadata::default(),
+            None,
+            None,
+        )?;
+        if let Some(record) = reply {
+            expect_record(&record, messages::OK, 0)?;
+        }
+        Ok(())
+    }
+
     /// The session's reconciliation root, core §10.
     ///
     /// After an authenticated resume a producer compares these revisions against what it retained
