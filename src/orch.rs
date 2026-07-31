@@ -10,7 +10,7 @@ use crate::{LaneClass, RequestMetadata, Session, SlotBinding, Surface, Track};
 
 #[derive(Debug, Clone)]
 pub struct DesktopSurface {
-    raw: Surface,
+    pub(crate) raw: Surface,
 }
 impl DesktopSurface {
     pub fn inner(&self) -> &Surface {
