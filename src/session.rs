@@ -1,0 +1,853 @@
+//! The control plane: connection establishment, request correlation, and the reader thread.
+//!
+//! [`Session`] owns the one control connection and the object registries every other module
+//! reaches through. Requests are correlated by request ID; unsolicited records become
+//! [`SessionEvent`]s rather than blocking a reply.
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::{io, thread};
+
+use vivid_protocol::anchor::AnchorKey;
+use vivid_protocol::auth::Secret32;
+use vivid_protocol::messages::{Envelope, Hello, HelloAuthentication, PayloadMap};
+use vivid_protocol::resource::ResourceContract;
+use vivid_protocol::revision::{SceneRevision, TargetGeneration, TrackRevision};
+use vivid_protocol::wire::{Connection, ConnectionReader, ConnectionWriter, Endpoint, Record};
+use vivid_protocol::{auth, messages};
+
+use crate::*;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub session_id: u64,
+    pub session_tag: [u8; messages::SESSION_TAG_BYTES],
+    pub root_context_id: u64,
+    pub target_generation: TargetGeneration,
+    pub target_profile: String,
+    pub target_descriptor: PayloadMap,
+    pub accepted_profiles: Vec<String>,
+    pub session_revision: u64,
+    pub scene_revision: SceneRevision,
+    pub establishment_state: u64,
+    pub resume_generation: u64,
+    pub resource_contract: ResourceContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    TargetChanged(PayloadMap),
+    AnchorReady {
+        context_id: u64,
+        anchor_id: u64,
+        payload: PayloadMap,
+    },
+    AnchorGone {
+        context_id: u64,
+        anchor_id: u64,
+        payload: PayloadMap,
+    },
+    TrackLost {
+        object_id: u64,
+        payload: PayloadMap,
+    },
+    ContextChanged {
+        object_id: u64,
+        payload: PayloadMap,
+    },
+    Other {
+        record_type: u16,
+        object_id: u64,
+        payload: PayloadMap,
+    },
+    /// The control transport became unusable; live session state must be reconciled or resumed.
+    ConnectionClosed {
+        diagnostic: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorStatus {
+    pub context_id: u64,
+    pub anchor_id: u64,
+    /// Unknown (`0`), ready (`1`), or gone (`2`).
+    pub state: u64,
+    pub target_generation: Option<TargetGeneration>,
+    /// Complete validated status payload, including optional cell/intersection fields.
+    pub payload: PayloadMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelEvent {
+    NeedKeyframe(PayloadMap),
+    NeedFullFrame(PayloadMap),
+    Error(PresenterError),
+}
+
+pub(crate) struct Endpoints {
+    pub(crate) interactive: Option<Endpoint>,
+    pub(crate) realtime: Option<Endpoint>,
+    pub(crate) bulk: Option<Endpoint>,
+}
+
+pub(crate) struct PendingControl {
+    pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
+    pub(crate) events: Mutex<VecDeque<SessionEvent>>,
+    pub(crate) closed: AtomicBool,
+}
+
+pub(crate) struct PendingInput {
+    pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
+    pub(crate) events: Mutex<VecDeque<InputLaneEvent>>,
+    pub(crate) closed: AtomicBool,
+}
+
+pub(crate) struct SessionLifecycle {
+    pub(crate) closed: AtomicBool,
+    pub(crate) diagnostic: Mutex<Option<String>>,
+    pub(crate) track_flows: Mutex<Vec<Weak<FlowSync>>>,
+    pub(crate) input_lanes: Mutex<Vec<Weak<PendingInput>>>,
+}
+
+impl SessionLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            diagnostic: Mutex::new(None),
+            track_flows: Mutex::new(Vec::new()),
+            input_lanes: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn ensure_active(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            let diagnostic = self
+                .diagnostic
+                .lock()
+                .ok()
+                .and_then(|value| value.clone())
+                .unwrap_or_else(|| "Vivid session is closed".into());
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, diagnostic))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn register_track_flow(&self, flow: &Arc<FlowSync>) -> io::Result<()> {
+        self.ensure_active()?;
+        let mut flows = lock(&self.track_flows, "session track registry")?;
+        flows.retain(|pending| pending.strong_count() != 0);
+        self.ensure_active()?;
+        flows.push(Arc::downgrade(flow));
+        Ok(())
+    }
+
+    pub(crate) fn register_input_lane(&self, lane: &Arc<PendingInput>) -> io::Result<()> {
+        self.ensure_active()?;
+        let mut lanes = lock(&self.input_lanes, "session input registry")?;
+        lanes.retain(|pending| pending.strong_count() != 0);
+        self.ensure_active()?;
+        lanes.push(Arc::downgrade(lane));
+        Ok(())
+    }
+
+    pub(crate) fn close(&self, message: &str) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut diagnostic) = self.diagnostic.lock() {
+            diagnostic.get_or_insert_with(|| message.to_owned());
+        }
+        if let Ok(mut flows) = self.track_flows.lock() {
+            flows.retain(|pending| {
+                let Some(flow) = pending.upgrade() else {
+                    return false;
+                };
+                if let Ok(mut state) = flow.state.lock() {
+                    state.closed = true;
+                    state.diagnostic.get_or_insert_with(|| message.to_owned());
+                    flow.changed.notify_all();
+                }
+                true
+            });
+        }
+        if let Ok(mut lanes) = self.input_lanes.lock() {
+            lanes.retain(|pending| {
+                let Some(lane) = pending.upgrade() else {
+                    return false;
+                };
+                close_input_lane(&lane, message);
+                true
+            });
+        }
+    }
+}
+
+pub(crate) enum ControlPlane {
+    Live {
+        writer: ConnectionWriter,
+        pending: Arc<PendingControl>,
+    },
+    Offline {
+        connection: Mutex<Connection>,
+    },
+}
+
+impl ControlPlane {
+    pub(crate) fn request(
+        &self,
+        request_id: u64,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<Option<Record>> {
+        match self {
+            Self::Offline { connection } => {
+                lock(connection, "offline control connection")?.write_record(
+                    record_type,
+                    0,
+                    object_id,
+                    body,
+                )?;
+                Ok(None)
+            }
+            Self::Live { writer, pending } => {
+                if pending.closed.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Vivid control connection is closed",
+                    ));
+                }
+                let (send, receive) = mpsc::channel();
+                {
+                    let mut requests = lock(&pending.requests, "pending request table")?;
+                    if pending.closed.load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "Vivid control connection is closed",
+                        ));
+                    }
+                    if requests.insert(request_id, send).is_some() {
+                        return Err(invalid_data("duplicate live request ID"));
+                    }
+                }
+                if let Err(error) = writer.write_record(record_type, 0, object_id, body) {
+                    let _ = lock(&pending.requests, "pending request table")?.remove(&request_id);
+                    return Err(error);
+                }
+                let result = receive.recv().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Vivid control dispatcher stopped",
+                    )
+                })?;
+                result
+                    .map(Some)
+                    .map_err(|message| io::Error::new(io::ErrorKind::BrokenPipe, message))
+            }
+        }
+    }
+
+    pub(crate) fn take_event(&self) -> io::Result<Option<SessionEvent>> {
+        match self {
+            Self::Live { pending, .. } => {
+                Ok(lock(&pending.events, "control event queue")?.pop_front())
+            }
+            Self::Offline { .. } => Ok(None),
+        }
+    }
+}
+
+/// An established Vivid 1.5 logical session.
+pub struct Session {
+    pub(crate) control: ControlPlane,
+    pub(crate) lifecycle: Arc<SessionLifecycle>,
+    pub(crate) endpoints: Endpoints,
+    pub(crate) connection_factory: Option<Arc<dyn ConnectionFactory>>,
+    pub(crate) channel_key: Secret32,
+    pub(crate) resume_key: Option<Secret32>,
+    pub(crate) lease_identity: Option<(u64, u64)>,
+    pub(crate) anchor_key: AnchorKey,
+    pub(crate) info: SessionInfo,
+    pub(crate) next_id: AtomicU64,
+    pub(crate) next_request_id: AtomicU64,
+    pub(crate) surfaces: HashMap<(u64, u64), Arc<Mutex<SurfaceLocal>>>,
+    pub(crate) tracks: Arc<Mutex<TrackRegistry>>,
+    pub(crate) closed: bool,
+    pub(crate) trace_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("session_id", &self.info.session_id)
+            .field("root_context_id", &self.info.root_context_id)
+            .field("target_profile", &self.info.target_profile)
+            .field("accepted_profiles", &self.info.accepted_profiles)
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+impl Session {
+    pub fn connect(config: ProducerConfig) -> io::Result<Self> {
+        config.validate()?;
+        if config.is_offline() {
+            return Self::connect_offline(config);
+        }
+        Self::connect_live(config, None)
+    }
+
+    /// Connect through a caller-provided transport factory.
+    ///
+    /// This supports authenticated carriers such as a WebSocket route without weakening or
+    /// duplicating the Vivid 1.5 protocol handshake.
+    pub fn connect_with_factory(
+        config: ProducerConfig,
+        connection_factory: Arc<dyn ConnectionFactory>,
+    ) -> io::Result<Self> {
+        config.validate()?;
+        if config.is_offline() {
+            return Err(invalid_input(
+                "a connection factory cannot be combined with dry-run or trace mode",
+            ));
+        }
+        Self::connect_live(config, Some(connection_factory))
+    }
+
+    pub(crate) fn connect_live(
+        config: ProducerConfig,
+        connection_factory: Option<Arc<dyn ConnectionFactory>>,
+    ) -> io::Result<Self> {
+        let control_endpoint = if connection_factory.is_some() {
+            optional_endpoint(
+                config.endpoint_control.as_deref(),
+                vivid_protocol::discovery::ENDPOINT_CONTROL,
+            )?
+        } else {
+            Some(endpoint(
+                config.endpoint_control.as_deref(),
+                vivid_protocol::discovery::ENDPOINT_CONTROL,
+            )?)
+        };
+        let interactive = optional_endpoint(
+            config.endpoint_interactive.as_deref(),
+            vivid_protocol::discovery::ENDPOINT_INTERACTIVE,
+        )?
+        .or_else(|| control_endpoint.clone());
+        let bulk = optional_endpoint(
+            config.endpoint_bulk.as_deref(),
+            vivid_protocol::discovery::ENDPOINT_BULK,
+        )?
+        .or_else(|| control_endpoint.clone());
+        let realtime = optional_endpoint(
+            config.endpoint_realtime.as_deref(),
+            vivid_protocol::discovery::ENDPOINT_REALTIME,
+        )?
+        .or_else(|| bulk.clone());
+
+        let mut connection = match &connection_factory {
+            Some(factory) => factory.open(ConnectionKind::Control, None)?,
+            None => Connection::open(
+                control_endpoint
+                    .as_ref()
+                    .ok_or_else(|| invalid_input("missing Vivid control endpoint"))?,
+                ConnectionKind::Control,
+            )?,
+        };
+        let preface = vivid_protocol::wire::encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY,
+        );
+        let (hello, session_secret) = build_hello(&config, &preface)?;
+        let hello_body = hello.encode(1)?;
+        connection.write_record(messages::HELLO, 0, 0, &hello_body)?;
+        let reply = connection.read_record()?;
+        if reply.record_type == messages::ERROR {
+            return Err(presenter_error(&reply.body)?);
+        }
+        if reply.record_type != messages::WELCOME || reply.object_id != 0 {
+            return Err(invalid_data("expected session-level WELCOME"));
+        }
+        let (welcome_request, welcome) = messages::Welcome::decode(&reply.body)?;
+        if welcome_request != 1 {
+            return Err(invalid_data("WELCOME request ID does not match HELLO"));
+        }
+        if welcome.target_profile != config.target_profile {
+            return Err(invalid_data("WELCOME selected a different target profile"));
+        }
+        let accepted: BTreeSet<&str> = welcome
+            .accepted_profiles
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let offered: BTreeSet<&str> = hello
+            .required_profiles
+            .iter()
+            .chain(&hello.optional_profiles)
+            .map(String::as_str)
+            .collect();
+        if hello
+            .required_profiles
+            .iter()
+            .any(|profile| !accepted.contains(profile.as_str()))
+            || accepted.iter().any(|profile| !offered.contains(profile))
+            || accepted.iter().any(|profile| {
+                vivid_protocol::registry::prerequisites(profile)
+                    .is_some_and(|required| required.iter().any(|value| !accepted.contains(value)))
+            })
+        {
+            return Err(invalid_data(
+                "WELCOME profile selection is not offered, complete, and prerequisite-closed",
+            ));
+        }
+        let auth_kind = hello.authentication.kind();
+        if welcome.authentication.kind != auth_kind {
+            return Err(invalid_data(
+                "WELCOME authentication kind does not match HELLO",
+            ));
+        }
+        match &hello.authentication {
+            HelloAuthentication::Root { .. }
+                if welcome.authentication.lease_state != 0
+                    || welcome.establishment_state != 0
+                    || welcome.resume_generation != 0 =>
+            {
+                return Err(invalid_data("root WELCOME contains resumable lease state"));
+            }
+            HelloAuthentication::LeaseActivation { .. }
+                if welcome.authentication.lease_state != 3 || welcome.establishment_state != 0 =>
+            {
+                return Err(invalid_data(
+                    "lease-activation WELCOME is not a new active lease",
+                ));
+            }
+            HelloAuthentication::Resume {
+                session_id,
+                resume_generation,
+                ..
+            } if welcome.authentication.lease_state != 3
+                || welcome.establishment_state != 1
+                || welcome.session_id != *session_id
+                || resume_generation.checked_add(1) != Some(welcome.resume_generation) =>
+            {
+                return Err(invalid_data(
+                    "resume WELCOME does not advance the named active lease",
+                ));
+            }
+            _ => {}
+        }
+        let prk = auth::extract_handshake_prk(
+            &session_secret,
+            &hello.client_nonce,
+            &welcome.server_nonce,
+            &CARRIER_BINDING_NONE,
+        );
+        let unconfirmed = welcome.unconfirmed_payload()?;
+        if !auth::verify_welcome_confirmation(
+            &prk,
+            &unconfirmed,
+            &welcome.authentication.confirmation,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "WELCOME authentication confirmation failed",
+            ));
+        }
+        let (keys, anchor_key) = auth::derive_session_keys(
+            &prk,
+            welcome.session_id,
+            welcome.resume_generation,
+            &welcome.session_tag,
+        );
+        let channel_key = Secret32::new(*keys.channel_key());
+        let resume_key =
+            (auth_kind != messages::AUTHENTICATION_ROOT).then(|| Secret32::new(*keys.resume_key()));
+        let lease_identity = hello_lease_identity(&hello);
+        connection.set_send_body_limit(welcome.maximum_control_body)?;
+        connection.set_receive_body_limit(config.maximum_control_body)?;
+        let info = session_info(&welcome);
+        let (reader, writer) = connection.split()?;
+        let pending = Arc::new(PendingControl {
+            requests: Mutex::new(HashMap::new()),
+            events: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+        });
+        let lifecycle = Arc::new(SessionLifecycle::new());
+        let tracks = Arc::new(Mutex::new(HashMap::new()));
+        spawn_control_reader(
+            reader,
+            writer.clone(),
+            pending.clone(),
+            lifecycle.clone(),
+            tracks.clone(),
+        )?;
+        Ok(Self {
+            control: ControlPlane::Live { writer, pending },
+            lifecycle,
+            endpoints: Endpoints {
+                interactive,
+                realtime,
+                bulk,
+            },
+            connection_factory,
+            channel_key,
+            resume_key,
+            lease_identity,
+            anchor_key,
+            info,
+            next_id: AtomicU64::new(1),
+            next_request_id: AtomicU64::new(2),
+            surfaces: HashMap::new(),
+            tracks,
+            closed: false,
+            trace_dir: None,
+        })
+    }
+
+    pub(crate) fn connect_offline(config: ProducerConfig) -> io::Result<Self> {
+        let lease_identity = producer_lease_identity(&config.authentication);
+        let resumable = lease_identity.is_some();
+        let mut connection = match &config.trace_dir {
+            Some(directory) => {
+                Connection::trace(&directory.join("control.vivid"), ConnectionKind::Control)?
+            }
+            None => Connection::sink(ConnectionKind::Control)?,
+        };
+        let preface = vivid_protocol::wire::encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY,
+        );
+        let offline_secret = Secret32::new([0x5a; 32]);
+        let mut client_nonce = [0; auth::NONCE_BYTES];
+        random_bytes(&mut client_nonce)?;
+        let mut hello = Hello {
+            producer_name: config.producer_name,
+            producer_version: config.producer_version,
+            required_profiles: config.required_profiles.clone(),
+            optional_profiles: config.optional_profiles.clone(),
+            maximum_control_body: config.maximum_control_body,
+            client_nonce,
+            authentication: HelloAuthentication::Root { proof: [0; 32] },
+            target_profile: config.target_profile.clone(),
+            extensions: vec![],
+        };
+        hello.authenticate_root(&offline_secret, &preface)?;
+        connection.write_record(messages::HELLO, 0, 0, &hello.encode(1)?)?;
+        let mut accepted_profiles = config.required_profiles;
+        accepted_profiles.extend(config.optional_profiles);
+        accepted_profiles.sort();
+        accepted_profiles.dedup();
+        let server_nonce = [0x33; auth::NONCE_BYTES];
+        let prk = auth::extract_handshake_prk(
+            &offline_secret,
+            &client_nonce,
+            &server_nonce,
+            &CARRIER_BINDING_NONE,
+        );
+        let session_tag = [0x44; messages::SESSION_TAG_BYTES];
+        let (keys, anchor_key) =
+            auth::derive_session_keys(&prk, OFFLINE_SESSION_ID, 0, &session_tag);
+        let channel_key = Secret32::new(*keys.channel_key());
+        let resume_key = resumable.then(|| Secret32::new(*keys.resume_key()));
+        let resource_contract = offline_contract();
+        let info = SessionInfo {
+            session_id: OFFLINE_SESSION_ID,
+            session_tag,
+            root_context_id: OFFLINE_CONTEXT_ID,
+            target_generation: TargetGeneration::ONE,
+            target_profile: config.target_profile,
+            target_descriptor: offline_target_descriptor(),
+            accepted_profiles,
+            session_revision: 1,
+            scene_revision: SceneRevision::ZERO,
+            establishment_state: 0,
+            resume_generation: 0,
+            resource_contract,
+        };
+        Ok(Self {
+            control: ControlPlane::Offline {
+                connection: Mutex::new(connection),
+            },
+            lifecycle: Arc::new(SessionLifecycle::new()),
+            endpoints: Endpoints {
+                interactive: Some(offline_endpoint()?),
+                realtime: Some(offline_endpoint()?),
+                bulk: Some(offline_endpoint()?),
+            },
+            connection_factory: None,
+            channel_key,
+            resume_key,
+            lease_identity,
+            anchor_key,
+            info,
+            next_id: AtomicU64::new(1),
+            next_request_id: AtomicU64::new(2),
+            surfaces: HashMap::new(),
+            tracks: Arc::new(Mutex::new(HashMap::new())),
+            closed: false,
+            trace_dir: config.trace_dir,
+        })
+    }
+
+    pub fn info(&self) -> &SessionInfo {
+        &self.info
+    }
+
+    /// The session channel key, which authenticates lane and track opens.
+    ///
+    /// Exposed for conformance harnesses that drive a lane or channel at the wire. It is session
+    /// key material: it must not be logged, serialized, or placed in a command argument.
+    pub fn channel_key(&self) -> Secret32 {
+        Secret32::new(*self.channel_key.expose())
+    }
+
+    pub fn supports(&self, profile: &str) -> bool {
+        self.info
+            .accepted_profiles
+            .binary_search_by(|value| value.as_str().cmp(profile))
+            .is_ok()
+    }
+
+    pub fn allocate_id(&self) -> io::Result<u64> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| invalid_data("SDK object ID space exhausted"))
+    }
+
+    pub fn take_event(&self) -> io::Result<Option<SessionEvent>> {
+        self.control.take_event()
+    }
+
+    pub fn close(mut self) -> io::Result<()> {
+        self.close_inner()
+    }
+
+    pub(crate) fn close_inner(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.lifecycle.close("Vivid session closed");
+        let result = self.request_ok(messages::GOODBYE, 0, vec![], &RequestMetadata::default());
+        for state in self.surfaces.values() {
+            if let Ok(mut state) = state.lock() {
+                state.destroyed = true;
+            }
+        }
+        let mut tracks = lock(&self.tracks, "track registry")?;
+        for state in tracks.values() {
+            if let Ok(mut state) = state.lock() {
+                state.destroyed = true;
+            }
+        }
+        self.surfaces.clear();
+        tracks.clear();
+        result
+    }
+
+    pub(crate) fn request_ok(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        payload: PayloadMap,
+        metadata: &RequestMetadata,
+    ) -> io::Result<()> {
+        let request_id = self.next_request()?;
+        let mut envelope = Envelope::correlated(request_id, payload)?;
+        metadata.apply(&mut envelope)?;
+        self.dispatch_ok(request_id, record_type, object_id, &envelope.encode()?)
+    }
+
+    pub(crate) fn dispatch_ok(
+        &self,
+        request_id: u64,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        if let Some(record) = self
+            .control
+            .request(request_id, record_type, object_id, body)?
+        {
+            if record.record_type == messages::ERROR {
+                return Err(presenter_error(&record.body)?);
+            }
+            expect_record(&record, messages::OK, object_id)?;
+            let envelope = messages::decode_control(&record.body)?;
+            if envelope.request_id != request_id || !envelope.payload.is_empty() {
+                return Err(invalid_data("malformed OK reply"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        payload: PayloadMap,
+        metadata: &RequestMetadata,
+        transaction_id: Option<u64>,
+        expected_target_generation: Option<u64>,
+    ) -> io::Result<Option<Record>> {
+        let request_id = self.next_request()?;
+        let mut envelope = Envelope::correlated(request_id, payload)?;
+        envelope.transaction_id = transaction_id;
+        envelope.expected_target_generation = expected_target_generation;
+        metadata.apply(&mut envelope)?;
+        let reply =
+            self.control
+                .request(request_id, record_type, object_id, &envelope.encode()?)?;
+        if let Some(record) = &reply {
+            if record.record_type == messages::ERROR {
+                return Err(presenter_error(&record.body)?);
+            }
+            let response = messages::decode_control(&record.body)?;
+            if response.request_id != request_id {
+                return Err(invalid_data("reply request ID does not match request"));
+            }
+        }
+        Ok(reply)
+    }
+
+    pub(crate) fn next_request(&self) -> io::Result<u64> {
+        self.next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| invalid_data("request ID space exhausted"))
+    }
+
+    pub(crate) fn advance_allocator_past(&self, adopted_id: u64) -> io::Result<()> {
+        let next = adopted_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("adopted object ID exhausts the SDK allocator"))?;
+        self.next_id.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Dropping is cancellation/unclean loss, not a clean GOODBYE. This is intentional:
+            // resumable sessions must be allowed to suspend rather than being silently destroyed.
+            self.lifecycle.close("Vivid control session dropped");
+            self.surfaces.clear();
+            if let Ok(mut tracks) = self.tracks.lock() {
+                tracks.clear();
+            }
+        }
+    }
+}
+
+pub(crate) fn spawn_control_reader(
+    mut reader: ConnectionReader,
+    writer: ConnectionWriter,
+    pending: Arc<PendingControl>,
+    lifecycle: Arc<SessionLifecycle>,
+    tracks: Arc<Mutex<TrackRegistry>>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("vivid-control-reader".into())
+        .spawn(move || {
+            let result = (|| -> io::Result<()> {
+                loop {
+                    let record = reader.read_record()?;
+                    let envelope = messages::decode_control(&record.body)?;
+                    if record.record_type == messages::PING {
+                        writer.write_record(
+                            messages::PONG,
+                            0,
+                            0,
+                            &Envelope::new(envelope.request_id, envelope.payload).encode()?,
+                        )?;
+                        continue;
+                    }
+                    if envelope.request_id != 0 {
+                        let Some(sender) = lock(&pending.requests, "pending request table")?
+                            .remove(&envelope.request_id)
+                        else {
+                            return Err(invalid_data(
+                                "control reply has no matching pending request",
+                            ));
+                        };
+                        let _ = sender.send(Ok(record));
+                        continue;
+                    }
+                    if record.record_type == messages::TRACK_LOST {
+                        apply_track_lost(record.object_id, &envelope.payload, &tracks)?;
+                    }
+                    let event =
+                        session_event(record.record_type, record.object_id, envelope.payload);
+                    let mut events = lock(&pending.events, "control event queue")?;
+                    if events.len() == MAX_CONTROL_EVENTS {
+                        return Err(invalid_data("control event queue exceeded its bound"));
+                    }
+                    events.push_back(event);
+                }
+            })();
+            pending.closed.store(true, Ordering::Release);
+            let message = result.err().map_or_else(
+                || "control connection closed".into(),
+                |error| error.to_string(),
+            );
+            lifecycle.close(&message);
+            if let Ok(mut events) = pending.events.lock() {
+                events.clear();
+                events.push_back(SessionEvent::ConnectionClosed {
+                    diagnostic: message.clone(),
+                });
+            }
+            if let Ok(mut requests) = pending.requests.lock() {
+                for (_, sender) in requests.drain() {
+                    let _ = sender.send(Err(message.clone()));
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+pub(crate) fn apply_track_lost(
+    object_id: u64,
+    payload: &PayloadMap,
+    tracks: &Mutex<TrackRegistry>,
+) -> io::Result<()> {
+    validate_exact_payload_keys("TRACK_LOST", payload, 0..=6)?;
+    let context_id = required_u64(payload, 0)?;
+    let surface_id = required_u64(payload, 1)?;
+    let track_id = required_u64(payload, 2)?;
+    let error_code = required_u64(payload, 3)?;
+    let revision = TrackRevision::new(required_u64(payload, 4)?);
+    let _detail = ErrorDetail::new(required_map(payload, 5)?.to_vec()).map_err(io::Error::other)?;
+    let diagnostic = required_text(payload, 6)?;
+    if track_id != object_id
+        || context_id == 0
+        || surface_id == 0
+        || track_id == 0
+        || error_code == 0
+        || diagnostic.len() > 4096
+    {
+        return Err(invalid_data("TRACK_LOST contains invalid actionable state"));
+    }
+    revision.require_nonzero()?;
+    let track = lock(tracks, "track registry")?
+        .get(&(context_id, surface_id, track_id))
+        .cloned();
+    if let Some(track) = track {
+        let mut state = lock(&track, "track")?;
+        if revision < state.revision {
+            return Err(invalid_data("TRACK_LOST moves track revision backward"));
+        }
+        state.revision = revision;
+        state.destroyed = true;
+        state.active_media = None;
+        let active_flow = state.active_flow.take();
+        close_track_flow(active_flow.as_ref(), diagnostic);
+    }
+    Ok(())
+}
