@@ -24,6 +24,7 @@ mod resume;
 mod scene;
 mod session;
 mod surface;
+mod target;
 mod track;
 mod wire;
 
@@ -33,12 +34,13 @@ pub(crate) use channel::{ChannelMediaState, FlowSync, close_track_flow};
 pub(crate) use handshake::{build_hello, hello_lease_identity, producer_lease_identity};
 pub(crate) use input::close_input_lane;
 pub(crate) use lease::TrackReadyValues;
-pub(crate) use offline::{
-    endpoint, offline_contract, offline_endpoint, offline_target_descriptor, optional_endpoint,
-    validate_terminal_target_descriptor,
-};
+pub(crate) use offline::{endpoint, offline_contract, offline_endpoint, optional_endpoint};
 pub(crate) use session::{ControlPlane, PendingInput, SessionLifecycle};
 pub(crate) use surface::SurfaceLocal;
+pub(crate) use target::{
+    descriptor_settled, last_descriptor_key, offline_target_descriptor, settled_key,
+    validate_target_descriptor,
+};
 pub(crate) use track::{TrackLocal, TrackMediaSequence, TrackRegistry};
 pub(crate) use wire::{
     decoded_payload, ensure_live_surface, ensure_live_track, expect_record, invalid_data,
@@ -69,6 +71,7 @@ pub use vivid_protocol::context::{
     ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE, OP_SCENE,
     OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
+pub use vivid_protocol::geometry::Rotation;
 pub use vivid_protocol::input::{
     INPUT_CLASS_KEYBOARD, INPUT_CLASS_KNOWN_MASK, INPUT_CLASS_POINTER_AXIS,
     INPUT_CLASS_POINTER_BUTTON, INPUT_CLASS_POINTER_MOTION, InputBinding, InputEvent, InputGate,
@@ -83,10 +86,11 @@ pub use vivid_protocol::registry::{
 };
 pub use vivid_protocol::scene::{Fit, SceneNode};
 pub use vivid_protocol::surface::{
-    CoordinateModel, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT, POLICY_DENY_IMAGE_CACHE,
-    POLICY_DENY_POSTER_RETENTION, POLICY_REDUCED_DIAGNOSTICS, SurfaceDefinition, SurfaceDescriptor,
-    SurfaceRole,
+    CoordinateModel, DesktopSurfaceParameters, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
+    POLICY_DENY_IMAGE_CACHE, POLICY_DENY_POSTER_RETENTION, POLICY_REDUCED_DIAGNOSTICS,
+    SurfaceDefinition, SurfaceDescriptor, SurfaceRole, input_capability,
 };
+pub use vivid_protocol::target::{DesktopTarget, OutputDescriptor};
 pub use vivid_protocol::track::{
     AudioConfiguration, ImageConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
     MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED, MILESTONE_DECODER_INITIALIZED,
@@ -120,7 +124,7 @@ mod tests {
     use vivid_protocol::anchor;
     use vivid_protocol::auth::{self, Secret32};
     use vivid_protocol::cbor::Value;
-    use vivid_protocol::messages::{self, TrackKind};
+    use vivid_protocol::messages::{self, PayloadMap, TrackKind};
 
     use vivid_protocol::revision::{
         ChannelGeneration, GrantGeneration, InputEpoch, SurfaceGeneration, TargetGeneration,
@@ -365,6 +369,178 @@ mod tests {
         let mut config = ProducerConfig::offline();
         config.required_profiles.reverse();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_desktop_preset_is_prerequisite_closed_and_selects_the_desktop_target() {
+        let config = ProducerConfig::desktop();
+        config
+            .validate()
+            .expect("the desktop preset is a legal offer");
+        assert_eq!(config.target_profile, DESKTOP_SURFACE);
+        // desktop-input-v1 declares desktop-surface-v1 and live-media-v1 as prerequisites, so an
+        // offer that omitted either would be refused by validate() rather than by the presenter.
+        assert!(config.optional_profiles.iter().any(|p| p == DESKTOP_INPUT));
+        assert!(config.required_profiles.iter().any(|p| p == LIVE_MEDIA));
+        assert!(config.required_profiles.iter().any(|p| p == CORE_CONTROL));
+    }
+
+    #[test]
+    fn a_dry_run_desktop_session_reports_a_real_desktop_target() {
+        // The dry run has to exercise the same coordinate math as a live desktop session, so its
+        // target is a parseable single-output topology, not a fabricated terminal grid.
+        let session = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let info = session.info();
+        assert_eq!(info.target_profile, DESKTOP_SURFACE);
+        let target = info
+            .desktop_target()
+            .expect("a desktop session has a desktop target");
+        assert_eq!((target.width, target.height), (1920, 1080));
+        assert_eq!(target.outputs.len(), 1);
+        assert!(target.outputs[0].primary);
+        assert!(info.target_settled().unwrap());
+
+        // A terminal session has no desktop target at all rather than a coerced one.
+        let terminal = Session::connect(ProducerConfig::offline()).unwrap();
+        assert_eq!(terminal.info().target_profile, TERMINAL_SURFACE);
+        assert!(terminal.info().desktop_target().is_none());
+    }
+
+    #[test]
+    fn target_changes_are_validated_against_the_negotiated_profile() {
+        // A desktop descriptor reaching a terminal session, or the reverse, must be refused: the
+        // keys parse either way, and only the profile says which shape is meaningful.
+        let mut desktop = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut terminal = Session::connect(ProducerConfig::offline()).unwrap();
+
+        let mut desktop_change = crate::target::offline_desktop_descriptor();
+        desktop_change.push((9, Value::Unsigned(2)));
+        desktop_change.push((10, Value::Unsigned(1)));
+        let mut terminal_change = crate::target::offline_terminal_descriptor();
+        terminal_change.push((9, Value::Unsigned(2)));
+        terminal_change.push((10, Value::Unsigned(1)));
+
+        assert_eq!(
+            desktop.apply_target_changed(&desktop_change).unwrap(),
+            TargetGeneration::new(2)
+        );
+        assert_eq!(
+            terminal.apply_target_changed(&terminal_change).unwrap(),
+            TargetGeneration::new(2)
+        );
+        assert!(desktop.apply_target_changed(&terminal_change).is_err());
+        assert!(terminal.apply_target_changed(&desktop_change).is_err());
+
+        // Those two are refused by the key schema, which is the cheap check. Drive the profile
+        // validator directly to prove it refuses a same-shaped descriptor that is wrong for the
+        // profile: a terminal descriptor truncated to the desktop key range still parses as a
+        // map, and only the desktop validator knows its outputs list is missing.
+        let truncated: PayloadMap = crate::target::offline_terminal_descriptor()
+            .into_iter()
+            .filter(|(key, _)| *key <= 6)
+            .collect();
+        assert!(crate::target::validate_target_descriptor(DESKTOP_SURFACE, &truncated).is_err());
+        assert!(
+            crate::target::validate_target_descriptor(
+                DESKTOP_SURFACE,
+                &crate::target::offline_desktop_descriptor()
+            )
+            .is_ok()
+        );
+        // An unrecognized target profile is refused rather than waved through.
+        assert!(
+            crate::target::validate_target_descriptor(
+                CANVAS_SURFACE,
+                &crate::target::offline_desktop_descriptor()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_desktop_target_change_still_enforces_the_settle_rule() {
+        // Terminal §2 and desktop §1 both forbid reusing a generation except for one final
+        // settle, and the settle flag lives at a different key in each profile.
+        let mut session = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let unsettled = DesktopTarget {
+            origin_x: 0,
+            origin_y: 0,
+            width: 1920,
+            height: 1080,
+            outputs: vec![OutputDescriptor {
+                output_id: 1,
+                origin_x: 0,
+                origin_y: 0,
+                width: 1920,
+                height: 1080,
+                scale_numerator: 1,
+                scale_denominator: 1,
+                rotation: Rotation::None,
+                primary: true,
+            }],
+            settled: false,
+            topology_revision: 2,
+        };
+        let mut change = unsettled.encode();
+        change.push((9, Value::Unsigned(2)));
+        change.push((10, Value::Unsigned(1)));
+        session.apply_target_changed(&change).unwrap();
+        assert!(!session.info().target_settled().unwrap());
+
+        // The same generation may repeat exactly once, to settle identical geometry.
+        let mut settled = unsettled.clone();
+        settled.settled = true;
+        let mut settle_change = settled.encode();
+        settle_change.push((9, Value::Unsigned(2)));
+        settle_change.push((10, Value::Unsigned(1)));
+        session.apply_target_changed(&settle_change).unwrap();
+        assert!(session.info().target_settled().unwrap());
+
+        // A second settle at the same generation is a protocol error, not an idempotent no-op.
+        assert!(session.apply_target_changed(&settle_change).is_err());
+    }
+
+    #[test]
+    fn typed_desktop_surface_parameters_round_trip_through_a_surface() {
+        // Desktop §2 keys 0-4 have a typed builder so no producer hand-encodes the map, which is
+        // where the topology sanitization rule would otherwise be dropped.
+        let parameters = DesktopSurfaceParameters {
+            captured_origin_x: -1920,
+            captured_origin_y: 0,
+            topology: vec![OutputDescriptor {
+                output_id: 1,
+                origin_x: -1920,
+                origin_y: 0,
+                width: 1920,
+                height: 1080,
+                scale_numerator: 1,
+                scale_denominator: 1,
+                rotation: Rotation::None,
+                primary: true,
+            }],
+            semantic_generation: 1,
+            input_capabilities: input_capability::KEYBOARD | input_capability::POINTER_MOTION,
+        };
+        let encoded = parameters.encode();
+        let decoded = DesktopSurfaceParameters::decode(&encoded).unwrap();
+        assert_eq!(decoded.captured_origin_x, -1920);
+        assert_eq!(decoded.semantic_generation, 1);
+        assert_eq!(decoded.topology.len(), 1);
+
+        let mut session = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut definition = surface(1, 1);
+        definition.semantic_profile = DESKTOP_CONTENT.into();
+        definition.profile_parameters = encoded;
+        let created = session
+            .create_surface(definition, &RequestMetadata::default())
+            .unwrap();
+        let stored = created.definition().unwrap().profile_parameters;
+        assert_eq!(
+            DesktopSurfaceParameters::decode(&stored)
+                .unwrap()
+                .input_capabilities,
+            input_capability::KEYBOARD | input_capability::POINTER_MOTION
+        );
     }
 
     #[test]

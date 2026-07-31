@@ -180,6 +180,37 @@ impl ProducerConfig {
         }
     }
 
+    /// A desktop producer's profile set: `desktop-surface-v1` as the target, with live media
+    /// required and input and observability offered.
+    ///
+    /// `desktop-input-v1` is optional rather than required because a presenter that presents a
+    /// desktop but refuses injection is a legitimate peer — view-only is a supported deployment,
+    /// and requiring the profile would close the session instead of degrading to it.
+    pub fn desktop() -> Self {
+        let mut required = vec![
+            CORE_CONTROL.to_owned(),
+            DESKTOP_SURFACE.to_owned(),
+            LIVE_MEDIA.to_owned(),
+        ];
+        required.sort();
+        let mut optional = vec![DESKTOP_INPUT.to_owned(), OBSERVABILITY.to_owned()];
+        optional.sort();
+        Self {
+            target_profile: DESKTOP_SURFACE.into(),
+            required_profiles: required,
+            optional_profiles: optional,
+            ..Self::default()
+        }
+    }
+
+    /// A dry-run desktop producer.
+    pub fn offline_desktop() -> Self {
+        Self {
+            dry_run: true,
+            ..Self::desktop()
+        }
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         if self.producer_name.len() > 256 || self.producer_version.len() > 128 {
             return Err(invalid_input("producer name or version is too long"));

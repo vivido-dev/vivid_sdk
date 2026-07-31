@@ -36,6 +36,25 @@ pub struct SessionInfo {
     pub resource_contract: ResourceContract,
 }
 
+impl SessionInfo {
+    /// The parsed desktop target, or `None` when this session's target is not a desktop.
+    ///
+    /// The descriptor is already validated for the negotiated profile, so a producer reads the
+    /// virtual rectangle, output topology, settle flag, and topology revision from here rather
+    /// than re-parsing a payload map — and a terminal session gets `None` instead of a guess.
+    pub fn desktop_target(&self) -> Option<vivid_protocol::target::DesktopTarget> {
+        if self.target_profile != DESKTOP_SURFACE {
+            return None;
+        }
+        vivid_protocol::target::DesktopTarget::decode(&self.target_descriptor).ok()
+    }
+
+    /// Whether the target is settled: geometry has stopped moving for this generation.
+    pub fn target_settled(&self) -> io::Result<bool> {
+        descriptor_settled(&self.target_profile, &self.target_descriptor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     TargetChanged(PayloadMap),
@@ -557,8 +576,8 @@ impl Session {
             session_tag,
             root_context_id: OFFLINE_CONTEXT_ID,
             target_generation: TargetGeneration::ONE,
+            target_descriptor: offline_target_descriptor(&config.target_profile),
             target_profile: config.target_profile,
-            target_descriptor: offline_target_descriptor(),
             accepted_profiles,
             session_revision: 1,
             scene_revision: SceneRevision::ZERO,

@@ -43,28 +43,34 @@ impl Session {
 
     /// Validate and apply one terminal `TARGET_CHANGED` payload to the cached target snapshot.
     pub fn apply_target_changed(&mut self, payload: &PayloadMap) -> io::Result<TargetGeneration> {
-        validate_exact_payload_keys("TARGET_CHANGED", payload, 0..=10)?;
+        // The descriptor's extent depends on the negotiated target profile; the generation and
+        // reason always sit immediately above it at keys 9 and 10.
+        let last = last_descriptor_key(&self.info.target_profile);
+        validate_payload_keys("TARGET_CHANGED", payload, 0..=last, &[9, 10])?;
+        required_u64(payload, 10)?;
         let generation = TargetGeneration::new(required_u64(payload, 9)?);
         generation.require_nonzero()?;
         let descriptor = payload
             .iter()
-            .filter(|(key, _)| *key <= 8)
+            .filter(|(key, _)| *key <= last)
             .cloned()
             .collect();
-        validate_terminal_target_descriptor(&descriptor)?;
+        validate_target_descriptor(&self.info.target_profile, &descriptor)?;
         if generation < self.info.target_generation {
             return Err(invalid_data(
                 "TARGET_CHANGED moved the target generation backward",
             ));
         }
         if generation == self.info.target_generation {
+            let profile = self.info.target_profile.clone();
+            let settle_key = settled_key(&profile);
             let current = &self.info.target_descriptor;
-            let current_settled = required_bool(current, 6)?;
-            let next_settled = required_bool(&descriptor, 6)?;
+            let current_settled = descriptor_settled(&profile, current)?;
+            let next_settled = descriptor_settled(&profile, &descriptor)?;
             let same_geometry = current
                 .iter()
-                .filter(|(key, _)| *key != 6)
-                .eq(descriptor.iter().filter(|(key, _)| *key != 6));
+                .filter(|(key, _)| *key != settle_key)
+                .eq(descriptor.iter().filter(|(key, _)| *key != settle_key));
             if current_settled || !next_settled || !same_geometry {
                 return Err(invalid_data(
                     "TARGET_CHANGED reused a generation without an identical final settle",
