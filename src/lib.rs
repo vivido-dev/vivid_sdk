@@ -16,6 +16,7 @@
 
 mod channel;
 mod config;
+mod controller;
 mod handshake;
 mod input;
 mod lease;
@@ -57,6 +58,11 @@ pub(crate) use wire::{
 pub use channel::TrackChannel;
 pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
+};
+pub use controller::{
+    ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, LaneEndpoints,
+    LeaseGrant, LeaseHandle, LeaseRequest, MAX_ACTIVATION_TIMEOUT_US, PresenterAdmin,
+    PresenterCapabilities, SessionLeaseBuilder, VividoAdmin, issue_handle, worker_context,
 };
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,

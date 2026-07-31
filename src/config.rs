@@ -133,6 +133,27 @@ impl ProducerAuthentication {
             proof_of_possession: None,
         })
     }
+
+    /// Activate a leased session from raw bytes.
+    ///
+    /// The vvdesk path uses this and only this: the activation secret reaches the worker as raw
+    /// bytes over a protected channel and never passes through a `String`. The hex constructor
+    /// stays for compatibility with hand-driven sessions.
+    pub fn lease_activation_bytes(
+        context_id: u64,
+        lease_id: u64,
+        activation_secret: Secret32,
+    ) -> io::Result<Self> {
+        let mut attempt_id = [0; auth::ATTEMPT_ID_BYTES];
+        random_bytes(&mut attempt_id)?;
+        Ok(Self::LeaseActivation {
+            context_id,
+            lease_id,
+            activation_secret,
+            attempt_id,
+            proof_of_possession: None,
+        })
+    }
 }
 
 /// Connection and negotiation policy. Secret-bearing fields are deliberately non-debuggable.
