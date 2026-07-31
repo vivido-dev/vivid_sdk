@@ -22,6 +22,7 @@ mod input;
 mod lease;
 mod offline;
 mod orch;
+mod pipeline;
 mod resume;
 mod scene;
 mod session;
@@ -70,6 +71,7 @@ pub use input::{
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
+pub use pipeline::{BoundedQueue, EncodedPacket, LatestFrame, TrackSender, recover_channel};
 pub use scene::{SceneCommit, SlotBinding};
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
@@ -103,11 +105,11 @@ pub use vivid_protocol::surface::{
 };
 pub use vivid_protocol::target::{DesktopTarget, OutputDescriptor};
 pub use vivid_protocol::track::{
-    AudioConfiguration, ImageConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
-    MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED, MILESTONE_DECODER_INITIALIZED,
-    MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA, MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY,
-    MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS, MILESTONE_TRACK_LOST, RasterConfiguration,
-    VideoConfiguration,
+    AudioConfiguration, ImageConfiguration, KindConfiguration, MILESTONE_BUFFERED_ENDED,
+    MILESTONE_CHANNEL_ACCEPTED, MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED,
+    MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA,
+    MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS,
+    MILESTONE_TRACK_LOST, RasterConfiguration, TrackConfiguration, TrackMode, VideoConfiguration,
 };
 
 const MAX_CONTROL_EVENTS: usize = 1024;
