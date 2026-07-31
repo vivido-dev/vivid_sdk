@@ -3292,6 +3292,8 @@ struct FlowSync {
 
 struct FlowLocal {
     flow: ChannelFlow,
+    initial_maximum_body_bytes: u64,
+    initial_maximum_media_records: u64,
     closed: bool,
     diagnostic: Option<String>,
 }
@@ -3418,6 +3420,8 @@ impl TrackChannel {
         let flow = Arc::new(FlowSync {
             state: Mutex::new(FlowLocal {
                 flow: ChannelFlow::new(maximum_bytes, maximum_records),
+                initial_maximum_body_bytes: maximum_bytes,
+                initial_maximum_media_records: maximum_records,
                 closed: false,
                 diagnostic: None,
             }),
@@ -3501,6 +3505,50 @@ impl TrackChannel {
 
     pub fn take_event(&self) -> io::Result<Option<ChannelEvent>> {
         Ok(lock(&self.events, "channel event queue")?.pop_front())
+    }
+
+    /// Wait until the presenter has made the ingress capacity used by every media record already
+    /// submitted on this channel reusable.
+    ///
+    /// This is an ingress-storage barrier, not a decode or presentation acknowledgment. A caller
+    /// that keeps at most one record outstanding can use it to avoid advancing another control or
+    /// media connection ahead of the presenter's processing of that record.
+    pub fn wait_for_reusable_media_capacity(&self) -> io::Result<()> {
+        if self.rate.is_none() {
+            // Offline sessions have no peer or reverse channel to return capacity.
+            return Ok(());
+        }
+        let mut state = lock(&self.flow.state, "channel flow state")?;
+        let required_body_bytes = state
+            .initial_maximum_body_bytes
+            .checked_add(state.flow.sent_body_bytes)
+            .ok_or_else(|| invalid_data("channel byte flow maximum would saturate"))?;
+        let required_media_records = state
+            .initial_maximum_media_records
+            .checked_add(state.flow.sent_media_records)
+            .ok_or_else(|| invalid_data("channel record flow maximum would saturate"))?;
+        loop {
+            self.lifecycle.ensure_active()?;
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    state
+                        .diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "track channel is closed".into()),
+                ));
+            }
+            if state.flow.maximum_body_bytes >= required_body_bytes
+                && state.flow.maximum_media_records >= required_media_records
+            {
+                return Ok(());
+            }
+            state = self
+                .flow
+                .changed
+                .wait(state)
+                .map_err(|_| io::Error::other("channel flow lock is poisoned"))?;
+        }
     }
 
     pub fn send_video(&self, packet: VideoPacket<'_>) -> io::Result<u64> {
