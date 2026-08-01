@@ -5,8 +5,8 @@ use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::TrackConfiguration;
 
 use crate::{
-    DesktopSurface, InputBindingGuard, InputLane, InputQueue, RequestMetadata, Session,
-    SurfaceSlots, TrackSender,
+    DesktopSurface, InputBindingGuard, InputLane, InputQueue, LaneEndpoints, ProducerConfig,
+    RequestMetadata, Session, SurfaceSlots, TrackSender,
 };
 
 pub struct DesktopSession {
@@ -152,6 +152,75 @@ impl DesktopSession {
             .destroy_track(&self.video_track, &RequestMetadata::default())?;
         self.video_track = new_track;
         self.video_sender = new_sender;
+        Ok(())
+    }
+
+    /// Reattach a suspended leased desktop session to fresh transports.
+    ///
+    /// The logical surface, tracks, and nodes stay presenter-owned during the bounded grace. The
+    /// fresh connection authenticates with the prior generation's resume key, explicitly adopts
+    /// the retained owner-qualified handles, advances only their detached channels, and reopens
+    /// input without carrying an old binding across generations.
+    pub fn resume(&mut self, endpoints: LaneEndpoints) -> io::Result<()> {
+        self.guard.release();
+        self.video_sender.detach();
+        if let Some(sender) = &self.audio_sender {
+            sender.detach();
+        }
+        let authentication = self.session.resume_authentication()?;
+        let info = self.session.info().clone();
+        let mut required_profiles = info.accepted_profiles.clone();
+        required_profiles.sort();
+        let mut resumed = Session::connect(ProducerConfig {
+            endpoint_control: Some(endpoints.control),
+            endpoint_interactive: endpoints.interactive,
+            endpoint_realtime: endpoints.realtime,
+            endpoint_bulk: endpoints.bulk,
+            authentication,
+            producer_name: "vivid-sdk-desktop-resume".into(),
+            producer_version: env!("CARGO_PKG_VERSION").into(),
+            target_profile: info.target_profile,
+            required_profiles,
+            optional_profiles: Vec::new(),
+            maximum_control_body: u32::try_from(
+                info.resource_contract
+                    .get(vivid_protocol::resource::Resource::ControlRecordBody),
+            )
+            .map_err(io::Error::other)?,
+            dry_run: false,
+            trace_dir: None,
+        })?;
+        resumed.adopt_surface(self.surface.inner())?;
+        resumed.adopt_track(&self.video_track)?;
+        if let Some(track) = &self.audio_track {
+            resumed.adopt_track(track)?;
+        }
+        resumed.advance_channel(&self.video_track, 3, &RequestMetadata::default())?;
+        let video_sender = TrackSender::new(resumed.open_track_channel(&self.video_track)?);
+        let audio_sender = if let Some(track) = &self.audio_track {
+            resumed.advance_channel(track, 3, &RequestMetadata::default())?;
+            Some(TrackSender::new(resumed.open_track_channel(track)?))
+        } else {
+            None
+        };
+        let mut slots = SurfaceSlots::new(self.surface.inner());
+        slots.require(1, &self.video_track, video_sender.generation(), 1 << 4)?;
+        if let (Some(track), Some(sender)) = (&self.audio_track, &audio_sender) {
+            slots.require(2, track, sender.generation(), 1 << 4)?;
+        }
+        slots.activate(&mut resumed)?;
+        let (lane, input_queue) = if resumed.supports(crate::DESKTOP_INPUT) {
+            let lane = resumed.open_input_lane(1)?;
+            (Some(lane), Some(InputQueue::new(1000)))
+        } else {
+            (None, None)
+        };
+        self.session = resumed;
+        self.video_sender = video_sender;
+        self.audio_sender = audio_sender;
+        self.guard = InputBindingGuard::new();
+        self.lane = lane;
+        self.input_queue = input_queue;
         Ok(())
     }
 

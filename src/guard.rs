@@ -47,6 +47,7 @@ enum GuardState {
 pub struct InputBindingGuard {
     epoch: u64,
     state: GuardState,
+    context_id: u64,
     surface_id: u64,
     surface_generation: SurfaceGeneration,
     watchdog_deadline: Option<Monotonic>,
@@ -57,6 +58,7 @@ impl InputBindingGuard {
         Self {
             epoch: 0,
             state: GuardState::Fresh,
+            context_id: 0,
             surface_id: 0,
             surface_generation: SurfaceGeneration::ZERO,
             watchdog_deadline: None,
@@ -88,7 +90,7 @@ impl InputBindingGuard {
                 grant_generation: vivid_protocol::revision::GrantGeneration::new(
                     g.grant_generation,
                 ),
-                context_id: 0,
+                context_id: self.context_id,
                 surface_id: self.surface_id,
                 surface_generation: self.surface_generation,
             }),
@@ -103,6 +105,28 @@ impl InputBindingGuard {
         watchdog_us: u64,
         reason: u64,
     ) -> io::Result<InputBinding> {
+        self.enable_for_context(
+            1,
+            surface_id,
+            surface_generation,
+            classes,
+            watchdog_us,
+            reason,
+        )
+    }
+
+    pub fn enable_for_context(
+        &mut self,
+        context_id: u64,
+        surface_id: u64,
+        surface_generation: SurfaceGeneration,
+        classes: u64,
+        watchdog_us: u64,
+        reason: u64,
+    ) -> io::Result<InputBinding> {
+        if context_id == 0 {
+            return Err(err("input context is zero"));
+        }
         if classes == 0 || classes & !INPUT_CLASS_KNOWN_MASK != 0 {
             return Err(err("requested classes contain unassigned bits"));
         }
@@ -128,11 +152,12 @@ impl InputBindingGuard {
             return Err(err("no requested class within capability mask"));
         }
         let epoch = self.advance_epoch();
+        self.context_id = context_id;
         self.surface_id = surface_id;
         self.surface_generation = surface_generation;
         Ok(InputBinding {
             producer_epoch: InputEpoch::new(epoch),
-            context_id: 0,
+            context_id,
             surface_id,
             surface_generation,
             requested_classes: classes,
