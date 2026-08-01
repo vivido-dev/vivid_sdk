@@ -507,8 +507,10 @@ pub fn worker_context(
 
 /// The presenter admin for a vvbridge gateway.
 ///
-/// Connects to the gateway's owner-only administrative Unix socket and speaks the
-/// length-prefixed CBOR protocol defined in [`admin protocol`](vvbridge::admin).
+/// Connects to the gateway's owner-only administrative Unix socket and speaks its
+/// length-prefixed CBOR protocol. Unix sockets are intentionally unavailable on
+/// non-Unix controller hosts until the gateway admin protocol gains a portable
+/// local transport.
 pub struct BridgeAdmin {
     socket: String,
 }
@@ -524,11 +526,13 @@ impl BridgeAdmin {
     }
 
     /// Open a connection to the admin socket.
+    #[cfg(unix)]
     fn connect(&self) -> io::Result<std::os::unix::net::UnixStream> {
         std::os::unix::net::UnixStream::connect(&self.socket)
     }
 
     /// Send a length-prefixed CBOR request and read the response.
+    #[cfg(unix)]
     fn call(
         &self,
         request: &vivid_protocol::cbor::Value,
@@ -557,6 +561,20 @@ impl BridgeAdmin {
         stream.read_exact(&mut resp_body)?;
 
         vivid_protocol::cbor::decode(&resp_body).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    #[cfg(not(unix))]
+    fn call(
+        &self,
+        _request: &vivid_protocol::cbor::Value,
+    ) -> io::Result<vivid_protocol::cbor::Value> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "vvbridge admin Unix sockets are unavailable on this platform: {}",
+                self.socket
+            ),
+        ))
     }
 
     fn cbor_request(
