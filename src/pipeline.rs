@@ -2,12 +2,12 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::revision::ChannelGeneration;
 
-use crate::{ChannelEvent, RequestMetadata, Session, Track, TrackChannel};
+use crate::{ChannelEvent, RequestMetadata, Session, Track, TrackChannel, invalid_data, lock};
 
 /// A single-slot atomic, latest-wins capture boundary with a drop counter.
 pub struct LatestFrame<T> {
@@ -174,19 +174,37 @@ pub struct AudioPacketData {
 }
 
 /// A per-track sender that drains a bounded queue through one channel generation.
+///
+/// Clones share the channel, the packet-ID counter, and the media epoch, so handing a clone to a
+/// media worker continues the exact sequence — exactly one sender per channel generation may send.
+#[derive(Clone)]
 pub struct TrackSender {
     channel: TrackChannel,
-    detached: AtomicBool,
-    last_packet_id: AtomicU64,
-    epoch: AtomicU32,
+    detached: Arc<AtomicBool>,
+    last_packet_id: Arc<AtomicU64>,
+    epoch: Arc<AtomicU32>,
 }
 impl TrackSender {
     pub fn new(channel: TrackChannel) -> Self {
         Self {
             channel,
-            detached: AtomicBool::new(false),
-            last_packet_id: AtomicU64::new(0),
-            epoch: AtomicU32::new(1),
+            detached: Arc::new(AtomicBool::new(false)),
+            last_packet_id: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    /// A sender continuing an existing track media sequence.
+    ///
+    /// Channel recovery must keep packet IDs increasing and the media epoch
+    /// non-decreasing across generations, so the sender starts past the recovery
+    /// unit's ID and at the track's current epoch.
+    pub(crate) fn seeded(channel: TrackChannel, next_packet_id: u64, epoch: u32) -> Self {
+        Self {
+            channel,
+            detached: Arc::new(AtomicBool::new(false)),
+            last_packet_id: Arc::new(AtomicU64::new(next_packet_id.saturating_sub(1))),
+            epoch: Arc::new(AtomicU32::new(epoch)),
         }
     }
     pub fn channel(&self) -> &TrackChannel {
@@ -258,26 +276,41 @@ impl TrackSender {
 ///
 /// Flow (c): only the affected track is touched. The caller provides a key unit (video) or fresh
 /// access unit (audio). The existing surface, node, and input binding are untouched.
+///
+/// The returned sender continues the track's media sequence: packet IDs stay strictly increasing
+/// and the epoch never moves backward across the recovered generation, so subsequent sends through
+/// the sender pass the track sequence checks.
 pub fn recover_channel(
     session: &mut Session,
     track: &Track,
     key_unit_or_fresh_au: &[u8],
-) -> io::Result<(TrackChannel, ChannelGeneration)> {
+) -> io::Result<TrackSender> {
     let _new_gen =
         session.advance_channel(track, 3 /* recovery */, &RequestMetadata::default())?;
     let channel = session.open_track_channel(track)?;
-    let effective = channel.generation();
-    // Send the recovery unit.
+    let (next_id, epoch) = {
+        let snapshot = lock(&track.inner, "track")?.clone();
+        let sequence = lock(&snapshot.media_sequence, "track media sequence")?;
+        let id = sequence
+            .last_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("track media ID space exhausted"))?;
+        (id, sequence.last_epoch.max(1))
+    };
+    // Send the recovery unit as the next media ID at the current epoch.
     channel.send_video(VideoPacket {
-        epoch: 1,
-        packet_id: 1,
+        epoch,
+        packet_id: next_id,
         pts_us: 0,
         dts_us: 0,
         duration_us: 0,
         key: true,
         data: key_unit_or_fresh_au,
     })?;
-    Ok((channel, effective))
+    let next = next_id
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("track media ID space exhausted"))?;
+    Ok(TrackSender::seeded(channel, next, epoch))
 }
 
 #[cfg(test)]
@@ -496,10 +529,41 @@ mod tests {
             retained_pixel_charge: 76800,
         };
         let tk = s.create_track(cfg, &RequestMetadata::default()).unwrap();
+        // Stream media first so the track sequence is past its initial ID, which is
+        // the state every real recovery faces.
+        let ch = s.open_track_channel(&tk).unwrap();
+        let first = TrackSender::new(ch);
+        assert!(
+            first
+                .send(&EncodedPacket::Video(VideoPacketData {
+                    epoch: 1,
+                    packet_id: first.next_packet_id(),
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 0,
+                    key: true,
+                    data: vec![0; 100],
+                }))
+                .is_ok()
+        );
         let key_unit = vec![0x00, 0x00, 0x00, 0x01, 0x67];
-        let (ch, ch_gen) = recover_channel(&mut s, &tk, &key_unit).unwrap();
-        assert!(ch_gen.get() > ChannelGeneration::ONE.get());
-        assert_eq!(ch.generation(), ch_gen);
+        let recovered = recover_channel(&mut s, &tk, &key_unit).unwrap();
+        assert!(recovered.generation().get() > ChannelGeneration::ONE.get());
         assert_eq!(tk.id(), 7);
+        // The recovered sender continues the track sequence: packet IDs strictly
+        // increase across the generation boundary and the epoch never moves backward.
+        assert!(
+            recovered
+                .send(&EncodedPacket::Video(VideoPacketData {
+                    epoch: recovered.current_epoch(),
+                    packet_id: recovered.next_packet_id(),
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 0,
+                    key: false,
+                    data: vec![0; 64],
+                }))
+                .is_ok()
+        );
     }
 }

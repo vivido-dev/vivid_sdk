@@ -48,6 +48,7 @@ pub(crate) struct ChannelRateState {
 }
 
 /// One accepted, authenticated track-channel generation.
+#[derive(Clone)]
 pub struct TrackChannel {
     pub(crate) track: Track,
     pub(crate) generation: ChannelGeneration,
@@ -57,7 +58,7 @@ pub struct TrackChannel {
     pub(crate) track_sequence: Arc<Mutex<TrackMediaSequence>>,
     pub(crate) media: Arc<Mutex<ChannelMediaState>>,
     pub(crate) events: Arc<Mutex<VecDeque<ChannelEvent>>>,
-    pub(crate) rate: Option<Mutex<ChannelRateState>>,
+    pub(crate) rate: Option<Arc<Mutex<ChannelRateState>>>,
 }
 
 impl std::fmt::Debug for TrackChannel {
@@ -218,14 +219,14 @@ impl TrackChannel {
                     .maximum_encoded_bits_per_second
                     .saturating_add(7)
                     / 8;
-                Mutex::new(ChannelRateState {
+                Arc::new(Mutex::new(ChannelRateState {
                     body_bytes: TokenBucket::new(
                         byte_rate,
                         u64::from(snapshot.maximum_record_body),
                     ),
                     records: TokenBucket::new(snapshot.configuration.maximum_records_per_second, 1),
                     updated_at: Instant::now(),
-                })
+                }))
             }),
         })
     }
