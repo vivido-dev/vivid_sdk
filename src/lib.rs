@@ -205,6 +205,21 @@ mod tests {
         }
     }
 
+    fn compressed_delta_raster_track(
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+    ) -> TrackConfiguration {
+        let mut configuration = raster_track(context_id, surface_id, track_id);
+        let KindConfiguration::Raster(raster) = &mut configuration.kind else {
+            unreachable!("the test track is raster")
+        };
+        raster.delta_enabled = true;
+        raster.maximum_delta_operations = 1;
+        raster.zstd_enabled = true;
+        configuration
+    }
+
     #[test]
     fn offline_lifecycle_uses_surfaces_tracks_and_ordered_eos() {
         let mut session = Session::connect(ProducerConfig::offline()).unwrap();
@@ -224,6 +239,42 @@ mod tests {
         assert_eq!(track.surface_id(), 7);
         assert_eq!(track.channel_generation(), ChannelGeneration::ONE);
         session.close().unwrap();
+    }
+
+    #[test]
+    fn adaptive_raster_encoding_falls_back_to_raw_when_zstd_is_larger() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        session
+            .create_surface(surface(1, 7), &RequestMetadata::default())
+            .unwrap();
+        let track = session
+            .create_track(
+                compressed_delta_raster_track(1, 7, 9),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        let rgba = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+        // A zstd wrapper is larger than this tiny, deliberately incompressible frame. The track's
+        // body ceiling is exactly the raw size, so succeeding proves the adaptive path used raw.
+        channel.send_raster_adaptive(0, 1, &rgba).unwrap();
+        channel
+            .send_raster_delta_adaptive(
+                0,
+                2,
+                1,
+                0,
+                0,
+                &[RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &rgba[..4],
+                }],
+            )
+            .unwrap();
     }
 
     #[test]

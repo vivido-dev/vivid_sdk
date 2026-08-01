@@ -359,6 +359,38 @@ impl TrackChannel {
         self.send_media(messages::RASTER_FRAME, frame_id, epoch, true, &body)
     }
 
+    /// Send a full raster frame using zstd only when the negotiated track permits it and the
+    /// encoded body is smaller than the raw representation.
+    ///
+    /// The size check is important because a track's maximum record body is commonly claimed from
+    /// the raw framebuffer size. An incompressible zstd frame can be slightly larger than that
+    /// claim, while a raw fallback is always admissible.
+    pub fn send_raster_adaptive(&self, epoch: u32, frame_id: u64, rgba: &[u8]) -> io::Result<u64> {
+        let configuration = self.track.configuration()?;
+        let KindConfiguration::Raster(raster) = configuration.kind else {
+            return Err(invalid_input("RASTER_FRAME requires a raster track"));
+        };
+        if raster.zstd_enabled {
+            let compressed = media::raster_frame_body_with_compression(
+                epoch,
+                frame_id,
+                raster.width,
+                raster.height,
+                rgba,
+                true,
+            )?;
+            let raw_length = usize::try_from(
+                media::rgba8_raw_frame_body_len(raster.width, raster.height)
+                    .map_err(|error| invalid_input(error.to_string()))?,
+            )
+            .map_err(|_| invalid_input("raw raster body exceeds address space"))?;
+            if compressed.len() < raw_length {
+                return self.send_media(messages::RASTER_FRAME, frame_id, epoch, true, &compressed);
+            }
+        }
+        self.send_raster(epoch, frame_id, rgba, false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn send_raster_delta(
         &self,
@@ -370,10 +402,84 @@ impl TrackChannel {
         operations: &[RasterDeltaOperation<'_>],
         compress: bool,
     ) -> io::Result<u64> {
+        let body = self.raster_delta_body(
+            epoch,
+            frame_id,
+            base_frame_id,
+            pts_us,
+            duration_us,
+            operations,
+            compress,
+        )?;
+        self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
+    }
+
+    /// Send a raster delta using zstd only when every negotiated constraint permits it and the
+    /// resulting body is smaller than the raw delta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raster_delta_adaptive(
+        &self,
+        epoch: u32,
+        frame_id: u64,
+        base_frame_id: u64,
+        pts_us: i64,
+        duration_us: u64,
+        operations: &[RasterDeltaOperation<'_>],
+    ) -> io::Result<u64> {
+        let raw = self.raster_delta_body(
+            epoch,
+            frame_id,
+            base_frame_id,
+            pts_us,
+            duration_us,
+            operations,
+            false,
+        )?;
+        let configuration = self.track.configuration()?;
+        let KindConfiguration::Raster(raster) = configuration.kind else {
+            return Err(invalid_input("RASTER_FRAME requires a raster track"));
+        };
+        let body = if raster.zstd_enabled {
+            let compressed = self.raster_delta_body(
+                epoch,
+                frame_id,
+                base_frame_id,
+                pts_us,
+                duration_us,
+                operations,
+                true,
+            )?;
+            if compressed.len() < raw.len() {
+                compressed
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn raster_delta_body(
+        &self,
+        epoch: u32,
+        frame_id: u64,
+        base_frame_id: u64,
+        pts_us: i64,
+        duration_us: u64,
+        operations: &[RasterDeltaOperation<'_>],
+        compress: bool,
+    ) -> io::Result<Vec<u8>> {
         let state = lock(&self.track.inner, "track")?.clone();
         let KindConfiguration::Raster(raster) = state.configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
+        if compress && !raster.zstd_enabled {
+            return Err(invalid_input(
+                "track configuration did not permit zstd raster frames",
+            ));
+        }
         if !raster.delta_enabled || state.delta_operation_limit == 0 {
             return Err(invalid_input(
                 "track configuration did not permit raster deltas",
@@ -389,7 +495,7 @@ impl TrackChannel {
                 "raster delta base must be the immediately preceding accepted frame",
             ));
         }
-        let body = media::raster_delta_frame_body(
+        media::raster_delta_frame_body(
             epoch,
             frame_id,
             base_frame_id,
@@ -400,8 +506,7 @@ impl TrackChannel {
             state.delta_operation_limit,
             operations,
             compress,
-        )?;
-        self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
+        )
     }
 
     pub fn send_image(&self, encoded: &[u8]) -> io::Result<u64> {
