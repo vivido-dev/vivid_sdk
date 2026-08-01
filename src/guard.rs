@@ -50,6 +50,7 @@ pub struct InputBindingGuard {
     surface_id: u64,
     surface_generation: SurfaceGeneration,
     watchdog_deadline: Option<Monotonic>,
+    last_renewal_sequence: u64,
     preconditions: DesktopPreconditions,
 }
 impl InputBindingGuard {
@@ -60,6 +61,7 @@ impl InputBindingGuard {
             surface_id: 0,
             surface_generation: SurfaceGeneration::ZERO,
             watchdog_deadline: None,
+            last_renewal_sequence: 0,
             preconditions: DesktopPreconditions::none(),
         }
     }
@@ -201,12 +203,24 @@ impl InputBindingGuard {
         if renewal.renewal_sequence == 0 {
             return Err(err("a renewal sequence is zero"));
         }
+        if renewal.renewal_sequence <= self.last_renewal_sequence {
+            return Err(err("a renewal moved the sequence backward"));
+        }
         if renewal.watchdog_timeout_us != grant.watchdog_timeout_us {
             return Err(err("a renewal changed the watchdog"));
+        }
+        // A renewal received at or after the deadline is late: the grant had already expired
+        // and must not be re-armed by reordered delivery (desktop §10).
+        if self
+            .watchdog_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Err(err("a renewal arrived after the watchdog expired"));
         }
         let deadline = now
             .checked_add_micros(renewal.watchdog_timeout_us)
             .ok_or_else(|| err("a renewal overflowed local time"))?;
+        self.last_renewal_sequence = renewal.renewal_sequence;
         self.watchdog_deadline = Some(deadline);
         Ok(())
     }
@@ -442,6 +456,67 @@ mod tests {
         )
         .unwrap();
         assert!(!g.is_expired(Monotonic::ZERO));
+        assert!(g.is_expired(Monotonic::from_micros(1_000_000)));
+    }
+    #[test]
+    fn late_or_reordered_renewal_rejected() {
+        let mut g = InputBindingGuard::new();
+        g.set_preconditions(pre());
+        let _ = g
+            .enable(
+                7,
+                SurfaceGeneration::new(1),
+                INPUT_CLASS_KEYBOARD,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        g.handle_bound(&InputBindingStatus {
+            producer_epoch: 1,
+            grant_generation: 5,
+            context_id: 1,
+            surface_id: 7,
+            surface_generation: 1,
+            effective_classes: INPUT_CLASS_KEYBOARD,
+            state: 1,
+            reason: 0,
+            watchdog_timeout_us: 1_000_000,
+        })
+        .unwrap();
+        g.handle_renewal(
+            &InputLeaseRenewal {
+                binding: renewal_tuple(),
+                renewal_sequence: 1,
+                watchdog_timeout_us: 1_000_000,
+            },
+            Monotonic::ZERO,
+        )
+        .unwrap();
+        // Reordered delivery: an older renewal must not re-arm the watchdog.
+        assert!(
+            g.handle_renewal(
+                &InputLeaseRenewal {
+                    binding: renewal_tuple(),
+                    renewal_sequence: 1,
+                    watchdog_timeout_us: 1_000_000,
+                },
+                Monotonic::from_micros(100),
+            )
+            .is_err()
+        );
+        // A renewal after expiry must not re-arm the grant either.
+        assert!(g.is_expired(Monotonic::from_micros(1_000_000)));
+        assert!(
+            g.handle_renewal(
+                &InputLeaseRenewal {
+                    binding: renewal_tuple(),
+                    renewal_sequence: 2,
+                    watchdog_timeout_us: 1_000_000,
+                },
+                Monotonic::from_micros(1_000_000),
+            )
+            .is_err()
+        );
         assert!(g.is_expired(Monotonic::from_micros(1_000_000)));
     }
     #[test]
