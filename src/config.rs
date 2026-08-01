@@ -111,6 +111,15 @@ pub enum ProducerAuthentication {
 /// session and channel keys, authenticates track channels, and enforces sequencing and flow.
 pub trait ConnectionFactory: Send + Sync {
     fn open(&self, kind: ConnectionKind, lane: Option<LaneClass>) -> io::Result<Connection>;
+
+    /// Channel binding shared by every Vivid connection opened by this factory generation.
+    ///
+    /// Native sockets, SSH forwarding, WebSocket, vvmux, transparent relays, and existing test
+    /// factories are intentionally unbound. A terminating WebTransport factory overrides this
+    /// with the TLS-exporter-derived key for its carrier session.
+    fn carrier_binding_key(&self) -> [u8; 32] {
+        [0; 32]
+    }
 }
 
 impl ProducerAuthentication {

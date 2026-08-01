@@ -6,18 +6,37 @@
 
 #![cfg(feature = "testing")]
 
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
+use vivid_protocol::messages::LaneClass;
 use vivid_protocol::revision::{InputEpoch, SurfaceGeneration};
 use vivid_protocol::surface::CoordinateModel;
+use vivid_protocol::wire::{Connection, Endpoint};
 use vivid_sdk::testing::{Fault, ROOT_SECRET_HEX, Script, TargetKind, TestPresenter};
 use vivid_sdk::{
-    CORE_CONTROL, CleanupPolicy, DESKTOP_CONTENT, DESKTOP_INPUT, DESKTOP_SURFACE,
-    DesktopSurfaceParameters, INPUT_CLASS_KEYBOARD, INPUT_CLASS_POINTER_AXIS,
+    CORE_CONTROL, CleanupPolicy, ConnectionFactory, ConnectionKind, DESKTOP_CONTENT, DESKTOP_INPUT,
+    DESKTOP_SURFACE, DesktopSurfaceParameters, INPUT_CLASS_KEYBOARD, INPUT_CLASS_POINTER_AXIS,
     INPUT_CLASS_POINTER_MOTION, InputBinding, LIVE_MEDIA, OBSERVABILITY, OutputDescriptor,
     ProducerAuthentication, ProducerConfig, RequestMetadata, Rotation, Session,
     SessionLeaseDefinition, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, input_capability,
 };
+
+struct BoundTestFactory {
+    endpoint: Endpoint,
+    binding: [u8; 32],
+}
+
+impl ConnectionFactory for BoundTestFactory {
+    fn open(&self, kind: ConnectionKind, _lane: Option<LaneClass>) -> io::Result<Connection> {
+        Connection::open(&self.endpoint, kind)
+    }
+
+    fn carrier_binding_key(&self) -> [u8; 32] {
+        self.binding
+    }
+}
 
 fn desktop_session(presenter: &TestPresenter) -> Session {
     Session::connect(ProducerConfig {
@@ -99,6 +118,26 @@ fn a_terminal_producer_against_a_desktop_presenter_is_refused() {
         ..ProducerConfig::default()
     });
     assert!(result.is_err(), "a terminal producer must not be welcomed");
+}
+
+#[test]
+fn welcome_confirmation_rejects_a_carrier_binding_disagreement() {
+    let presenter = TestPresenter::start_desktop(1920, 1080).unwrap();
+    let factory = Arc::new(BoundTestFactory {
+        endpoint: Endpoint::parse(presenter.endpoint()).unwrap(),
+        binding: [0x5a; 32],
+    });
+    let result = Session::connect_with_factory(
+        ProducerConfig {
+            authentication: ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+            ..ProducerConfig::desktop()
+        },
+        factory,
+    );
+    assert!(
+        result.is_err(),
+        "zero/exporter disagreement must fail WELCOME authentication"
+    );
 }
 
 #[test]

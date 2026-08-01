@@ -779,6 +779,103 @@ impl PresenterAdmin for BridgeAdmin {
     }
 }
 
+/// Presenter administration for an authority-transparent vvbridge route.
+///
+/// Vvbridge reveals only owner-protected lane endpoints for the public route ID. This controller
+/// then establishes an ordinary root-authenticated Vivid session directly with vvweb; vvbridge
+/// never receives the root secret and cannot issue a new authenticated lease on its own.
+pub struct DirectBrowserAdmin {
+    inner: VividoAdmin,
+}
+
+impl DirectBrowserAdmin {
+    pub fn connect(
+        admin_socket: impl Into<String>,
+        route_id: [u8; 16],
+        root_secret: Secret32,
+    ) -> io::Result<Self> {
+        use vivid_protocol::cbor::Value;
+
+        let bridge = BridgeAdmin::new(admin_socket);
+        let request =
+            BridgeAdmin::cbor_request("discover", vec![(1, Value::Bytes(route_id.to_vec()))]);
+        let response = retry_on_timeout(|| bridge.call(&request))?;
+        let Value::Map(map) = response else {
+            return Err(io::Error::other(
+                "transparent discovery response is not a map",
+            ));
+        };
+        if let Some((_, Value::Text(error))) = map.iter().find(|(key, _)| *key == 99) {
+            return Err(io::Error::other(error.clone()));
+        }
+        if map
+            .iter()
+            .find(|(key, _)| *key == 0)
+            .and_then(|(_, value)| value.as_bool())
+            != Some(true)
+        {
+            return Err(io::Error::other("transparent route discovery failed"));
+        }
+        let endpoint = |key| {
+            map.iter()
+                .find(|(candidate, _)| *candidate == key)
+                .and_then(|(_, value)| value.as_text())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    io::Error::other(format!("transparent discovery omitted lane {key}"))
+                })
+        };
+        let endpoints = LaneEndpoints {
+            control: endpoint(1)?,
+            interactive: Some(endpoint(2)?),
+            realtime: Some(endpoint(3)?),
+            bulk: Some(endpoint(4)?),
+        };
+        let mut required = vec![
+            registry::CORE_CONTROL.to_owned(),
+            registry::DESKTOP_SURFACE.to_owned(),
+        ];
+        required.sort();
+        let mut optional = vec![
+            registry::DESKTOP_INPUT.to_owned(),
+            registry::LIVE_MEDIA.to_owned(),
+            registry::OBSERVABILITY.to_owned(),
+        ];
+        optional.sort();
+        let session = Session::connect(ProducerConfig {
+            endpoint_control: Some(endpoints.control.clone()),
+            endpoint_interactive: endpoints.interactive.clone(),
+            endpoint_realtime: endpoints.realtime.clone(),
+            endpoint_bulk: endpoints.bulk.clone(),
+            authentication: ProducerAuthentication::Root { root_secret },
+            target_profile: registry::DESKTOP_SURFACE.to_owned(),
+            required_profiles: required,
+            optional_profiles: optional,
+            ..ProducerConfig::default()
+        })?;
+        Ok(Self {
+            inner: VividoAdmin {
+                session: Mutex::new(session),
+                endpoints,
+            },
+        })
+    }
+}
+
+impl PresenterAdmin for DirectBrowserAdmin {
+    fn capabilities(&self) -> io::Result<PresenterCapabilities> {
+        self.inner.capabilities()
+    }
+
+    fn issue(&self, request: &LeaseRequest) -> io::Result<LeaseGrant> {
+        self.inner.issue(request)
+    }
+
+    fn revoke(&self, grant: &LeaseGrant) -> io::Result<()> {
+        self.inner.revoke(grant)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

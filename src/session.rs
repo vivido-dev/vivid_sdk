@@ -366,6 +366,11 @@ impl Session {
         )?
         .or_else(|| bulk.clone());
 
+        let carrier_binding_key = connection_factory
+            .as_ref()
+            .map_or(CARRIER_BINDING_NONE, |factory| {
+                factory.carrier_binding_key()
+            });
         let mut connection = match &connection_factory {
             Some(factory) => factory.open(ConnectionKind::Control, None)?,
             None => Connection::open(
@@ -461,7 +466,7 @@ impl Session {
             &session_secret,
             &hello.client_nonce,
             &welcome.server_nonce,
-            &CARRIER_BINDING_NONE,
+            &carrier_binding_key,
         );
         let unconfirmed = welcome.unconfirmed_payload()?;
         if !auth::verify_welcome_confirmation(

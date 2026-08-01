@@ -64,9 +64,10 @@ pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
 };
 pub use controller::{
-    ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, LaneEndpoints,
-    LeaseGrant, LeaseHandle, LeaseRequest, MAX_ACTIVATION_TIMEOUT_US, PresenterAdmin,
-    PresenterCapabilities, SessionLeaseBuilder, VividoAdmin, issue_handle, worker_context,
+    ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
+    LaneEndpoints, LeaseGrant, LeaseHandle, LeaseRequest, MAX_ACTIVATION_TIMEOUT_US,
+    PresenterAdmin, PresenterCapabilities, SessionLeaseBuilder, VividoAdmin, issue_handle,
+    worker_context,
 };
 pub use desktop::DesktopSession;
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
