@@ -592,29 +592,62 @@ impl PresenterAdmin for BridgeAdmin {
     fn capabilities(&self) -> io::Result<PresenterCapabilities> {
         use vivid_protocol::cbor::Value;
         let req = Self::cbor_request("capabilities", vec![]);
-        let resp = self.call(&req)?;
+        let resp = retry_on_timeout(|| self.call(&req))?;
 
         let Value::Map(map) = resp else {
             return Err(io::Error::other("expected map response"));
         };
 
-        let profiles: Vec<String> = map
+        if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
+            return Err(io::Error::other(err.clone()));
+        }
+
+        if map
+            .iter()
+            .find(|(k, _)| *k == 0)
+            .and_then(|(_, value)| value.as_bool())
+            != Some(true)
+        {
+            return Err(io::Error::other("capabilities response was not successful"));
+        }
+        let profiles = map
             .iter()
             .find(|(k, _)| *k == 1)
-            .and_then(|(_, v)| match v {
-                Value::Array(arr) => Some(
-                    arr.iter()
-                        .filter_map(|v| v.as_text().map(String::from))
-                        .collect(),
-                ),
-                _ => None,
+            .and_then(|(_, value)| value.as_array())
+            .ok_or_else(|| io::Error::other("capabilities omitted profile array"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_text()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| io::Error::other("capability profile is not text"))
             })
-            .unwrap_or_default();
+            .collect::<io::Result<Vec<_>>>()?;
+        if profiles.is_empty() {
+            return Err(io::Error::other("capabilities returned no profiles"));
+        }
+
+        let contract_ceiling = map
+            .iter()
+            .find(|(k, _)| *k == 3)
+            .map(|(_, value)| ResourceContract::from_value(value))
+            .transpose()
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("capabilities omitted contract ceiling"))?;
+        let carrier = match map
+            .iter()
+            .find(|(k, _)| *k == 2)
+            .and_then(|(_, value)| value.as_text())
+        {
+            Some("native") => Carrier::Native,
+            Some("web") => Carrier::Web,
+            _ => return Err(io::Error::other("capabilities reported an unknown carrier")),
+        };
 
         Ok(PresenterCapabilities {
             profiles,
-            contract_ceiling: ResourceContract::denied(),
-            carrier: Carrier::Web,
+            contract_ceiling,
+            carrier,
         })
     }
 
@@ -638,9 +671,13 @@ impl PresenterAdmin for BridgeAdmin {
                 (2, Value::Array(profiles)),
                 (3, Value::Unsigned(request.activation_timeout_us)),
                 (4, Value::Unsigned(request.disconnect_grace_us)),
+                (5, Value::Unsigned(request.lease_id)),
+                (6, Value::Unsigned(request.cleanup_policy as u64)),
+                (7, request.contract.to_value()),
+                (8, Value::Unsigned(request.parent_context_id)),
             ],
         );
-        let resp = self.call(&req)?;
+        let resp = retry_on_timeout(|| self.call(&req))?;
 
         let Value::Map(map) = resp else {
             return Err(io::Error::other("expected map response"));
@@ -650,47 +687,93 @@ impl PresenterAdmin for BridgeAdmin {
         if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
             return Err(io::Error::other(err.clone()));
         }
+        if map
+            .iter()
+            .find(|(k, _)| *k == 0)
+            .and_then(|(_, value)| value.as_bool())
+            != Some(true)
+        {
+            return Err(io::Error::other("lease grant response was not successful"));
+        }
 
-        // Parse the grant from the response.
-        let context_id = map
+        let field = |key| {
+            map.iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| value)
+                .ok_or_else(|| io::Error::other(format!("lease grant omitted field {key}")))
+        };
+        let number = |key| {
+            field(key)?
+                .as_u64()
+                .ok_or_else(|| io::Error::other(format!("lease grant field {key} is not unsigned")))
+        };
+        let context_id = number(1)?;
+        let lease_id = number(2)?;
+        if lease_id != request.lease_id {
+            return Err(io::Error::other("lease grant changed the lease identity"));
+        }
+        let endpoint = field(3)?
+            .as_text()
+            .ok_or_else(|| io::Error::other("lease endpoint is not text"))?
+            .to_owned();
+        let permitted_profiles = field(4)?
+            .as_array()
+            .ok_or_else(|| io::Error::other("lease profiles are not an array"))?
             .iter()
-            .find(|(k, _)| *k == 1)
-            .and_then(|(_, v)| v.as_u64())
-            .unwrap_or(0);
-        let lease_id = map
-            .iter()
-            .find(|(k, _)| *k == 2)
-            .and_then(|(_, v)| v.as_u64())
-            .unwrap_or(request.lease_id);
+            .map(|value| {
+                value
+                    .as_text()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| io::Error::other("lease profile is not text"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let contract = ResourceContract::from_value(field(5)?).map_err(io::Error::other)?;
+        let cleanup_policy = CleanupPolicy::try_from(number(8)?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
         Ok(LeaseGrant {
             endpoints: LaneEndpoints {
-                control: String::new(),
-                interactive: None,
-                realtime: None,
-                bulk: None,
+                control: endpoint.clone(),
+                interactive: Some(endpoint.clone()),
+                realtime: Some(endpoint.clone()),
+                bulk: Some(endpoint),
             },
             context_id,
             lease_id,
             activation,
-            permitted_profiles: request.permitted_profiles.clone(),
-            contract: request.contract.clone(),
-            grace_us: request.disconnect_grace_us,
-            activation_timeout_us: request.activation_timeout_us,
-            cleanup_policy: request.cleanup_policy,
-            revision: 1,
+            permitted_profiles,
+            contract,
+            grace_us: number(6)?,
+            activation_timeout_us: number(7)?,
+            cleanup_policy,
+            revision: number(9)?,
         })
     }
 
     fn revoke(&self, grant: &LeaseGrant) -> io::Result<()> {
         use vivid_protocol::cbor::Value;
-        let req = Self::cbor_request("revoke", vec![(1, Value::Unsigned(grant.lease_id))]);
-        let resp = self.call(&req)?;
+        let req = Self::cbor_request(
+            "revoke",
+            vec![
+                (1, Value::Unsigned(grant.context_id)),
+                (2, Value::Unsigned(grant.lease_id)),
+            ],
+        );
+        let resp = retry_on_timeout(|| self.call(&req))?;
 
-        if let Value::Map(map) = resp {
-            if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
-                return Err(io::Error::other(err.clone()));
-            }
+        let Value::Map(map) = resp else {
+            return Err(io::Error::other("expected map response"));
+        };
+        if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
+            return Err(io::Error::other(err.clone()));
+        }
+        if map
+            .iter()
+            .find(|(k, _)| *k == 0)
+            .and_then(|(_, value)| value.as_bool())
+            != Some(true)
+        {
+            return Err(io::Error::other("lease revoke response was not successful"));
         }
         Ok(())
     }
