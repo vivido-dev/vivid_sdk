@@ -185,10 +185,40 @@ impl TrackBuilder {
         contract: &ResourceContract,
         track_id: u64,
     ) -> io::Result<TrackConfiguration> {
-        let kind = self
+        let mut kind = self
             .kind
             .take()
             .ok_or_else(|| err("a track must have a media kind"))?;
+        let record_ceiling = u32::try_from(
+            contract
+                .get(Resource::MediaRecordBody)
+                .min(u64::from(u32::MAX)),
+        )
+        .map_err(|_| err("MediaRecordBody ceiling does not fit u32"))?;
+        if record_ceiling == 0 {
+            return Err(err("MediaRecordBody contract denies track media"));
+        }
+        self.maximum_record_body = self.maximum_record_body.max(1).min(record_ceiling);
+        if let KindConfiguration::Video(video) = &mut kind {
+            const VIDEO_PACKET_OVERHEAD: u32 = 48;
+            video.maximum_access_unit_bytes = video.maximum_access_unit_bytes.min(
+                self.maximum_record_body
+                    .saturating_sub(VIDEO_PACKET_OVERHEAD),
+            );
+            if video.maximum_access_unit_bytes == 0 {
+                return Err(err("MediaRecordBody ceiling cannot carry a video packet"));
+            }
+        }
+        let inflight_ceiling = contract.get(Resource::InflightMediaBytes);
+        if inflight_ceiling < u64::from(self.maximum_record_body) {
+            return Err(err(
+                "InflightMediaBytes contract cannot carry one maximum media record",
+            ));
+        }
+        self.maximum_inflight_body_bytes = self
+            .maximum_inflight_body_bytes
+            .max(u64::from(self.maximum_record_body))
+            .min(inflight_ceiling);
         checks(&self, contract)?;
         Ok(TrackConfiguration {
             context_id: self.surface.context_id(),
@@ -201,9 +231,7 @@ impl TrackBuilder {
             maximum_rate_millihertz: self.max_rate_millihertz.max(1),
             maximum_encoded_bits_per_second: self.max_encoded_bits_per_second,
             maximum_records_per_second: self.max_records_per_second.max(1),
-            maximum_inflight_body_bytes: self
-                .maximum_inflight_body_bytes
-                .max(u64::from(self.maximum_record_body)),
+            maximum_inflight_body_bytes: self.maximum_inflight_body_bytes,
             kind,
             target_latency_us: self.target_latency_us,
             maximum_latency_us: self.maximum_latency_us,
@@ -213,18 +241,18 @@ impl TrackBuilder {
 }
 
 fn checks(b: &TrackBuilder, c: &ResourceContract) -> io::Result<()> {
-    let _ = check(
+    check(
         c,
         Resource::EncodedBitsPerSecond,
         b.max_encoded_bits_per_second,
         "EncodedBitsPerSecond",
-    );
-    let _ = check(
+    )?;
+    check(
         c,
         Resource::MediaRecordsPerSecond,
         b.max_records_per_second,
         "MediaRecordsPerSecond",
-    );
+    )?;
     check(
         c,
         Resource::MediaRecordBody,
@@ -405,6 +433,55 @@ mod tests {
             .unwrap();
         assert_eq!(t.surface_id, 1);
         assert_eq!(t.slot, 1);
+    }
+
+    #[test]
+    fn web_contract_narrows_video_records_and_access_units_before_create_track() {
+        let mut s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut contract = big_contract();
+        contract.set(
+            Resource::MediaRecordBody,
+            u64::from(vivid_protocol::web::MAX_MEDIA_RECORD_BODY),
+        );
+        contract.set(
+            Resource::InflightMediaBytes,
+            vivid_protocol::web::MAX_AGGREGATE_REASSEMBLY / 2,
+        );
+        let surface = s.create_surface(ts(), &RequestMetadata::default()).unwrap();
+        let track = TrackBuilder::new(&surface, 1, TrackMode::Live, LaneClass::Bulk)
+            .video(1920, 1080, "h264")
+            .build(&contract, 7)
+            .unwrap();
+        assert_eq!(
+            track.maximum_record_body,
+            vivid_protocol::web::MAX_MEDIA_RECORD_BODY
+        );
+        assert_eq!(
+            track.maximum_inflight_body_bytes,
+            vivid_protocol::web::MAX_AGGREGATE_REASSEMBLY / 2
+        );
+        let KindConfiguration::Video(video) = track.kind else {
+            panic!("video builder returned another track kind")
+        };
+        assert_eq!(
+            video.maximum_access_unit_bytes,
+            vivid_protocol::web::MAX_MEDIA_RECORD_BODY - 48
+        );
+    }
+
+    #[test]
+    fn rate_and_bitrate_claims_are_enforced_before_track_creation() {
+        let mut s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut contract = big_contract();
+        contract.set(Resource::EncodedBitsPerSecond, 1);
+        contract.set(Resource::MediaRecordsPerSecond, 1);
+        let surface = s.create_surface(ts(), &RequestMetadata::default()).unwrap();
+        assert!(
+            TrackBuilder::new(&surface, 1, TrackMode::Live, LaneClass::Bulk)
+                .video(1920, 1080, "h264")
+                .build(&contract, 7)
+                .is_err()
+        );
     }
     #[test]
     fn slot_gen_must_match_current() {
