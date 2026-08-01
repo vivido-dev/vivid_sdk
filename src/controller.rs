@@ -507,40 +507,174 @@ pub fn worker_context(
 
 /// The presenter admin for a vvbridge gateway.
 ///
-/// Stage 2 ships the type and the trait surface; the gateway's owner-only administrative socket is
-/// parent-plan Stage 4. Until then every method returns `unimplemented!` so the type cannot be
-/// mistaken for working: a caller that constructs it gets a loud failure at the first use rather
-/// than a silent no-op. The worker-side contract — it consumes a [`LeaseGrant`] and cannot tell
-/// which presenter issued it — is what the in-memory [`FakeAdmin`](crate::testing::FakeAdmin)
-/// validates.
+/// Connects to the gateway's owner-only administrative Unix socket and speaks the
+/// length-prefixed CBOR protocol defined in [`admin protocol`](vvbridge::admin).
 pub struct BridgeAdmin {
-    #[allow(dead_code)]
     socket: String,
 }
 
 impl BridgeAdmin {
     /// Construct against a gateway's administrative socket path.
     ///
-    /// Does not connect: construction is cheap, and the socket may not exist yet when a controller
-    /// is being configured.
+    /// Does not connect: construction is cheap, and the socket may not exist yet.
     pub fn new(socket: impl Into<String>) -> Self {
         Self {
             socket: socket.into(),
         }
     }
+
+    /// Open a connection to the admin socket.
+    fn connect(&self) -> io::Result<std::os::unix::net::UnixStream> {
+        std::os::unix::net::UnixStream::connect(&self.socket)
+    }
+
+    /// Send a length-prefixed CBOR request and read the response.
+    fn call(
+        &self,
+        request: &vivid_protocol::cbor::Value,
+    ) -> io::Result<vivid_protocol::cbor::Value> {
+        use std::io::{Read, Write};
+        let body =
+            vivid_protocol::cbor::encode(request).map_err(|e| io::Error::other(e.to_string()))?;
+        if body.len() > 64 * 1024 {
+            return Err(io::Error::other("admin request exceeds 64 KiB ceiling"));
+        }
+
+        let mut stream = self.connect()?;
+        let len_be = (body.len() as u32).to_be_bytes();
+        stream.write_all(&len_be)?;
+        stream.write_all(&body)?;
+        stream.flush()?;
+
+        // Read the 4-byte length prefix.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        if resp_len > 64 * 1024 {
+            return Err(io::Error::other("admin response exceeds 64 KiB ceiling"));
+        }
+        let mut resp_body = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_body)?;
+
+        vivid_protocol::cbor::decode(&resp_body).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn cbor_request(
+        kind: &str,
+        fields: Vec<(u64, vivid_protocol::cbor::Value)>,
+    ) -> vivid_protocol::cbor::Value {
+        use vivid_protocol::cbor::Value;
+        let mut map = vec![(0, Value::Text(kind.into()))];
+        map.extend(fields);
+        Value::Map(map)
+    }
 }
 
 impl PresenterAdmin for BridgeAdmin {
     fn capabilities(&self) -> io::Result<PresenterCapabilities> {
-        unimplemented!("vvbridge administrative capabilities land in Stage 4")
+        use vivid_protocol::cbor::Value;
+        let req = Self::cbor_request("capabilities", vec![]);
+        let resp = self.call(&req)?;
+
+        let Value::Map(map) = resp else {
+            return Err(io::Error::other("expected map response"));
+        };
+
+        let profiles: Vec<String> = map
+            .iter()
+            .find(|(k, _)| *k == 1)
+            .and_then(|(_, v)| match v {
+                Value::Array(arr) => Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_text().map(String::from))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        Ok(PresenterCapabilities {
+            profiles,
+            contract_ceiling: ResourceContract::denied(),
+            carrier: Carrier::Web,
+        })
     }
 
-    fn issue(&self, _request: &LeaseRequest) -> io::Result<LeaseGrant> {
-        unimplemented!("vvbridge lease issuance lands in Stage 4")
+    fn issue(&self, request: &LeaseRequest) -> io::Result<LeaseGrant> {
+        use vivid_protocol::cbor::Value;
+
+        // Mint the activation secret on the controller side.
+        let activation = ActivationSecret::new(request.lease_id)?;
+        let verifier = activation.verifier();
+
+        let profiles: Vec<Value> = request
+            .permitted_profiles
+            .iter()
+            .map(|p| Value::Text(p.clone()))
+            .collect();
+
+        let req = Self::cbor_request(
+            "issue",
+            vec![
+                (1, Value::Bytes(verifier.to_vec())),
+                (2, Value::Array(profiles)),
+                (3, Value::Unsigned(request.activation_timeout_us)),
+                (4, Value::Unsigned(request.disconnect_grace_us)),
+            ],
+        );
+        let resp = self.call(&req)?;
+
+        let Value::Map(map) = resp else {
+            return Err(io::Error::other("expected map response"));
+        };
+
+        // Check for error response.
+        if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
+            return Err(io::Error::other(err.clone()));
+        }
+
+        // Parse the grant from the response.
+        let context_id = map
+            .iter()
+            .find(|(k, _)| *k == 1)
+            .and_then(|(_, v)| v.as_u64())
+            .unwrap_or(0);
+        let lease_id = map
+            .iter()
+            .find(|(k, _)| *k == 2)
+            .and_then(|(_, v)| v.as_u64())
+            .unwrap_or(request.lease_id);
+
+        Ok(LeaseGrant {
+            endpoints: LaneEndpoints {
+                control: String::new(),
+                interactive: None,
+                realtime: None,
+                bulk: None,
+            },
+            context_id,
+            lease_id,
+            activation,
+            permitted_profiles: request.permitted_profiles.clone(),
+            contract: request.contract.clone(),
+            grace_us: request.disconnect_grace_us,
+            activation_timeout_us: request.activation_timeout_us,
+            cleanup_policy: request.cleanup_policy,
+            revision: 1,
+        })
     }
 
-    fn revoke(&self, _grant: &LeaseGrant) -> io::Result<()> {
-        unimplemented!("vvbridge lease revocation lands in Stage 4")
+    fn revoke(&self, grant: &LeaseGrant) -> io::Result<()> {
+        use vivid_protocol::cbor::Value;
+        let req = Self::cbor_request("revoke", vec![(1, Value::Unsigned(grant.lease_id))]);
+        let resp = self.call(&req)?;
+
+        if let Value::Map(map) = resp {
+            if let Some((_, Value::Text(err))) = map.iter().find(|(k, _)| *k == 99) {
+                return Err(io::Error::other(err.clone()));
+            }
+        }
+        Ok(())
     }
 }
 
