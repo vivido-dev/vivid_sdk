@@ -155,6 +155,21 @@ impl DesktopSession {
         Ok(())
     }
 
+    /// Remove the optional desktop audio track while leaving video and input live.
+    pub fn disable_audio_track(&mut self) -> io::Result<()> {
+        let Some(audio_track) = self.audio_track.take() else {
+            return Ok(());
+        };
+        if let Some(sender) = self.audio_sender.take() {
+            sender.detach();
+        }
+        let mut slots = SurfaceSlots::new(self.surface.inner());
+        slots.require(1, &self.video_track, self.video_sender.generation(), 1 << 4)?;
+        slots.activate(&mut self.session)?;
+        self.session
+            .destroy_track(&audio_track, &RequestMetadata::default())
+    }
+
     /// Reattach a suspended leased desktop session to fresh transports.
     ///
     /// The logical surface, tracks, and nodes stay presenter-owned during the bounded grace. The
@@ -312,6 +327,38 @@ mod tests {
         }
     }
 
+    fn acfg(sid: u64, tid: u64) -> TrackConfiguration {
+        TrackConfiguration {
+            context_id: 1,
+            surface_id: sid,
+            track_id: tid,
+            slot: 2,
+            mode: TrackMode::Live,
+            lane: LaneClass::Realtime,
+            maximum_record_body: 65_536,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 512_000,
+            maximum_records_per_second: 50,
+            maximum_inflight_body_bytes: 131_072,
+            kind: KindConfiguration::Audio(AudioConfiguration {
+                codec: "opus".into(),
+                packetization: "opus-packet-v1".into(),
+                extradata: vec![
+                    b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', 1, 2, 0x38, 0x01, 0x80, 0xbb,
+                    0x00, 0x00, 0, 0, 0,
+                ],
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 1_500,
+                codec_string: Some("opus".into()),
+            }),
+            target_latency_us: 40_000,
+            maximum_latency_us: 250_000,
+            retained_pixel_charge: 0,
+        }
+    }
+
     #[test]
     fn establish_creates_surface_and_tracks() {
         let s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
@@ -331,6 +378,17 @@ mod tests {
         assert_eq!(ds.desktop_surface().generation(), g);
         assert_eq!(ds.desktop_surface().id(), 1);
         assert_eq!(ds.video_track().id(), 9);
+        assert!(ds.close().is_ok());
+    }
+    #[test]
+    fn disabling_audio_leaves_video_live() {
+        let s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut ds = DesktopSession::establish(s, surf(), vcfg(1, 7), Some(acfg(1, 8))).unwrap();
+        assert!(ds.audio_track().is_some());
+        ds.disable_audio_track().unwrap();
+        assert!(ds.audio_track().is_none());
+        assert!(ds.audio_sender().is_none());
+        assert_eq!(ds.video_track().id(), 7);
         assert!(ds.close().is_ok());
     }
     #[test]
