@@ -646,6 +646,17 @@ impl Session {
         self.control.take_event()
     }
 
+    /// Close the session lifecycle without a `GOODBYE` round trip.
+    ///
+    /// Wakes every channel-flow wait with a closed error so senders blocked on
+    /// a stalled presenter can exit; the quit path calls this before joining
+    /// media worker threads. The session may still be closed normally
+    /// afterwards, which sends the `GOODBYE` over the live control connection.
+    pub fn abort(&mut self) -> io::Result<()> {
+        self.lifecycle.close("Vivid session aborted");
+        Ok(())
+    }
+
     pub fn close(mut self) -> io::Result<()> {
         self.close_inner()
     }

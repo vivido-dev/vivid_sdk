@@ -427,6 +427,26 @@ mod tests {
         assert!(ds.close().is_ok());
     }
     #[test]
+    fn abort_wakes_channel_flows_so_blocked_senders_exit() {
+        let s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut ds = DesktopSession::establish(s, surf(), vcfg(1, 7), None).unwrap();
+        let sender = ds.video_sender().clone();
+        ds.session_mut().abort().unwrap();
+        let result = sender.send(&crate::EncodedPacket::Video(
+            crate::pipeline::VideoPacketData {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 0,
+                key: true,
+                data: vec![0, 0, 0, 1, 0x67],
+            },
+        ));
+        assert!(result.is_err());
+        assert!(ds.close().is_ok());
+    }
+    #[test]
     fn replace_video_track_leaves_surface() {
         let s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
         let mut ds = DesktopSession::establish(s, surf(), vcfg(1, 7), None).unwrap();
