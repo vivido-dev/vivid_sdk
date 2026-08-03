@@ -626,6 +626,8 @@ fn serve(serving: Serving) -> io::Result<()> {
                             (3, Value::Unsigned(revision)),
                             (4, Value::Unsigned(unsigned(6).unwrap_or(1))),
                             (5, Value::Unsigned(unsigned(3).unwrap_or(2))),
+                            // The observed condition value, exactly as vivido reports it.
+                            (6, Value::Unsigned(unsigned(4).unwrap_or(0))),
                         ],
                     )?,
                 )
