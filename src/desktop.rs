@@ -6,8 +6,29 @@ use vivid_protocol::track::TrackConfiguration;
 
 use crate::{
     DesktopSurface, InputBindingGuard, InputLane, InputQueue, LaneEndpoints, ProducerConfig,
-    RequestMetadata, Session, SurfaceSlots, TrackSender,
+    RequestMetadata, Session, SurfaceSlots, Track, TrackSender, TrackWaitCondition,
 };
+
+/// Bounded wait for decoded-output readiness before slot activation.
+const SLOT_ACTIVATION_TIMEOUT_US: u64 = 30_000_000;
+
+/// Wait until the track has decoded/composed output ready (milestone 4) on its
+/// current channel generation, which the presenter requires before `ACTIVATE_TRACK`.
+fn wait_output_ready(session: &mut Session, track: &Track) -> io::Result<()> {
+    let satisfied = session.wait_track(
+        track,
+        TrackWaitCondition::MilestoneSet,
+        Some(vivid_protocol::track::MILESTONE_OUTPUT_READY),
+        SLOT_ACTIVATION_TIMEOUT_US,
+    )?;
+    if satisfied.observed_value.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for decoded-output readiness before slot activation",
+        ));
+    }
+    Ok(())
+}
 
 pub struct DesktopSession {
     session: Session,
@@ -56,6 +77,13 @@ impl DesktopSession {
         self.input_queue.as_ref()
     }
 
+    /// Create the desktop surface, scene node, tracks, and channels without
+    /// activating slots.
+    ///
+    /// Slot activation requires decoded-output readiness (milestone 4) on every
+    /// bound track, which only exists after the presenter decodes the first media.
+    /// The caller therefore streams media through the senders and then calls
+    /// [`activate_slots`](Self::activate_slots).
     pub fn establish(
         mut session: Session,
         surface_def: SurfaceDefinition,
@@ -94,13 +122,6 @@ impl DesktopSession {
             (None, None)
         };
 
-        let mut slots = SurfaceSlots::new(surface.inner());
-        slots.require(1, &video_track, video_sender.generation(), 1 << 4)?;
-        if let (Some(at), Some(asender)) = (&audio_track, &audio_sender) {
-            slots.require(2, at, asender.generation(), 1 << 4)?;
-        }
-        slots.activate(&mut session)?;
-
         let guard = InputBindingGuard::new();
         let (lane, input_queue) = if session.supports(crate::DESKTOP_INPUT) {
             let l = session.open_input_lane(1)?;
@@ -120,6 +141,34 @@ impl DesktopSession {
             lane,
             input_queue,
         })
+    }
+
+    /// Wait for decoded-output readiness and atomically activate the video and
+    /// audio slots.
+    ///
+    /// The presenter requires milestone 4 on every bound track before
+    /// `ACTIVATE_TRACK` (media §7); the caller primes media through the senders
+    /// returned by [`establish`](Self::establish) and calls this once the first
+    /// key unit and pre-roll are in flight.
+    pub fn activate_slots(&mut self) -> io::Result<()> {
+        wait_output_ready(&mut self.session, &self.video_track)?;
+        let mut slots = SurfaceSlots::new(self.surface.inner());
+        slots.require(
+            1,
+            &self.video_track,
+            self.video_sender.generation(),
+            vivid_protocol::track::MILESTONE_OUTPUT_READY,
+        )?;
+        if let (Some(at), Some(asender)) = (&self.audio_track, &self.audio_sender) {
+            wait_output_ready(&mut self.session, at)?;
+            slots.require(
+                2,
+                at,
+                asender.generation(),
+                vivid_protocol::track::MILESTONE_OUTPUT_READY,
+            )?;
+        }
+        slots.activate(&mut self.session)
     }
 
     pub fn replace_video_track(
@@ -142,6 +191,7 @@ impl DesktopSession {
                 data: key_unit.to_vec(),
             },
         ))?;
+        wait_output_ready(&mut self.session, &new_track)?;
         let mut slots = SurfaceSlots::new(self.surface.inner());
         slots.require(1, &new_track, new_sender.generation(), 1 << 4)?;
         if let (Some(at), Some(a_sender)) = (&self.audio_track, &self.audio_sender) {
@@ -163,6 +213,7 @@ impl DesktopSession {
         if let Some(sender) = self.audio_sender.take() {
             sender.detach();
         }
+        wait_output_ready(&mut self.session, &self.video_track)?;
         let mut slots = SurfaceSlots::new(self.surface.inner());
         slots.require(1, &self.video_track, self.video_sender.generation(), 1 << 4)?;
         slots.activate(&mut self.session)?;
@@ -366,6 +417,13 @@ mod tests {
         assert_eq!(ds.desktop_surface().id(), 1);
         assert_eq!(ds.video_track().id(), 7);
         assert!(ds.audio_track().is_none());
+        assert!(ds.close().is_ok());
+    }
+    #[test]
+    fn activate_slots_waits_for_output_ready_then_activates() {
+        let s = Session::connect(ProducerConfig::offline_desktop()).unwrap();
+        let mut ds = DesktopSession::establish(s, surf(), vcfg(1, 7), Some(acfg(1, 8))).unwrap();
+        assert!(ds.activate_slots().is_ok());
         assert!(ds.close().is_ok());
     }
     #[test]
