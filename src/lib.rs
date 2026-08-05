@@ -59,7 +59,7 @@ pub(crate) use wire::{
     validate_track_owner, validate_track_tuple,
 };
 
-pub use channel::TrackChannel;
+pub use channel::{SendPressure, TrackChannel};
 pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
 };

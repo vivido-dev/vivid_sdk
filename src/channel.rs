@@ -47,6 +47,34 @@ pub(crate) struct ChannelRateState {
     pub(crate) updated_at: Instant,
 }
 
+/// Where a media send actually spent its time.
+///
+/// A producer adapting to a slow session has to know *which* limit it hit, because the three have
+/// opposite answers. Waiting on the declared-rate limiter is self-imposed pacing and means nothing
+/// is wrong. Waiting for channel-flow capacity means the presenter is behind on *records*, which
+/// fewer, larger frames would not help. Only time inside the transport write says the link itself
+/// will not take the bytes, which is the one case where encoding at a lower rate is the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendPressure {
+    /// Held back by this producer's own `maximum_encoded_bits_per_second`/records-per-second claim.
+    pub rate_limited: Duration,
+    /// Waiting for the presenter to return channel-flow capacity.
+    pub flow_limited: Duration,
+    /// Inside the transport write.
+    pub transport: Duration,
+    /// Media records that completed while this pressure accumulated.
+    pub records: u64,
+}
+
+impl SendPressure {
+    fn accumulate(&mut self, other: Self) {
+        self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
+        self.flow_limited = self.flow_limited.saturating_add(other.flow_limited);
+        self.transport = self.transport.saturating_add(other.transport);
+        self.records = self.records.saturating_add(other.records);
+    }
+}
+
 /// One accepted, authenticated track-channel generation.
 #[derive(Clone)]
 pub struct TrackChannel {
@@ -59,6 +87,7 @@ pub struct TrackChannel {
     pub(crate) media: Arc<Mutex<ChannelMediaState>>,
     pub(crate) events: Arc<Mutex<VecDeque<ChannelEvent>>>,
     pub(crate) rate: Option<Arc<Mutex<ChannelRateState>>>,
+    pub(crate) pressure: Arc<Mutex<SendPressure>>,
 }
 
 impl std::fmt::Debug for TrackChannel {
@@ -228,7 +257,16 @@ impl TrackChannel {
                     updated_at: Instant::now(),
                 }))
             }),
+            pressure: Arc::new(Mutex::new(SendPressure::default())),
         })
+    }
+
+    /// Take and reset the accumulated [`SendPressure`] for this channel.
+    pub fn take_send_pressure(&self) -> SendPressure {
+        self.pressure
+            .lock()
+            .map(|mut pressure| std::mem::take(&mut *pressure))
+            .unwrap_or_default()
     }
 
     pub fn track(&self) -> &Track {
@@ -629,7 +667,10 @@ impl TrackChannel {
         body_length: u32,
         body: &[u8],
     ) -> io::Result<u64> {
+        let rate_started = Instant::now();
         self.wait_for_rate(body_length)?;
+        let rate_limited = rate_started.elapsed();
+        let flow_started = Instant::now();
         let mut state = lock(&self.flow.state, "channel flow state")?;
         loop {
             self.lifecycle.ensure_active()?;
@@ -645,7 +686,15 @@ impl TrackChannel {
             let mut admitted = state.flow;
             match admitted.admit(body_length) {
                 Ok(()) => {
+                    let flow_limited = flow_started.elapsed();
+                    let transport_started = Instant::now();
                     let sequence = self.writer.write_record(record_type, 0, object_id, body)?;
+                    self.record_send_pressure(SendPressure {
+                        rate_limited,
+                        flow_limited,
+                        transport: transport_started.elapsed(),
+                        records: 1,
+                    });
                     state.flow = admitted;
                     return Ok(sequence);
                 }
@@ -658,6 +707,12 @@ impl TrackChannel {
                 }
                 Err(error) => return Err(io::Error::other(error)),
             }
+        }
+    }
+
+    fn record_send_pressure(&self, pressure: SendPressure) {
+        if let Ok(mut total) = self.pressure.lock() {
+            total.accumulate(pressure);
         }
     }
 
