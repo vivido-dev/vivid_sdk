@@ -192,6 +192,7 @@ pub struct TrackStatus {
     pub ingress_depth_bucket: u64,
     pub playback_state: Option<PayloadMap>,
     pub terminal_loss_code: Option<u64>,
+    pub audio_gain: Option<AudioGain>,
 }
 
 /// One bounded `WAIT_TRACK` condition.
@@ -428,7 +429,7 @@ impl Session {
                 snapshot.configuration.track_id,
             )?;
             let payload = decoded_payload(&record)?;
-            validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22])?;
+            validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22, 23])?;
             validate_track_tuple(&payload, &snapshot.configuration)?;
             let kind = TrackKind::try_from(required_u64(&payload, 4)?).map_err(io::Error::other)?;
             let mode = TrackMode::try_from(required_u64(&payload, 5)?).map_err(io::Error::other)?;
@@ -437,6 +438,14 @@ impl Session {
             let milestones = required_u64(&payload, 9)?;
             if lifecycle > 7 || attachment_state > 2 || milestones & !MILESTONE_KNOWN_MASK != 0 {
                 return Err(invalid_data("TRACK_STATUS contains an unknown state bit"));
+            }
+            let audio_gain = optional_u64(&payload, 23)?
+                .map(|raw| AudioGain::new(raw).ok_or_else(|| invalid_data("invalid audio gain")))
+                .transpose()?;
+            if audio_gain.is_some() && (!self.supports(AUDIO_GAIN) || kind != TrackKind::Audio) {
+                return Err(invalid_data(
+                    "TRACK_STATUS reports audio gain without a negotiated audio track",
+                ));
             }
             TrackStatus {
                 context_id: required_u64(&payload, 0)?,
@@ -462,6 +471,7 @@ impl Session {
                 ingress_depth_bucket: required_u64(&payload, 20)?,
                 playback_state: optional_map(&payload, 21)?.cloned(),
                 terminal_loss_code: optional_u64(&payload, 22)?,
+                audio_gain,
             }
         } else {
             let media = *lock(&snapshot.media_sequence, "track media sequence")?;
@@ -503,6 +513,9 @@ impl Session {
                 ingress_depth_bucket: 0,
                 playback_state: None,
                 terminal_loss_code: None,
+                audio_gain: (self.supports(AUDIO_GAIN)
+                    && matches!(snapshot.configuration.kind, KindConfiguration::Audio(_)))
+                .then_some(AudioGain::UNITY),
             }
         };
         status.revision.require_nonzero()?;
@@ -690,6 +703,25 @@ impl Session {
 
     pub fn pause(&mut self, track: &Track) -> io::Result<()> {
         self.track_control(messages::PAUSE, track, vec![])
+    }
+
+    pub fn set_audio_gain(&mut self, track: &Track, gain: AudioGain) -> io::Result<()> {
+        if !self.supports(AUDIO_GAIN) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "audio-gain-v1 was not accepted",
+            ));
+        }
+        let state = lock(&track.inner, "track")?.clone();
+        ensure_live_track(&state)?;
+        if !matches!(state.configuration.kind, KindConfiguration::Audio(_)) {
+            return Err(invalid_input("SET_AUDIO_GAIN requires an audio track"));
+        }
+        self.track_control(
+            messages::SET_AUDIO_GAIN,
+            track,
+            vec![(3, Value::Unsigned(gain.raw()))],
+        )
     }
 
     pub fn flush(&mut self, track: &Track, new_epoch: u32) -> io::Result<()> {

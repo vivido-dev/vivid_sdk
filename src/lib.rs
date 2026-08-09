@@ -102,8 +102,9 @@ pub use vivid_protocol::lease::{CleanupPolicy, SessionLeaseDefinition};
 pub use vivid_protocol::media::RasterDeltaOperation;
 pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
-    CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT, DESKTOP_SURFACE,
-    GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA,
+    AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
+    DESKTOP_SURFACE, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT,
+    TERMINAL_SURFACE, TIMED_MEDIA,
 };
 pub use vivid_protocol::scene::{Fit, SceneNode};
 pub use vivid_protocol::surface::{
@@ -113,7 +114,7 @@ pub use vivid_protocol::surface::{
 };
 pub use vivid_protocol::target::{DesktopTarget, OutputDescriptor};
 pub use vivid_protocol::track::{
-    AudioConfiguration, ImageConfiguration, KindConfiguration, MILESTONE_BUFFERED_ENDED,
+    AudioConfiguration, AudioGain, ImageConfiguration, KindConfiguration, MILESTONE_BUFFERED_ENDED,
     MILESTONE_CHANNEL_ACCEPTED, MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED,
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA,
     MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS,
@@ -308,6 +309,7 @@ mod tests {
             ingress_depth_bucket: 0,
             playback_state: None,
             terminal_loss_code: None,
+            audio_gain: None,
         };
 
         submitted.reconcile_status(&status, false);

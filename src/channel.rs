@@ -687,16 +687,24 @@ impl TrackChannel {
             match admitted.admit(body_length) {
                 Ok(()) => {
                     let flow_limited = flow_started.elapsed();
-                    let transport_started = Instant::now();
-                    let sequence = self.writer.write_record(record_type, 0, object_id, body)?;
-                    self.record_send_pressure(SendPressure {
-                        rate_limited,
-                        flow_limited,
-                        transport: transport_started.elapsed(),
-                        records: 1,
-                    });
+                    // Commit the allowance before entering transport I/O, then release the flow
+                    // lock. The reverse-channel reader needs this same lock to publish
+                    // MAX_CHANNEL_DATA. Holding it across a blocked media write can fill both
+                    // socket directions: the presenter cannot finish returning credit, and the
+                    // producer cannot observe the credit that would let it make progress.
                     state.flow = admitted;
-                    return Ok(sequence);
+                    drop(state);
+                    let transport_started = Instant::now();
+                    let result = self.writer.write_record(record_type, 0, object_id, body);
+                    if result.is_ok() {
+                        self.record_send_pressure(SendPressure {
+                            rate_limited,
+                            flow_limited,
+                            transport: transport_started.elapsed(),
+                            records: 1,
+                        });
+                    }
+                    return result;
                 }
                 Err(ResourceError::FlowControl) => {
                     state = self
@@ -722,6 +730,12 @@ impl TrackChannel {
         };
         loop {
             self.lifecycle.ensure_active()?;
+            if lock(&self.flow.state, "channel flow state")?.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "track channel is closed",
+                ));
+            }
             let mut state = lock(rate, "channel rate state")?;
             let now = Instant::now();
             let elapsed = now.saturating_duration_since(state.updated_at);
@@ -978,5 +992,137 @@ pub(crate) fn close_track_flow(flow: Option<&Weak<FlowSync>>, message: &str) {
         state.closed = true;
         state.diagnostic.get_or_insert_with(|| message.to_owned());
         flow.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    use vivid_protocol::messages::{self, LaneClass};
+    use vivid_protocol::track::{
+        KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
+    };
+    use vivid_protocol::wire::{Connection, ConnectionKind};
+
+    use crate::{
+        CoordinateModel, ProducerConfig, RequestMetadata, Session, SurfaceDefinition,
+        SurfaceDescriptor, SurfaceRole,
+    };
+
+    struct BlockingWriter {
+        armed: Arc<AtomicBool>,
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_transport_write_does_not_hide_returned_flow_credit() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let context = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id: context,
+                    surface_id: 1,
+                    semantic_profile: crate::GENERIC_CONTENT.into(),
+                    coordinate_model: CoordinateModel::DesktopLogicalPixels,
+                    logical_width: 1,
+                    logical_height: 1,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "flow-lock-test".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: Vec::new(),
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id: context,
+                    surface_id: surface.id(),
+                    track_id: 2,
+                    slot: 3,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 1024,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 2048,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 1,
+                        height: 1,
+                        alpha_mode: 1,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 16_000,
+                    maximum_latency_us: 100_000,
+                    retained_pixel_charge: 4,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut channel = session.open_track_channel(&track).unwrap();
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let connection = Connection::from_streams(
+            Box::new(io::empty()),
+            Box::new(BlockingWriter {
+                armed: armed.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            ConnectionKind::Track,
+        )
+        .unwrap();
+        channel.writer = connection.writer();
+
+        armed.store(true, Ordering::SeqCst);
+        let sending = channel.clone();
+        let sender = thread::spawn(move || {
+            sending.write_charged_record(messages::RASTER_FRAME, 2, 64, &[0; 64])
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test transport never blocked");
+        let reader_can_publish_credit = channel.flow.state.try_lock().is_ok();
+        release_tx.send(()).unwrap();
+        sender.join().unwrap().unwrap();
+        assert!(
+            reader_can_publish_credit,
+            "a blocked transport write held the flow lock needed by MAX_CHANNEL_DATA"
+        );
     }
 }
