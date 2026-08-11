@@ -421,6 +421,191 @@ class ImagePresentation:
         self.close()
 
 
+@dataclass
+class _PanePresentation:
+    context_id: int
+    node_id: int
+    surface: Surface
+    track: Track
+    channel: TrackChannel
+
+
+class PaneSession:
+    """Stateful, secret-safe image presentation for a terminal pane.
+
+    ``from_env()`` consumes the standard Vivid discovery environment. A new
+    image replaces the previous owner-scoped node and surface, and ``clear()``
+    is idempotent.
+    """
+
+    def __init__(self, session: Session) -> None:
+        if not supports(session, PROFILE_TERMINAL_SURFACE):
+            raise ValueError("pane presentation requires terminal-surface-v1")
+        self._session = session
+        self._current: Optional[_PanePresentation] = None
+        self._next_frame_id = 1
+
+    @classmethod
+    def from_env(cls, **connect_options: Any) -> "PaneSession":
+        return cls(connect(**connect_options))
+
+    def __repr__(self) -> str:
+        return f"PaneSession(has_presentation={self._current is not None})"
+
+    def show_encoded_image(
+        self,
+        encoded: BytesLike,
+        *,
+        title: str = "image",
+        columns: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> None:
+        data = bytes(encoded)
+        encoding, width, height = _image_info(data)
+        if width <= 0 or height <= 0:
+            raise ValueError("pane image dimensions must be positive")
+        self.clear()
+        presentation = self._create(
+            width,
+            height,
+            title=title,
+            columns=columns,
+            rows=rows,
+            config=ImageTrackConfig(
+                width=width,
+                height=height,
+                encoded_length=len(data),
+                encoding=encoding,
+                sha256=hashlib.sha256(data).digest(),
+            ),
+        )
+        try:
+            send_image(presentation.channel, data)
+            activate_track(self._session, presentation.surface, presentation.track)
+        except BaseException:
+            self._discard(presentation)
+            raise
+        self._current = presentation
+
+    def show_rgba(
+        self,
+        width: int,
+        height: int,
+        rgba: BytesLike,
+        *,
+        title: str = "image",
+        columns: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> None:
+        data = bytes(rgba)
+        if width <= 0 or height <= 0:
+            raise ValueError("pane image dimensions must be positive")
+        expected = _checked_mul(_checked_mul(width, height), 4)
+        if len(data) != expected:
+            raise ValueError("RGBA input length does not equal width * height * 4")
+        self.clear()
+        presentation = self._create(
+            width,
+            height,
+            title=title,
+            columns=columns,
+            rows=rows,
+            config=RasterTrackConfig(
+                width=width,
+                height=height,
+                maximum_rate_millihertz=1,
+                maximum_records_per_second=1,
+            ),
+        )
+        frame_id = self._next_frame_id
+        self._next_frame_id += 1
+        try:
+            send_raster(presentation.channel, data, frame_id=frame_id)
+            activate_track(self._session, presentation.surface, presentation.track)
+        except BaseException:
+            self._discard(presentation)
+            raise
+        self._current = presentation
+
+    def clear(self) -> None:
+        presentation = self._current
+        self._current = None
+        if presentation is not None:
+            self._discard(presentation)
+
+    def close(self) -> None:
+        try:
+            self.clear()
+        finally:
+            if not self._session.closed:
+                close(self._session)
+
+    def __enter__(self) -> "PaneSession":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _create(
+        self,
+        width: int,
+        height: int,
+        *,
+        title: str,
+        columns: Optional[int],
+        rows: Optional[int],
+        config: TrackConfig,
+    ) -> _PanePresentation:
+        if width <= 0 or height <= 0:
+            raise ValueError("pane image dimensions must be positive")
+        actual_columns = min(width, 80) if columns is None else columns
+        actual_rows = min(height, 24) if rows is None else rows
+        if actual_columns <= 0 or actual_rows <= 0:
+            raise ValueError("pane placement dimensions must be positive")
+        info = session_info(self._session)
+        node_id = allocate_id(self._session)
+        surface = create_surface(
+            self._session,
+            SurfaceConfig(
+                logical_width=width,
+                logical_height=height,
+                role=ROLE_FIGURE,
+                title=title,
+            ),
+        )
+        try:
+            place_terminal_surface(
+                self._session,
+                surface,
+                node_id=node_id,
+                width=actual_columns << 32,
+                height=actual_rows << 32,
+            )
+            track = create_track(self._session, surface, config)
+            channel = open_track_channel(self._session, track)
+            return _PanePresentation(
+                context_id=info.root_context_id,
+                node_id=node_id,
+                surface=surface,
+                track=track,
+                channel=channel,
+            )
+        except BaseException:
+            try:
+                delete_node(self._session, info.root_context_id, node_id)
+            finally:
+                destroy_surface(self._session, surface)
+            raise
+
+    def _discard(self, presentation: _PanePresentation) -> None:
+        if not presentation.channel.closed:
+            close_channel(presentation.channel)
+        try:
+            delete_node(self._session, presentation.context_id, presentation.node_id)
+        finally:
+            destroy_surface(self._session, presentation.surface)
+
+
 def connect(
     *,
     dry_run: bool = False,
@@ -649,6 +834,12 @@ def place_terminal_surface(
     )
 
 
+def delete_node(
+    session: Session, context_id: int, node_id: int
+) -> Tuple[int, int]:
+    return _native.delete_node(session, context_id, node_id)
+
+
 def anchor_marker(
     session: Session, *, context_id: Optional[int] = None, anchor_id: Optional[int] = None
 ) -> str:
@@ -797,6 +988,7 @@ __all__ = [
     "ClosedHandleError",
     "ImagePresentation",
     "ImageTrackConfig",
+    "PaneSession",
     "RasterTrackConfig",
     "Session",
     "SessionInfo",
@@ -818,6 +1010,7 @@ __all__ = [
     "create_track",
     "destroy_surface",
     "destroy_track",
+    "delete_node",
     "display_image",
     "open_track_channel",
     "place_terminal_surface",

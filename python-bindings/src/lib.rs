@@ -603,6 +603,21 @@ fn place_terminal_surface(
 }
 
 #[pyfunction]
+fn delete_node(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    context_id: u64,
+    node_id: u64,
+) -> PyResult<(u64, u64)> {
+    let mut guard = lock(&session.inner, "session")?;
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    let result = py
+        .detach(|| session.delete_node(context_id, node_id, &RequestMetadata::default()))
+        .map_err(io_error)?;
+    Ok((result.scene_revision.get(), result.target_generation.get()))
+}
+
+#[pyfunction]
 fn anchor_marker(
     session: PyRef<'_, PySession>,
     context_id: u64,
@@ -813,6 +828,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(activate_track, module)?)?;
     module.add_function(wrap_pyfunction!(wait_track, module)?)?;
     module.add_function(wrap_pyfunction!(place_terminal_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(delete_node, module)?)?;
     module.add_function(wrap_pyfunction!(anchor_marker, module)?)?;
     Ok(())
 }

@@ -195,3 +195,41 @@ def test_public_connect_removes_required_profiles_from_optional_set() -> None:
         ),
     )
     vivid.close(session)
+
+
+def test_pane_session_replaces_media_and_clears_idempotently() -> None:
+    png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + (2).to_bytes(4, "big") + (
+        1
+    ).to_bytes(4, "big") + b"\x08\x06\0\0\0"
+    pane = vivid.PaneSession.from_env(dry_run=True)
+    try:
+        pane.show_encoded_image(png, title="encoded")
+        pane.show_rgba(1, 1, b"\x01\x02\x03\x04", title="raster")
+        pane.clear()
+        pane.clear()
+        assert repr(pane) == "PaneSession(has_presentation=False)"
+    finally:
+        pane.close()
+
+
+def test_pane_session_repr_does_not_expose_authentication() -> None:
+    secret = "42" * 32
+    pane = vivid.PaneSession.from_env(dry_run=True, root_secret=secret)
+    try:
+        debug = repr(pane)
+        assert secret not in debug
+        assert "secret" not in debug.lower()
+        assert "endpoint" not in debug.lower()
+    finally:
+        pane.close()
+
+
+def test_pane_session_rejects_invalid_replacement_without_clearing() -> None:
+    pane = vivid.PaneSession.from_env(dry_run=True)
+    try:
+        pane.show_rgba(1, 1, b"\0\0\0\xff")
+        with pytest.raises(ValueError, match="dimensions"):
+            pane.show_rgba(0, 1, b"")
+        assert repr(pane) == "PaneSession(has_presentation=True)"
+    finally:
+        pane.close()

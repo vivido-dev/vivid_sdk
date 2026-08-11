@@ -24,6 +24,7 @@ mod input;
 mod lease;
 mod offline;
 mod orch;
+mod pane;
 mod pipeline;
 mod resume;
 mod scene;
@@ -76,6 +77,7 @@ pub use input::{
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
+pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
     AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, TrackSender, VideoPacketData,
     recover_channel,
