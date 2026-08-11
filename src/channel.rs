@@ -37,6 +37,7 @@ pub(crate) struct ChannelMediaState {
     pub(crate) last_sequence: u64,
     pub(crate) needs_recovery: bool,
     pub(crate) minimum_recovery_epoch: u32,
+    pub(crate) recovery_revision: u64,
     pub(crate) image_sent: bool,
     pub(crate) eos: bool,
 }
@@ -83,6 +84,8 @@ pub struct TrackChannel {
     pub(crate) writer: ConnectionWriter,
     pub(crate) lifecycle: Arc<SessionLifecycle>,
     pub(crate) flow: Arc<FlowSync>,
+    /// Serializes stateful media sends without blocking the reverse-channel reader.
+    pub(crate) send_order: Arc<Mutex<()>>,
     pub(crate) track_sequence: Arc<Mutex<TrackMediaSequence>>,
     pub(crate) media: Arc<Mutex<ChannelMediaState>>,
     pub(crate) events: Arc<Mutex<VecDeque<ChannelEvent>>>,
@@ -198,6 +201,7 @@ impl TrackChannel {
             needs_recovery: true,
             minimum_recovery_epoch: lock(&snapshot.media_sequence, "track media sequence")?
                 .last_epoch,
+            recovery_revision: 0,
             image_sent: false,
             eos: false,
         }));
@@ -239,6 +243,7 @@ impl TrackChannel {
             writer,
             lifecycle,
             flow,
+            send_order: Arc::new(Mutex::new(())),
             track_sequence: snapshot.media_sequence,
             media,
             events,
@@ -549,6 +554,7 @@ impl TrackChannel {
 
     pub fn send_image(&self, encoded: &[u8]) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
         let configuration = self.track.configuration()?;
         let KindConfiguration::EncodedImage(image) = configuration.kind else {
             return Err(invalid_input("IMAGE_DATA requires an encoded-image track"));
@@ -558,15 +564,18 @@ impl TrackChannel {
                 "encoded image length differs from immutable track configuration",
             ));
         }
-        let mut state = lock(&self.media, "channel media state")?;
-        if state.eos {
-            return Err(invalid_input("media cannot follow CHANNEL_EOS"));
-        }
-        if state.image_sent {
-            return Err(invalid_input(
-                "encoded-image track accepts exactly one IMAGE_DATA record per generation",
-            ));
-        }
+        let recovery_revision = {
+            let state = lock(&self.media, "channel media state")?;
+            if state.eos {
+                return Err(invalid_input("media cannot follow CHANNEL_EOS"));
+            }
+            if state.image_sent {
+                return Err(invalid_input(
+                    "encoded-image track accepts exactly one IMAGE_DATA record per generation",
+                ));
+            }
+            state.recovery_revision
+        };
         let body_length =
             u32::try_from(encoded.len()).map_err(|_| invalid_input("image body exceeds u32"))?;
         let sequence = self.write_charged_record(
@@ -575,19 +584,26 @@ impl TrackChannel {
             body_length,
             encoded,
         )?;
+        let mut state = lock(&self.media, "channel media state")?;
         state.last_sequence = sequence;
-        state.needs_recovery = false;
+        if state.recovery_revision == recovery_revision {
+            state.needs_recovery = false;
+        }
         state.image_sent = true;
         Ok(sequence)
     }
 
     pub fn eos(&self) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
         let configuration = self.track.configuration()?;
-        let mut media_state = lock(&self.media, "channel media state")?;
-        if media_state.eos {
-            return Err(invalid_input("CHANNEL_EOS was already sent"));
-        }
+        let last_sequence = {
+            let media_state = lock(&self.media, "channel media state")?;
+            if media_state.eos {
+                return Err(invalid_input("CHANNEL_EOS was already sent"));
+            }
+            media_state.last_sequence
+        };
         let body = Envelope::new(
             0,
             vec![
@@ -601,14 +617,14 @@ impl TrackChannel {
                         lock(&self.track_sequence, "track media sequence")?.last_epoch,
                     )),
                 ),
-                (5, Value::Unsigned(media_state.last_sequence)),
+                (5, Value::Unsigned(last_sequence)),
             ],
         )
         .encode()?;
         let sequence =
             self.writer
                 .write_record(messages::CHANNEL_EOS, 0, configuration.track_id, &body)?;
-        media_state.eos = true;
+        lock(&self.media, "channel media state")?.eos = true;
         Ok(sequence)
     }
 
@@ -628,23 +644,27 @@ impl TrackChannel {
         body: &[u8],
     ) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
         let body_length =
             u32::try_from(body.len()).map_err(|_| invalid_input("media body exceeds u32"))?;
         let configuration = self.track.configuration()?;
-        let mut media_state = lock(&self.media, "channel media state")?;
-        if media_state.eos {
-            return Err(invalid_input("media cannot follow CHANNEL_EOS"));
-        }
-        if media_state.needs_recovery && !recovery_unit {
-            return Err(invalid_input(
-                "channel generation must begin with a recovery unit",
-            ));
-        }
-        if recovery_unit && epoch < media_state.minimum_recovery_epoch {
-            return Err(invalid_input(
-                "recovery unit epoch is below the presenter-requested minimum",
-            ));
-        }
+        let recovery_revision = {
+            let media_state = lock(&self.media, "channel media state")?;
+            if media_state.eos {
+                return Err(invalid_input("media cannot follow CHANNEL_EOS"));
+            }
+            if media_state.needs_recovery && !recovery_unit {
+                return Err(invalid_input(
+                    "channel generation must begin with a recovery unit",
+                ));
+            }
+            if recovery_unit && epoch < media_state.minimum_recovery_epoch {
+                return Err(invalid_input(
+                    "recovery unit epoch is below the presenter-requested minimum",
+                ));
+            }
+            media_state.recovery_revision
+        };
         let mut track_sequence = lock(&self.track_sequence, "track media sequence")?;
         let mut next_sequence = *track_sequence;
         next_sequence.accept(media_id, epoch)?;
@@ -652,8 +672,10 @@ impl TrackChannel {
             self.write_charged_record(record_type, configuration.track_id, body_length, body)?;
         *track_sequence = next_sequence;
         track_sequence.last_record_sequence = sequence;
+        drop(track_sequence);
+        let mut media_state = lock(&self.media, "channel media state")?;
         media_state.last_sequence = sequence;
-        if recovery_unit {
+        if recovery_unit && media_state.recovery_revision == recovery_revision {
             media_state.needs_recovery = false;
             media_state.minimum_recovery_epoch = epoch;
         }
@@ -945,6 +967,10 @@ pub(crate) fn spawn_channel_reader(
                             validate_payload_keys("NEED_KEYFRAME", &payload, 0..=5, &[6])?;
                             let minimum_epoch = required_u32(&payload, 4)?;
                             let mut state = lock(&media, "channel media state")?;
+                            state.recovery_revision =
+                                state.recovery_revision.checked_add(1).ok_or_else(|| {
+                                    invalid_data("channel recovery revision exhausted")
+                                })?;
                             state.needs_recovery = true;
                             state.minimum_recovery_epoch =
                                 state.minimum_recovery_epoch.max(minimum_epoch);
@@ -953,7 +979,13 @@ pub(crate) fn spawn_channel_reader(
                         }
                         messages::NEED_FULL_FRAME => {
                             validate_exact_payload_keys("NEED_FULL_FRAME", &payload, 0..=4)?;
-                            lock(&media, "channel media state")?.needs_recovery = true;
+                            let mut state = lock(&media, "channel media state")?;
+                            state.recovery_revision =
+                                state.recovery_revision.checked_add(1).ok_or_else(|| {
+                                    invalid_data("channel recovery revision exhausted")
+                                })?;
+                            state.needs_recovery = true;
+                            drop(state);
                             push_channel_event(&events, ChannelEvent::NeedFullFrame(payload))?;
                         }
                         _ if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 => {}
@@ -1003,7 +1035,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use vivid_protocol::messages::{self, LaneClass};
+    use vivid_protocol::messages::LaneClass;
     use vivid_protocol::track::{
         KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
     };
@@ -1035,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_transport_write_does_not_hide_returned_flow_credit() {
+    fn blocked_media_write_does_not_hide_flow_credit_or_recovery() {
         let mut session = Session::connect(ProducerConfig::offline()).unwrap();
         let context = session.info().root_context_id;
         let surface = session
@@ -1111,18 +1143,33 @@ mod tests {
 
         armed.store(true, Ordering::SeqCst);
         let sending = channel.clone();
-        let sender = thread::spawn(move || {
-            sending.write_charged_record(messages::RASTER_FRAME, 2, 64, &[0; 64])
-        });
+        let sender = thread::spawn(move || sending.send_raster(1, 1, &[0, 0, 0, 0], false));
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("test transport never blocked");
         let reader_can_publish_credit = channel.flow.state.try_lock().is_ok();
+        let reader_can_publish_recovery = channel.media.try_lock().is_ok();
+        {
+            let mut media = channel
+                .media
+                .try_lock()
+                .expect("a blocked media send held the reverse reader's recovery lock");
+            media.recovery_revision += 1;
+            media.needs_recovery = true;
+        }
         release_tx.send(()).unwrap();
         sender.join().unwrap().unwrap();
         assert!(
             reader_can_publish_credit,
             "a blocked transport write held the flow lock needed by MAX_CHANNEL_DATA"
+        );
+        assert!(
+            reader_can_publish_recovery,
+            "a blocked media write held the state lock needed by NEED_KEYFRAME"
+        );
+        assert!(
+            channel.media.lock().unwrap().needs_recovery,
+            "the completed in-flight frame erased a newer recovery request"
         );
     }
 }
