@@ -1,43 +1,118 @@
 # vivid_sdk
 
-`vivid_sdk` is the reusable full-duplex Vivid 1.1 producer client shared by Vivi, Vvrd, and Veston.
-It owns authentication, control dispatch, heartbeat handling, reply correlation, text anchors,
-scene transactions, authoritative observability, cancellation-safe waits, transport attachment,
-and credit-aware media senders.
+`vivid_sdk` is the full-duplex Rust producer SDK for Vivid Protocol 1.5.
 
-The crate deliberately separates each source's `MediaSender` from the control session. A blocked
-video credit wait therefore cannot prevent audio delivery, display/visibility processing, `PING`
-replies, or scene updates. Bulk endpoint fallback is attempted before `ATTACH_CHANNEL`. If the
-attachment write itself fails ambiguously, the SDK queries authoritative source state; it retries
-on the primary endpoint only when attachment state proves the ticket was not consumed. An attached
-or closed ticket is never replayed.
+Version 1.5 is a direct, breaking cutover. The SDK no longer exposes Vivid 1.1 sources, media
+tickets, feature IDs, rolling credits, attachment generations, or source-scoped scenes. Its public
+objects match the 1.5 protocol:
 
-`play_at` returns when `PLAY` is admitted. Call `wait_until_playing` for the authoritative playback
-transition, or use `play_and_wait_until_playing` when both steps are intentionally required.
-`begin_wait_source` returns a handle that sends `CANCEL_WAIT` when cancelled or dropped. Query and
-event APIs maintain scene and source revisions beside `DisplayState`, and scene pagination is
-explicitly caller-bounded.
+- `Session` performs profile negotiation and transcript-bound root, lease-activation, or resume
+  authentication.
+- `Surface` is stable semantic, scene, policy, and input identity.
+- `Track` is one immutable video, audio, raster, or encoded-image configuration owned by a
+  surface.
+- `TrackChannel` is one authenticated channel generation with positive `CHANNEL_ACCEPTED`,
+  cumulative byte/record maxima, recovery-unit enforcement, and ordered `CHANNEL_EOS`.
+- `InputLane` is a separately authenticated interactive-lane generation. It exposes
+  generation-qualified input, watchdog renewals, revocations, resets, and fail-closed lane loss.
 
-The 1.1 API also exposes:
+Changing a codec, encoded resolution, bitrate contract, or transport does not recreate a surface.
+Create and prime a replacement track, atomically activate its slot, then destroy the old track.
+Only a real coordinate/injection-target change advances surface generation.
 
-- typed source/scene/anchor/limit status, revision state, coalesced observation events, milestones,
-  and cancellation-safe waits;
-- preconditions, idempotency keys, and causation IDs on mutating operations;
-- delegated-context creation/delegation/revocation with capability bytes exposed only through an
-  explicit accessor;
-- source descriptors and capture-policy creation/update helpers;
-- delta-capable raster sources with full-frame fallback and `NEED_FULL_FRAME` recovery;
-- context-local encoded-image cache hints and cache-hit state;
-- sender-derived ordered EOS using the actual attachment generation and last media record sequence;
-- advertised rolling byte/packet windows, delta operation limits, and diagnostic clock estimates.
+Use `query_surface()`, `query_track()`, and bounded `wait_track()` calls for authoritative
+readiness and recovery. A leased session can prepare its next secret-redacted
+`ProducerAuthentication` with `resume_authentication()`. After authenticated resume, retain the
+old handles, reconcile them, then call `adopt_surface()` followed by `adopt_track()` before
+advancing and reopening channels.
 
-Every optional call remains feature-gated. Callers must not infer support from the protocol minor
-version alone, and diagnostic clock estimates must not drive playback, drop, epoch, or credit
-policy.
+## Rust example
 
-Version fallback is disabled by default. Callers may explicitly enable one retry after a typed
-version rejection; the SDK then opens a fresh connection only for a fully implemented reported
-version and never carries a media ticket across attempts.
+```rust,no_run
+use vivid_protocol::{
+    messages::LaneClass,
+    track::{KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode},
+};
+use vivid_sdk::{
+    CoordinateModel, GENERIC_CONTENT, ProducerConfig, RequestMetadata, Session,
+    SurfaceDefinition, SurfaceDescriptor, SurfaceRole,
+};
 
-No token-bearing configuration implements `Debug`. Applications should continue to keep
-`VIVID_TOKEN`, tickets, and derived anchor material out of arguments, logs, and child environments.
+let mut session = Session::connect(ProducerConfig::default())?;
+let context_id = session.info().root_context_id;
+let surface_id = session.allocate_id()?;
+let surface = session.create_surface(
+    SurfaceDefinition {
+        context_id,
+        surface_id,
+        semantic_profile: GENERIC_CONTENT.into(),
+        coordinate_model: CoordinateModel::DesktopLogicalPixels,
+        logical_width: 640,
+        logical_height: 480,
+        scale_numerator: 1,
+        scale_denominator: 1,
+        rotation: 0,
+        descriptor: SurfaceDescriptor {
+            role: SurfaceRole::Figure,
+            title: "frame".into(),
+            semantic_content_revision: 1,
+            semantic_availability: 0,
+            locator_hint: String::new(),
+        },
+        policy: 0,
+        profile_parameters: vec![],
+    },
+    &RequestMetadata::default(),
+)?;
+
+let track_id = session.allocate_id()?;
+let track = session.create_track(
+    TrackConfiguration {
+        context_id,
+        surface_id,
+        track_id,
+        slot: 3,
+        mode: TrackMode::Live,
+        lane: LaneClass::Bulk,
+        maximum_record_body: 72 + 640 * 480 * 4,
+        maximum_rate_millihertz: 60_000,
+        maximum_encoded_bits_per_second: 600_000_000,
+        maximum_records_per_second: 60,
+        maximum_inflight_body_bytes: 8_000_000,
+        kind: KindConfiguration::Raster(RasterConfiguration {
+            width: 640,
+            height: 480,
+            alpha_mode: 1,
+            delta_enabled: false,
+            maximum_delta_operations: 1,
+            zstd_enabled: false,
+        }),
+        target_latency_us: 16_000,
+        maximum_latency_us: 100_000,
+        retained_pixel_charge: 640 * 480,
+    },
+    &RequestMetadata::default(),
+)?;
+
+let channel = session.open_track_channel(&track)?;
+channel.send_raster(0, 1, &vec![0; 640 * 480 * 4], false)?;
+channel.eos()?;
+# Ok::<(), std::io::Error>(())
+```
+
+Native discovery uses `VIVID_ENDPOINT_CONTROL`, `VIVID_ENDPOINT_INTERACTIVE`,
+`VIVID_ENDPOINT_REALTIME`, `VIVID_ENDPOINT_BULK`, and `VIVID_ROOT_SECRET`. Missing lane endpoints
+select the protocol-defined fallback endpoint value while remaining separate connections.
+
+Secret-bearing configuration deliberately implements neither `Debug` nor `Display`. Dropping a
+session is an unclean transport loss so a resumable lease may suspend. Call `Session::close()` to
+send clean `GOODBYE` and perform final logical-session cleanup.
+
+Desktop input is deliberately not folded into the control event stream. Offer
+`desktop-input-v1` and its prerequisite profiles, call `Session::open_input_lane()`, and establish
+an `InputBinding` with a fresh producer epoch. Decode ordinary `InputLaneEvent` values with the
+current surface dimensions, then apply `InputGate` immediately before the OS injection call.
+`Revoked`, `Reset`, `LaneClosed`, or watchdog expiry must atomically disable injection and release
+held keys and buttons. Queue overflow closes the affected lane rather than discarding transitions.
+
+See [MIGRATING-1.1-TO-1.5.md](MIGRATING-1.1-TO-1.5.md) for the old-to-new API mapping.

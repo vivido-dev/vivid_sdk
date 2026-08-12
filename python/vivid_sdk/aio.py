@@ -1,522 +1,148 @@
-"""Asyncio facade for :mod:`vivid_sdk`.
+"""Cancellation-safe asyncio facade for :mod:`vivid_sdk`.
 
-The Rust SDK is synchronous. These wrappers run the same public functions in worker threads while
-the native extension releases Python around blocking I/O. Cancellation never abandons a native
-operation with a borrowed handle; media waits are first interrupted through SourceCancellation.
+Native operations run in worker threads so flow waits and control replies do
+not block the event loop. Cancellation waits for the native call to finish;
+it never abandons a handle while Rust is mutating it.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-from contextlib import suppress
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple, TypeVar, Union
+import functools
+from pathlib import Path
+from typing import Any, Callable, Optional, TypeVar, Union
 
-import vivid_sdk as _sync
-from vivid_sdk import (
-    AudioSourceConfig,
-    AnchorStatus,
+from . import (
+    AudioTrackConfig,
     BytesLike,
-    ContextQuotas,
-    ContextReady,
-    DisplayState,
-    ImageSourceConfig,
-    MediaSender,
-    LimitsStatus,
-    ObservationEvent,
-    RevisionState,
-    SceneStatus,
-    SceneNode,
-    SceneNodeConfig,
+    ImageTrackConfig,
+    RasterTrackConfig,
     Session,
-    Source,
-    SourceDescriptor,
-    SourceEvent,
-    SourceLike,
-    SourceStatus,
-    VideoSourceConfig,
-    Wait,
+    SessionInfo,
+    Surface,
+    SurfaceConfig,
+    Track,
+    TrackChannel,
+    VideoTrackConfig,
     WaitSatisfied,
+    MILESTONE_OUTPUT_READY,
 )
+from . import activate_track as _activate_track
+from . import anchor_marker as _anchor_marker
+from . import channel_eos as _channel_eos
+from . import close as _close
+from . import close_channel as _close_channel
+from . import connect as _connect
+from . import create_surface as _create_surface
+from . import create_track as _create_track
+from . import destroy_surface as _destroy_surface
+from . import destroy_track as _destroy_track
+from . import open_track_channel as _open_track_channel
+from . import place_terminal_surface as _place_terminal_surface
+from . import send_audio as _send_audio
+from . import send_image as _send_image
+from . import send_raster as _send_raster
+from . import send_video as _send_video
+from . import session_info as _session_info
+from . import supports as _supports
+from . import update_surface as _update_surface
+from . import wait_track as _wait_track
 
-T = TypeVar("T")
+
+_T = TypeVar("_T")
 
 
-async def _call(
-    function: Callable[..., T],
-    *args: Any,
-    cleanup: Optional[Callable[[T], None]] = None,
-    cancel_media: Optional[MediaSender] = None,
-    cancel_wait: Optional[Wait] = None,
-    **kwargs: Any,
-) -> T:
-    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+async def _run(function: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
     try:
-        return await asyncio.shield(worker)
+        return await asyncio.shield(future)
     except asyncio.CancelledError:
-        if cancel_media is not None:
-            with suppress(Exception):
-                await asyncio.to_thread(
-                    _sync.cancel_sender,
-                    cancel_media,
-                    "asyncio media operation cancelled",
-                )
-        if cancel_wait is not None:
-            with suppress(Exception):
-                await asyncio.to_thread(_sync.cancel_wait, cancel_wait)
-        result: Optional[T] = None
-        with suppress(Exception):
-            result = await asyncio.shield(worker)
-        if cleanup is not None and result is not None:
-            with suppress(Exception):
-                await asyncio.to_thread(cleanup, result)
+        await future
         raise
 
 
 async def connect(
     *,
-    endpoint: Optional[str] = None,
-    bulk_endpoint: Optional[str] = None,
-    token: Optional[str] = None,
     dry_run: bool = False,
-    trace_dir: Optional[os.PathLike[str]] = None,
-    verbose: bool = False,
-    producer: str = "vivid-sdk-python",
-    producer_version: str = _sync.__version__,
-    required_features: Iterable[int] = _sync.DEFAULT_REQUIRED_FEATURES,
-    optional_features: Iterable[int] = _sync.DEFAULT_OPTIONAL_FEATURES,
-    authentication_kind: int = _sync.AUTHENTICATION_WINDOW_ROOT,
+    trace_dir: Optional[Union[str, Path]] = None,
+    **options: Any,
 ) -> Session:
-    return await _call(
-        _sync.connect,
-        endpoint=endpoint,
-        bulk_endpoint=bulk_endpoint,
-        token=token,
-        dry_run=dry_run,
-        trace_dir=trace_dir,
-        verbose=verbose,
-        producer=producer,
-        producer_version=producer_version,
-        required_features=required_features,
-        optional_features=optional_features,
-        authentication_kind=authentication_kind,
-        cleanup=_sync.close,
-    )
+    return await _run(_connect, dry_run=dry_run, trace_dir=trace_dir, **options)
 
 
 async def close(session: Session) -> None:
-    await _call(_sync.close, session)
+    await _run(_close, session)
 
 
-async def allocate_id(session: Session) -> int:
-    return await _call(_sync.allocate_id, session)
+async def supports(session: Session, profile: str) -> bool:
+    return await _run(_supports, session, profile)
 
 
-async def supports(session: Session, feature: int) -> bool:
-    return await _call(_sync.supports, session, feature)
+async def session_info(session: Session) -> SessionInfo:
+    return await _run(_session_info, session)
 
 
-async def root_context_id(session: Session) -> int:
-    return await _call(_sync.root_context_id, session)
+async def create_surface(session: Session, config: SurfaceConfig) -> Surface:
+    return await _run(_create_surface, session, config)
 
 
-async def display_state(session: Session) -> DisplayState:
-    return await _call(_sync.display_state, session)
-
-
-async def revision_state(session: Session) -> RevisionState:
-    return await _call(_sync.revision_state, session)
-
-
-async def set_observation(session: Session, class_mask: int) -> None:
-    await _call(_sync.set_observation, session, class_mask)
-
-
-async def create_context(
-    session: Session,
-    *,
-    context_id: int,
-    parent_context_id: int,
-    class_mask: int,
-    label: str,
-    expiry_us: int,
-    quotas: ContextQuotas,
-) -> ContextReady:
-    return await _call(
-        _sync.create_context,
-        session,
-        context_id=context_id,
-        parent_context_id=parent_context_id,
-        class_mask=class_mask,
-        label=label,
-        expiry_us=expiry_us,
-        quotas=quotas,
-    )
-
-
-async def delegate_context(session: Session, context_id: int) -> bytes:
-    return await _call(_sync.delegate_context, session, context_id)
-
-
-async def revoke_context(session: Session, context_id: int) -> None:
-    await _call(_sync.revoke_context, session, context_id)
-
-
-async def take_observation(session: Session) -> Optional[ObservationEvent]:
-    return await _call(_sync.take_observation, session)
-
-
-async def query_source(session: Session, source: SourceLike) -> SourceStatus:
-    return await _call(_sync.query_source, session, source)
-
-
-async def query_scene(
-    session: Session,
-    *,
-    maximum_nodes_per_page: int = 256,
-    maximum_pages: int = 16,
-) -> SceneStatus:
-    return await _call(
-        _sync.query_scene,
-        session,
-        maximum_nodes_per_page=maximum_nodes_per_page,
-        maximum_pages=maximum_pages,
-    )
-
-
-async def query_anchor(session: Session, anchor_id: int) -> AnchorStatus:
-    return await _call(_sync.query_anchor, session, anchor_id)
-
-
-async def query_limits(session: Session) -> LimitsStatus:
-    return await _call(_sync.query_limits, session)
-
-
-async def begin_wait_source(
-    session: Session,
-    source: SourceLike,
-    condition: int,
-    *,
-    value: Optional[int] = None,
-    timeout: float = 30.0,
-) -> Wait:
-    return await _call(
-        _sync.begin_wait_source,
-        session,
-        source,
-        condition,
-        value=value,
-        timeout=timeout,
-        cleanup=_sync.cancel_wait,
-    )
-
-
-async def wait(wait_handle: Wait) -> WaitSatisfied:
-    return await _call(_sync.wait, wait_handle, cancel_wait=wait_handle)
-
-
-async def cancel_wait(wait_handle: Wait) -> None:
-    await _call(_sync.cancel_wait, wait_handle)
-
-
-async def wait_source(
-    session: Session,
-    source: SourceLike,
-    condition: int,
-    *,
-    value: Optional[int] = None,
-    timeout: float = 30.0,
-) -> WaitSatisfied:
-    handle = await begin_wait_source(
-        session, source, condition, value=value, timeout=timeout
-    )
-    return await wait(handle)
-
-
-async def create_text_anchor(session: Session) -> Optional[int]:
-    return await _call(_sync.create_text_anchor, session)
-
-
-def _destroy(session: Session) -> Callable[[Source], None]:
-    return lambda created: _sync.destroy_source(session, created)
-
-
-async def create_raster_source(
-    session: Session,
-    width: int,
-    height: int,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return await _call(
-        _sync.create_raster_source,
-        session,
-        width,
-        height,
-        source_id=source_id,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-        capture_policy=capture_policy,
-        descriptor=descriptor,
-        cleanup=_destroy(session),
-    )
-
-
-async def create_image_source(
-    session: Session,
-    config: ImageSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return await _call(
-        _sync.create_image_source,
-        session,
-        config,
-        source_id=source_id,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-        capture_policy=capture_policy,
-        descriptor=descriptor,
-        cleanup=_destroy(session),
-    )
-
-
-async def create_video_source(
-    session: Session,
-    config: VideoSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return await _call(
-        _sync.create_video_source,
-        session,
-        config,
-        source_id=source_id,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-        capture_policy=capture_policy,
-        descriptor=descriptor,
-        cleanup=_destroy(session),
-    )
-
-
-async def create_audio_source(
-    session: Session,
-    config: AudioSourceConfig,
-    *,
-    source_id: Optional[int] = None,
-    linked_video: Optional[SourceLike] = None,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-    capture_policy: int = 0,
-    descriptor: Optional[SourceDescriptor] = None,
-) -> Source:
-    return await _call(
-        _sync.create_audio_source,
-        session,
-        config,
-        source_id=source_id,
-        linked_video=linked_video,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-        capture_policy=capture_policy,
-        descriptor=descriptor,
-        cleanup=_destroy(session),
-    )
-
-
-async def create_linked_av_sources(
-    session: Session,
-    video: VideoSourceConfig,
-    audio: AudioSourceConfig,
-    *,
-    video_source_id: Optional[int] = None,
-    audio_source_id: Optional[int] = None,
-    video_capture_policy: int = 0,
-    audio_capture_policy: int = 0,
-    video_descriptor: Optional[SourceDescriptor] = None,
-    audio_descriptor: Optional[SourceDescriptor] = None,
-) -> Tuple[Source, Source]:
-    def cleanup(created: Tuple[Source, Source]) -> None:
-        for handle in created:
-            _sync.destroy_source(session, handle)
-
-    return await _call(
-        _sync.create_linked_av_sources,
-        session,
-        video,
-        audio,
-        video_source_id=video_source_id,
-        audio_source_id=audio_source_id,
-        video_capture_policy=video_capture_policy,
-        audio_capture_policy=audio_capture_policy,
-        video_descriptor=video_descriptor,
-        audio_descriptor=audio_descriptor,
-        cleanup=cleanup,
-    )
-
-
-async def set_source_policy(
-    session: Session, source: SourceLike, capture_policy: int
+async def update_surface(
+    session: Session, surface: Surface, config: SurfaceConfig
 ) -> None:
-    await _call(_sync.set_source_policy, session, source, capture_policy)
+    await _run(_update_surface, session, surface, config)
 
 
-async def update_source_descriptor(
+async def destroy_surface(session: Session, surface: Surface) -> None:
+    await _run(_destroy_surface, session, surface)
+
+
+async def create_track(
     session: Session,
-    source: SourceLike,
-    descriptor: SourceDescriptor,
-    *,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    await _call(
-        _sync.update_source_descriptor,
-        session,
-        source,
-        descriptor,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-    )
+    surface: Surface,
+    config: Union[
+        RasterTrackConfig, ImageTrackConfig, VideoTrackConfig, AudioTrackConfig
+    ],
+) -> Track:
+    return await _run(_create_track, session, surface, config)
 
 
-async def probe_video_config(session: Session, config: VideoSourceConfig) -> bool:
-    return await _call(_sync.probe_video_config, session, config)
+async def destroy_track(session: Session, track: Track) -> None:
+    await _run(_destroy_track, session, track)
 
 
-async def probe_audio_config(session: Session, config: AudioSourceConfig) -> bool:
-    return await _call(_sync.probe_audio_config, session, config)
+async def open_track_channel(session: Session, track: Track) -> TrackChannel:
+    return await _run(_open_track_channel, session, track)
 
 
-async def place_source(
-    session: Session,
-    source: SourceLike,
-    columns: int,
-    rows: int,
-    *,
-    node_id: Optional[int] = None,
-    anchor: bool = True,
-    anchor_id: Optional[int] = None,
-) -> SceneNode:
-    return await _call(
-        _sync.place_source,
-        session,
-        source,
-        columns,
-        rows,
-        node_id=node_id,
-        anchor=anchor,
-        anchor_id=anchor_id,
-        cleanup=lambda node: _sync.delete_scene_node(session, node.id),
-    )
-
-
-async def create_scene_node(session: Session, config: SceneNodeConfig) -> SceneNode:
-    return await _call(
-        _sync.create_scene_node,
-        session,
-        config,
-        cleanup=lambda node: _sync.delete_scene_node(session, node.id),
-    )
-
-
-async def update_scene_node(session: Session, config: SceneNodeConfig) -> SceneNode:
-    return await _call(_sync.update_scene_node, session, config)
-
-
-async def delete_scene_node(session: Session, node_id: int) -> None:
-    await _call(_sync.delete_scene_node, session, node_id)
-
-
-async def destroy_source(session: Session, source: SourceLike) -> None:
-    await _call(_sync.destroy_source, session, source)
-
-
-async def wait_until_visible(session: Session, source: Source) -> None:
-    await _call(_sync.wait_until_visible, session, source)
-
-
-async def check_source(session: Session, source: Source) -> None:
-    await _call(_sync.check_source, session, source)
-
-
-async def take_event(handle: Union[Source, MediaSender]) -> Optional[SourceEvent]:
-    return await _call(_sync.take_event, handle)
-
-
-async def is_visible(handle: Union[Source, MediaSender]) -> bool:
-    return await _call(_sync.is_visible, handle)
-
-
-async def visibility_reasons(handle: Union[Source, MediaSender]) -> int:
-    return await _call(_sync.visibility_reasons, handle)
-
-
-async def open_sender(session: Session, source: Source) -> MediaSender:
-    return await _call(
-        _sync.open_sender,
-        session,
-        source,
-        cleanup=lambda sender: _sync.cancel_sender(
-            sender, "asyncio sender creation cancelled"
-        ),
-    )
+async def close_channel(channel: TrackChannel) -> None:
+    await _run(_close_channel, channel)
 
 
 async def send_raster(
-    sender: MediaSender,
+    channel: TrackChannel,
     rgba: BytesLike,
     *,
-    width: int,
-    height: int,
-    epoch: int = 1,
+    epoch: int = 0,
     frame_id: int = 1,
-) -> None:
-    await _call(
-        _sync.send_raster,
-        sender,
+    compress: bool = False,
+) -> int:
+    return await _run(
+        _send_raster,
+        channel,
         rgba,
-        width=width,
-        height=height,
         epoch=epoch,
         frame_id=frame_id,
-        cancel_media=sender,
+        compress=compress,
     )
 
 
-async def send_image(sender: MediaSender, encoded: BytesLike) -> None:
-    await _call(
-        _sync.send_image,
-        sender,
-        encoded,
-        cancel_media=sender,
-    )
+async def send_image(channel: TrackChannel, encoded: BytesLike) -> int:
+    return await _run(_send_image, channel, encoded)
 
 
 async def send_video(
-    sender: MediaSender,
+    channel: TrackChannel,
     data: BytesLike,
     *,
     packet_id: int,
@@ -524,11 +150,11 @@ async def send_video(
     dts_us: int,
     duration_us: int,
     key: bool,
-    epoch: int = 1,
-) -> None:
-    await _call(
-        _sync.send_video,
-        sender,
+    epoch: int = 0,
+) -> int:
+    return await _run(
+        _send_video,
+        channel,
         data,
         packet_id=packet_id,
         pts_us=pts_us,
@@ -536,232 +162,106 @@ async def send_video(
         duration_us=duration_us,
         key=key,
         epoch=epoch,
-        cancel_media=sender,
     )
 
 
 async def send_audio(
-    sender: MediaSender,
+    channel: TrackChannel,
     data: BytesLike,
     *,
     packet_id: int,
     pts_us: int,
     dts_us: int,
     duration_us: int,
+    epoch: int = 0,
     trim_start_samples: int = 0,
     trim_end_samples: int = 0,
-    epoch: int = 1,
-) -> None:
-    await _call(
-        _sync.send_audio,
-        sender,
+) -> int:
+    return await _run(
+        _send_audio,
+        channel,
         data,
         packet_id=packet_id,
         pts_us=pts_us,
         dts_us=dts_us,
         duration_us=duration_us,
+        epoch=epoch,
         trim_start_samples=trim_start_samples,
         trim_end_samples=trim_end_samples,
-        epoch=epoch,
-        cancel_media=sender,
     )
 
 
-async def cancel_sender(
-    sender: MediaSender, reason: str = "Python media sender cancelled"
-) -> None:
-    await _call(_sync.cancel_sender, sender, reason)
+async def channel_eos(channel: TrackChannel) -> int:
+    return await _run(_channel_eos, channel)
 
 
-async def play(
+async def activate_track(
     session: Session,
-    source: SourceLike,
+    surface: Surface,
+    track: Track,
     *,
-    start_pts_us: int = 0,
-    minimum_buffer_us: int = 0,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    await _call(
-        _sync.play,
+    required_milestone: int = MILESTONE_OUTPUT_READY,
+) -> int:
+    return await _run(
+        _activate_track,
         session,
-        source,
-        start_pts_us=start_pts_us,
-        minimum_buffer_us=minimum_buffer_us,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
+        surface,
+        track,
+        required_milestone=required_milestone,
     )
 
 
-async def wait_until_playing(
-    session: Session, source: SourceLike, *, timeout: float = 30.0
+async def wait_track(
+    session: Session,
+    track: Track,
+    *,
+    condition: int,
+    value: Optional[int] = None,
+    timeout_us: int = 30_000_000,
 ) -> WaitSatisfied:
-    return await _call(
-        _sync.wait_until_playing, session, source, timeout=timeout
-    )
-
-
-async def play_and_wait_until_playing(
-    session: Session,
-    source: SourceLike,
-    *,
-    start_pts_us: int = 0,
-    minimum_buffer_us: int = 0,
-    timeout: float = 30.0,
-) -> WaitSatisfied:
-    return await _call(
-        _sync.play_and_wait_until_playing,
+    return await _run(
+        _wait_track,
         session,
-        source,
-        start_pts_us=start_pts_us,
-        minimum_buffer_us=minimum_buffer_us,
-        timeout=timeout,
+        track,
+        condition=condition,
+        value=value,
+        timeout_us=timeout_us,
     )
 
 
-async def pause(
+async def place_terminal_surface(
     session: Session,
-    source: SourceLike,
+    surface: Surface,
     *,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    await _call(
-        _sync.pause,
+    node_id: Optional[int] = None,
+    x: int = 0,
+    y: int = 0,
+    width: int,
+    height: int,
+    text_layer: int = 1,
+) -> tuple[int, int]:
+    return await _run(
+        _place_terminal_surface,
         session,
-        source,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
+        surface,
+        node_id=node_id,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        text_layer=text_layer,
     )
 
 
-async def flush(
+async def anchor_marker(
     session: Session,
-    source: SourceLike,
     *,
-    epoch: int,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    await _call(
-        _sync.flush,
+    context_id: Optional[int] = None,
+    anchor_id: Optional[int] = None,
+) -> str:
+    return await _run(
+        _anchor_marker,
         session,
-        source,
-        epoch=epoch,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
+        context_id=context_id,
+        anchor_id=anchor_id,
     )
-
-
-async def eos(
-    session: Session,
-    source: SourceLike,
-    *,
-    epoch: int,
-    preconditions: Optional[Dict[int, int]] = None,
-    idempotency_key: Optional[BytesLike] = None,
-    causation_id: Optional[BytesLike] = None,
-) -> None:
-    await _call(
-        _sync.eos,
-        session,
-        source,
-        epoch=epoch,
-        preconditions=preconditions,
-        idempotency_key=idempotency_key,
-        causation_id=causation_id,
-    )
-
-
-async def drain(
-    session: Session,
-    source: SourceLike,
-    *,
-    timeout: Optional[float] = None,
-) -> None:
-    await _call(_sync.drain, session, source, timeout=timeout)
-
-
-async def display_image(
-    path: Union[str, os.PathLike[str]],
-    scale: float = 1.0,
-    *,
-    endpoint: Optional[str] = None,
-    bulk_endpoint: Optional[str] = None,
-    token: Optional[str] = None,
-    dry_run: bool = False,
-    trace_dir: Optional[os.PathLike[str]] = None,
-    verbose: bool = False,
-) -> None:
-    await _call(
-        _sync.display_image,
-        path,
-        scale,
-        endpoint=endpoint,
-        bulk_endpoint=bulk_endpoint,
-        token=token,
-        dry_run=dry_run,
-        trace_dir=trace_dir,
-        verbose=verbose,
-    )
-
-
-__all__ = [
-    "allocate_id",
-    "begin_wait_source",
-    "cancel_wait",
-    "cancel_sender",
-    "check_source",
-    "close",
-    "connect",
-    "create_audio_source",
-    "create_image_source",
-    "create_linked_av_sources",
-    "create_raster_source",
-    "create_scene_node",
-    "create_text_anchor",
-    "create_video_source",
-    "delete_scene_node",
-    "destroy_source",
-    "display_state",
-    "display_image",
-    "drain",
-    "eos",
-    "flush",
-    "is_visible",
-    "open_sender",
-    "pause",
-    "place_source",
-    "play",
-    "play_and_wait_until_playing",
-    "probe_audio_config",
-    "probe_video_config",
-    "root_context_id",
-    "revision_state",
-    "set_observation",
-    "set_source_policy",
-    "query_source",
-    "query_scene",
-    "query_anchor",
-    "query_limits",
-    "take_observation",
-    "send_audio",
-    "send_image",
-    "send_raster",
-    "send_video",
-    "supports",
-    "take_event",
-    "update_scene_node",
-    "update_source_descriptor",
-    "visibility_reasons",
-    "wait_until_visible",
-    "wait",
-    "wait_source",
-    "wait_until_playing",
-]

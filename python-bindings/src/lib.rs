@@ -1,130 +1,33 @@
-// Python-facing functions intentionally retain explicit signatures for generated help and stubs.
+//! Private PyO3 extension for the public `vivid_sdk` Python package.
+
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
 
 use pyo3::create_exception;
-use pyo3::exceptions::{
-    PyInterruptedError, PyKeyError, PyOSError, PyOverflowError, PyTimeoutError, PyValueError,
-};
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule};
+use pyo3::types::{PyDict, PyModule};
 use vivid_protocol::media::{AudioPacket, VideoPacket};
-use vivid_protocol::messages::{
-    ClipRect, ContextQuotas, CreateContextRequest, ImageSourceConfig, PlaybackSnapshot,
-    ReportedSourceDescriptor, SceneNodeConfig, SourceDescriptor, SourceStatus, WaitSource,
+use vivid_protocol::messages::{LaneClass, TrackKind};
+use vivid_protocol::track::{
+    AudioConfiguration, ImageConfiguration, KindConfiguration, RasterConfiguration,
+    TrackConfiguration, TrackMode, VideoConfiguration,
 };
-use vivid_protocol::wire::ConnectionKind;
 use vivid_sdk::{
-    AudioSourceSpec, DiagnosticTraceComponent, MediaSender as RustMediaSender, ObservationEvent,
-    ProducerConfig, ProducerSession, RequestMetadata, SessionEvent, SourceCancellation,
-    SourceEvent, SourceHandle, SourceWaitCancellation, SourceWaitHandle, VideoSourceSpec,
+    CoordinateModel, GENERIC_CONTENT, ProducerAuthentication, ProducerConfig, RequestMetadata,
+    Session, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, Track,
+    TrackChannel, TrackWaitCondition,
 };
 
 create_exception!(_native, VividError, PyOSError);
 create_exception!(_native, ClosedHandleError, VividError);
 
-type DisplayStateTuple = (u64, u32, u32, u32, u32, u32, u32, bool);
-type ContextReadyTuple = (u64, u64, u64, u64, u64, u64, u64, u64);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    Raster,
-    Image,
-    Video,
-    Audio,
-}
-
-fn parse_request_metadata(
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<RequestMetadata> {
-    let preconditions = preconditions
-        .map(|values| {
-            values
-                .iter()
-                .map(|(kind, value)| Ok((kind.extract::<u64>()?, value.extract::<u64>()?)))
-                .collect::<PyResult<BTreeMap<_, _>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let idempotency_key = idempotency_key
-        .map(|value| {
-            value
-                .try_into()
-                .map_err(|_| PyValueError::new_err("idempotency_key must contain exactly 16 bytes"))
-        })
-        .transpose()?;
-    let causation_id = causation_id
-        .map(|value| {
-            value
-                .try_into()
-                .map_err(|_| PyValueError::new_err("causation_id must contain exactly 16 bytes"))
-        })
-        .transpose()?;
-    let metadata = RequestMetadata {
-        preconditions,
-        idempotency_key,
-        causation_id,
-    };
-    metadata
-        .validate()
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(metadata)
-}
-
-fn parse_source_descriptor(
-    value: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<SourceDescriptor>> {
-    value
-        .map(|value| {
-            let field = |name: &str| {
-                value
-                    .get_item(name)?
-                    .ok_or_else(|| PyKeyError::new_err(format!("missing descriptor field {name}")))
-            };
-            let descriptor = SourceDescriptor {
-                role: field("role")?.extract()?,
-                title: field("title")?.extract()?,
-                content_revision: field("content_revision")?.extract()?,
-                semantic_availability: field("semantic_availability")?.extract()?,
-                locator: field("locator")?.extract()?,
-            };
-            vivid_protocol::messages::validate_source_descriptor(&descriptor)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            Ok(descriptor)
-        })
-        .transpose()
-}
-
-impl SourceKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Raster => "raster",
-            Self::Image => "image",
-            Self::Video => "video",
-            Self::Audio => "audio",
-        }
-    }
-
-    fn connection(self) -> ConnectionKind {
-        match self {
-            Self::Raster => ConnectionKind::Raster,
-            Self::Image => ConnectionKind::Blob,
-            Self::Video => ConnectionKind::Video,
-            Self::Audio => ConnectionKind::Audio,
-        }
-    }
-}
-
 #[pyclass(name = "Session", module = "vivid_sdk._native")]
 struct PySession {
-    inner: Mutex<Option<ProducerSession>>,
+    inner: Mutex<Option<Session>>,
 }
 
 #[pymethods]
@@ -135,264 +38,215 @@ impl PySession {
     }
 
     fn __repr__(&self) -> PyResult<String> {
-        Ok(format!(
-            "<vivid_sdk.Session closed={}>",
-            lock(&self.inner, "session")?.is_none()
-        ))
+        let guard = lock(&self.inner, "session")?;
+        Ok(match guard.as_ref() {
+            Some(session) => format!(
+                "<vivid_sdk.Session id={} target_profile='{}' closed=False>",
+                session.info().session_id,
+                session.info().target_profile
+            ),
+            None => "<vivid_sdk.Session closed=True>".into(),
+        })
     }
 }
 
-#[pyclass(name = "Source", module = "vivid_sdk._native")]
-struct PySource {
-    inner: Mutex<Option<SourceHandle>>,
-    id: u64,
-    kind: SourceKind,
+#[pyclass(name = "Surface", module = "vivid_sdk._native", skip_from_py_object)]
+#[derive(Clone)]
+struct PySurface {
+    inner: Surface,
 }
 
 #[pymethods]
-impl PySource {
+impl PySurface {
+    #[getter]
+    fn context_id(&self) -> u64 {
+        self.inner.context_id()
+    }
+
     #[getter]
     fn id(&self) -> u64 {
-        self.id
+        self.inner.id()
+    }
+
+    #[getter]
+    fn revision(&self) -> u64 {
+        self.inner.revision().get()
+    }
+
+    #[getter]
+    fn generation(&self) -> u64 {
+        self.inner.generation().get()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<vivid_sdk.Surface context_id={} id={} revision={} generation={}>",
+            self.context_id(),
+            self.id(),
+            self.revision(),
+            self.generation()
+        )
+    }
+}
+
+#[pyclass(name = "Track", module = "vivid_sdk._native", skip_from_py_object)]
+#[derive(Clone)]
+struct PyTrack {
+    inner: Track,
+}
+
+#[pymethods]
+impl PyTrack {
+    #[getter]
+    fn context_id(&self) -> u64 {
+        self.inner.context_id()
+    }
+
+    #[getter]
+    fn surface_id(&self) -> u64 {
+        self.inner.surface_id()
+    }
+
+    #[getter]
+    fn id(&self) -> u64 {
+        self.inner.id()
     }
 
     #[getter]
     fn kind(&self) -> &'static str {
-        self.kind.name()
+        kind_name(self.inner.kind())
     }
 
     #[getter]
-    fn closed(&self) -> PyResult<bool> {
-        Ok(lock(&self.inner, "source")?.is_none())
+    fn revision(&self) -> u64 {
+        self.inner.revision().get()
     }
 
-    fn __repr__(&self) -> PyResult<String> {
-        Ok(format!(
-            "<vivid_sdk.Source id={} kind='{}' closed={}>",
-            self.id,
-            self.kind.name(),
-            lock(&self.inner, "source")?.is_none()
-        ))
+    #[getter]
+    fn channel_generation(&self) -> u64 {
+        self.inner.channel_generation().get()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<vivid_sdk.Track context_id={} surface_id={} id={} kind='{}' generation={}>",
+            self.context_id(),
+            self.surface_id(),
+            self.id(),
+            self.kind(),
+            self.channel_generation()
+        )
     }
 }
 
-#[pyclass(name = "MediaSender", module = "vivid_sdk._native")]
-struct PyMediaSender {
-    inner: Mutex<Option<RustMediaSender>>,
-    cancellation: SourceCancellation,
-    id: u64,
-    kind: SourceKind,
-}
-
-#[pyclass(name = "Wait", module = "vivid_sdk._native")]
-struct PyWait {
-    inner: Mutex<Option<SourceWaitHandle>>,
-    cancellation: SourceWaitCancellation,
-    request_id: u64,
-    source_id: u64,
-}
-
-#[pymethods]
-impl PyWait {
-    #[getter]
-    fn request_id(&self) -> u64 {
-        self.request_id
-    }
-
-    #[getter]
-    fn source_id(&self) -> u64 {
-        self.source_id
-    }
-
-    #[getter]
-    fn closed(&self) -> PyResult<bool> {
-        Ok(lock(&self.inner, "wait")?.is_none())
-    }
-
-    fn __repr__(&self) -> PyResult<String> {
-        Ok(format!(
-            "<vivid_sdk.Wait request_id={} source_id={} closed={}>",
-            self.request_id,
-            self.source_id,
-            lock(&self.inner, "wait")?.is_none()
-        ))
-    }
+#[pyclass(name = "TrackChannel", module = "vivid_sdk._native")]
+struct PyTrackChannel {
+    inner: Mutex<Option<TrackChannel>>,
+    context_id: u64,
+    surface_id: u64,
+    track_id: u64,
+    kind: TrackKind,
+    generation: u64,
 }
 
 #[pymethods]
-impl PyMediaSender {
+impl PyTrackChannel {
     #[getter]
-    fn id(&self) -> u64 {
-        self.id
+    fn context_id(&self) -> u64 {
+        self.context_id
+    }
+
+    #[getter]
+    fn surface_id(&self) -> u64 {
+        self.surface_id
+    }
+
+    #[getter]
+    fn track_id(&self) -> u64 {
+        self.track_id
     }
 
     #[getter]
     fn kind(&self) -> &'static str {
-        self.kind.name()
+        kind_name(self.kind)
+    }
+
+    #[getter]
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[getter]
     fn closed(&self) -> PyResult<bool> {
-        Ok(lock(&self.inner, "media sender")?.is_none())
+        Ok(lock(&self.inner, "track channel")?.is_none())
     }
 
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "<vivid_sdk.MediaSender id={} kind='{}' closed={}>",
-            self.id,
-            self.kind.name(),
-            lock(&self.inner, "media sender")?.is_none()
+            "<vivid_sdk.TrackChannel context_id={} surface_id={} track_id={} kind='{}' generation={} closed={}>",
+            self.context_id,
+            self.surface_id,
+            self.track_id,
+            kind_name(self.kind),
+            self.generation,
+            self.closed()?
         ))
     }
-}
-
-fn lock<'a, T>(
-    mutex: &'a Mutex<Option<T>>,
-    description: &str,
-) -> PyResult<MutexGuard<'a, Option<T>>> {
-    mutex
-        .lock()
-        .map_err(|_| VividError::new_err(format!("{description} state is poisoned")))
-}
-
-fn open_mut<'a, T>(value: &'a mut Option<T>, description: &str) -> PyResult<&'a mut T> {
-    value
-        .as_mut()
-        .ok_or_else(|| ClosedHandleError::new_err(format!("{description} is closed or consumed")))
-}
-
-fn io_error(error: io::Error) -> PyErr {
-    match error.kind() {
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
-            PyValueError::new_err(error.to_string())
-        }
-        io::ErrorKind::TimedOut => PyTimeoutError::new_err(error.to_string()),
-        io::ErrorKind::Interrupted => PyInterruptedError::new_err(error.to_string()),
-        _ => VividError::new_err(error.to_string()),
-    }
-}
-
-fn source(handle: SourceHandle, kind: SourceKind) -> PySource {
-    let id = handle.id;
-    PySource {
-        inner: Mutex::new(Some(handle)),
-        id,
-        kind,
-    }
-}
-
-macro_rules! dict_value {
-    ($dict:expr, $key:literal, $ty:ty) => {
-        $dict
-            .get_item($key)?
-            .ok_or_else(|| PyKeyError::new_err($key))?
-            .extract::<$ty>()?
-    };
-}
-
-fn parse_video(config: &Bound<'_, PyDict>) -> PyResult<VideoSourceSpec> {
-    Ok(VideoSourceSpec {
-        codec: dict_value!(config, "codec", String),
-        packetization: dict_value!(config, "packetization", String),
-        extradata: dict_value!(config, "extradata", Vec<u8>),
-        width: dict_value!(config, "width", u32),
-        height: dict_value!(config, "height", u32),
-        profile: dict_value!(config, "profile", i32),
-        level: dict_value!(config, "level", i32),
-        bitrate: dict_value!(config, "bitrate", i64),
-        color_primaries: dict_value!(config, "color_primaries", u64),
-        transfer: dict_value!(config, "transfer", u64),
-        matrix: dict_value!(config, "matrix", u64),
-        range: dict_value!(config, "range", u64),
-        sar_num: dict_value!(config, "sar_num", u32),
-        sar_den: dict_value!(config, "sar_den", u32),
-        max_access_unit_bytes: dict_value!(config, "max_access_unit_bytes", u32),
-        codec_string: dict_value!(config, "codec_string", Option<String>),
-        decoder_config: dict_value!(config, "decoder_config", Option<Vec<u8>>),
-    })
-}
-
-fn parse_audio(config: &Bound<'_, PyDict>) -> PyResult<AudioSourceSpec> {
-    Ok(AudioSourceSpec {
-        codec: dict_value!(config, "codec", String),
-        packetization: dict_value!(config, "packetization", String),
-        extradata: dict_value!(config, "extradata", Vec<u8>),
-        sample_rate: dict_value!(config, "sample_rate", u32),
-        channels: dict_value!(config, "channels", u16),
-        channel_mask: dict_value!(config, "channel_mask", u64),
-        bitrate: dict_value!(config, "bitrate", i64),
-        max_access_unit_bytes: dict_value!(config, "max_access_unit_bytes", u32),
-        codec_string: dict_value!(config, "codec_string", Option<String>),
-    })
-}
-
-fn parse_clip(value: &Bound<'_, PyAny>) -> PyResult<Option<ClipRect>> {
-    if value.is_none() {
-        return Ok(None);
-    }
-    let clip = value.cast::<PyDict>()?;
-    Ok(Some(ClipRect {
-        x: dict_value!(clip, "x", i64),
-        y: dict_value!(clip, "y", i64),
-        width: dict_value!(clip, "width", i64),
-        height: dict_value!(clip, "height", i64),
-    }))
-}
-
-fn parse_scene(config: &Bound<'_, PyDict>) -> PyResult<SceneNodeConfig> {
-    let clip = config
-        .get_item("clip")?
-        .ok_or_else(|| PyKeyError::new_err("clip"))?;
-    Ok(SceneNodeConfig {
-        node_id: dict_value!(config, "node_id", u64),
-        source_id: dict_value!(config, "source_id", u64),
-        context_id: dict_value!(config, "context_id", u64),
-        x: dict_value!(config, "x", i64),
-        y: dict_value!(config, "y", i64),
-        width: dict_value!(config, "width", i64),
-        height: dict_value!(config, "height", i64),
-        text_layer: dict_value!(config, "text_layer", u64),
-        z_index: dict_value!(config, "z_index", i64),
-        visible: dict_value!(config, "visible", bool),
-        anchor_id: dict_value!(config, "anchor_id", Option<u64>),
-        clip: parse_clip(&clip)?,
-    })
 }
 
 #[pyfunction]
-#[pyo3(signature = (endpoint, bulk_endpoint, token, dry_run, trace_dir, verbose, producer, producer_version, required_features, optional_features, authentication_kind=0))]
+#[pyo3(signature = (
+    *,
+    dry_run=false,
+    trace_dir=None,
+    endpoint_control=None,
+    endpoint_interactive=None,
+    endpoint_realtime=None,
+    endpoint_bulk=None,
+    root_secret=None,
+    producer_name="vivid-sdk-python".to_owned(),
+    producer_version=env!("CARGO_PKG_VERSION").to_owned(),
+    target_profile="terminal-surface-v1".to_owned(),
+    required_profiles=None,
+    optional_profiles=None
+))]
 fn connect(
     py: Python<'_>,
-    endpoint: Option<String>,
-    bulk_endpoint: Option<String>,
-    token: Option<String>,
     dry_run: bool,
-    trace_dir: Option<String>,
-    verbose: bool,
-    producer: String,
+    trace_dir: Option<PathBuf>,
+    endpoint_control: Option<String>,
+    endpoint_interactive: Option<String>,
+    endpoint_realtime: Option<String>,
+    endpoint_bulk: Option<String>,
+    root_secret: Option<String>,
+    producer_name: String,
     producer_version: String,
-    required_features: Vec<u64>,
-    optional_features: Vec<u64>,
-    authentication_kind: u64,
+    target_profile: String,
+    required_profiles: Option<Vec<String>>,
+    optional_profiles: Option<Vec<String>>,
 ) -> PyResult<PySession> {
-    let config = ProducerConfig {
-        endpoint,
-        bulk_endpoint,
-        token,
-        dry_run,
-        trace_dir: trace_dir.map(PathBuf::from),
-        verbose,
-        producer,
+    let mut config = ProducerConfig {
+        endpoint_control,
+        endpoint_interactive,
+        endpoint_realtime,
+        endpoint_bulk,
+        producer_name,
         producer_version,
-        required_features,
-        optional_features,
-        authentication_kind,
-        allow_version_retry: false,
+        target_profile,
+        dry_run,
+        trace_dir,
+        ..ProducerConfig::default()
     };
-    config.validate().map_err(io_error)?;
-    let session = py
-        .detach(|| ProducerSession::connect(&config).map_err(|error| error.to_string()))
-        .map_err(VividError::new_err)?;
+    if let Some(secret) = root_secret {
+        config.authentication = ProducerAuthentication::root_hex(&secret).map_err(value_error)?;
+    }
+    if let Some(profiles) = required_profiles {
+        config.required_profiles = profiles;
+    }
+    if let Some(profiles) = optional_profiles {
+        config.optional_profiles = profiles;
+    }
+    let session = py.detach(|| Session::connect(config)).map_err(io_error)?;
     Ok(PySession {
         inner: Mutex::new(Some(session)),
     })
@@ -400,607 +254,192 @@ fn connect(
 
 #[pyfunction]
 fn close(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    let Some(mut inner) = guard.take() else {
-        return Ok(());
-    };
-    py.detach(|| inner.goodbye()).map_err(io_error)
+    let value = lock(&session.inner, "session")?
+        .take()
+        .ok_or_else(closed_session)?;
+    py.detach(|| value.close()).map_err(io_error)
 }
 
 #[pyfunction]
-fn allocate_id(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<u64> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.allocate_id()).map_err(io_error)
+fn allocate_id(session: PyRef<'_, PySession>) -> PyResult<u64> {
+    with_session(&session, |session| session.allocate_id())
 }
 
 #[pyfunction]
-fn supports(session: PyRef<'_, PySession>, feature: u64) -> PyResult<bool> {
-    let mut guard = lock(&session.inner, "session")?;
-    Ok(open_mut(&mut guard, "session")?.supports(feature))
+fn supports(session: PyRef<'_, PySession>, profile: &str) -> PyResult<bool> {
+    let guard = lock(&session.inner, "session")?;
+    Ok(guard.as_ref().ok_or_else(closed_session)?.supports(profile))
 }
 
 #[pyfunction]
-fn root_context_id(session: PyRef<'_, PySession>) -> PyResult<u64> {
-    let mut guard = lock(&session.inner, "session")?;
-    Ok(open_mut(&mut guard, "session")?.root_context_id())
+fn session_info(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<Py<PyDict>> {
+    let guard = lock(&session.inner, "session")?;
+    let info = guard.as_ref().ok_or_else(closed_session)?.info();
+    let result = PyDict::new(py);
+    result.set_item("session_id", info.session_id)?;
+    result.set_item("session_tag", info.session_tag)?;
+    result.set_item("root_context_id", info.root_context_id)?;
+    result.set_item("target_generation", info.target_generation.get())?;
+    result.set_item("target_profile", &info.target_profile)?;
+    result.set_item("accepted_profiles", &info.accepted_profiles)?;
+    result.set_item("session_revision", info.session_revision)?;
+    result.set_item("scene_revision", info.scene_revision.get())?;
+    result.set_item("establishment_state", info.establishment_state)?;
+    result.set_item("resume_generation", info.resume_generation)?;
+    Ok(result.unbind())
 }
 
 #[pyfunction]
-fn display_state(session: PyRef<'_, PySession>) -> PyResult<DisplayStateTuple> {
-    let mut guard = lock(&session.inner, "session")?;
-    let state = open_mut(&mut guard, "session")?.display_state();
-    Ok((
-        state.display_generation,
-        state.viewport_width,
-        state.viewport_height,
-        state.grid_columns,
-        state.grid_rows,
-        state.cell_width,
-        state.cell_height,
-        state.settled,
-    ))
-}
-
-#[pyfunction]
-fn create_text_anchor(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<Option<u64>> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.create_text_anchor()).map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, width, height, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
-fn create_raster_source(
+fn create_surface(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    width: u32,
-    height: u32,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-    capture_policy: u64,
-    descriptor: Option<&Bound<'_, PyDict>>,
-) -> PyResult<PySource> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let descriptor = parse_source_descriptor(descriptor)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| {
-        inner.create_raster_source_with_options(
-            source_id,
-            width,
-            height,
-            capture_policy,
-            descriptor.as_ref(),
-            &metadata,
-        )
-    })
-    .map(|handle| source(handle, SourceKind::Raster))
-    .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, encoding, width, height, encoded_length, sha256, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
-fn create_image_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    encoding: u64,
-    width: u32,
-    height: u32,
-    encoded_length: u32,
-    sha256: Option<Vec<u8>>,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-    capture_policy: u64,
-    descriptor: Option<&Bound<'_, PyDict>>,
-) -> PyResult<PySource> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let descriptor = parse_source_descriptor(descriptor)?;
-    let sha256 = sha256
-        .map(|value| {
-            value
-                .try_into()
-                .map_err(|_| PyValueError::new_err("image sha256 must contain exactly 32 bytes"))
-        })
-        .transpose()?;
-    let config = ImageSourceConfig {
-        source_id,
-        encoding,
-        width,
-        height,
-        encoded_length,
-        sha256,
-    };
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| {
-        inner.create_image_source_with_options(
-            &config,
-            capture_policy,
-            descriptor.as_ref(),
-            &metadata,
-        )
-    })
-    .map(|handle| source(handle, SourceKind::Image))
-    .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
-fn create_video_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
     config: &Bound<'_, PyDict>,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-    capture_policy: u64,
-    descriptor: Option<&Bound<'_, PyDict>>,
-) -> PyResult<PySource> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let config = parse_video(config)?;
-    let descriptor = parse_source_descriptor(descriptor)?;
+) -> PyResult<PySurface> {
+    let definition = parse_surface(config)?;
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| {
-        inner.create_video_source_with_options(
-            source_id,
-            &config,
-            capture_policy,
-            descriptor.as_ref(),
-            &metadata,
-        )
-    })
-    .map(|handle| source(handle, SourceKind::Video))
-    .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, linked_video_source_id, config, preconditions=None, idempotency_key=None, causation_id=None, capture_policy=0, descriptor=None))]
-fn create_audio_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    linked_video_source_id: Option<u64>,
-    config: &Bound<'_, PyDict>,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-    capture_policy: u64,
-    descriptor: Option<&Bound<'_, PyDict>>,
-) -> PyResult<PySource> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let config = parse_audio(config)?;
-    let descriptor = parse_source_descriptor(descriptor)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| {
-        inner.create_audio_source_with_options(
-            source_id,
-            linked_video_source_id,
-            &config,
-            capture_policy,
-            descriptor.as_ref(),
-            &metadata,
-        )
-    })
-    .map(|handle| source(handle, SourceKind::Audio))
-    .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, video_source_id, video_config, audio_source_id, audio_config, video_capture_policy=0, audio_capture_policy=0, video_descriptor=None, audio_descriptor=None))]
-fn create_linked_av_sources(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    video_source_id: u64,
-    video_config: &Bound<'_, PyDict>,
-    audio_source_id: u64,
-    audio_config: &Bound<'_, PyDict>,
-    video_capture_policy: u64,
-    audio_capture_policy: u64,
-    video_descriptor: Option<&Bound<'_, PyDict>>,
-    audio_descriptor: Option<&Bound<'_, PyDict>>,
-) -> PyResult<(PySource, Option<PySource>, Option<String>)> {
-    let video_config = parse_video(video_config)?;
-    let audio_config = parse_audio(audio_config)?;
-    let video_descriptor = parse_source_descriptor(video_descriptor)?;
-    let audio_descriptor = parse_source_descriptor(audio_descriptor)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let (video, audio) = py
-        .detach(|| {
-            inner.create_linked_av_sources_with_options(
-                video_source_id,
-                &video_config,
-                video_capture_policy,
-                video_descriptor.as_ref(),
-                audio_source_id,
-                &audio_config,
-                audio_capture_policy,
-                audio_descriptor.as_ref(),
-            )
-        })
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    let surface = py
+        .detach(|| session.create_surface(definition, &RequestMetadata::default()))
         .map_err(io_error)?;
-    let video = source(video, SourceKind::Video);
-    match audio {
-        Ok(audio) => Ok((video, Some(source(audio, SourceKind::Audio)), None)),
-        Err(error) => Ok((video, None, Some(error.to_string()))),
-    }
+    Ok(PySurface { inner: surface })
 }
 
 #[pyfunction]
-fn set_source_policy(
+fn update_surface(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    capture_policy: u64,
+    surface: PyRef<'_, PySurface>,
+    config: &Bound<'_, PyDict>,
 ) -> PyResult<()> {
+    let definition = parse_surface(config)?;
+    let surface = surface.inner.clone();
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.set_source_policy(source_id, capture_policy))
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    py.detach(|| session.update_surface(&surface, definition, &RequestMetadata::default()))
         .map_err(io_error)
 }
 
 #[pyfunction]
-fn update_source_descriptor(
+fn destroy_surface(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    descriptor: &Bound<'_, PyDict>,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
+    surface: PyRef<'_, PySurface>,
 ) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let descriptor = parse_source_descriptor(Some(descriptor))?
-        .expect("a supplied descriptor always parses as Some");
+    let surface = surface.inner.clone();
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.update_source_descriptor_with_metadata(source_id, &descriptor, &metadata))
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    py.detach(|| session.destroy_surface(&surface, &RequestMetadata::default()))
         .map_err(io_error)
 }
 
 #[pyfunction]
-fn probe_video_config(
+fn create_track(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
     config: &Bound<'_, PyDict>,
-) -> PyResult<bool> {
-    let config = parse_video(config)?;
+) -> PyResult<PyTrack> {
+    let configuration = parse_track(config)?;
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.probe_video_config(&config))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn probe_audio_config(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    config: &Bound<'_, PyDict>,
-) -> PyResult<bool> {
-    let config = parse_audio(config)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.probe_audio_config(&config))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn place_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    node_id: u64,
-    anchor_id: Option<u64>,
-    columns: u32,
-    rows: u32,
-) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.place_source(source_id, node_id, anchor_id, columns, rows))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn create_scene_node(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    config: &Bound<'_, PyDict>,
-) -> PyResult<(u64, u64)> {
-    let config = parse_scene(config)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let node = py
-        .detach(|| inner.create_scene_node(&config))
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    let track = py
+        .detach(|| session.create_track(configuration, &RequestMetadata::default()))
         .map_err(io_error)?;
-    Ok((node.id, node.source_id))
+    Ok(PyTrack { inner: track })
 }
 
 #[pyfunction]
-fn update_scene_node(
+fn destroy_track(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    config: &Bound<'_, PyDict>,
-) -> PyResult<(u64, u64)> {
-    let config = parse_scene(config)?;
+    track: PyRef<'_, PyTrack>,
+) -> PyResult<()> {
+    let track = track.inner.clone();
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let node = py
-        .detach(|| inner.update_scene_node(&config))
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    py.detach(|| session.destroy_track(&track, &RequestMetadata::default()))
+        .map_err(io_error)
+}
+
+#[pyfunction]
+fn open_track_channel(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    track: PyRef<'_, PyTrack>,
+) -> PyResult<PyTrackChannel> {
+    let track_handle = track.inner.clone();
+    let context_id = track_handle.context_id();
+    let surface_id = track_handle.surface_id();
+    let track_id = track_handle.id();
+    let kind = track_handle.kind();
+    let guard = lock(&session.inner, "session")?;
+    let session = guard.as_ref().ok_or_else(closed_session)?;
+    let channel = py
+        .detach(|| session.open_track_channel(&track_handle))
         .map_err(io_error)?;
-    Ok((node.id, node.source_id))
-}
-
-#[pyfunction]
-fn delete_scene_node(py: Python<'_>, session: PyRef<'_, PySession>, node_id: u64) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.delete_scene_node(node_id))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, preconditions=None, idempotency_key=None, causation_id=None))]
-fn destroy_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.destroy_source_with_metadata(source_id, &metadata))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn wait_until_visible(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source: PyRef<'_, PySource>,
-) -> PyResult<()> {
-    let mut session_guard = lock(&session.inner, "session")?;
-    let session = open_mut(&mut session_guard, "session")?;
-    let mut source_guard = lock(&source.inner, "source")?;
-    let source = open_mut(&mut source_guard, "source")?;
-    py.detach(|| session.wait_until_visible(source))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn check_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source: PyRef<'_, PySource>,
-) -> PyResult<()> {
-    let mut session_guard = lock(&session.inner, "session")?;
-    let session = open_mut(&mut session_guard, "session")?;
-    let mut source_guard = lock(&source.inner, "source")?;
-    let source = open_mut(&mut source_guard, "source")?;
-    py.detach(|| session.apply_pending_source_events(source))
-        .map_err(io_error)
-}
-
-type EventTuple = (String, Option<bool>, Option<u32>, Option<String>);
-
-fn event_tuple(event: SourceEvent) -> EventTuple {
-    match event {
-        SourceEvent::Visibility(visible) => ("visibility".into(), Some(visible), None, None),
-        SourceEvent::NeedKeyframe(epoch) => ("need_keyframe".into(), None, Some(epoch), None),
-        SourceEvent::Lost(message) => ("lost".into(), None, None, Some(message)),
-    }
-}
-
-fn playback_tuple(snapshot: PlaybackSnapshot) -> (u64, i64, u32, u64, u64, u64, u64) {
-    (
-        snapshot.state,
-        snapshot.clock_pts_us,
-        snapshot.epoch,
-        snapshot.buffered_ahead_us,
-        snapshot.underrun_count,
-        snapshot.late_drop_count,
-        snapshot.eos_state,
-    )
-}
-
-fn source_status_dict(py: Python<'_>, status: SourceStatus) -> PyResult<Py<PyDict>> {
-    let output = PyDict::new(py);
-    output.set_item("source_id", status.source_id)?;
-    output.set_item("source_revision", status.source_revision.get())?;
-    output.set_item("kind", status.kind)?;
-    output.set_item("lifecycle", status.lifecycle)?;
-    output.set_item("epoch", status.epoch)?;
-    output.set_item("attachment_state", status.attachment_state)?;
-    output.set_item("attachment_generation", status.attachment_generation)?;
-    output.set_item("last_media_id", status.last_media_id)?;
-    output.set_item("last_media_sequence", status.last_media_sequence)?;
-    output.set_item("last_decoded_pts_us", status.last_decoded_pts_us)?;
-    output.set_item("last_presented_pts_us", status.last_presented_pts_us)?;
-    output.set_item("last_presentation_id", status.last_presentation_id)?;
-    output.set_item("visible", status.visible)?;
-    output.set_item("capture_policy", status.capture_policy)?;
-    output.set_item("linked_source_id", status.linked_source_id)?;
-    output.set_item("milestones", status.milestones)?;
-    output.set_item("outstanding_byte_credit", status.outstanding_byte_credit)?;
-    output.set_item(
-        "outstanding_packet_credit",
-        status.outstanding_packet_credit,
-    )?;
-    output.set_item("ingress_queue_depth", status.ingress_queue_depth)?;
-    let descriptor = status.descriptor.as_ref().map(|descriptor| {
-        let value = PyDict::new(py);
-        match descriptor {
-            ReportedSourceDescriptor::Full(descriptor) => {
-                value.set_item("role", descriptor.role)?;
-                value.set_item("title", &descriptor.title)?;
-                value.set_item("content_revision", descriptor.content_revision)?;
-                value.set_item("semantic_availability", descriptor.semantic_availability)?;
-                value.set_item("locator", &descriptor.locator)?;
-            }
-            ReportedSourceDescriptor::RoleOnly { role } => {
-                value.set_item("role", role)?;
-            }
-        }
-        Ok::<_, PyErr>(value.unbind())
-    });
-    output.set_item("descriptor", descriptor.transpose()?)?;
-    output.set_item("playback", status.playback.map(playback_tuple))?;
-    output.set_item("terminal_loss_code", status.terminal_loss_code)?;
-    Ok(output.unbind())
-}
-
-type ObservationTuple = (
-    String,
-    Option<u64>,
-    u64,
-    u64,
-    u64,
-    Option<u64>,
-    Option<(u64, i64, u32, u64, u64, u64, u64)>,
-);
-
-fn observation_tuple(event: ObservationEvent) -> ObservationTuple {
-    match event {
-        ObservationEvent::Source(event) => (
-            "source".into(),
-            Some(event.source_id),
-            event.source_revision.get(),
-            event.changed_fields,
-            event.observation_sequence.get(),
-            event.first_lost_sequence.map(|sequence| sequence.get()),
-            None,
-        ),
-        ObservationEvent::Scene(event) => (
-            "scene".into(),
-            None,
-            event.scene_revision.get(),
-            event.reason_mask,
-            event.observation_sequence.get(),
-            event.first_lost_sequence.map(|sequence| sequence.get()),
-            None,
-        ),
-        ObservationEvent::Playback(event) => (
-            "playback".into(),
-            Some(event.source_id),
-            event.source_revision.get(),
-            event.snapshot.state,
-            event.observation_sequence.get(),
-            None,
-            Some(playback_tuple(event.snapshot)),
-        ),
-    }
-}
-
-#[pyfunction]
-fn take_source_event(source: PyRef<'_, PySource>) -> PyResult<Option<EventTuple>> {
-    let mut guard = lock(&source.inner, "source")?;
-    Ok(open_mut(&mut guard, "source")?
-        .take_event()
-        .map(event_tuple))
-}
-
-#[pyfunction]
-fn source_is_visible(source: PyRef<'_, PySource>) -> PyResult<bool> {
-    let mut guard = lock(&source.inner, "source")?;
-    Ok(open_mut(&mut guard, "source")?.is_visible())
-}
-
-#[pyfunction]
-fn source_visibility_reasons(source: PyRef<'_, PySource>) -> PyResult<u64> {
-    let mut guard = lock(&source.inner, "source")?;
-    Ok(open_mut(&mut guard, "source")?.visibility_reasons())
-}
-
-#[pyfunction]
-fn open_sender(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source: PyRef<'_, PySource>,
-) -> PyResult<PyMediaSender> {
-    let mut session_guard = lock(&session.inner, "session")?;
-    let session = open_mut(&mut session_guard, "session")?;
-    let mut source_guard = lock(&source.inner, "source")?;
-    let handle = source_guard.take().ok_or_else(|| {
-        ClosedHandleError::new_err("source is closed or was already consumed by a sender")
-    })?;
-    let kind = source.kind;
-    let sender = py
-        .detach(move || session.open_media_sender(handle, kind.connection()))
-        .map_err(io_error)?;
-    let id = sender.source_id();
-    let cancellation = sender.source().cancellation();
-    Ok(PyMediaSender {
-        inner: Mutex::new(Some(sender)),
-        cancellation,
-        id,
+    Ok(PyTrackChannel {
+        context_id,
+        surface_id,
+        track_id,
         kind,
+        generation: channel.generation().get(),
+        inner: Mutex::new(Some(channel)),
     })
 }
 
-fn ensure_kind(actual: SourceKind, expected: SourceKind) -> PyResult<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(PyValueError::new_err(format!(
-            "{} sender cannot send {} media",
-            actual.name(),
-            expected.name()
-        )))
-    }
-}
-
 #[pyfunction]
+#[pyo3(signature = (channel, rgba, *, epoch=0, frame_id=1, compress=false))]
 fn send_raster(
     py: Python<'_>,
-    sender: PyRef<'_, PyMediaSender>,
+    channel: PyRef<'_, PyTrackChannel>,
+    rgba: Vec<u8>,
     epoch: u32,
     frame_id: u64,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-) -> PyResult<()> {
-    ensure_kind(sender.kind, SourceKind::Raster)?;
-    let mut guard = lock(&sender.inner, "media sender")?;
-    let inner = open_mut(&mut guard, "media sender")?;
-    py.detach(|| inner.send_raster(epoch, frame_id, width, height, &rgba))
+    compress: bool,
+) -> PyResult<u64> {
+    let guard = lock(&channel.inner, "track channel")?;
+    let channel = guard.as_ref().ok_or_else(closed_channel)?;
+    py.detach(|| channel.send_raster(epoch, frame_id, &rgba, compress))
         .map_err(io_error)
 }
 
 #[pyfunction]
-fn send_image(py: Python<'_>, sender: PyRef<'_, PyMediaSender>, encoded: Vec<u8>) -> PyResult<()> {
-    ensure_kind(sender.kind, SourceKind::Image)?;
-    let mut guard = lock(&sender.inner, "media sender")?;
-    let inner = open_mut(&mut guard, "media sender")?;
-    py.detach(|| inner.send_image(&encoded)).map_err(io_error)
+fn send_image(
+    py: Python<'_>,
+    channel: PyRef<'_, PyTrackChannel>,
+    encoded: Vec<u8>,
+) -> PyResult<u64> {
+    let guard = lock(&channel.inner, "track channel")?;
+    let channel = guard.as_ref().ok_or_else(closed_channel)?;
+    py.detach(|| channel.send_image(&encoded)).map_err(io_error)
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    channel,
+    data,
+    *,
+    packet_id,
+    pts_us,
+    dts_us,
+    duration_us,
+    key,
+    epoch=0
+))]
 fn send_video(
     py: Python<'_>,
-    sender: PyRef<'_, PyMediaSender>,
-    epoch: u32,
+    channel: PyRef<'_, PyTrackChannel>,
+    data: Vec<u8>,
     packet_id: u64,
     pts_us: i64,
     dts_us: i64,
     duration_us: u64,
     key: bool,
-    data: Vec<u8>,
-) -> PyResult<()> {
-    ensure_kind(sender.kind, SourceKind::Video)?;
-    let mut guard = lock(&sender.inner, "media sender")?;
-    let inner = open_mut(&mut guard, "media sender")?;
+    epoch: u32,
+) -> PyResult<u64> {
+    let guard = lock(&channel.inner, "track channel")?;
+    let channel = guard.as_ref().ok_or_else(closed_channel)?;
     py.detach(|| {
-        inner.send_video(VideoPacket {
+        channel.send_video(VideoPacket {
             epoch,
             packet_id,
             pts_us,
@@ -1014,23 +453,34 @@ fn send_video(
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    channel,
+    data,
+    *,
+    packet_id,
+    pts_us,
+    dts_us,
+    duration_us,
+    epoch=0,
+    trim_start_samples=0,
+    trim_end_samples=0
+))]
 fn send_audio(
     py: Python<'_>,
-    sender: PyRef<'_, PyMediaSender>,
-    epoch: u32,
+    channel: PyRef<'_, PyTrackChannel>,
+    data: Vec<u8>,
     packet_id: u64,
     pts_us: i64,
     dts_us: i64,
     duration_us: u64,
+    epoch: u32,
     trim_start_samples: u32,
     trim_end_samples: u32,
-    data: Vec<u8>,
-) -> PyResult<()> {
-    ensure_kind(sender.kind, SourceKind::Audio)?;
-    let mut guard = lock(&sender.inner, "media sender")?;
-    let inner = open_mut(&mut guard, "media sender")?;
+) -> PyResult<u64> {
+    let guard = lock(&channel.inner, "track channel")?;
+    let channel = guard.as_ref().ok_or_else(closed_channel)?;
     py.detach(|| {
-        inner.send_audio(AudioPacket {
+        channel.send_audio(AudioPacket {
             epoch,
             packet_id,
             pts_us,
@@ -1045,486 +495,309 @@ fn send_audio(
 }
 
 #[pyfunction]
-fn cancel_sender(sender: PyRef<'_, PyMediaSender>, reason: String) -> PyResult<()> {
-    sender.cancellation.cancel(reason);
-    lock(&sender.inner, "media sender")?.take();
-    Ok(())
+fn channel_eos(py: Python<'_>, channel: PyRef<'_, PyTrackChannel>) -> PyResult<u64> {
+    let guard = lock(&channel.inner, "track channel")?;
+    let channel = guard.as_ref().ok_or_else(closed_channel)?;
+    py.detach(|| channel.eos()).map_err(io_error)
 }
 
 #[pyfunction]
-fn take_sender_event(sender: PyRef<'_, PyMediaSender>) -> PyResult<Option<EventTuple>> {
-    let mut guard = lock(&sender.inner, "media sender")?;
-    Ok(open_mut(&mut guard, "media sender")?
-        .take_event()
-        .map(event_tuple))
+fn close_channel(py: Python<'_>, channel: PyRef<'_, PyTrackChannel>) -> PyResult<()> {
+    let value = lock(&channel.inner, "track channel")?
+        .take()
+        .ok_or_else(closed_channel)?;
+    py.detach(|| value.close()).map_err(io_error)
 }
 
 #[pyfunction]
-fn sender_is_visible(sender: PyRef<'_, PyMediaSender>) -> PyResult<bool> {
-    let mut guard = lock(&sender.inner, "media sender")?;
-    Ok(open_mut(&mut guard, "media sender")?.source().is_visible())
-}
-
-#[pyfunction]
-fn sender_visibility_reasons(sender: PyRef<'_, PyMediaSender>) -> PyResult<u64> {
-    let mut guard = lock(&sender.inner, "media sender")?;
-    Ok(open_mut(&mut guard, "media sender")?
-        .source()
-        .visibility_reasons())
-}
-
-#[pyfunction]
-fn revision_state(session: PyRef<'_, PySession>) -> PyResult<(u64, Vec<(u64, u64)>)> {
+#[pyo3(signature = (session, surface, track, *, required_milestone=1 << 4))]
+fn activate_track(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    surface: PyRef<'_, PySurface>,
+    track: PyRef<'_, PyTrack>,
+    required_milestone: u64,
+) -> PyResult<u64> {
+    let surface_handle = surface.inner.clone();
+    let track_handle = track.inner.clone();
+    let configuration = track_handle.configuration().map_err(io_error)?;
+    let binding = SlotBinding {
+        slot: configuration.slot,
+        track_id: track_handle.id(),
+        expected_channel_generation: track_handle.channel_generation(),
+        required_milestone,
+    };
     let mut guard = lock(&session.inner, "session")?;
-    let state = open_mut(&mut guard, "session")?.revision_state();
-    let mut sources = state
-        .sources
-        .into_iter()
-        .map(|(source_id, revision)| (source_id, revision.get()))
-        .collect::<Vec<_>>();
-    sources.sort_unstable_by_key(|(source_id, _)| *source_id);
-    Ok((state.scene.get(), sources))
-}
-
-#[pyfunction]
-fn set_observation(py: Python<'_>, session: PyRef<'_, PySession>, class_mask: u64) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.set_observation(class_mask))
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    py.detach(|| session.activate_tracks(&surface_handle, &[binding], &RequestMetadata::default()))
         .map_err(io_error)
 }
 
 #[pyfunction]
 #[pyo3(signature = (
     session,
-    context_id,
-    parent_context_id,
-    class_mask,
-    label,
-    expiry_us,
-    maximum_sources,
-    maximum_nodes,
-    maximum_retained_pixels,
-    maximum_media_bytes,
-    maximum_media_connections
+    track,
+    *,
+    condition,
+    value=None,
+    timeout_us=30_000_000
 ))]
-#[allow(clippy::too_many_arguments)]
-fn create_context(
+fn wait_track(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    context_id: u64,
-    parent_context_id: u64,
-    class_mask: u64,
-    label: String,
-    expiry_us: u64,
-    maximum_sources: u64,
-    maximum_nodes: u64,
-    maximum_retained_pixels: u64,
-    maximum_media_bytes: u64,
-    maximum_media_connections: u64,
-) -> PyResult<ContextReadyTuple> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let ready = py
-        .detach(|| {
-            inner.create_context(&CreateContextRequest {
-                context_id,
-                parent_context_id,
-                class_mask,
-                label,
-                expiry_us,
-                quotas: ContextQuotas {
-                    maximum_sources,
-                    maximum_nodes,
-                    maximum_retained_pixels,
-                    maximum_media_bytes,
-                    maximum_media_connections,
-                },
-            })
-        })
-        .map_err(io_error)?;
-    Ok((
-        ready.context_id,
-        ready.class_mask,
-        ready.expiry_us,
-        ready.quotas.maximum_sources,
-        ready.quotas.maximum_nodes,
-        ready.quotas.maximum_retained_pixels,
-        ready.quotas.maximum_media_bytes,
-        ready.quotas.maximum_media_connections,
-    ))
-}
-
-#[pyfunction]
-fn delegate_context(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    context_id: u64,
-) -> PyResult<Vec<u8>> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| {
-        inner
-            .delegate_context(context_id)
-            .map(|capability| capability.expose_bytes().to_vec())
-    })
-    .map_err(io_error)
-}
-
-#[pyfunction]
-fn revoke_context(py: Python<'_>, session: PyRef<'_, PySession>, context_id: u64) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.revoke_context(context_id))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn take_observation(session: PyRef<'_, PySession>) -> PyResult<Option<ObservationTuple>> {
-    let mut guard = lock(&session.inner, "session")?;
-    Ok(open_mut(&mut guard, "session")?
-        .take_observation()
-        .map_err(io_error)?
-        .map(observation_tuple))
-}
-
-#[pyfunction]
-fn capability_generation(session: PyRef<'_, PySession>) -> PyResult<u64> {
-    let mut guard = lock(&session.inner, "session")?;
-    Ok(open_mut(&mut guard, "session")?.capability_generation())
-}
-
-#[pyfunction]
-fn take_session_event(session: PyRef<'_, PySession>) -> PyResult<Option<(u64, u64)>> {
-    let mut guard = lock(&session.inner, "session")?;
-    Ok(open_mut(&mut guard, "session")?
-        .take_session_event()
-        .map_err(io_error)?
-        .map(|event| match event {
-            SessionEvent::Capabilities(changed) => {
-                (changed.capability_generation, changed.reason_mask)
-            }
-        }))
-}
-
-#[pyfunction]
-fn set_trace_callback(session: PyRef<'_, PySession>, callback: Py<PyAny>) -> PyResult<()> {
-    let mut guard = lock(&session.inner, "session")?;
-    open_mut(&mut guard, "session")?
-        .set_trace_callback(DiagnosticTraceComponent::Sdk, move |record| {
-            Python::attach(|py| {
-                let _ = callback.call1(py, (record.ndjson_line(),));
-            });
-        })
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn query_source(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-) -> PyResult<Py<PyDict>> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let status = py
-        .detach(|| inner.query_source(source_id))
-        .map_err(io_error)?;
-    source_status_dict(py, status)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, maximum_nodes_per_page=256, maximum_pages=16))]
-fn query_scene(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    maximum_nodes_per_page: u64,
-    maximum_pages: usize,
-) -> PyResult<Py<PyDict>> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let status = py
-        .detach(|| inner.query_scene(maximum_nodes_per_page, maximum_pages))
-        .map_err(io_error)?;
-    let output = PyDict::new(py);
-    output.set_item("scene_revision", status.scene_revision.get())?;
-    output.set_item("total_nodes", status.total_nodes)?;
-    let nodes = PyList::empty(py);
-    for parsed in status.nodes {
-        let node = PyDict::new(py);
-        node.set_item("node_id", parsed.node.node_id)?;
-        node.set_item("source_id", parsed.node.source_id)?;
-        node.set_item("context_id", parsed.node.context_id)?;
-        node.set_item("x", parsed.node.x)?;
-        node.set_item("y", parsed.node.y)?;
-        node.set_item("width", parsed.node.width)?;
-        node.set_item("height", parsed.node.height)?;
-        node.set_item("text_layer", parsed.node.text_layer)?;
-        node.set_item("z_index", parsed.node.z_index)?;
-        node.set_item("visible", parsed.node.visible)?;
-        node.set_item("anchor_id", parsed.node.anchor_id)?;
-        node.set_item(
-            "clip",
-            parsed
-                .clip
-                .map(|clip| (clip.x, clip.y, clip.width, clip.height)),
-        )?;
-        nodes.append(node)?;
-    }
-    output.set_item("nodes", nodes)?;
-    Ok(output.unbind())
-}
-
-#[pyfunction]
-fn query_anchor(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    anchor_id: u64,
-) -> PyResult<(u64, u64, u64, u64, bool, u64)> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let status = py
-        .detach(|| inner.query_anchor(anchor_id))
-        .map_err(io_error)?;
-    Ok((
-        status.anchor_id,
-        status.state,
-        status.column,
-        status.row,
-        status.visible,
-        status.display_generation,
-    ))
-}
-
-#[pyfunction]
-fn query_limits(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<Py<PyDict>> {
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let status = py.detach(|| inner.query_limits()).map_err(io_error)?;
-    let output = PyDict::new(py);
-    output.set_item("maximum_sources", status.maximum_sources)?;
-    output.set_item("maximum_nodes", status.maximum_nodes)?;
-    output.set_item("maximum_transactions", status.maximum_transactions)?;
-    output.set_item("maximum_anchors", status.maximum_anchors)?;
-    output.set_item("maximum_control_body", status.maximum_control_body)?;
-    output.set_item("maximum_media_body", status.maximum_media_body)?;
-    output.set_item("maximum_waits", status.maximum_waits)?;
-    output.set_item("maximum_pending_requests", status.maximum_pending_requests)?;
-    output.set_item("rolling_byte_window", status.rolling_byte_window)?;
-    output.set_item("rolling_packet_window", status.rolling_packet_window)?;
-    output.set_item("retained_pixel_budget", status.retained_pixel_budget)?;
-    output.set_item("current_sources", status.current_sources)?;
-    output.set_item("current_nodes", status.current_nodes)?;
-    output.set_item("current_retained_pixels", status.current_retained_pixels)?;
-    output.set_item("image_cache_budget", status.image_cache_budget)?;
-    Ok(output.unbind())
-}
-
-fn timeout_duration(seconds: f64) -> PyResult<Duration> {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(PyValueError::new_err(
-            "timeout must be finite and greater than zero",
-        ));
-    }
-    Duration::try_from_secs_f64(seconds)
-        .map_err(|error| PyOverflowError::new_err(error.to_string()))
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, condition, value, timeout))]
-fn begin_wait_source(
-    session: PyRef<'_, PySession>,
-    source_id: u64,
+    track: PyRef<'_, PyTrack>,
     condition: u64,
     value: Option<u64>,
-    timeout: f64,
-) -> PyResult<PyWait> {
-    let timeout_us = u64::try_from(timeout_duration(timeout)?.as_micros())
-        .map_err(|_| PyOverflowError::new_err("wait timeout is too large"))?;
-    let mut guard = lock(&session.inner, "session")?;
-    let handle = open_mut(&mut guard, "session")?
-        .begin_wait_source(WaitSource {
-            source_id,
-            condition,
-            value,
-            timeout_us,
-        })
+    timeout_us: u64,
+) -> PyResult<Py<PyDict>> {
+    let condition = TrackWaitCondition::try_from(condition).map_err(value_error)?;
+    let track = track.inner.clone();
+    let guard = lock(&session.inner, "session")?;
+    let session = guard.as_ref().ok_or_else(closed_session)?;
+    let result = py
+        .detach(|| session.wait_track(&track, condition, value, timeout_us))
         .map_err(io_error)?;
-    let request_id = handle.request_id();
-    let cancellation = handle.cancellation();
-    Ok(PyWait {
-        inner: Mutex::new(Some(handle)),
-        cancellation,
-        request_id,
-        source_id,
-    })
+    let output = PyDict::new(py);
+    output.set_item("context_id", result.context_id)?;
+    output.set_item("surface_id", result.surface_id)?;
+    output.set_item("track_id", result.track_id)?;
+    output.set_item("revision", result.revision.get())?;
+    output.set_item("channel_generation", result.channel_generation.get())?;
+    output.set_item("condition", result.condition as u64)?;
+    output.set_item("observed_value", result.observed_value)?;
+    Ok(output.unbind())
 }
 
 #[pyfunction]
-fn wait_source(py: Python<'_>, wait: PyRef<'_, PyWait>) -> PyResult<(u64, u64, u64, Option<u64>)> {
-    let mut handle = lock(&wait.inner, "wait")?
-        .take()
-        .ok_or_else(|| ClosedHandleError::new_err("wait is closed or consumed"))?;
-    let satisfied = py.detach(|| handle.wait()).map_err(io_error)?;
-    Ok((
-        satisfied.source_id,
-        satisfied.source_revision.get(),
-        satisfied.condition,
-        satisfied.observed_value,
-    ))
-}
-
-#[pyfunction]
-fn cancel_wait(wait: PyRef<'_, PyWait>) -> PyResult<()> {
-    wait.cancellation.cancel().map_err(io_error)?;
-    lock(&wait.inner, "wait")?.take();
-    Ok(())
-}
-
-#[pyfunction]
-fn wait_until_playing(
+#[pyo3(signature = (
+    session,
+    surface,
+    *,
+    node_id,
+    x=0,
+    y=0,
+    width,
+    height,
+    text_layer=1
+))]
+fn place_terminal_surface(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    timeout: f64,
-) -> PyResult<(u64, u64, u64, Option<u64>)> {
-    let timeout = timeout_duration(timeout)?;
+    surface: PyRef<'_, PySurface>,
+    node_id: u64,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    text_layer: u64,
+) -> PyResult<(u64, u64)> {
+    let surface = surface.inner.clone();
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let satisfied = py
-        .detach(|| inner.wait_until_playing(source_id, timeout))
-        .map_err(io_error)?;
-    Ok((
-        satisfied.source_id,
-        satisfied.source_revision.get(),
-        satisfied.condition,
-        satisfied.observed_value,
-    ))
-}
-
-#[pyfunction]
-fn play_and_wait_until_playing(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    start_pts_us: i64,
-    minimum_buffer_us: u64,
-    timeout: f64,
-) -> PyResult<(u64, u64, u64, Option<u64>)> {
-    let timeout = timeout_duration(timeout)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    let satisfied = py
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    let result = py
         .detach(|| {
-            inner.play_and_wait_until_playing(source_id, start_pts_us, minimum_buffer_us, timeout)
+            session.place_terminal_surface(&surface, node_id, x, y, width, height, text_layer)
         })
         .map_err(io_error)?;
-    Ok((
-        satisfied.source_id,
-        satisfied.source_revision.get(),
-        satisfied.condition,
-        satisfied.observed_value,
-    ))
+    Ok((result.scene_revision.get(), result.target_generation.get()))
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, start_pts_us, minimum_buffer_us, preconditions=None, idempotency_key=None, causation_id=None))]
-fn play(
+fn delete_node(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    start_pts_us: i64,
-    minimum_buffer_us: u64,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
+    context_id: u64,
+    node_id: u64,
+) -> PyResult<(u64, u64)> {
     let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.play_at_with_metadata(source_id, start_pts_us, minimum_buffer_us, &metadata))
-        .map_err(io_error)
+    let session = guard.as_mut().ok_or_else(closed_session)?;
+    let result = py
+        .detach(|| session.delete_node(context_id, node_id, &RequestMetadata::default()))
+        .map_err(io_error)?;
+    Ok((result.scene_revision.get(), result.target_generation.get()))
 }
 
 #[pyfunction]
-#[pyo3(signature = (session, source_id, preconditions=None, idempotency_key=None, causation_id=None))]
-fn pause(
-    py: Python<'_>,
+fn anchor_marker(
     session: PyRef<'_, PySession>,
-    source_id: u64,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.pause_with_metadata(source_id, &metadata))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, epoch, preconditions=None, idempotency_key=None, causation_id=None))]
-fn flush(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    epoch: u32,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.flush_with_metadata(source_id, epoch, &metadata))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (session, source_id, epoch, preconditions=None, idempotency_key=None, causation_id=None))]
-fn eos(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    epoch: u32,
-    preconditions: Option<&Bound<'_, PyDict>>,
-    idempotency_key: Option<Vec<u8>>,
-    causation_id: Option<Vec<u8>>,
-) -> PyResult<()> {
-    let metadata = parse_request_metadata(preconditions, idempotency_key, causation_id)?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| inner.eos_with_metadata(source_id, epoch, &metadata))
-        .map_err(io_error)
-}
-
-#[pyfunction]
-fn drain(
-    py: Python<'_>,
-    session: PyRef<'_, PySession>,
-    source_id: u64,
-    timeout_seconds: Option<f64>,
-) -> PyResult<()> {
-    let timeout = timeout_seconds
-        .map(|seconds| {
-            if !seconds.is_finite() || seconds < 0.0 {
-                Err(PyValueError::new_err(
-                    "timeout_seconds must be finite and non-negative",
-                ))
-            } else {
-                Duration::try_from_secs_f64(seconds)
-                    .map_err(|error| PyOverflowError::new_err(error.to_string()))
-            }
-        })
-        .transpose()?;
-    let mut guard = lock(&session.inner, "session")?;
-    let inner = open_mut(&mut guard, "session")?;
-    py.detach(|| match timeout {
-        Some(timeout) => inner.drain_with_timeout(source_id, timeout),
-        None => inner.drain(source_id),
+    context_id: u64,
+    anchor_id: u64,
+) -> PyResult<String> {
+    with_session(&session, |session| {
+        session.anchor_marker(context_id, anchor_id)
     })
-    .map_err(io_error)
+}
+
+fn parse_surface(config: &Bound<'_, PyDict>) -> PyResult<SurfaceDefinition> {
+    let role = SurfaceRole::try_from(required::<u64>(config, "role")?)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let coordinate_model = CoordinateModel::try_from(required::<u64>(config, "coordinate_model")?)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(SurfaceDefinition {
+        context_id: required(config, "context_id")?,
+        surface_id: required(config, "surface_id")?,
+        semantic_profile: optional(config, "semantic_profile")?
+            .unwrap_or_else(|| GENERIC_CONTENT.into()),
+        coordinate_model,
+        logical_width: required(config, "logical_width")?,
+        logical_height: required(config, "logical_height")?,
+        scale_numerator: optional(config, "scale_numerator")?.unwrap_or(1),
+        scale_denominator: optional(config, "scale_denominator")?.unwrap_or(1),
+        rotation: optional(config, "rotation")?.unwrap_or(0),
+        descriptor: SurfaceDescriptor {
+            role,
+            title: optional(config, "title")?.unwrap_or_default(),
+            semantic_content_revision: optional(config, "semantic_content_revision")?.unwrap_or(0),
+            semantic_availability: optional(config, "semantic_availability")?.unwrap_or(0),
+            locator_hint: optional(config, "locator_hint")?.unwrap_or_default(),
+        },
+        policy: optional(config, "policy")?.unwrap_or(0),
+        profile_parameters: vec![],
+    })
+}
+
+fn parse_track(config: &Bound<'_, PyDict>) -> PyResult<TrackConfiguration> {
+    let kind_name: String = required(config, "kind")?;
+    let kind = match kind_name.as_str() {
+        "video" => KindConfiguration::Video(VideoConfiguration {
+            codec: required(config, "codec")?,
+            packetization: required(config, "packetization")?,
+            extradata: optional(config, "extradata")?.unwrap_or_default(),
+            coded_width: required(config, "width")?,
+            coded_height: required(config, "height")?,
+            profile: optional(config, "profile")?.unwrap_or(0),
+            level: optional(config, "level")?.unwrap_or(0),
+            maximum_reorder_depth: optional(config, "maximum_reorder_depth")?.unwrap_or(0),
+            color_primaries: optional(config, "color_primaries")?.unwrap_or(1),
+            transfer: optional(config, "transfer")?.unwrap_or(1),
+            matrix: optional(config, "matrix")?.unwrap_or(1),
+            signal_range: optional(config, "signal_range")?.unwrap_or(2),
+            aspect_numerator: optional(config, "aspect_numerator")?.unwrap_or(1),
+            aspect_denominator: optional(config, "aspect_denominator")?.unwrap_or(1),
+            maximum_access_unit_bytes: required(config, "maximum_access_unit_bytes")?,
+            codec_string: optional(config, "codec_string")?,
+            decoder_configuration: optional(config, "decoder_configuration")?,
+        }),
+        "audio" => KindConfiguration::Audio(AudioConfiguration {
+            codec: required(config, "codec")?,
+            packetization: required(config, "packetization")?,
+            extradata: optional(config, "extradata")?.unwrap_or_default(),
+            sample_rate: required(config, "sample_rate")?,
+            channels: required(config, "channels")?,
+            channel_mask: optional(config, "channel_mask")?.unwrap_or(0),
+            maximum_access_unit_bytes: required(config, "maximum_access_unit_bytes")?,
+            codec_string: optional(config, "codec_string")?,
+        }),
+        "raster" => KindConfiguration::Raster(RasterConfiguration {
+            width: required(config, "width")?,
+            height: required(config, "height")?,
+            alpha_mode: optional(config, "alpha_mode")?.unwrap_or(1),
+            delta_enabled: optional(config, "delta_enabled")?.unwrap_or(false),
+            maximum_delta_operations: optional(config, "maximum_delta_operations")?.unwrap_or(1),
+            zstd_enabled: optional(config, "zstd_enabled")?.unwrap_or(false),
+        }),
+        "image" => KindConfiguration::EncodedImage(ImageConfiguration {
+            encoding: required(config, "encoding")?,
+            width: required(config, "width")?,
+            height: required(config, "height")?,
+            encoded_length: required(config, "encoded_length")?,
+            sha256: optional::<Vec<u8>>(config, "sha256")?
+                .map(|value| {
+                    value
+                        .try_into()
+                        .map_err(|_| PyValueError::new_err("sha256 must contain 32 bytes"))
+                })
+                .transpose()?,
+            cache_lookup: optional(config, "cache_lookup")?.unwrap_or(false),
+        }),
+        _ => {
+            return Err(PyValueError::new_err(
+                "track kind must be video, audio, raster, or image",
+            ));
+        }
+    };
+    let mode = TrackMode::try_from(optional(config, "mode")?.unwrap_or(1))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let lane = LaneClass::try_from(optional(config, "lane")?.unwrap_or(3))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(TrackConfiguration {
+        context_id: required(config, "context_id")?,
+        surface_id: required(config, "surface_id")?,
+        track_id: required(config, "track_id")?,
+        slot: required(config, "slot")?,
+        mode,
+        lane,
+        maximum_record_body: required(config, "maximum_record_body")?,
+        maximum_rate_millihertz: required(config, "maximum_rate_millihertz")?,
+        maximum_encoded_bits_per_second: required(config, "maximum_encoded_bits_per_second")?,
+        maximum_records_per_second: required(config, "maximum_records_per_second")?,
+        maximum_inflight_body_bytes: required(config, "maximum_inflight_body_bytes")?,
+        kind,
+        target_latency_us: optional(config, "target_latency_us")?.unwrap_or(0),
+        maximum_latency_us: optional(config, "maximum_latency_us")?.unwrap_or(0),
+        retained_pixel_charge: optional(config, "retained_pixel_charge")?.unwrap_or(0),
+    })
+}
+
+fn required<'py, T>(dict: &Bound<'py, PyDict>, name: &str) -> PyResult<T>
+where
+    for<'a> T: FromPyObject<'a, 'py, Error = PyErr>,
+{
+    dict.get_item(name)?
+        .ok_or_else(|| PyValueError::new_err(format!("missing configuration field {name}")))?
+        .extract()
+}
+
+fn optional<'py, T>(dict: &Bound<'py, PyDict>, name: &str) -> PyResult<Option<T>>
+where
+    for<'a> T: FromPyObject<'a, 'py, Error = PyErr>,
+{
+    dict.get_item(name)?
+        .map(|value| value.extract())
+        .transpose()
+}
+
+fn with_session<T>(
+    session: &PySession,
+    operation: impl FnOnce(&Session) -> io::Result<T>,
+) -> PyResult<T> {
+    let guard = lock(&session.inner, "session")?;
+    operation(guard.as_ref().ok_or_else(closed_session)?).map_err(io_error)
+}
+
+fn kind_name(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Video => "video",
+        TrackKind::Audio => "audio",
+        TrackKind::Raster => "raster",
+        TrackKind::EncodedImage => "image",
+    }
+}
+
+fn lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> PyResult<MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| VividError::new_err(format!("{name} lock is poisoned")))
+}
+
+fn closed_session() -> PyErr {
+    ClosedHandleError::new_err("session is closed")
+}
+
+fn closed_channel() -> PyErr {
+    ClosedHandleError::new_err("track channel is closed")
+}
+
+fn value_error(error: io::Error) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+fn io_error(error: io::Error) -> PyErr {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        PyValueError::new_err(error.to_string())
+    } else {
+        VividError::new_err(error.to_string())
+    }
 }
 
 #[pymodule]
@@ -1532,67 +805,30 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("VividError", py.get_type::<VividError>())?;
     module.add("ClosedHandleError", py.get_type::<ClosedHandleError>())?;
     module.add_class::<PySession>()?;
-    module.add_class::<PySource>()?;
-    module.add_class::<PyMediaSender>()?;
-    module.add_class::<PyWait>()?;
-
+    module.add_class::<PySurface>()?;
+    module.add_class::<PyTrack>()?;
+    module.add_class::<PyTrackChannel>()?;
     module.add_function(wrap_pyfunction!(connect, module)?)?;
     module.add_function(wrap_pyfunction!(close, module)?)?;
     module.add_function(wrap_pyfunction!(allocate_id, module)?)?;
     module.add_function(wrap_pyfunction!(supports, module)?)?;
-    module.add_function(wrap_pyfunction!(root_context_id, module)?)?;
-    module.add_function(wrap_pyfunction!(display_state, module)?)?;
-    module.add_function(wrap_pyfunction!(create_text_anchor, module)?)?;
-    module.add_function(wrap_pyfunction!(create_raster_source, module)?)?;
-    module.add_function(wrap_pyfunction!(create_image_source, module)?)?;
-    module.add_function(wrap_pyfunction!(create_video_source, module)?)?;
-    module.add_function(wrap_pyfunction!(create_audio_source, module)?)?;
-    module.add_function(wrap_pyfunction!(create_linked_av_sources, module)?)?;
-    module.add_function(wrap_pyfunction!(set_source_policy, module)?)?;
-    module.add_function(wrap_pyfunction!(update_source_descriptor, module)?)?;
-    module.add_function(wrap_pyfunction!(probe_video_config, module)?)?;
-    module.add_function(wrap_pyfunction!(probe_audio_config, module)?)?;
-    module.add_function(wrap_pyfunction!(place_source, module)?)?;
-    module.add_function(wrap_pyfunction!(create_scene_node, module)?)?;
-    module.add_function(wrap_pyfunction!(update_scene_node, module)?)?;
-    module.add_function(wrap_pyfunction!(delete_scene_node, module)?)?;
-    module.add_function(wrap_pyfunction!(destroy_source, module)?)?;
-    module.add_function(wrap_pyfunction!(wait_until_visible, module)?)?;
-    module.add_function(wrap_pyfunction!(check_source, module)?)?;
-    module.add_function(wrap_pyfunction!(take_source_event, module)?)?;
-    module.add_function(wrap_pyfunction!(source_is_visible, module)?)?;
-    module.add_function(wrap_pyfunction!(source_visibility_reasons, module)?)?;
-    module.add_function(wrap_pyfunction!(open_sender, module)?)?;
+    module.add_function(wrap_pyfunction!(session_info, module)?)?;
+    module.add_function(wrap_pyfunction!(create_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(update_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(destroy_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(create_track, module)?)?;
+    module.add_function(wrap_pyfunction!(destroy_track, module)?)?;
+    module.add_function(wrap_pyfunction!(open_track_channel, module)?)?;
     module.add_function(wrap_pyfunction!(send_raster, module)?)?;
     module.add_function(wrap_pyfunction!(send_image, module)?)?;
     module.add_function(wrap_pyfunction!(send_video, module)?)?;
     module.add_function(wrap_pyfunction!(send_audio, module)?)?;
-    module.add_function(wrap_pyfunction!(cancel_sender, module)?)?;
-    module.add_function(wrap_pyfunction!(take_sender_event, module)?)?;
-    module.add_function(wrap_pyfunction!(sender_is_visible, module)?)?;
-    module.add_function(wrap_pyfunction!(sender_visibility_reasons, module)?)?;
-    module.add_function(wrap_pyfunction!(revision_state, module)?)?;
-    module.add_function(wrap_pyfunction!(set_observation, module)?)?;
-    module.add_function(wrap_pyfunction!(create_context, module)?)?;
-    module.add_function(wrap_pyfunction!(delegate_context, module)?)?;
-    module.add_function(wrap_pyfunction!(revoke_context, module)?)?;
-    module.add_function(wrap_pyfunction!(take_observation, module)?)?;
-    module.add_function(wrap_pyfunction!(capability_generation, module)?)?;
-    module.add_function(wrap_pyfunction!(take_session_event, module)?)?;
-    module.add_function(wrap_pyfunction!(set_trace_callback, module)?)?;
-    module.add_function(wrap_pyfunction!(query_source, module)?)?;
-    module.add_function(wrap_pyfunction!(query_scene, module)?)?;
-    module.add_function(wrap_pyfunction!(query_anchor, module)?)?;
-    module.add_function(wrap_pyfunction!(query_limits, module)?)?;
-    module.add_function(wrap_pyfunction!(begin_wait_source, module)?)?;
-    module.add_function(wrap_pyfunction!(wait_source, module)?)?;
-    module.add_function(wrap_pyfunction!(cancel_wait, module)?)?;
-    module.add_function(wrap_pyfunction!(wait_until_playing, module)?)?;
-    module.add_function(wrap_pyfunction!(play_and_wait_until_playing, module)?)?;
-    module.add_function(wrap_pyfunction!(play, module)?)?;
-    module.add_function(wrap_pyfunction!(pause, module)?)?;
-    module.add_function(wrap_pyfunction!(flush, module)?)?;
-    module.add_function(wrap_pyfunction!(eos, module)?)?;
-    module.add_function(wrap_pyfunction!(drain, module)?)?;
+    module.add_function(wrap_pyfunction!(channel_eos, module)?)?;
+    module.add_function(wrap_pyfunction!(close_channel, module)?)?;
+    module.add_function(wrap_pyfunction!(activate_track, module)?)?;
+    module.add_function(wrap_pyfunction!(wait_track, module)?)?;
+    module.add_function(wrap_pyfunction!(place_terminal_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(delete_node, module)?)?;
+    module.add_function(wrap_pyfunction!(anchor_marker, module)?)?;
     Ok(())
 }

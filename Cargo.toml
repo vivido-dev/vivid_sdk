@@ -1,17 +1,22 @@
 [package]
 name = "vivid_sdk"
-version = "0.2.0"
+version = "1.5.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.87.0"
 license = "Apache-2.0"
-description = "Reusable full-duplex Vivid Protocol producer client"
+description = "Reusable full-duplex Vivid Protocol 1.5 producer SDK"
 repository = "https://github.com/vivido-dev/vivid_sdk"
+
+[features]
+# An in-process Vivid 1.5 presenter for producer tests. Off by default: it is only compiled into
+# crates that ask for it, and it never affects a production build of the SDK.
+testing = []
 
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.4"
-vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 
 [dev-dependencies]
 tempfile = "3"

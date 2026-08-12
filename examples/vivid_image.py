@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Display a PNG or JPEG in Vivido through vivid-sdk."""
+"""Display a PNG or JPEG through Vivid 1.5 until Enter is pressed."""
 
 import argparse
 
@@ -7,6 +7,9 @@ import vivid_sdk
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("image")
-parser.add_argument("--scale", type=float, default=1.0)
 args = parser.parse_args()
-vivid_sdk.display_image(args.image, args.scale)
+presentation = vivid_sdk.display_image(args.image)
+try:
+    input("press Enter to remove the image")
+finally:
+    presentation.close()
