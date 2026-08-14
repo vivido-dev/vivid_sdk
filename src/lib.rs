@@ -18,6 +18,7 @@ mod channel;
 mod config;
 mod controller;
 mod desktop;
+mod file_drop;
 mod guard;
 mod handshake;
 mod input;
@@ -71,6 +72,10 @@ pub use controller::{
     worker_context,
 };
 pub use desktop::DesktopSession;
+pub use file_drop::{
+    FileDropBindingGuard, IncomingFileTransfer, IncomingFileTransferEvent,
+    IncomingFileTransferRequest,
+};
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
@@ -91,8 +96,14 @@ pub use vivid_protocol::messages::LaneClass;
 pub use vivid_protocol::wire::ConnectionKind;
 
 pub use vivid_protocol::context::{
-    ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE, OP_SCENE,
-    OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE,
+    OP_RECEIVE_FILE_DROP, OP_SCENE, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+};
+pub use vivid_protocol::file_drop::{
+    AcceptFileDrop, AdvanceFileTransfer, CancelFileDrop, FileDropAccepted, FileDropBinding,
+    FileDropBindingState, FileDropDestination, FileDropGrant, FileDropOffer, FileDropState,
+    FileDropStatus, FileDropTuple, FileFinish, FileResult, FileResultCode, FileTransferAbort,
+    FileTransferAccepted, FileTransferAdvanced, MaximumFileData, QueryFileDrop,
 };
 pub use vivid_protocol::geometry::Rotation;
 pub use vivid_protocol::input::{
@@ -105,9 +116,10 @@ pub use vivid_protocol::media::RasterDeltaOperation;
 pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
     AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
-    DESKTOP_SURFACE, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT,
+    DESKTOP_SURFACE, FILE_DROP, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT,
     TERMINAL_SURFACE, TIMED_MEDIA,
 };
+pub use vivid_protocol::revision::FileTransferGeneration;
 pub use vivid_protocol::scene::{Fit, SceneNode};
 pub use vivid_protocol::surface::{
     CoordinateModel, DesktopSurfaceParameters, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,

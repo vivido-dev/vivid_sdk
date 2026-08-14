@@ -76,6 +76,10 @@ pub enum SessionEvent {
         object_id: u64,
         payload: PayloadMap,
     },
+    /// A user-originated regular file was dropped on an effective presenter binding.
+    FileDropOffered(FileDropOffer),
+    /// The presenter cancelled an offered or accepted drop asynchronously.
+    FileDropCancelled(CancelFileDrop),
     Other {
         record_type: u16,
         object_id: u64,
@@ -818,7 +822,7 @@ pub(crate) fn spawn_control_reader(
                         apply_track_lost(record.object_id, &envelope.payload, &tracks)?;
                     }
                     let event =
-                        session_event(record.record_type, record.object_id, envelope.payload);
+                        session_event(record.record_type, record.object_id, envelope.payload)?;
                     let mut events = lock(&pending.events, "control event queue")?;
                     if events.len() == MAX_CONTROL_EVENTS {
                         return Err(invalid_data("control event queue exceeded its bound"));

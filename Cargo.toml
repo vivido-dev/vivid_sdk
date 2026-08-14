@@ -11,12 +11,14 @@ repository = "https://github.com/vivido-dev/vivid_sdk"
 [features]
 # An in-process Vivid 1.5 presenter for producer tests. Off by default: it is only compiled into
 # crates that ask for it, and it never affects a production build of the SDK.
+default = ["native-media"]
+native-media = ["vivid_protocol/native"]
 testing = []
 
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.4"
-vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features = false, features = ["native-transport"] }
 
 [dev-dependencies]
 tempfile = "3"

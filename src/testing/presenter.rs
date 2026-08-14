@@ -834,10 +834,14 @@ fn accept_secondary_connections(
                     serve_interactive_lane(stream, shared, key, script, lane_writer, stop)
                 }));
             }
-            _ => {
+            vivid_protocol::wire::ConnectionKind::Track => {
                 workers.push(thread::spawn(move || {
                     serve_track_channel(stream, shared, key, script)
                 }));
+            }
+            vivid_protocol::wire::ConnectionKind::Control
+            | vivid_protocol::wire::ConnectionKind::FileTransfer => {
+                // The test presenter advertises neither a second control leg nor file-drop-v1.
             }
         }
     }
