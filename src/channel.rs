@@ -665,14 +665,26 @@ impl TrackChannel {
             }
             media_state.recovery_revision
         };
-        let mut track_sequence = lock(&self.track_sequence, "track media sequence")?;
-        let mut next_sequence = *track_sequence;
+        // Validate this record against the accepted sequence, then release the lock before
+        // transport I/O and merge the result afterwards.
+        //
+        // `send_order` above is what orders media sends against each other, so this lock only
+        // protects the value. Holding it across the write hands a media write that blocks — a
+        // presenter that has stopped reading because it is holding decoded output for PLAY — the
+        // power to stall every control request that reconciles `TRACK_STATUS`, which is exactly
+        // the observer the producer needs in order to issue that PLAY and unblock its own write.
+        let mut next_sequence = *lock(&self.track_sequence, "track media sequence")?;
         next_sequence.accept(media_id, epoch)?;
         let sequence =
             self.write_charged_record(record_type, configuration.track_id, body_length, body)?;
-        *track_sequence = next_sequence;
-        track_sequence.last_record_sequence = sequence;
-        drop(track_sequence);
+        {
+            // Merge rather than overwrite: a control reply may have reconciled the presenter's
+            // view while this record was in transport, and both are monotone progress.
+            let mut track_sequence = lock(&self.track_sequence, "track media sequence")?;
+            track_sequence.last_id = track_sequence.last_id.max(next_sequence.last_id);
+            track_sequence.last_epoch = track_sequence.last_epoch.max(next_sequence.last_epoch);
+            track_sequence.last_record_sequence = track_sequence.last_record_sequence.max(sequence);
+        }
         let mut media_state = lock(&self.media, "channel media state")?;
         media_state.last_sequence = sequence;
         if recovery_unit && media_state.recovery_revision == recovery_revision {
@@ -1149,6 +1161,15 @@ mod tests {
             .expect("test transport never blocked");
         let reader_can_publish_credit = channel.flow.state.try_lock().is_ok();
         let reader_can_publish_recovery = channel.media.try_lock().is_ok();
+        let control_can_reconcile_status = channel.track_sequence.try_lock().is_ok();
+        // A presenter holding decoded output for PLAY stops reading, which blocks the producer's
+        // next media write. Every control request the producer could use to notice that and issue
+        // PLAY reconciles TRACK_STATUS through this lock, so a write that holds it deadlocks the
+        // producer against itself. The reconcile that gets through must also survive the write.
+        if let Ok(mut sequence) = channel.track_sequence.try_lock() {
+            sequence.last_id = 99;
+            sequence.last_epoch = 7;
+        }
         {
             let mut media = channel
                 .media
@@ -1168,8 +1189,18 @@ mod tests {
             "a blocked media write held the state lock needed by NEED_KEYFRAME"
         );
         assert!(
+            control_can_reconcile_status,
+            "a blocked media write held the sequence lock every TRACK_STATUS reconcile takes"
+        );
+        assert!(
             channel.media.lock().unwrap().needs_recovery,
             "the completed in-flight frame erased a newer recovery request"
+        );
+        let sequence = *channel.track_sequence.lock().unwrap();
+        assert_eq!(
+            (sequence.last_id, sequence.last_epoch),
+            (99, 7),
+            "the completed in-flight record overwrote presenter progress instead of merging it"
         );
     }
 }
