@@ -862,7 +862,7 @@ pub(crate) fn apply_track_lost(
     let track_id = required_u64(payload, 2)?;
     let error_code = required_u64(payload, 3)?;
     let revision = TrackRevision::new(required_u64(payload, 4)?);
-    let _detail = ErrorDetail::new(required_map(payload, 5)?.to_vec()).map_err(io::Error::other)?;
+    let detail = ErrorDetail::new(required_map(payload, 5)?.to_vec()).map_err(io::Error::other)?;
     let diagnostic = required_text(payload, 6)?;
     if track_id != object_id
         || context_id == 0
@@ -884,6 +884,11 @@ pub(crate) fn apply_track_lost(
         }
         state.revision = revision;
         state.destroyed = true;
+        state.lost = Some(TrackLostError {
+            code: error_code,
+            detail,
+            diagnostic: diagnostic.to_owned(),
+        });
         state.active_media = None;
         let active_flow = state.active_flow.take();
         close_track_flow(active_flow.as_ref(), diagnostic);

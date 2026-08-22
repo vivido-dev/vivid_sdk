@@ -64,6 +64,7 @@ pub(crate) use wire::{
 pub use channel::{SendPressure, TrackChannel};
 pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
+    TrackLostError,
 };
 pub use controller::{
     ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
@@ -997,6 +998,13 @@ mod tests {
 
         assert!(lock(&first.inner, "track").unwrap().destroyed);
         assert!(!lock(&second.inner, "track").unwrap().destroyed);
+        let lost = session.open_track_channel(&first).unwrap_err();
+        let lost = lost
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<TrackLostError>())
+            .expect("the actionable presenter loss is preserved");
+        assert_eq!(lost.code, 18);
+        assert_eq!(lost.diagnostic, "decoder lost");
         assert_eq!(
             first_channel
                 .send_raster(0, 1, &[0, 0, 0, 255].repeat(4), false)

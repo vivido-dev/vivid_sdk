@@ -67,6 +67,33 @@ impl std::fmt::Display for PresenterError {
 
 impl std::error::Error for PresenterError {}
 
+/// A terminal track failure reported asynchronously by the presenter.
+///
+/// Unlike [`PresenterError`], this is not a rejection of a correlated request. The presenter may
+/// report it while the producer is sending media, so subsequent operations on the handle return
+/// this stored cause instead of the less useful fact that the track is no longer live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackLostError {
+    /// Stable presenter error code describing the failure class.
+    pub code: u64,
+    /// Validated structured failure detail supplied by the presenter.
+    pub detail: ErrorDetail,
+    /// Bounded display-only diagnostic supplied by the presenter.
+    pub diagnostic: String,
+}
+
+impl std::fmt::Display for TrackLostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Vivid presenter lost the track with error {}: {}",
+            self.code, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for TrackLostError {}
+
 impl From<messages::ErrorReply> for PresenterError {
     fn from(value: messages::ErrorReply) -> Self {
         Self {

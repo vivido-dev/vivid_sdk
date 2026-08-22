@@ -271,6 +271,9 @@ pub(crate) fn ensure_live_surface(state: &SurfaceLocal) -> io::Result<()> {
 
 pub(crate) fn ensure_live_track(state: &TrackLocal) -> io::Result<()> {
     if state.destroyed {
+        if let Some(error) = &state.lost {
+            return Err(io::Error::other(error.clone()));
+        }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             "track is destroyed",
