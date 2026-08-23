@@ -1,6 +1,6 @@
 [package]
 name = "vivid_sdk"
-version = "1.5.2"
+version = "1.5.3"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.87.0"
@@ -18,7 +18,9 @@ testing = []
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.4"
-vivid_protocol = { version = "1.5.1", path = "../vivid_protocol", default-features = false, features = ["native-transport"] }
+vivid_protocol = { version = "1.5.1", path = "../vivid_protocol", default-features = false, features = [
+  "native-transport",
+] }
 
 [dev-dependencies]
 tempfile = "3"
