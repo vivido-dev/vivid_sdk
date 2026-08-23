@@ -117,8 +117,8 @@ pub use vivid_protocol::media::RasterDeltaOperation;
 pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
     AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
-    DESKTOP_SURFACE, FILE_DROP, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT,
-    TERMINAL_SURFACE, TIMED_MEDIA,
+    DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY,
+    TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA,
 };
 pub use vivid_protocol::revision::FileTransferGeneration;
 pub use vivid_protocol::scene::{Fit, SceneNode};

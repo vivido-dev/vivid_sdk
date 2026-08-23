@@ -179,6 +179,8 @@ pub struct IncomingFileTransfer {
     writer: ConnectionWriter,
     request: IncomingFileTransferRequest,
     flow: FileTransferFlow,
+    /// Whether this session negotiated `file-drop-path-v1` and may disclose a committed path.
+    committed_path_allowed: bool,
 }
 
 impl std::fmt::Debug for IncomingFileTransfer {
@@ -272,6 +274,15 @@ impl IncomingFileTransfer {
 
     pub fn send_result(&self, result: &FileResult) -> io::Result<()> {
         self.validate_generation(result.transfer_id, result.transfer_generation)?;
+        // A presenter that never negotiated the profile rejects key 5 outright, which would fail
+        // the whole transfer. Catch it here so a caller that forgets the check gets a local error
+        // instead of poisoning the connection.
+        if result.committed_path.is_some() && !self.committed_path_allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file-drop-path-v1 was not negotiated",
+            ));
+        }
         self.writer.write_record(
             records::FILE_RESULT,
             0,
@@ -566,6 +577,7 @@ impl Session {
             reader,
             writer,
             request,
+            committed_path_allowed: self.supports(FILE_DROP_PATH),
             flow: FileTransferFlow::new(
                 request.transfer_generation,
                 request.resume_offset,
