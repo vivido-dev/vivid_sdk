@@ -25,6 +25,19 @@ pub(crate) struct FlowSync {
     pub(crate) changed: Condvar,
 }
 
+struct ChannelHandleLifetime {
+    flow: Arc<FlowSync>,
+}
+
+impl Drop for ChannelHandleLifetime {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.flow.state.lock() {
+            state.closed = true;
+            self.flow.changed.notify_all();
+        }
+    }
+}
+
 pub(crate) struct FlowLocal {
     pub(crate) flow: ChannelFlow,
     pub(crate) initial_maximum_body_bytes: u64,
@@ -91,6 +104,7 @@ pub struct TrackChannel {
     pub(crate) events: Arc<Mutex<VecDeque<ChannelEvent>>>,
     pub(crate) rate: Option<Arc<Mutex<ChannelRateState>>>,
     pub(crate) pressure: Arc<Mutex<SendPressure>>,
+    _handle_lifetime: Arc<ChannelHandleLifetime>,
 }
 
 impl std::fmt::Debug for TrackChannel {
@@ -237,6 +251,7 @@ impl TrackChannel {
                 events.clone(),
             )?;
         }
+        let handle_lifetime = Arc::new(ChannelHandleLifetime { flow: flow.clone() });
         Ok(Self {
             track,
             generation: snapshot.channel_generation,
@@ -263,6 +278,7 @@ impl TrackChannel {
                 }))
             }),
             pressure: Arc::new(Mutex::new(SendPressure::default())),
+            _handle_lifetime: handle_lifetime,
         })
     }
 
@@ -792,15 +808,6 @@ impl TrackChannel {
     }
 }
 
-impl Drop for TrackChannel {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.flow.state.lock() {
-            state.closed = true;
-            self.flow.changed.notify_all();
-        }
-    }
-}
-
 impl Session {
     pub fn open_track_channel(&self, track: &Track) -> io::Result<TrackChannel> {
         self.lifecycle.ensure_active()?;
@@ -1137,6 +1144,14 @@ mod tests {
             )
             .unwrap();
         let mut channel = session.open_track_channel(&track).unwrap();
+
+        // A worker and its owner commonly hold cloned handles to the same channel. Retiring a
+        // temporary owner-side clone must not close the sender's shared flow state.
+        drop(channel.clone());
+        assert!(
+            !channel.flow.state.lock().unwrap().closed,
+            "dropping one TrackChannel clone closed every remaining handle"
+        );
 
         let armed = Arc::new(AtomicBool::new(false));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
