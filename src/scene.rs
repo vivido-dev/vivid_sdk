@@ -417,3 +417,241 @@ impl Session {
         output.flush()
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Terminal-grid placement
+//
+// Contain-fit of a fixed-size source into the terminal grid, in 32.32 fixed-point cells. Shared
+// because every terminal producer needs exactly this and the integer arithmetic is easy to get
+// subtly wrong; the grid metrics come from the negotiated target descriptor, never from an ioctl,
+// because through `vvssh` or inside `vvmux` the local terminal is not the presenter's terminal.
+// ---------------------------------------------------------------------------------------------
+
+/// Grid metrics of the `terminal-surface-v1` target, extracted from the target descriptor.
+///
+/// Vivid 1.5 carries these on the negotiated target instead of a producer-side display state, so
+/// they are read from the session and never from an ioctl or an escape-sequence query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalDisplay {
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub cell_width: u32,
+    pub cell_height: u32,
+}
+
+/// Grid-cell coordinate space of the terminal target.
+pub const COORDINATE_SPACE_GRID_CELL: u64 = 1;
+/// The text layer between the background and glyph layers of the target.
+pub const TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH: u64 = 1;
+
+const FIXED_ONE: i128 = 1_i128 << 32;
+
+/// A contain-fit rectangle in 32.32 fixed-point terminal cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPlacement {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub source_width: u32,
+    pub source_height: u32,
+    status_row: u32,
+}
+
+impl TerminalPlacement {
+    /// Fit `source_width` by `source_height` into the grid, reserving the last row for status.
+    pub fn calculate(
+        display: TerminalDisplay,
+        source_width: u32,
+        source_height: u32,
+    ) -> io::Result<Self> {
+        Self::calculate_mode(display, source_width, source_height, true)
+    }
+
+    /// Fit into the whole grid with no status row reserved.
+    pub fn calculate_full(
+        display: TerminalDisplay,
+        source_width: u32,
+        source_height: u32,
+    ) -> io::Result<Self> {
+        Self::calculate_mode(display, source_width, source_height, false)
+    }
+
+    fn calculate_mode(
+        display: TerminalDisplay,
+        source_width: u32,
+        source_height: u32,
+        reserve_status_row: bool,
+    ) -> io::Result<Self> {
+        let reserved_rows = if reserve_status_row { 1 } else { 0 };
+        if source_width == 0
+            || source_height == 0
+            || display.grid_columns == 0
+            || display.grid_rows < 1 + reserved_rows
+            || display.cell_width == 0
+            || display.cell_height == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "display or source geometry cannot reserve a streaming area",
+            ));
+        }
+        let available_columns = i128::from(display.grid_columns);
+        let available_rows = i128::from(display.grid_rows - reserved_rows);
+        let available_width_px = available_columns
+            .checked_mul(i128::from(display.cell_width))
+            .ok_or_else(overflow)?;
+        let available_height_px = available_rows
+            .checked_mul(i128::from(display.cell_height))
+            .ok_or_else(overflow)?;
+        let source_width = i128::from(source_width);
+        let source_height = i128::from(source_height);
+        let width_limited_height = available_width_px
+            .checked_mul(source_height)
+            .and_then(|value| value.checked_div(source_width))
+            .ok_or_else(overflow)?;
+        let (render_width_px, render_height_px) = if width_limited_height <= available_height_px {
+            (available_width_px, width_limited_height)
+        } else {
+            let width = available_height_px
+                .checked_mul(source_width)
+                .and_then(|value| value.checked_div(source_height))
+                .ok_or_else(overflow)?;
+            (width, available_height_px)
+        };
+        let x_px = (available_width_px - render_width_px) / 2;
+        let y_px = (available_height_px - render_height_px) / 2;
+        let fixed = |pixels: i128, cell: u32| -> io::Result<i64> {
+            pixels
+                .checked_mul(FIXED_ONE)
+                .and_then(|value| value.checked_div(i128::from(cell)))
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(overflow)
+        };
+        Ok(Self {
+            x: fixed(x_px, display.cell_width)?,
+            y: fixed(y_px, display.cell_height)?,
+            width: fixed(render_width_px, display.cell_width)?,
+            height: fixed(render_height_px, display.cell_height)?,
+            source_width: u32::try_from(source_width).expect("input was u32"),
+            source_height: u32::try_from(source_height).expect("input was u32"),
+            status_row: display.grid_rows - reserved_rows,
+        })
+    }
+
+    /// The grid row the status line is drawn on, the first row below the media rectangle.
+    pub fn status_row(self) -> u32 {
+        self.status_row
+    }
+
+    /// The scene node that places this surface on the terminal grid.
+    pub fn node(self, node_id: u64, surface_context_id: u64, surface_id: u64) -> SceneNode {
+        SceneNode {
+            owning_context_id: surface_context_id,
+            node_id,
+            surface_context_id,
+            surface_id,
+            geometry: vec![
+                (0, Value::Unsigned(COORDINATE_SPACE_GRID_CELL)),
+                (1, Value::Unsigned(u64::try_from(self.x).unwrap_or(0))),
+                (2, Value::Unsigned(u64::try_from(self.y).unwrap_or(0))),
+                (3, Value::Unsigned(u64::try_from(self.width).unwrap_or(0))),
+                (4, Value::Unsigned(u64::try_from(self.height).unwrap_or(0))),
+                (5, Value::Unsigned(TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH)),
+            ],
+            fit: vivid_protocol::scene::Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        }
+    }
+}
+
+fn overflow() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "scene geometry overflow")
+}
+
+#[cfg(test)]
+mod terminal_placement_tests {
+    use super::*;
+
+    fn display(columns: u32, rows: u32) -> TerminalDisplay {
+        TerminalDisplay {
+            grid_columns: columns,
+            grid_rows: rows,
+            cell_width: 10,
+            cell_height: 20,
+        }
+    }
+
+    #[test]
+    fn contains_wide_video_and_reserves_status_row() {
+        let placement = TerminalPlacement::calculate(display(80, 25), 1920, 1080).unwrap();
+        assert!(placement.height <= 24_i64 << 32);
+        assert!(placement.x >= 0);
+        assert!(placement.y >= 0);
+        assert_eq!(placement.status_row(), 24);
+    }
+
+    #[test]
+    fn full_mode_uses_every_row() {
+        let reserved = TerminalPlacement::calculate(display(80, 25), 1920, 1080).unwrap();
+        let full = TerminalPlacement::calculate_full(display(80, 25), 1920, 1080).unwrap();
+        assert_eq!(full.status_row(), 25);
+        assert!(full.height >= reserved.height);
+    }
+
+    #[test]
+    fn tall_source_is_pillarboxed() {
+        let placement = TerminalPlacement::calculate(display(80, 25), 800, 1200).unwrap();
+        assert!(placement.x > 0, "a tall source must leave side margins");
+        assert!(placement.height <= 24_i64 << 32);
+    }
+
+    #[test]
+    fn never_exceeds_the_available_grid() {
+        for (source_width, source_height) in [(1920, 1080), (800, 1200), (640, 480), (65, 33)] {
+            let placement =
+                TerminalPlacement::calculate(display(80, 25), source_width, source_height).unwrap();
+            assert!(placement.x + placement.width <= 80_i64 << 32);
+            assert!(placement.y + placement.height <= 24_i64 << 32);
+        }
+    }
+
+    #[test]
+    fn rejects_degenerate_geometry() {
+        // One row cannot hold both a status row and any media.
+        assert!(TerminalPlacement::calculate(display(80, 1), 640, 480).is_err());
+        assert!(TerminalPlacement::calculate(display(0, 25), 640, 480).is_err());
+        assert!(TerminalPlacement::calculate(display(80, 25), 0, 480).is_err());
+        assert!(TerminalPlacement::calculate(display(80, 25), 640, 0).is_err());
+        let zero_cell = TerminalDisplay {
+            grid_columns: 80,
+            grid_rows: 25,
+            cell_width: 0,
+            cell_height: 20,
+        };
+        assert!(TerminalPlacement::calculate(zero_cell, 640, 480).is_err());
+    }
+
+    #[test]
+    fn node_encodes_grid_cell_geometry() {
+        let placement = TerminalPlacement::calculate(display(80, 25), 1280, 720).unwrap();
+        let node = placement.node(7, 2, 3);
+        assert_eq!(node.node_id, 7);
+        assert_eq!(node.surface_context_id, 2);
+        assert_eq!(node.surface_id, 3);
+        assert_eq!(
+            node.geometry[0],
+            (0, Value::Unsigned(COORDINATE_SPACE_GRID_CELL))
+        );
+        assert_eq!(
+            node.geometry[5],
+            (5, Value::Unsigned(TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH))
+        );
+        assert!(node.visible);
+        assert_eq!(node.opacity, u16::MAX);
+    }
+}

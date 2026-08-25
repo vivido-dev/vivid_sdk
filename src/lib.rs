@@ -85,10 +85,13 @@ pub use lease::{ContextReady, SessionLeaseReady};
 pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
 pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
-    AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, TrackSender, VideoPacketData,
-    recover_channel,
+    AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, MINIMUM_TARGET_BITS_PER_SECOND,
+    TrackSender, VideoPacketData, VideoRateControl, VideoRateSnapshot, recover_channel,
 };
-pub use scene::{SceneCommit, SlotBinding};
+pub use scene::{
+    COORDINATE_SPACE_GRID_CELL, SceneCommit, SlotBinding, TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+    TerminalDisplay, TerminalPlacement,
+};
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
 pub use track::{Track, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied};
