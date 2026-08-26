@@ -136,6 +136,7 @@ pub struct TestPresenter {
     endpoint: String,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
+    control_shutdown: Arc<Mutex<Option<TcpStream>>>,
     control_writer: Arc<Mutex<Option<TcpStream>>>,
     sequence: Arc<Mutex<u64>>,
     target: Arc<Mutex<Target>>,
@@ -165,6 +166,7 @@ impl TestPresenter {
         let endpoint = format!("tcp:{}", listener.local_addr()?);
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let control_shutdown = Arc::new(Mutex::new(None));
         let control_writer = Arc::new(Mutex::new(None));
         let sequence = Arc::new(Mutex::new(0));
         let target = Arc::new(Mutex::new(Target {
@@ -176,6 +178,7 @@ impl TestPresenter {
         let join = {
             let shared = shared.clone();
             let stop = stop.clone();
+            let control_shutdown = control_shutdown.clone();
             let control_writer = control_writer.clone();
             let sequence = sequence.clone();
             let target = target.clone();
@@ -188,6 +191,7 @@ impl TestPresenter {
                         listener,
                         shared,
                         stop,
+                        control_shutdown,
                         control_writer,
                         sequence,
                         target,
@@ -201,6 +205,7 @@ impl TestPresenter {
             endpoint,
             shared,
             stop,
+            control_shutdown,
             control_writer,
             sequence,
             target,
@@ -338,7 +343,10 @@ impl TestPresenter {
 impl Drop for TestPresenter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.control_writer.lock()
+        // Wake an accepted connection even when it has not completed the handshake yet. The
+        // serving thread installs this clone while holding the same mutex and checks `stop` before
+        // doing so, which closes the race between this take and its handoff.
+        if let Ok(mut guard) = self.control_shutdown.lock()
             && let Some(stream) = guard.take()
         {
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -400,6 +408,7 @@ struct Serving {
     listener: TcpListener,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
+    control_shutdown: Arc<Mutex<Option<TcpStream>>>,
     control_writer: Arc<Mutex<Option<TcpStream>>>,
     sequence: Arc<Mutex<u64>>,
     target: Arc<Mutex<Target>>,
@@ -407,11 +416,22 @@ struct Serving {
     lane_writer: Arc<Mutex<Option<(TcpStream, u64)>>>,
 }
 
+struct ControlShutdownGuard(Arc<Mutex<Option<TcpStream>>>);
+
+impl Drop for ControlShutdownGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.take();
+        }
+    }
+}
+
 fn serve(serving: Serving) -> io::Result<()> {
     let Serving {
         listener,
         shared,
         stop,
+        control_shutdown,
         control_writer,
         sequence,
         target,
@@ -421,8 +441,18 @@ fn serve(serving: Serving) -> io::Result<()> {
     let initial_target = *target.lock().expect("target");
     let address = listener.local_addr()?;
     let (mut control, _) = listener.accept()?;
-    control.set_read_timeout(Some(Duration::from_secs(10)))?;
-    control.set_write_timeout(Some(Duration::from_secs(10)))?;
+    {
+        let mut guard = control_shutdown.lock().expect("control shutdown");
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        *guard = Some(control.try_clone()?);
+    }
+    let _control_shutdown_guard = ControlShutdownGuard(control_shutdown);
+    // No read or write timeout here. A presenter serves until its peer closes the connection or
+    // the harness drops it: a mid-session timeout would abandon a still-open session, and every
+    // request the producer sends afterwards would wait forever for a reply nobody will read.
+    // Drop shuts the stream down, which is the wake-up this loop needs.
     let mut preface_bytes = [0_u8; PREFACE_SIZE];
     control.read_exact(&mut preface_bytes)?;
     let _ = Preface::decode(preface_bytes)?;
@@ -826,22 +856,34 @@ fn accept_secondary_connections(
         let shared = shared.clone();
         let key = Secret32::new(*channel_key.expose());
         let script = script.clone();
+        let shutdown = stream.try_clone()?;
         match preface.kind {
             vivid_protocol::wire::ConnectionKind::Lane => {
                 let lane_writer = lane_writer.clone();
                 let stop = stop.clone();
-                workers.push(thread::spawn(move || {
-                    serve_interactive_lane(stream, shared, key, script, lane_writer, stop)
-                }));
+                workers.push((
+                    thread::spawn(move || {
+                        serve_interactive_lane(stream, shared, key, script, lane_writer, stop)
+                    }),
+                    shutdown,
+                ));
             }
-            _ => {
-                workers.push(thread::spawn(move || {
-                    serve_track_channel(stream, shared, key, script)
-                }));
+            vivid_protocol::wire::ConnectionKind::Track => {
+                workers.push((
+                    thread::spawn(move || serve_track_channel(stream, shared, key, script)),
+                    shutdown,
+                ));
+            }
+            vivid_protocol::wire::ConnectionKind::Control
+            | vivid_protocol::wire::ConnectionKind::FileTransfer => {
+                // The test presenter advertises neither a second control leg nor file-drop-v1.
             }
         }
     }
-    for worker in workers {
+    // A producer may leave secondary channels open when the control session ends. Wake every
+    // worker before joining so teardown is prompt and no test-owned thread outlives its presenter.
+    for (worker, stream) in workers {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         let _ = worker.join();
     }
     Ok(())
@@ -1188,4 +1230,54 @@ fn generous_contract() -> ResourceContract {
     );
     contract.set(Resource::MediaRecordBody, 16 * 1024 * 1024);
     contract
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn assert_drop_completes(presenter: TestPresenter) {
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(presenter);
+            dropped.send(()).expect("drop observer");
+        });
+        observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("presenter drop blocked");
+        dropper.join().expect("drop thread");
+    }
+
+    #[test]
+    fn drop_wakes_an_unaccepted_control_connection() {
+        let presenter = TestPresenter::start(80, 24).expect("presenter");
+        assert_drop_completes(presenter);
+    }
+
+    #[test]
+    fn drop_wakes_an_incomplete_control_handshake() {
+        let presenter = TestPresenter::start(80, 24).expect("presenter");
+        let _stalled_peer = TcpStream::connect(
+            presenter
+                .endpoint()
+                .strip_prefix("tcp:")
+                .expect("TCP endpoint"),
+        )
+        .expect("connect stalled peer");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while presenter
+            .control_shutdown
+            .lock()
+            .expect("control shutdown")
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "presenter did not accept peer");
+            thread::yield_now();
+        }
+
+        assert_drop_completes(presenter);
+    }
 }

@@ -37,6 +37,7 @@ pub(crate) struct TrackLocal {
     pub(crate) active_flow: Option<Weak<FlowSync>>,
     pub(crate) active_media: Option<Weak<Mutex<ChannelMediaState>>>,
     pub(crate) destroyed: bool,
+    pub(crate) lost: Option<TrackLostError>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -403,6 +404,7 @@ impl Session {
             active_flow: None,
             active_media: None,
             destroyed: false,
+            lost: None,
         }));
         lock(&self.tracks, "track registry")?.insert(key, inner.clone());
         Ok(Track { inner })

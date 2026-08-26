@@ -76,6 +76,10 @@ pub enum SessionEvent {
         object_id: u64,
         payload: PayloadMap,
     },
+    /// A user-originated regular file was dropped on an effective presenter binding.
+    FileDropOffered(FileDropOffer),
+    /// The presenter cancelled an offered or accepted drop asynchronously.
+    FileDropCancelled(CancelFileDrop),
     Other {
         record_type: u16,
         object_id: u64,
@@ -818,7 +822,7 @@ pub(crate) fn spawn_control_reader(
                         apply_track_lost(record.object_id, &envelope.payload, &tracks)?;
                     }
                     let event =
-                        session_event(record.record_type, record.object_id, envelope.payload);
+                        session_event(record.record_type, record.object_id, envelope.payload)?;
                     let mut events = lock(&pending.events, "control event queue")?;
                     if events.len() == MAX_CONTROL_EVENTS {
                         return Err(invalid_data("control event queue exceeded its bound"));
@@ -858,7 +862,7 @@ pub(crate) fn apply_track_lost(
     let track_id = required_u64(payload, 2)?;
     let error_code = required_u64(payload, 3)?;
     let revision = TrackRevision::new(required_u64(payload, 4)?);
-    let _detail = ErrorDetail::new(required_map(payload, 5)?.to_vec()).map_err(io::Error::other)?;
+    let detail = ErrorDetail::new(required_map(payload, 5)?.to_vec()).map_err(io::Error::other)?;
     let diagnostic = required_text(payload, 6)?;
     if track_id != object_id
         || context_id == 0
@@ -880,6 +884,11 @@ pub(crate) fn apply_track_lost(
         }
         state.revision = revision;
         state.destroyed = true;
+        state.lost = Some(TrackLostError {
+            code: error_code,
+            detail,
+            diagnostic: diagnostic.to_owned(),
+        });
         state.active_media = None;
         let active_flow = state.active_flow.take();
         close_track_flow(active_flow.as_ref(), diagnostic);

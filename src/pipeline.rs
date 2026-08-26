@@ -3,11 +3,14 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::revision::ChannelGeneration;
 
-use crate::{ChannelEvent, RequestMetadata, Session, Track, TrackChannel, invalid_data, lock};
+use crate::{
+    ChannelEvent, RequestMetadata, SendPressure, Session, Track, TrackChannel, invalid_data, lock,
+};
 
 /// A single-slot atomic, latest-wins capture boundary with a drop counter.
 pub struct LatestFrame<T> {
@@ -564,6 +567,381 @@ mod tests {
                     data: vec![0; 64],
                 }))
                 .is_ok()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Closed-loop video bitrate control
+//
+// A producer cannot measure the link directly, so it measures where its sends actually wait. Only
+// `SendPressure::transport` means the link will not take the bytes: the declared-rate limiter is
+// self-imposed, and channel-flow waiting means the presenter is behind on *records*, which fewer
+// bits per frame would not help.
+//
+// Getting this wrong is not a matter of tuning. If the bitrate answers a frame-rate limit, the
+// bytes delivered fall in proportion to the target, the next window sees an even lower delivered
+// rate, and the loop decays to the floor with no fixed point: the picture degrades to a blurry
+// mess over a few seconds while the link sits idle. Hence both the transport-only signal and the
+// delivered-target guard in `next_target`.
+// ---------------------------------------------------------------------------------------------
+
+/// Encoder targets move in whole steps so ordinary jitter cannot cause a re-open.
+const RATE_STEP_BITS_PER_SECOND: u64 = 250_000;
+/// Below this the picture is no longer worth the bits; the frame rate absorbs the rest.
+pub const MINIMUM_TARGET_BITS_PER_SECOND: u64 = 400_000;
+/// One decision per window. Shorter windows chase individual key frames.
+const RATE_WINDOW: Duration = Duration::from_millis(1_000);
+/// The share of a window spent inside the transport write that counts as congestion.
+const CONGESTED_TRANSPORT_PERCENT: u64 = 10;
+/// Below this the link is carrying everything offered and the target may grow again.
+const UNCONGESTED_TRANSPORT_PERCENT: u64 = 2;
+/// Audio backlog that means the session is congested even if video happens not to be blocked.
+const CONGESTED_AUDIO_BACKLOG_US: u64 = 250_000;
+/// Delivering this share of the target means the target is not what is limiting the stream, so
+/// lowering it cannot help. Without this the loop has no fixed point and decays to the floor.
+const DELIVERED_TARGET_PERCENT: u64 = 90;
+
+pub struct VideoRateControl {
+    configured_bits_per_second: u64,
+    target_bits_per_second: AtomicU64,
+    inner: Mutex<RateWindow>,
+}
+
+struct RateWindow {
+    started: Instant,
+    bytes: u64,
+    pressure: SendPressure,
+    audio_backlog_us: u64,
+    adjustments: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoRateSnapshot {
+    pub configured_bits_per_second: u64,
+    pub target_bits_per_second: u64,
+    pub adjustments: u64,
+    pub rate_limited: Duration,
+    pub flow_limited: Duration,
+    pub transport: Duration,
+}
+
+impl VideoRateControl {
+    pub fn new(configured_bits_per_second: u64) -> Self {
+        let configured = configured_bits_per_second.max(MINIMUM_TARGET_BITS_PER_SECOND);
+        Self {
+            configured_bits_per_second: configured,
+            target_bits_per_second: AtomicU64::new(configured),
+            inner: Mutex::new(RateWindow {
+                started: Instant::now(),
+                bytes: 0,
+                pressure: SendPressure::default(),
+                audio_backlog_us: 0,
+                adjustments: 0,
+            }),
+        }
+    }
+
+    pub fn target(&self) -> u64 {
+        self.target_bits_per_second.load(Ordering::Acquire)
+    }
+
+    pub fn configured(&self) -> u64 {
+        self.configured_bits_per_second
+    }
+
+    /// Account one completed media send: its body size and where the send waited.
+    pub fn observe_send(&self, bytes: usize, pressure: SendPressure) {
+        let mut window = self.lock();
+        window.bytes = window
+            .bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        window.pressure.rate_limited = window
+            .pressure
+            .rate_limited
+            .saturating_add(pressure.rate_limited);
+        window.pressure.flow_limited = window
+            .pressure
+            .flow_limited
+            .saturating_add(pressure.flow_limited);
+        window.pressure.transport = window.pressure.transport.saturating_add(pressure.transport);
+        window.pressure.records = window.pressure.records.saturating_add(pressure.records);
+    }
+
+    /// Audio that cannot be handed to the transport is congestion the video target has to answer
+    /// for: audio is two orders of magnitude cheaper, so if it is backing up, video is the cause.
+    pub fn observe_audio_backlog(&self, queued_duration_us: u64) {
+        let mut window = self.lock();
+        window.audio_backlog_us = window.audio_backlog_us.max(queued_duration_us);
+    }
+
+    /// Close the window if it is due and return a changed target.
+    pub fn poll(&self) -> Option<u64> {
+        let mut window = self.lock();
+        let elapsed = window.started.elapsed();
+        if elapsed < RATE_WINDOW {
+            return None;
+        }
+        let current = self.target_bits_per_second.load(Ordering::Acquire);
+        let next = next_target(
+            current,
+            self.configured_bits_per_second,
+            achieved_bits_per_second(window.bytes, elapsed),
+            blocked_percent(window.pressure.transport, elapsed),
+            window.audio_backlog_us,
+        );
+        window.started = Instant::now();
+        window.bytes = 0;
+        window.pressure = SendPressure::default();
+        window.audio_backlog_us = 0;
+        if next == current {
+            return None;
+        }
+        window.adjustments = window.adjustments.saturating_add(1);
+        self.target_bits_per_second.store(next, Ordering::Release);
+        Some(next)
+    }
+
+    pub fn snapshot(&self) -> VideoRateSnapshot {
+        let window = self.lock();
+        VideoRateSnapshot {
+            configured_bits_per_second: self.configured_bits_per_second,
+            target_bits_per_second: self.target_bits_per_second.load(Ordering::Acquire),
+            adjustments: window.adjustments,
+            rate_limited: window.pressure.rate_limited,
+            flow_limited: window.pressure.flow_limited,
+            transport: window.pressure.transport,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RateWindow> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn achieved_bits_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    let micros = elapsed.as_micros().max(1);
+    u64::try_from(u128::from(bytes).saturating_mul(8_000_000) / micros).unwrap_or(u64::MAX)
+}
+
+fn blocked_percent(blocked: Duration, elapsed: Duration) -> u64 {
+    let micros = elapsed.as_micros().max(1);
+    u64::try_from(blocked.as_micros().saturating_mul(100) / micros)
+        .unwrap_or(100)
+        .min(100)
+}
+
+/// The control law, split out so the decision is testable without a transport.
+///
+/// `transport_percent` is the share of the window spent inside the transport write — deliberately
+/// not the total time `send` blocked, which also covers this producer's own rate limiter and the
+/// presenter's channel-flow window. Neither of those is answered by encoding at a lower rate.
+fn next_target(
+    current: u64,
+    configured: u64,
+    achieved_bits_per_second: u64,
+    transport_percent: u64,
+    audio_backlog_us: u64,
+) -> u64 {
+    // If the target is reaching the presenter, the target is not the constraint. Whatever else is
+    // slow — the encoder, the camera, the presenter's decode — lowering the bitrate only spends
+    // the same frames worse, and each lower target would make the next window look worse still.
+    // This is the guard that gives the loop a fixed point.
+    let delivering = achieved_bits_per_second.saturating_mul(100)
+        >= current.saturating_mul(DELIVERED_TARGET_PERCENT);
+    let link_full = transport_percent >= CONGESTED_TRANSPORT_PERCENT && !delivering;
+    // Audio is two orders of magnitude cheaper than video. If it cannot reach the transport, the
+    // session is over-subscribed whatever the video sends look like.
+    let over_subscribed = audio_backlog_us >= CONGESTED_AUDIO_BACKLOG_US;
+    let candidate = if link_full || over_subscribed {
+        // Back off from whatever the link actually carried, not from what was asked for: a target
+        // that only ever halves itself takes far too long to reach a link an order of magnitude
+        // slower than the configured ceiling.
+        let reference = if achieved_bits_per_second > 0 {
+            current.min(achieved_bits_per_second)
+        } else {
+            current
+        };
+        reference.saturating_mul(7) / 8
+    } else if transport_percent <= UNCONGESTED_TRANSPORT_PERCENT
+        && audio_backlog_us < CONGESTED_AUDIO_BACKLOG_US
+    {
+        current.saturating_add(configured / 8)
+    } else {
+        current
+    };
+    quantize_target(candidate, configured)
+}
+
+fn quantize_target(candidate: u64, configured: u64) -> u64 {
+    let clamped = candidate.clamp(MINIMUM_TARGET_BITS_PER_SECOND, configured);
+    if clamped >= configured {
+        return configured;
+    }
+    (clamped / RATE_STEP_BITS_PER_SECOND)
+        .saturating_mul(RATE_STEP_BITS_PER_SECOND)
+        .max(MINIMUM_TARGET_BITS_PER_SECOND)
+}
+
+#[cfg(test)]
+mod video_rate_tests {
+    use super::*;
+
+    const CONFIGURED: u64 = 4_000_000;
+
+    #[test]
+    fn an_idle_link_climbs_back_to_the_configured_ceiling() {
+        let mut target = 1_000_000;
+        for _ in 0..64 {
+            target = next_target(target, CONFIGURED, target, 0, 0);
+        }
+        assert_eq!(target, CONFIGURED);
+    }
+
+    #[test]
+    fn a_congested_link_backs_off() {
+        let lowered = next_target(CONFIGURED, CONFIGURED, 1_000_000, 50, 0);
+        assert!(
+            lowered < CONFIGURED,
+            "a blocked transport must lower the target, got {lowered}"
+        );
+    }
+
+    #[test]
+    fn back_off_references_the_achieved_rate_not_the_target() {
+        // A link carrying 1 Mbps against a 4 Mbps target must fall towards 1 Mbps in one step,
+        // not shave an eighth off 4 Mbps. Repeatedly halving the *target* takes far too long to
+        // reach a link an order of magnitude slower than the ceiling.
+        let from_achieved = next_target(CONFIGURED, CONFIGURED, 1_000_000, 50, 0);
+        assert!(
+            from_achieved <= 1_000_000,
+            "expected a step towards the achieved rate, got {from_achieved}"
+        );
+    }
+
+    #[test]
+    fn delivering_the_target_prevents_the_decay_to_the_floor() {
+        // The fixed-point guard: transport time is high, but the link is carrying the full
+        // target, so something other than the bitrate is slow and lowering it cannot help.
+        let held = next_target(CONFIGURED, CONFIGURED, CONFIGURED, 90, 0);
+        assert_eq!(held, CONFIGURED);
+
+        // And it must hold across repeated windows rather than merely surviving one.
+        let mut target = CONFIGURED;
+        for _ in 0..32 {
+            target = next_target(target, CONFIGURED, target, 90, 0);
+        }
+        assert_eq!(target, CONFIGURED);
+    }
+
+    #[test]
+    fn audio_backlog_alone_triggers_a_back_off() {
+        // Video is not blocked at all, but audio cannot reach the transport, so the session is
+        // over-subscribed and video is the only thing big enough to be the cause.
+        let lowered = next_target(
+            CONFIGURED,
+            CONFIGURED,
+            CONFIGURED,
+            0,
+            CONGESTED_AUDIO_BACKLOG_US,
+        );
+        assert!(lowered < CONFIGURED, "got {lowered}");
+        // Just under the threshold must not.
+        let held = next_target(
+            CONFIGURED,
+            CONFIGURED,
+            CONFIGURED,
+            0,
+            CONGESTED_AUDIO_BACKLOG_US - 1,
+        );
+        assert_eq!(held, CONFIGURED);
+    }
+
+    #[test]
+    fn never_falls_below_the_floor() {
+        let mut target = CONFIGURED;
+        for _ in 0..200 {
+            target = next_target(target, CONFIGURED, 1, 100, 0);
+        }
+        assert_eq!(target, MINIMUM_TARGET_BITS_PER_SECOND);
+    }
+
+    #[test]
+    fn targets_are_quantized_to_whole_steps() {
+        // Whole steps are what keep ordinary jitter from re-opening the encoder every window.
+        for candidate in [500_001, 1_234_567, 3_999_999] {
+            let quantized = quantize_target(candidate, CONFIGURED);
+            assert_eq!(
+                quantized % RATE_STEP_BITS_PER_SECOND,
+                0,
+                "{candidate} quantized to {quantized}"
+            );
+            assert!(quantized <= candidate);
+        }
+        assert_eq!(quantize_target(CONFIGURED + 1, CONFIGURED), CONFIGURED);
+        assert_eq!(
+            quantize_target(0, CONFIGURED),
+            MINIMUM_TARGET_BITS_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn a_moderate_transport_share_holds_the_target_steady() {
+        // Between the congested and uncongested thresholds the loop does nothing, so it does not
+        // oscillate around the boundary.
+        let held = next_target(2_000_000, CONFIGURED, 2_000_000, 5, 0);
+        assert_eq!(held, 2_000_000);
+    }
+
+    #[test]
+    fn observed_sends_accumulate_into_the_window() {
+        let control = VideoRateControl::new(CONFIGURED);
+        assert_eq!(control.target(), CONFIGURED);
+        control.observe_send(
+            1_024,
+            SendPressure {
+                transport: Duration::from_millis(5),
+                records: 1,
+                ..SendPressure::default()
+            },
+        );
+        control.observe_send(
+            2_048,
+            SendPressure {
+                transport: Duration::from_millis(5),
+                records: 1,
+                ..SendPressure::default()
+            },
+        );
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.transport, Duration::from_millis(10));
+        assert_eq!(snapshot.configured_bits_per_second, CONFIGURED);
+        assert_eq!(snapshot.adjustments, 0);
+        // The window is not due yet, so no decision is taken.
+        assert_eq!(control.poll(), None);
+    }
+
+    #[test]
+    fn a_configured_rate_below_the_floor_is_raised_to_it() {
+        let control = VideoRateControl::new(1_000);
+        assert_eq!(control.target(), MINIMUM_TARGET_BITS_PER_SECOND);
+        assert_eq!(control.configured(), MINIMUM_TARGET_BITS_PER_SECOND);
+    }
+
+    #[test]
+    fn rate_helpers_handle_degenerate_windows() {
+        assert_eq!(achieved_bits_per_second(0, Duration::ZERO), 0);
+        assert_eq!(blocked_percent(Duration::ZERO, Duration::ZERO), 0);
+        // Blocked longer than the window is still reported as fully blocked, not more.
+        assert_eq!(
+            blocked_percent(Duration::from_secs(10), Duration::from_secs(1)),
+            100
+        );
+        assert_eq!(
+            achieved_bits_per_second(1_000, Duration::from_secs(1)),
+            8_000
         );
     }
 }

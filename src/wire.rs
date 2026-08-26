@@ -16,8 +16,12 @@ use vivid_protocol::wire::Record;
 
 use crate::*;
 
-pub(crate) fn session_event(record_type: u16, object_id: u64, payload: PayloadMap) -> SessionEvent {
-    match record_type {
+pub(crate) fn session_event(
+    record_type: u16,
+    object_id: u64,
+    payload: PayloadMap,
+) -> io::Result<SessionEvent> {
+    Ok(match record_type {
         messages::TARGET_CHANGED => SessionEvent::TargetChanged(payload),
         messages::ANCHOR_READY => SessionEvent::AnchorReady {
             context_id: optional_u64(&payload, 0)
@@ -39,12 +43,22 @@ pub(crate) fn session_event(record_type: u16, object_id: u64, payload: PayloadMa
         },
         messages::TRACK_LOST => SessionEvent::TrackLost { object_id, payload },
         messages::CONTEXT_CHANGED => SessionEvent::ContextChanged { object_id, payload },
+        messages::FILE_DROP_OFFER => SessionEvent::FileDropOffered(
+            vivid_protocol::file_drop::FileDropOffer::decode(object_id, &Value::Map(payload))?,
+        ),
+        messages::FILE_DROP_CANCELLED => {
+            SessionEvent::FileDropCancelled(vivid_protocol::file_drop::CancelFileDrop::decode(
+                "FILE_DROP_CANCELLED",
+                object_id,
+                &Value::Map(payload),
+            )?)
+        }
         _ => SessionEvent::Other {
             record_type,
             object_id,
             payload,
         },
-    }
+    })
 }
 
 pub(crate) fn session_info(welcome: &messages::Welcome) -> SessionInfo {
@@ -257,6 +271,9 @@ pub(crate) fn ensure_live_surface(state: &SurfaceLocal) -> io::Result<()> {
 
 pub(crate) fn ensure_live_track(state: &TrackLocal) -> io::Result<()> {
     if state.destroyed {
+        if let Some(error) = &state.lost {
+            return Err(io::Error::other(error.clone()));
+        }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             "track is destroyed",

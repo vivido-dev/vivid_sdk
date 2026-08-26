@@ -18,6 +18,7 @@ mod channel;
 mod config;
 mod controller;
 mod desktop;
+mod file_drop;
 mod guard;
 mod handshake;
 mod input;
@@ -63,6 +64,7 @@ pub(crate) use wire::{
 pub use channel::{SendPressure, TrackChannel};
 pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
+    TrackLostError,
 };
 pub use controller::{
     ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
@@ -71,6 +73,10 @@ pub use controller::{
     worker_context,
 };
 pub use desktop::DesktopSession;
+pub use file_drop::{
+    FileDropBindingGuard, IncomingFileTransfer, IncomingFileTransferEvent,
+    IncomingFileTransferRequest,
+};
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
@@ -79,10 +85,13 @@ pub use lease::{ContextReady, SessionLeaseReady};
 pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
 pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
-    AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, TrackSender, VideoPacketData,
-    recover_channel,
+    AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, MINIMUM_TARGET_BITS_PER_SECOND,
+    TrackSender, VideoPacketData, VideoRateControl, VideoRateSnapshot, recover_channel,
 };
-pub use scene::{SceneCommit, SlotBinding};
+pub use scene::{
+    COORDINATE_SPACE_GRID_CELL, SceneCommit, SlotBinding, TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
+    TerminalDisplay, TerminalPlacement,
+};
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
 pub use track::{Track, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied};
@@ -91,8 +100,14 @@ pub use vivid_protocol::messages::LaneClass;
 pub use vivid_protocol::wire::ConnectionKind;
 
 pub use vivid_protocol::context::{
-    ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE, OP_SCENE,
-    OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE,
+    OP_RECEIVE_FILE_DROP, OP_SCENE, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+};
+pub use vivid_protocol::file_drop::{
+    AcceptFileDrop, AdvanceFileTransfer, CancelFileDrop, FileDropAccepted, FileDropBinding,
+    FileDropBindingState, FileDropDestination, FileDropGrant, FileDropOffer, FileDropState,
+    FileDropStatus, FileDropTuple, FileFinish, FileResult, FileResultCode, FileTransferAbort,
+    FileTransferAccepted, FileTransferAdvanced, MaximumFileData, QueryFileDrop,
 };
 pub use vivid_protocol::geometry::Rotation;
 pub use vivid_protocol::input::{
@@ -105,9 +120,10 @@ pub use vivid_protocol::media::RasterDeltaOperation;
 pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
     AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
-    DESKTOP_SURFACE, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY, TERMINAL_CONTENT,
-    TERMINAL_SURFACE, TIMED_MEDIA,
+    DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY,
+    TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA,
 };
+pub use vivid_protocol::revision::FileTransferGeneration;
 pub use vivid_protocol::scene::{Fit, SceneNode};
 pub use vivid_protocol::surface::{
     CoordinateModel, DesktopSurfaceParameters, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
@@ -985,6 +1001,13 @@ mod tests {
 
         assert!(lock(&first.inner, "track").unwrap().destroyed);
         assert!(!lock(&second.inner, "track").unwrap().destroyed);
+        let lost = session.open_track_channel(&first).unwrap_err();
+        let lost = lost
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<TrackLostError>())
+            .expect("the actionable presenter loss is preserved");
+        assert_eq!(lost.code, 18);
+        assert_eq!(lost.diagnostic, "decoder lost");
         assert_eq!(
             first_channel
                 .send_raster(0, 1, &[0, 0, 0, 255].repeat(4), false)
