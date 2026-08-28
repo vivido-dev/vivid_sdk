@@ -27,6 +27,7 @@ pub(crate) struct FlowSync {
 
 struct ChannelHandleLifetime {
     flow: Arc<FlowSync>,
+    writer: ConnectionWriter,
 }
 
 impl Drop for ChannelHandleLifetime {
@@ -35,6 +36,7 @@ impl Drop for ChannelHandleLifetime {
             state.closed = true;
             self.flow.changed.notify_all();
         }
+        let _ = self.writer.shutdown();
     }
 }
 
@@ -251,7 +253,10 @@ impl TrackChannel {
                 events.clone(),
             )?;
         }
-        let handle_lifetime = Arc::new(ChannelHandleLifetime { flow: flow.clone() });
+        let handle_lifetime = Arc::new(ChannelHandleLifetime {
+            flow: flow.clone(),
+            writer: writer.clone(),
+        });
         Ok(Self {
             track,
             generation: snapshot.channel_generation,
@@ -665,10 +670,16 @@ impl TrackChannel {
     }
 
     pub fn close(&self) -> io::Result<()> {
-        let mut state = lock(&self.flow.state, "channel flow state")?;
-        state.closed = true;
-        self.flow.changed.notify_all();
-        Ok(())
+        {
+            let mut state = lock(&self.flow.state, "channel flow state")?;
+            state.closed = true;
+            self.flow.changed.notify_all();
+        }
+        // The reverse-channel reader owns the other half of this independent connection. Closing
+        // only local flow leaves both that reader and the presenter's connection handler blocked,
+        // so repeated channel generations eventually exhaust the presenter's connection budget.
+        // Transport shutdown wakes both sides and is shared by every TrackChannel clone.
+        self.writer.shutdown()
     }
 
     pub(crate) fn send_media(
