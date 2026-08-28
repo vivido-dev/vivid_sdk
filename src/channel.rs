@@ -346,6 +346,26 @@ impl TrackChannel {
         }
     }
 
+    /// Whether one more media record of `body_length` bytes fits the current window right now.
+    ///
+    /// This is a non-blocking read of the same absolute cumulative flow the send path charges, for
+    /// a producer that must not enter a wait only the presenter can end - one servicing keyboard
+    /// input on the thread that writes media, for instance. It is a point-in-time answer: a `true`
+    /// is only authoritative for the single sender that asked.
+    pub fn media_credit_available(&self, body_length: u32) -> bool {
+        if self.lifecycle.ensure_active().is_err() {
+            return false;
+        }
+        let Ok(state) = self.flow.state.lock() else {
+            return false;
+        };
+        if state.closed {
+            return false;
+        }
+        let mut admitted = state.flow;
+        admitted.admit(body_length).is_ok()
+    }
+
     pub fn send_video(&self, packet: VideoPacket<'_>) -> io::Result<u64> {
         if self.track.kind() != TrackKind::Video {
             return Err(invalid_input("VIDEO_PACKET requires a video track"));
