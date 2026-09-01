@@ -1,6 +1,6 @@
 [package]
 name = "vivid_sdk"
-version = "1.5.4"
+version = "1.5.5"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.87.0"
