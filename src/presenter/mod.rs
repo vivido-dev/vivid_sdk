@@ -15,11 +15,13 @@
 mod config;
 mod listener;
 mod service;
+mod socket;
 mod transport;
 
 pub use config::*;
 pub use listener::{ConnectionCancel, PresenterListener, Transport};
 pub use service::*;
+pub use socket::SocketListener;
 pub use transport::{Reader, Writer};
 
 /// Why a presenter asked its producer for a keyframe.

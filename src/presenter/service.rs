@@ -2000,7 +2000,11 @@ impl VirtualVivid {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    /// Block until this pane holds media a capture could compose, or the timeout elapses.
+    ///
+    /// Not test-only despite having started that way: any consumer that captures a pane needs to
+    /// know when there is something to capture, and a bounded condvar wait is strictly better than
+    /// the polling loop it would otherwise write.
     pub fn wait_for_retained_media(&self, pane: PaneId, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = lock(&self.state);
