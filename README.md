@@ -1,6 +1,11 @@
 # vivid_sdk
 
-`vivid_sdk` is the full-duplex Rust producer SDK for Vivid Protocol 1.5.
+`vivid_sdk` is the full-duplex Rust SDK for Vivid Protocol 1.5. It serves both roles: the crate
+root is the producer, and [`presenter`](src/presenter/) — behind the off-by-default `presenter`
+feature — is the terminating presenter that accepts one.
+
+A presenter is namespaced rather than flattened into the crate root, because the two roles name some
+things alike: a presenter's `SceneNode` is its own projection of a node, not the producer's.
 
 Version 1.5 is a direct, breaking cutover. The SDK no longer exposes Vivid 1.1 sources, media
 tickets, feature IDs, rolling credits, attachment generations, or source-scoped scenes. Its public

@@ -78,6 +78,20 @@ pub(crate) fn session_info(welcome: &messages::Welcome) -> SessionInfo {
     }
 }
 
+/// The body of a `PONG`, which is the `PING` payload returned unchanged.
+///
+/// One helper rather than three literals: the test presenter used to answer with an empty envelope
+/// while the real presenter and this crate's own producer echoed, so a producer regression that
+/// dropped the payload passed against the fake and would have failed against Vivido. Keeping the
+/// construction in one place is what stops the two from drifting apart again.
+#[cfg(any(feature = "presenter", feature = "testing"))]
+pub(crate) fn pong_body(
+    request_id: u64,
+    payload: PayloadMap,
+) -> Result<Vec<u8>, messages::MessageError> {
+    messages::Envelope::new(request_id, payload).encode()
+}
+
 pub(crate) fn decoded_payload(record: &Record) -> io::Result<PayloadMap> {
     Ok(messages::decode_control(&record.body)?.payload)
 }
@@ -317,5 +331,34 @@ pub(crate) fn signed(value: i64) -> Value {
         Value::Unsigned(value as u64)
     } else {
         Value::Negative(value)
+    }
+}
+
+#[cfg(all(test, any(feature = "presenter", feature = "testing")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pong_returns_the_ping_payload_unchanged() {
+        let payload: PayloadMap = vec![(0, Value::Unsigned(7)), (1, Value::Text("probe".into()))];
+        let body = pong_body(41, payload.clone()).expect("encode");
+        let decoded = messages::decode_control(&body).expect("decode");
+
+        assert_eq!(decoded.request_id, 41, "the PONG correlates to its PING");
+        assert_eq!(
+            decoded.payload, payload,
+            "a PONG carries the PING payload byte for byte, which an empty envelope did not"
+        );
+    }
+
+    #[test]
+    fn an_empty_ping_payload_stays_empty() {
+        let body = pong_body(1, Vec::new()).expect("encode");
+        let decoded = messages::decode_control(&body).expect("decode");
+
+        assert!(
+            decoded.payload.is_empty(),
+            "nothing is invented for an empty PING"
+        );
     }
 }

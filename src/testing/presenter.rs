@@ -792,7 +792,13 @@ fn serve(serving: Serving) -> io::Result<()> {
                     )?,
                 )
             }
-            messages::PING => (messages::PONG, messages::ok(request_id)),
+            // Echo the payload, as every real presenter and the SDK's own producer do. Replying
+            // with an empty envelope let a producer regression that dropped the payload pass here
+            // and fail against Vivido.
+            messages::PING => (
+                messages::PONG,
+                crate::wire::pong_body(request_id, envelope.payload.clone())?,
+            ),
             _ => (messages::OK, messages::ok(request_id)),
         };
 

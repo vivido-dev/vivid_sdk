@@ -205,13 +205,11 @@ impl Session {
         self.surfaces.remove(&(context_id, surface_id));
         lock(&self.tracks, "track registry")?.retain(|(context, owner, _), state| {
             let keep = *context != context_id || *owner != surface_id;
-            if !keep {
-                if let Ok(mut state) = state.lock() {
-                    state.destroyed = true;
-                    let active_flow = state.active_flow.take();
-                    state.active_media = None;
-                    close_track_flow(active_flow.as_ref(), "owning surface destroyed");
-                }
+            if !keep && let Ok(mut state) = state.lock() {
+                state.destroyed = true;
+                let active_flow = state.active_flow.take();
+                state.active_media = None;
+                close_track_flow(active_flow.as_ref(), "owning surface destroyed");
             }
             keep
         });

@@ -1,4 +1,4 @@
-//! Full-duplex producer SDK for Vivid Protocol 1.5.
+//! Full-duplex producer and presenter SDK for Vivid Protocol 1.5.
 //!
 //! The public object model deliberately follows the 1.5 wire model:
 //!
@@ -11,6 +11,11 @@
 //! The crate is organized by wire concern — one module per object family — and every public item
 //! is re-exported here, so `vivid_sdk::Session` and its neighbours keep the paths producers
 //! already use. Module boundaries are an implementation detail; the public surface is this file.
+//!
+//! [`presenter`] is the exception, and stays namespaced. It is the other role rather than another
+//! object family, and the two roles name some things alike: a presenter's `SceneNode` is its own
+//! projection of a node, not the producer's [`SceneNode`]. `vivid_sdk::presenter::` keeps that
+//! distinction visible instead of resolving it by collision.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +37,8 @@ mod scene;
 mod session;
 mod surface;
 
+#[cfg(feature = "presenter")]
+pub mod presenter;
 mod target;
 #[cfg(feature = "testing")]
 pub mod testing;
