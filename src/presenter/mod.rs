@@ -14,12 +14,14 @@
 
 mod config;
 mod listener;
+pub(crate) mod resource;
 mod service;
 mod socket;
 mod transport;
 
 pub use config::*;
 pub use listener::{ConnectionCancel, PresenterListener, Transport};
+pub use resource::{Binding, MediaResourceDescription, ResourceError, TrackFacts};
 pub use service::*;
 pub use socket::SocketListener;
 pub use transport::{Reader, Writer};

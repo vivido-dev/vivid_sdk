@@ -693,6 +693,9 @@ struct State {
     nodes: HashMap<NodeKey, NodeEntry>,
     transactions: HashMap<(u64, u64, u64), Vec<NodeMutation>>,
     next_session: u64,
+    /// Media resources this instance has minted, by opaque id.
+    resources: HashMap<String, crate::presenter::resource::ResourceRecord>,
+    next_resource: u64,
     projection_revision: u64,
     projected_sources: HashSet<SourceKey>,
     /// Decoder-reset serial acknowledged by the outer presenter for each projected source.
@@ -796,6 +799,8 @@ impl VirtualVivid {
             nodes: HashMap::new(),
             transactions: HashMap::new(),
             next_session: 0,
+            resources: HashMap::new(),
+            next_resource: 0,
             projection_revision: 0,
             projected_sources: HashSet::new(),
             projected_decoder_resets: HashMap::new(),
@@ -1998,6 +2003,150 @@ impl VirtualVivid {
                 ..relay
             },
         }
+    }
+
+    /// Mint an opaque reference to media this presenter holds.
+    ///
+    /// The id is minted here rather than by the producer or the mesh, because only the runtime
+    /// holding the content knows how it was composed. It is scoped to this instance and means
+    /// nothing to any other one — including the far side of a gateway, which must mint its own.
+    ///
+    /// A pinned reference captures every revision, generation and epoch now, and will refuse to
+    /// resolve once any of them moves. A live reference remembers only the surface.
+    pub fn announce_media_resource(
+        &self,
+        source: SourceKey,
+        binding: crate::presenter::Binding,
+    ) -> Result<String, crate::presenter::ResourceError> {
+        use crate::presenter::resource::{PinnedFacts, ResourceRecord};
+
+        let mut state = lock(&self.state);
+        let Some((key, track)) = state
+            .tracks
+            .iter()
+            .find(|(key, _)| bridge_track_key(**key) == source)
+            .map(|(key, track)| (*key, track))
+        else {
+            // Announcing a track that is not here would mint an id guaranteed to be stale, which
+            // is a worse answer than refusing.
+            return Err(crate::presenter::ResourceError::Unknown);
+        };
+        let Some(surface) = state.surfaces.get(&key.surface) else {
+            return Err(crate::presenter::ResourceError::Unknown);
+        };
+
+        let pinned = match binding {
+            crate::presenter::Binding::Pinned => Some(PinnedFacts {
+                track_id: key.track,
+                surface_revision: surface.state.revision.get(),
+                surface_generation: surface.state.generation.get(),
+                track_revision: track.state.revision.get(),
+                channel_generation: track.state.channel_generation.get(),
+                media_epoch: track.state.media_epoch,
+            }),
+            crate::presenter::Binding::Live => None,
+        };
+        let record = ResourceRecord {
+            producer: key.surface.session,
+            context_id: key.surface.context,
+            surface_id: key.surface.surface,
+            pinned,
+        };
+
+        // Qualified by this presenter instance so an id minted by a restarted runtime cannot be
+        // mistaken for one of its predecessor's, and opaque so nothing reads structure into it.
+        state.next_resource = state.next_resource.saturating_add(1);
+        let instance = state
+            .presenter
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let id = format!("{instance}-{}", state.next_resource);
+        state.resources.insert(id.clone(), record);
+        Ok(id)
+    }
+
+    /// Resolve a resource against this instance's current state.
+    ///
+    /// A pinned reference that no longer matches returns [`ResourceError::Stale`] and never the
+    /// content that replaced it. Answering with whatever is there now would be the media equivalent
+    /// of an address retargeting after a tab is reordered: the caller asked for one thing and would
+    /// be handed another with no way to tell.
+    ///
+    /// [`ResourceError::Stale`]: crate::presenter::ResourceError::Stale
+    pub fn describe_media_resource(
+        &self,
+        id: &str,
+    ) -> Result<crate::presenter::MediaResourceDescription, crate::presenter::ResourceError> {
+        use crate::presenter::{MediaResourceDescription, ResourceError, TrackFacts};
+
+        let state = lock(&self.state);
+        let record = *state.resources.get(id).ok_or(ResourceError::Unknown)?;
+
+        // Both kinds die with their owner: a session that is gone cannot be described, and its
+        // numbers may already belong to somebody else.
+        if !state.sessions.contains_key(&record.producer) {
+            return Err(ResourceError::Stale);
+        }
+        let surface_key = SurfaceKey {
+            session: record.producer,
+            context: record.context_id,
+            surface: record.surface_id,
+        };
+        let surface = state
+            .surfaces
+            .get(&surface_key)
+            .ok_or(ResourceError::Stale)?;
+
+        let facts = |key: TrackKey, track: &TrackEntry| TrackFacts {
+            track_id: key.track,
+            revision: track.state.revision.get(),
+            channel_generation: track.state.channel_generation.get(),
+            media_epoch: track.state.media_epoch,
+            capturable: has_retained_media(track),
+        };
+
+        let track = match record.pinned {
+            Some(pinned) => {
+                let key = TrackKey {
+                    surface: surface_key,
+                    track: pinned.track_id,
+                };
+                let track = state.tracks.get(&key).ok_or(ResourceError::Stale)?;
+                let current = facts(key, track);
+                let unchanged = surface.state.revision.get() == pinned.surface_revision
+                    && surface.state.generation.get() == pinned.surface_generation
+                    && current.revision == pinned.track_revision
+                    && current.channel_generation == pinned.channel_generation
+                    && current.media_epoch == pinned.media_epoch;
+                if !unchanged {
+                    return Err(ResourceError::Stale);
+                }
+                Some(current)
+            }
+            None => state
+                .tracks
+                .iter()
+                .filter(|(key, _)| key.surface == surface_key)
+                .min_by_key(|(key, _)| key.track)
+                .map(|(key, track)| facts(*key, track)),
+        };
+
+        Ok(MediaResourceDescription {
+            binding: record.binding(),
+            producer: record.producer,
+            context_id: record.context_id,
+            surface_id: record.surface_id,
+            surface_revision: surface.state.revision.get(),
+            surface_generation: surface.state.generation.get(),
+            track,
+        })
+    }
+
+    /// Forget a resource. A reference to it then reports as unknown rather than stale.
+    pub fn release_media_resource(&self, id: &str) -> bool {
+        lock(&self.state).resources.remove(id).is_some()
     }
 
     /// Block until this pane holds media a capture could compose, or the timeout elapses.
