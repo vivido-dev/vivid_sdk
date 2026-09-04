@@ -5,22 +5,27 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use pyo3::create_exception;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::messages::{LaneClass, TrackKind};
 use vivid_protocol::track::{
     AudioConfiguration, ImageConfiguration, KindConfiguration, RasterConfiguration,
     TrackConfiguration, TrackMode, VideoConfiguration,
 };
+use vivid_sdk::presenter::{
+    CaptureContent, MediaConfig, PresenterConfig, PresenterListener, SocketListener, VirtualVivid,
+};
 use vivid_sdk::{
     CoordinateModel, GENERIC_CONTENT, ProducerAuthentication, ProducerConfig, RequestMetadata,
     Session, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, Track,
     TrackChannel, TrackWaitCondition,
 };
+use vivid_sdk::{DesktopTarget, OutputDescriptor, Rotation};
 
 create_exception!(_native, VividError, PyOSError);
 create_exception!(_native, ClosedHandleError, VividError);
@@ -47,6 +52,41 @@ impl PySession {
             ),
             None => "<vivid_sdk.Session closed=True>".into(),
         })
+    }
+}
+
+/// A running presenter.
+///
+/// The presenter's own threads are pure Rust and never acquire the GIL. That holds only because
+/// nothing here takes a Python callback: the listener is supplied as an endpoint string and built
+/// in Rust, so a Python exception can never surface inside an accept loop. Keep it that way.
+#[pyclass(name = "Presenter", module = "vivid_sdk._native")]
+struct PyPresenter {
+    inner: Mutex<Option<VirtualVivid>>,
+    endpoint: String,
+}
+
+#[pymethods]
+impl PyPresenter {
+    #[getter]
+    fn closed(&self) -> PyResult<bool> {
+        Ok(lock(&self.inner, "presenter")?.is_none())
+    }
+
+    #[getter]
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        // The endpoint is addressing, not capability material. Pane secrets are returned to the
+        // caller and never held here, so there is nothing else that could leak through a repr.
+        let closed = lock(&self.inner, "presenter")?.is_none();
+        Ok(format!(
+            "<vivid_sdk.Presenter endpoint='{}' closed={}>",
+            self.endpoint,
+            if closed { "True" } else { "False" }
+        ))
     }
 }
 
@@ -774,6 +814,220 @@ fn kind_name(kind: TrackKind) -> &'static str {
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (endpoint, desktop=None, retained_bytes=None))]
+fn presenter_start(
+    py: Python<'_>,
+    endpoint: &str,
+    desktop: Option<(u32, u32)>,
+    retained_bytes: Option<u64>,
+) -> PyResult<PyPresenter> {
+    let mut media = MediaConfig::default();
+    if let Some(bytes) = retained_bytes {
+        media.aggregate_retained_bytes = bytes;
+    }
+    let config = match desktop {
+        Some((width, height)) => PresenterConfig::desktop(media, desktop_target(width, height)),
+        None => PresenterConfig::terminal(media),
+    };
+
+    let (presenter, endpoint) = py
+        .detach(|| {
+            let listener = SocketListener::bind(endpoint)?;
+            let resolved = listener.endpoint();
+            let presenter = VirtualVivid::start_configured(listener, config, None)?;
+            io::Result::Ok((presenter, resolved))
+        })
+        .map_err(io_error)?;
+
+    Ok(PyPresenter {
+        inner: Mutex::new(Some(presenter)),
+        endpoint,
+    })
+}
+
+fn desktop_target(width: u32, height: u32) -> DesktopTarget {
+    DesktopTarget {
+        origin_x: 0,
+        origin_y: 0,
+        width,
+        height,
+        settled: true,
+        topology_revision: 1,
+        outputs: vec![OutputDescriptor {
+            output_id: 1,
+            origin_x: 0,
+            origin_y: 0,
+            width,
+            height,
+            scale_numerator: 1,
+            scale_denominator: 1,
+            rotation: Rotation::None,
+            primary: true,
+        }],
+    }
+}
+
+#[pyfunction]
+fn presenter_close(py: Python<'_>, presenter: PyRef<'_, PyPresenter>) -> PyResult<()> {
+    let taken = lock(&presenter.inner, "presenter")?.take();
+    // Dropping signals shutdown and wakes the accept and delivery waiters. Do it off the GIL: the
+    // presenter's threads may be mid-write when it happens.
+    py.detach(move || drop(taken));
+    Ok(())
+}
+
+#[pyfunction]
+fn presenter_issue_pane_capability(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+) -> PyResult<String> {
+    let guard = lock(&presenter.inner, "presenter")?;
+    let value = guard.as_ref().ok_or_else(closed_presenter)?;
+    py.detach(|| value.issue_pane_capability(pane))
+        .map_err(io_error)
+}
+
+#[pyfunction]
+fn presenter_revoke_pane(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+) -> PyResult<()> {
+    let guard = lock(&presenter.inner, "presenter")?;
+    let value = guard.as_ref().ok_or_else(closed_presenter)?;
+    py.detach(|| value.revoke_pane(pane));
+    Ok(())
+}
+
+#[pyfunction]
+fn presenter_update_metrics(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+    columns: u16,
+    rows: u16,
+    cell_width: u16,
+    cell_height: u16,
+) -> PyResult<()> {
+    let guard = lock(&presenter.inner, "presenter")?;
+    let value = guard.as_ref().ok_or_else(closed_presenter)?;
+    py.detach(|| value.update_metrics(pane, columns, rows, (cell_width, cell_height)));
+    Ok(())
+}
+
+#[pyfunction]
+fn presenter_wait_for_media(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+    timeout_us: u64,
+) -> PyResult<bool> {
+    let guard = lock(&presenter.inner, "presenter")?;
+    let value = guard.as_ref().ok_or_else(closed_presenter)?;
+    Ok(py.detach(|| value.wait_for_retained_media(pane, Duration::from_micros(timeout_us))))
+}
+
+#[pyfunction]
+fn presenter_capture_pane(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+    viewport_offset: usize,
+) -> PyResult<Py<PyDict>> {
+    let capture = {
+        let guard = lock(&presenter.inner, "presenter")?;
+        let value = guard.as_ref().ok_or_else(closed_presenter)?;
+        py.detach(|| value.capture_pane(pane, viewport_offset))
+    };
+
+    let layers = PyList::empty(py);
+    for layer in &capture.layers {
+        let entry = PyDict::new(py);
+        entry.set_item("source", source_key(py, layer.source)?)?;
+        entry.set_item("node_id", layer.node_id)?;
+        entry.set_item("z_index", layer.z_index)?;
+        entry.set_item("x", layer.x)?;
+        entry.set_item("y", layer.y)?;
+        entry.set_item("width", layer.width)?;
+        entry.set_item("height", layer.height)?;
+        let content = PyDict::new(py);
+        match &layer.content {
+            CaptureContent::Raster(raster) => {
+                content.set_item("kind", "raster")?;
+                content.set_item("epoch", raster.epoch)?;
+                content.set_item("frame_id", raster.frame_id)?;
+                content.set_item("width", raster.width)?;
+                content.set_item("height", raster.height)?;
+                // A copy, deliberately. The retained buffer is behind the presenter's mutex and is
+                // mutated by media threads; a memoryview into it would outlive the guard.
+                content.set_item("rgba", PyBytes::new(py, &raster.pixels))?;
+            }
+            CaptureContent::EncodedImage(bytes) => {
+                content.set_item("kind", "encoded_image")?;
+                content.set_item("data", PyBytes::new(py, bytes))?;
+            }
+        }
+        entry.set_item("content", content)?;
+        layers.append(entry)?;
+    }
+
+    let skipped = PyList::empty(py);
+    for entry in &capture.skipped {
+        let item = PyDict::new(py);
+        item.set_item("source", source_key(py, entry.source)?)?;
+        item.set_item("node_id", entry.node_id)?;
+        item.set_item("reason", entry.reason.as_str())?;
+        skipped.append(item)?;
+    }
+
+    let result = PyDict::new(py);
+    result.set_item("layers", layers)?;
+    result.set_item("skipped", skipped)?;
+    Ok(result.unbind())
+}
+
+#[pyfunction]
+fn presenter_pane_media_summary(
+    py: Python<'_>,
+    presenter: PyRef<'_, PyPresenter>,
+    pane: u64,
+) -> PyResult<Py<PyDict>> {
+    let summary = {
+        let guard = lock(&presenter.inner, "presenter")?;
+        let value = guard.as_ref().ok_or_else(closed_presenter)?;
+        py.detach(|| value.pane_media_summary(pane))
+    };
+
+    let tracks = PyList::empty(py);
+    for track in &summary.tracks {
+        let entry = PyDict::new(py);
+        entry.set_item("source", source_key(py, track.source)?)?;
+        entry.set_item("kind", track.kind)?;
+        entry.set_item("capturable", track.capturable)?;
+        tracks.append(entry)?;
+    }
+
+    let result = PyDict::new(py);
+    result.set_item("surfaces", &summary.surfaces)?;
+    result.set_item("tracks", tracks)?;
+    Ok(result.unbind())
+}
+
+fn source_key(py: Python<'_>, source: vivid_sdk::presenter::SourceKey) -> PyResult<Py<PyDict>> {
+    let entry = PyDict::new(py);
+    entry.set_item("producer", source.producer)?;
+    entry.set_item("context", source.context)?;
+    entry.set_item("surface", source.surface)?;
+    entry.set_item("track", source.track)?;
+    Ok(entry.unbind())
+}
+
+fn closed_presenter() -> PyErr {
+    ClosedHandleError::new_err("presenter is closed")
+}
+
 fn lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> PyResult<MutexGuard<'a, T>> {
     mutex
         .lock()
@@ -804,6 +1058,7 @@ fn io_error(error: io::Error) -> PyErr {
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("VividError", py.get_type::<VividError>())?;
     module.add("ClosedHandleError", py.get_type::<ClosedHandleError>())?;
+    module.add_class::<PyPresenter>()?;
     module.add_class::<PySession>()?;
     module.add_class::<PySurface>()?;
     module.add_class::<PyTrack>()?;
@@ -830,5 +1085,13 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(place_terminal_surface, module)?)?;
     module.add_function(wrap_pyfunction!(delete_node, module)?)?;
     module.add_function(wrap_pyfunction!(anchor_marker, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_start, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_close, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_issue_pane_capability, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_revoke_pane, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_update_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_wait_for_media, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_capture_pane, module)?)?;
+    module.add_function(wrap_pyfunction!(presenter_pane_media_summary, module)?)?;
     Ok(())
 }

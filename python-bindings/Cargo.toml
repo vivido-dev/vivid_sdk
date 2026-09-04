@@ -17,4 +17,5 @@ doctest = false
 [dependencies]
 pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
 vivid_protocol = { version = "1.5", path = "../../vivid_protocol" }
-vivid_sdk = { version = "1.5", path = ".." }
+# The wheel carries both roles: one artifact, a producer and a presenter.
+vivid_sdk = { version = "1.5", path = "..", features = ["presenter"] }

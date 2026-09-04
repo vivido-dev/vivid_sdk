@@ -46,7 +46,9 @@ from . import send_video as _send_video
 from . import session_info as _session_info
 from . import supports as _supports
 from . import update_surface as _update_surface
+from . import presenter as _presenter_module
 from . import wait_track as _wait_track
+from .presenter import PaneCapture, PaneMediaSummary, Presenter
 
 
 _T = TypeVar("_T")
@@ -265,3 +267,56 @@ async def anchor_marker(
         context_id=context_id,
         anchor_id=anchor_id,
     )
+
+
+class _PresenterFacade:
+    """The presenter API, mirrored as coroutines.
+
+    Every call runs in a worker thread and is cancellation-safe the same way the producer facade is:
+    cancelling waits for the native call to finish rather than abandoning a handle while Rust is
+    mutating it. :func:`wait_for_media` is the one that matters here — it blocks for its whole
+    timeout, and running it on the event loop thread would stall every other task.
+    """
+
+    @staticmethod
+    async def start(endpoint: str, **options: Any) -> Presenter:
+        return await _run(_presenter_module.start, endpoint, **options)
+
+    @staticmethod
+    def endpoint(presenter: Presenter) -> str:
+        # A field read, not a call into the presenter. Left synchronous rather than wrapped in a
+        # thread that would cost more than the read.
+        return _presenter_module.endpoint(presenter)
+
+    @staticmethod
+    async def close(presenter: Presenter) -> None:
+        await _run(_presenter_module.close, presenter)
+
+    @staticmethod
+    async def issue_pane_capability(presenter: Presenter, pane: int) -> str:
+        return await _run(_presenter_module.issue_pane_capability, presenter, pane)
+
+    @staticmethod
+    async def revoke_pane(presenter: Presenter, pane: int) -> None:
+        await _run(_presenter_module.revoke_pane, presenter, pane)
+
+    @staticmethod
+    async def update_metrics(presenter: Presenter, pane: int, **geometry: Any) -> None:
+        await _run(_presenter_module.update_metrics, presenter, pane, **geometry)
+
+    @staticmethod
+    async def wait_for_media(presenter: Presenter, pane: int, timeout: float) -> bool:
+        return await _run(_presenter_module.wait_for_media, presenter, pane, timeout)
+
+    @staticmethod
+    async def capture_pane(
+        presenter: Presenter, pane: int, viewport_offset: int = 0
+    ) -> PaneCapture:
+        return await _run(_presenter_module.capture_pane, presenter, pane, viewport_offset)
+
+    @staticmethod
+    async def pane_media_summary(presenter: Presenter, pane: int) -> PaneMediaSummary:
+        return await _run(_presenter_module.pane_media_summary, presenter, pane)
+
+
+presenter = _PresenterFacade()

@@ -20,3 +20,7 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 *.so
+
+# Python build and cache artifacts. The package ships from python/, so these sit beside sources.
+__pycache__/
+*.py[cod]
