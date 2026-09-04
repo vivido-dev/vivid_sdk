@@ -982,6 +982,7 @@ def _image_info(data: bytes) -> Tuple[int, int, int]:
 
 
 from . import aio as aio  # noqa: E402
+from . import automation as automation  # noqa: E402
 from . import presenter as presenter  # noqa: E402
 
 __all__ = [
@@ -1001,6 +1002,7 @@ __all__ = [
     "VividError",
     "activate_track",
     "aio",
+    "automation",
     "presenter",
     "allocate_id",
     "anchor_marker",

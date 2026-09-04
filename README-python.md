@@ -106,3 +106,42 @@ retrying.
 `vivid_sdk.aio.presenter` mirrors all of it as coroutines, over the same cancellation-safe worker
 threads as the producer facade. `wait_for_media` is the one that matters: it blocks for its whole
 timeout, and running it on the event loop thread would stall every other task.
+
+## Automation client
+
+`vivid_sdk.automation` drives the terminal runtimes over their local automation endpoints — the
+same socket the CLIs use, without spawning one: `vivido` (windows, keys, grid reads, waits),
+`vivida` (which embeds vivido's host and adds workspace layout on the same endpoint), and `vvmux`
+(panes, tabs, agents, over the VVMX framing `vvmux api schema --json` publishes).
+
+```python
+import vivid_sdk as vivid
+
+v = vivid.automation.vivido_connect(target="scratch")   # or socket=..., or nothing to discover
+before = v.request("inspect", {"window_id": 1})["window"]["sequences"]["screen"]
+v.request("typing", {"text": "cargo test", "window_id": 1})
+v.request("key", {"key": "Enter", "mods": [], "repeat": 1, "route": "application",
+                  "target": {"window_id": 1}})
+v.request("wait_text", {"text": "test result", "regex": False, "after_screen": before,
+                        "common": {"timeout": 30000, "target": {"window_id": 1}}})
+v.close()
+
+m = vivid.automation.vvmux_connect("default")
+panes = m.request({"method": "list_panes"})
+m.close()
+```
+
+Params mirror the *serde* shape of each runtime's request struct, not its CLI flags: clap's
+`flatten` and defaults do not apply to serde, so structs flattened on the command line arrive as
+nested objects (`target`, `common`), and fields the CLI would default are still required on the
+wire when the struct lacks `#[serde(default)]`. A `hello` handshake on connect answers with the
+capability document naming what the instance claims.
+
+Errors are typed: a failed reply raises `vivid.automation.AutomationError` carrying the runtime's
+`code`, `message`, and optional `data`. Discovery follows the CLI's own order, and a named target
+that has gone away is an error, never a silent fall-through to another instance.
+
+Unix only, and one operating-system account of trust: every socket is owner-checked before a byte
+is written and peer-credential-checked after connect; registries are only read from a plain,
+owner-only runtime directory, and identity is derived from the session name rather than taken from
+the registry. The module is pure standard library.
