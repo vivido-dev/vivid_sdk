@@ -4812,14 +4812,14 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
 }
 
 fn surface_ready_payload(key: SurfaceKey, surface: &SurfaceState) -> Vec<(u64, Value)> {
-    vec![
-        (0, Value::Unsigned(key.context)),
-        (1, Value::Unsigned(key.surface)),
-        (2, Value::Unsigned(surface.revision.get())),
-        (3, Value::Unsigned(surface.generation.get())),
-        (4, Value::Unsigned(surface.definition.policy)),
-        (5, Value::Map(surface.definition.profile_parameters.clone())),
-    ]
+    vivid_protocol::surface::surface_ready_payload(
+        key.context,
+        key.surface,
+        surface.revision,
+        surface.generation,
+        surface.definition.policy,
+        surface.definition.profile_parameters.clone(),
+    )
 }
 
 fn surface_status_payload(key: SurfaceKey, surface: &SurfaceEntry) -> Vec<(u64, Value)> {
@@ -5318,20 +5318,29 @@ fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
     send_flow_update(delivery.track, track);
 }
 
+/// The reason a raster delta chain cannot continue: no base frame to apply it to, media §13.
+const NEED_FULL_FRAME_NO_BASE: u64 = 1;
+
+fn track_address(key: TrackKey, track: &TrackEntry) -> vivid_protocol::track::TrackAddress {
+    vivid_protocol::track::TrackAddress {
+        context_id: key.surface.context,
+        surface_id: key.surface.surface,
+        track_id: key.track,
+        channel_generation: track.state.channel_generation,
+    }
+}
+
 fn send_flow_update(key: TrackKey, track: &TrackEntry) {
     let Some(writer) = &track.channel_writer else {
         return;
     };
     if let Ok(body) = Envelope::new(
         0,
-        vec![
-            (0, Value::Unsigned(key.surface.context)),
-            (1, Value::Unsigned(key.surface.surface)),
-            (2, Value::Unsigned(key.track)),
-            (3, Value::Unsigned(track.state.channel_generation.get())),
-            (4, Value::Unsigned(track.state.flow.maximum_body_bytes)),
-            (5, Value::Unsigned(track.state.flow.maximum_media_records)),
-        ],
+        vivid_protocol::track::max_channel_data_payload(
+            track_address(key, track),
+            track.state.flow.maximum_body_bytes,
+            track.state.flow.maximum_media_records,
+        ),
     )
     .encode()
     {
@@ -5345,14 +5354,11 @@ fn send_need_keyframe(key: TrackKey, track: &TrackEntry, minimum_epoch: u32, rea
     };
     if let Ok(body) = Envelope::new(
         0,
-        vec![
-            (0, Value::Unsigned(key.surface.context)),
-            (1, Value::Unsigned(key.surface.surface)),
-            (2, Value::Unsigned(key.track)),
-            (3, Value::Unsigned(track.state.channel_generation.get())),
-            (4, Value::Unsigned(u64::from(minimum_epoch))),
-            (5, Value::Unsigned(reason)),
-        ],
+        vivid_protocol::track::need_keyframe_payload(
+            track_address(key, track),
+            minimum_epoch,
+            reason,
+        ),
     )
     .encode()
     {
@@ -5369,13 +5375,10 @@ fn send_need_full_frame(key: TrackKey, track: &TrackEntry) {
     };
     if let Ok(body) = Envelope::new(
         0,
-        vec![
-            (0, Value::Unsigned(key.surface.context)),
-            (1, Value::Unsigned(key.surface.surface)),
-            (2, Value::Unsigned(key.track)),
-            (3, Value::Unsigned(track.state.channel_generation.get())),
-            (4, Value::Unsigned(1)),
-        ],
+        vivid_protocol::track::need_full_frame_payload(
+            track_address(key, track),
+            NEED_FULL_FRAME_NO_BASE,
+        ),
     )
     .encode()
     {
