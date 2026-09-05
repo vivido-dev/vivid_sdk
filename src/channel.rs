@@ -94,6 +94,7 @@ impl SendPressure {
 /// One accepted, authenticated track-channel generation.
 #[derive(Clone)]
 pub struct TrackChannel {
+    input: Arc<Mutex<VecDeque<(Instant, crate::InputPacket)>>>,
     pub(crate) track: Track,
     pub(crate) generation: ChannelGeneration,
     pub(crate) writer: ConnectionWriter,
@@ -128,6 +129,12 @@ impl TrackChannel {
         offline: bool,
     ) -> io::Result<Self> {
         let snapshot = lock(&track.inner, "track")?.clone();
+        let uplink = snapshot.configuration.direction == TrackDirection::Uplink;
+        if uplink && (!vivid_protocol::audio_input::supports(&snapshot.configuration) || offline) {
+            return Err(invalid_input(
+                "microphone requires a live PCM uplink channel",
+            ));
+        }
         connection.write_record(
             messages::CHANNEL_OPEN,
             0,
@@ -178,8 +185,8 @@ impl TrackChannel {
                 Some(()),
             )
         };
-        if maximum_bytes < u64::from(maximum_body)
-            || maximum_records == 0
+        if (uplink && (maximum_bytes != 0 || maximum_records != 0))
+            || (!uplink && (maximum_bytes < u64::from(maximum_body) || maximum_records == 0))
             || maximum_body == 0
             || maximum_body > snapshot.maximum_record_body
         {
@@ -243,6 +250,7 @@ impl TrackChannel {
             state.active_media = Some(Arc::downgrade(&media));
         }
         let events = Arc::new(Mutex::new(VecDeque::new()));
+        let input = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(reader) = reader {
             spawn_channel_reader(
                 reader,
@@ -251,6 +259,8 @@ impl TrackChannel {
                 flow.clone(),
                 media.clone(),
                 events.clone(),
+                input.clone(),
+                snapshot.media_sequence.clone(),
             )?;
         }
         let handle_lifetime = Arc::new(ChannelHandleLifetime {
@@ -258,6 +268,7 @@ impl TrackChannel {
             writer: writer.clone(),
         });
         Ok(Self {
+            input,
             track,
             generation: snapshot.channel_generation,
             writer,
@@ -297,6 +308,81 @@ impl TrackChannel {
 
     pub fn track(&self) -> &Track {
         &self.track
+    }
+
+    /// Grant the initial bounded receive window, or replenish capacity after consumption.
+    pub fn grant_audio_input(&self) -> io::Result<()> {
+        let configuration = self.track.configuration()?;
+        if configuration.direction != TrackDirection::Uplink {
+            return Err(invalid_input("audio input credit requires an uplink track"));
+        }
+        // Queue and flow locks have the same order as the receiving worker.
+        let queue = lock(&self.input, "microphone queue")?;
+        let queued = queue.len();
+        let (bytes, records) = {
+            let mut state = lock(&self.flow.state, "microphone flow")?;
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "microphone channel closed",
+                ));
+            }
+            let free = (vivid_protocol::audio_input::QUEUE_PACKETS - queued) as u64;
+            let records = state
+                .flow
+                .sent_media_records
+                .checked_add(free)
+                .ok_or_else(|| invalid_data("microphone record maximum exhausted"))?;
+            let bytes = records
+                .checked_mul(u64::from(vivid_protocol::audio_input::BODY_BYTES))
+                .ok_or_else(|| invalid_data("microphone byte maximum exhausted"))?;
+            state.flow.raise_maxima(bytes, records);
+            (bytes, records)
+        };
+        drop(queue);
+        let payload = vivid_protocol::track::max_channel_data_payload(
+            vivid_protocol::track::TrackAddress {
+                context_id: configuration.context_id,
+                surface_id: configuration.surface_id,
+                track_id: configuration.track_id,
+                channel_generation: self.generation,
+            },
+            bytes,
+            records,
+        );
+        self.writer.write_record(
+            messages::MAX_CHANNEL_DATA,
+            0,
+            configuration.track_id,
+            &Envelope::new(0, payload).encode()?,
+        )?;
+        Ok(())
+    }
+
+    /// Take one packet without waiting. Replenish with `grant_audio_input` after consuming it.
+    pub fn take_audio_input(&self) -> io::Result<Option<crate::InputPacket>> {
+        let mut input = lock(&self.input, "microphone queue")?;
+        if lock(&self.flow.state, "microphone flow")?.closed {
+            input.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "microphone channel closed",
+            ));
+        }
+        let mut expired = false;
+        while input
+            .front()
+            .is_some_and(|(at, _)| at.elapsed() > Duration::from_millis(200))
+        {
+            input.pop_front();
+            expired = true;
+        }
+        let packet = input.pop_front().map(|(_, packet)| packet);
+        drop(input);
+        if expired {
+            self.grant_audio_input()?;
+        }
+        Ok(packet)
     }
 
     pub fn generation(&self) -> ChannelGeneration {
@@ -638,6 +724,9 @@ impl TrackChannel {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
         let configuration = self.track.configuration()?;
+        if configuration.direction == TrackDirection::Uplink {
+            return Err(invalid_input("only the presenter may send uplink EOS"));
+        }
         let last_sequence = {
             let media_state = lock(&self.media, "channel media state")?;
             if media_state.eos {
@@ -696,6 +785,9 @@ impl TrackChannel {
             u32::try_from(body.len()).map_err(|_| invalid_input("media body exceeds u32"))?;
         let configuration = self.track.configuration()?;
         let recovery_revision = {
+            if configuration.direction == TrackDirection::Uplink {
+                return Err(invalid_input("only the presenter may send uplink media"));
+            }
             let media_state = lock(&self.media, "channel media state")?;
             if media_state.eos {
                 return Err(invalid_input("media cannot follow CHANNEL_EOS"));
@@ -975,6 +1067,7 @@ impl Session {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_channel_reader(
     mut reader: ConnectionReader,
     configuration: TrackConfiguration,
@@ -982,11 +1075,18 @@ pub(crate) fn spawn_channel_reader(
     flow: Arc<FlowSync>,
     media: Arc<Mutex<ChannelMediaState>>,
     events: Arc<Mutex<VecDeque<ChannelEvent>>>,
+    input: Arc<Mutex<VecDeque<(Instant, crate::InputPacket)>>>,
+    input_sequence: Arc<Mutex<TrackMediaSequence>>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(format!("vivid-track-reader-{}", configuration.track_id))
         .spawn(move || {
             let result = (|| -> io::Result<()> {
+                let mut last_input_id = 0;
+                let mut last_input_pts = None;
+                let mut last_input_sequence = 0;
+                let mut input_rate = TokenBucket::new(50, 1);
+                let mut input_updated = Instant::now();
                 loop {
                     let record = reader.read_record()?;
                     if record.object_id != configuration.track_id {
@@ -997,6 +1097,45 @@ pub(crate) fn spawn_channel_reader(
                         push_channel_event(&events, ChannelEvent::Error(error.into()))?;
                         continue;
                     }
+                    if configuration.direction == TrackDirection::Uplink
+                        && record.record_type == messages::AUDIO_PACKET
+                    {
+                        let packet = crate::InputPacket::decode(&record.body)?;
+                        let now = Instant::now();
+                        input_rate
+                            .replenish(now.saturating_duration_since(input_updated))
+                            .map_err(io::Error::other)?;
+                        input_updated = now;
+                        input_rate.charge(1).map_err(io::Error::other)?;
+                        if packet.epoch != 1
+                            || packet.packet_id <= last_input_id
+                            || last_input_pts
+                                .is_some_and(|pts: i64| packet.pts_us < pts.saturating_add(20_000))
+                        {
+                            return Err(invalid_data(
+                                "microphone packet sequence or timeline regressed",
+                            ));
+                        }
+                        let mut queue = lock(&input, "microphone queue")?;
+                        let mut state = lock(&flow.state, "microphone flow")?;
+                        if state.closed {
+                            return Err(invalid_data("retired microphone generation"));
+                        }
+                        state
+                            .flow
+                            .admit(vivid_protocol::audio_input::BODY_BYTES)
+                            .map_err(io::Error::other)?;
+                        if queue.len() >= vivid_protocol::audio_input::QUEUE_PACKETS {
+                            return Err(invalid_data("microphone queue exceeded its bound"));
+                        }
+                        last_input_id = packet.packet_id;
+                        lock(&input_sequence, "microphone sequence")?
+                            .accept(packet.packet_id, packet.epoch)?;
+                        last_input_pts = Some(packet.pts_us);
+                        last_input_sequence = record.sequence;
+                        queue.push_back((Instant::now(), packet));
+                        continue;
+                    }
                     let payload = decoded_payload(&record)?;
                     validate_track_tuple(&payload, &configuration)?;
                     if required_u64(&payload, 3)? != generation.get() {
@@ -1005,7 +1144,22 @@ pub(crate) fn spawn_channel_reader(
                         ));
                     }
                     match record.record_type {
+                        messages::CHANNEL_EOS
+                            if configuration.direction == TrackDirection::Uplink =>
+                        {
+                            validate_exact_payload_keys("CHANNEL_EOS", &payload, 0..=5)?;
+                            if required_u64(&payload, 4)? != u64::from(last_input_id != 0)
+                                || required_u64(&payload, 5)? != last_input_sequence
+                            {
+                                return Err(invalid_data("microphone EOS barrier mismatch"));
+                            }
+                            lock(&input, "microphone queue")?.clear();
+                            return Ok(());
+                        }
                         messages::MAX_CHANNEL_DATA => {
+                            if configuration.direction == TrackDirection::Uplink {
+                                return Err(invalid_data("presenter cannot grant uplink credit"));
+                            }
                             validate_exact_payload_keys("MAX_CHANNEL_DATA", &payload, 0..=5)?;
                             let maximum_bytes = required_u64(&payload, 4)?;
                             let maximum_records = required_u64(&payload, 5)?;
@@ -1148,6 +1302,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: context,
                     surface_id: surface.id(),
                     track_id: 2,

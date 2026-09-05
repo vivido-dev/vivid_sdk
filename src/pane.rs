@@ -276,6 +276,7 @@ impl PaneSession {
             )?;
             let track = self.session.create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id,
                     track_id: self.session.allocate_id()?,

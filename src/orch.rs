@@ -221,6 +221,7 @@ impl TrackBuilder {
             .min(inflight_ceiling);
         checks(&self, contract)?;
         Ok(TrackConfiguration {
+            direction: Default::default(),
             context_id: self.surface.context_id(),
             surface_id: self.surface.id(),
             track_id,

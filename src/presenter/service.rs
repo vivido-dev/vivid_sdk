@@ -604,6 +604,7 @@ struct SurfaceEntry {
 }
 
 struct TrackEntry {
+    microphone: Option<MicrophoneEndpoint>,
     configuration: TrackConfiguration,
     state: TrackState,
     decoder_reset_serial: u64,
@@ -742,6 +743,76 @@ pub struct VirtualVivid {
 }
 
 impl VirtualVivid {
+    /// Microphones are independent of viewport visibility and presentation-slot projection.
+    pub fn microphone_requests(&self) -> Vec<super::MicrophoneRequest> {
+        let state = lock(&self.state);
+        state
+            .tracks
+            .iter()
+            .filter_map(|(key, track)| {
+                let session = state.sessions.get(&key.surface.session)?;
+                let surface = state.surfaces.get(&key.surface)?;
+                if session.closed || track.microphone.is_none() {
+                    return None;
+                }
+                Some(super::MicrophoneRequest {
+                    source: bridge_track_key(*key),
+                    generation: track.state.channel_generation.get(),
+                    pane: session.pane,
+                    title: surface.state.definition.descriptor.title.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Enqueue without device I/O or waiting on the actor. Empty bytes revoke the current route.
+    pub fn queue_microphone(
+        &self,
+        source: SourceKey,
+        generation: u64,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        let packet = if bytes.is_empty() {
+            None
+        } else {
+            Some((Instant::now(), crate::InputPacket::decode(bytes)?))
+        };
+        let mut state = lock(&self.state);
+        let key = TrackKey {
+            surface: SurfaceKey {
+                session: source.producer,
+                context: source.context,
+                surface: source.surface,
+            },
+            track: source.track,
+        };
+        let Some(track) = state
+            .tracks
+            .get_mut(&key)
+            .filter(|t| t.state.channel_generation.get() == generation)
+        else {
+            return Ok(false);
+        };
+        let Some(endpoint) = &track.microphone else {
+            return Ok(false);
+        };
+        if packet.is_none() {
+            // Cancel even when its queue is full, so revocation never waits behind speech.
+            track.microphone.take();
+            return Ok(true);
+        }
+        Ok(endpoint.sender.try_send(packet).is_ok())
+    }
+
+    /// Revocation on detach is owner-local; remote devices remain alive and supply silence.
+    pub fn revoke_microphones(&self) {
+        let mut state = lock(&self.state);
+        for track in state.tracks.values_mut() {
+            track.microphone.take();
+        }
+        advance_projection(&mut state);
+    }
+
     #[allow(dead_code)]
     pub fn start<L: PresenterListener>(listener: L, config: MediaConfig) -> io::Result<Self> {
         Self::start_configured(listener, PresenterConfig::terminal(config), None)
@@ -1420,7 +1491,10 @@ impl VirtualVivid {
         let sources = state
             .tracks
             .iter()
-            .filter(|(key, _)| sessions.contains(&key.surface.session))
+            .filter(|(key, track)| {
+                sessions.contains(&key.surface.session)
+                    && track.configuration.direction != crate::TrackDirection::Uplink
+            })
             .map(|(key, track)| SnapshotSource {
                 key: bridge_track_key(*key),
                 descriptor: source_descriptor(&state.tracks, *key, track),
@@ -3068,7 +3142,12 @@ fn dispatch_control(
         messages::PROBE_TRACK_CONFIG => {
             let configuration = TrackConfiguration::decode(0, &value, true)
                 .map_err(|_| ControlError::bad("invalid track probe"))?;
-            let supported = supports_track(&configuration);
+            let supported = supports_track(&configuration)
+                && (configuration.direction != crate::TrackDirection::Uplink
+                    || state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)));
             (
                 messages::TRACK_SUPPORT,
                 0,
@@ -3109,7 +3188,13 @@ fn dispatch_control(
             if !state.surfaces.contains_key(&surface) {
                 return Err(ControlError::missing("owning surface does not exist"));
             }
-            if !supports_track(&configuration) {
+            if !supports_track(&configuration)
+                || (configuration.direction == crate::TrackDirection::Uplink
+                    && !state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)))
+            {
                 return Err(ControlError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
                     message: "track configuration is unsupported",
@@ -3133,6 +3218,7 @@ fn dispatch_control(
             state.tracks.insert(
                 key,
                 TrackEntry {
+                    microphone: None,
                     configuration,
                     state: track_state,
                     decoder_reset_serial: 1,
@@ -3215,6 +3301,7 @@ fn dispatch_control(
                     track.channel_advance_pending_flush = true;
                 }
                 track.channel_writer = None;
+                track.microphone.take();
                 track.recovery_pending = true;
                 track.recovery_requested = false;
                 track.discard_blocked_for_recovery = false;
@@ -3310,7 +3397,8 @@ fn dispatch_control(
                         track: track_id,
                     })
                     .ok_or_else(|| ControlError::missing("activation track is absent"))?;
-                if track.configuration.slot != slot
+                if track.configuration.direction == crate::TrackDirection::Uplink
+                    || track.configuration.slot != slot
                     || track.state.channel_generation.get() != required_u64(&binding, 2)?
                     || track.state.milestones & required_u64(&binding, 3)? == 0
                 {
@@ -3725,6 +3813,110 @@ fn dispatch_control(
     Ok(Some(response))
 }
 
+struct MicrophoneEndpoint {
+    sender: mpsc::SyncSender<Option<(Instant, crate::InputPacket)>>,
+    cancel: super::ConnectionCancel,
+}
+
+impl Drop for MicrophoneEndpoint {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn microphone_channel(
+    reader: &mut Reader,
+    shared: &Arc<Mutex<State>>,
+    key: TrackKey,
+    generation: ChannelGeneration,
+    configuration: &TrackConfiguration,
+) -> io::Result<()> {
+    let writer = reader.writer();
+    let sender = Arc::new(crate::AudioInputSender::new(
+        configuration,
+        generation,
+        move |kind, object, body| writer.write_record(kind, object, body),
+    )?);
+    let (tx, rx) = mpsc::sync_channel::<Option<(Instant, crate::InputPacket)>>(
+        vivid_protocol::audio_input::QUEUE_PACKETS,
+    );
+    let cancel = reader.cancel();
+    let worker_cancel = cancel.clone();
+    let worker_sender = sender.clone();
+    let writing_since = Arc::new(Mutex::new(None::<Instant>));
+    let worker_writing = writing_since.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = finished.clone();
+    let watchdog_cancel = cancel.clone();
+    thread::Builder::new()
+        .name("vivid-microphone-deadline".into())
+        .spawn(move || {
+            while !watchdog_finished.load(Ordering::Acquire)
+                && Arc::strong_count(&watchdog_finished) > 1
+            {
+                if lock(&writing_since).is_some_and(|at| at.elapsed() > Duration::from_millis(200))
+                {
+                    watchdog_cancel.cancel();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })?;
+    thread::Builder::new()
+        .name("vivid-microphone-relay".into())
+        .spawn(move || {
+            while let Ok(Some((at, packet))) = rx.recv() {
+                if at.elapsed() <= Duration::from_millis(200) {
+                    *lock(&worker_writing) = Some(Instant::now());
+                    let result = worker_sender.try_send(&packet);
+                    *lock(&worker_writing) = None;
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+            *lock(&worker_writing) = Some(Instant::now());
+            let _ = worker_sender.eos();
+            worker_cancel.cancel();
+            finished.store(true, Ordering::Release);
+        })?;
+    let wake = {
+        let mut state = lock(shared);
+        let track = state
+            .tracks
+            .get_mut(&key)
+            .filter(|t| t.state.channel_generation == generation)
+            .ok_or_else(|| io::Error::other("microphone owner disappeared"))?;
+        track.microphone = Some(MicrophoneEndpoint { sender: tx, cancel });
+        advance_projection(&mut state);
+        state.media_wakeup.clone()
+    };
+    if let Some(wake) = wake {
+        wake();
+    }
+    let result = (|| loop {
+        sender.grant(&reader.read_record(ConnectionKind::Track)?)?;
+    })();
+    let wake = {
+        let mut state = lock(shared);
+        if let Some(track) = state
+            .tracks
+            .get_mut(&key)
+            .filter(|t| t.state.channel_generation == generation)
+        {
+            track.microphone.take();
+            track.channel_writer = None;
+            let _ = track.state.detach();
+        }
+        advance_projection(&mut state);
+        state.media_wakeup.clone()
+    };
+    if let Some(wake) = wake {
+        wake();
+    }
+    result
+}
+
 fn handle_track(
     reader: &mut Reader,
     shared: &Arc<Mutex<State>>,
@@ -3821,6 +4013,37 @@ fn handle_track(
                 io::ErrorKind::AlreadyExists,
                 "track channel is busy",
             ));
+        }
+        if track.configuration.direction == crate::TrackDirection::Uplink {
+            let configuration = track.configuration.clone();
+            track.state.milestones = MILESTONE_CHANNEL_ACCEPTED;
+            track.state.revision = track.state.revision.advance()?;
+            track.channel_writer = Some(writer.clone());
+            let revision = track.state.revision.get();
+            drop(state);
+            writer.write_record(
+                messages::CHANNEL_ACCEPTED,
+                open.track_id,
+                &Envelope::new(
+                    request_id,
+                    vec![
+                        (0, Value::Unsigned(open.context_id)),
+                        (1, Value::Unsigned(open.surface_id)),
+                        (2, Value::Unsigned(open.track_id)),
+                        (3, Value::Unsigned(open.channel_generation)),
+                        (4, Value::Unsigned(0)),
+                        (5, Value::Unsigned(0)),
+                        (
+                            6,
+                            Value::Unsigned(u64::from(configuration.maximum_record_body)),
+                        ),
+                        (7, Value::Unsigned(revision)),
+                    ],
+                )
+                .encode()?,
+            )?;
+            reader.clear_read_deadline()?;
+            return microphone_channel(reader, shared, key, generation, &configuration);
         }
         let maximum_bytes = u64::from(track.configuration.maximum_record_body);
         track
@@ -4943,6 +5166,9 @@ fn semantic_descriptor(descriptor: &SurfaceDescriptor) -> SemanticDescriptor {
 }
 
 fn supports_track(configuration: &TrackConfiguration) -> bool {
+    if configuration.direction == crate::TrackDirection::Uplink {
+        return vivid_protocol::audio_input::supports(configuration);
+    }
     (1..=4).contains(&configuration.slot)
         && match &configuration.kind {
             KindConfiguration::Video(video) => {
@@ -5872,6 +6098,7 @@ mod tests {
 
     fn raster(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         TrackConfiguration {
+            direction: Default::default(),
             context_id,
             surface_id,
             track_id,
@@ -5899,6 +6126,7 @@ mod tests {
 
     fn video(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         TrackConfiguration {
+            direction: Default::default(),
             context_id,
             surface_id,
             track_id,
@@ -5953,6 +6181,7 @@ mod tests {
     fn audio(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         let maximum_record_body = media::audio_body_len(256).unwrap();
         TrackConfiguration {
+            direction: Default::default(),
             context_id,
             surface_id,
             track_id,
@@ -5977,6 +6206,82 @@ mod tests {
             target_latency_us: 0,
             maximum_latency_us: 1_000_000,
             retained_pixel_charge: 0,
+        }
+    }
+
+    #[test]
+    fn microphone_flow_and_revocation_are_scoped_to_complete_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("mic.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        let mut owners = Vec::new();
+        for pane in [7, 8] {
+            presenter.update_metrics(pane, 80, 24, (8, 16));
+            let secret = presenter.issue_pane_capability(pane).unwrap();
+            let mut config = producer(presenter.endpoint(), &secret);
+            config.optional_profiles.push(registry::AUDIO_INPUT.into());
+            config.optional_profiles.sort();
+            let mut session = crate::Session::connect(config).unwrap();
+            let context = session.info().root_context_id;
+            session
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = session
+                .create_track(
+                    vivid_protocol::audio_input::configuration(context, 9, 11),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let channel = session.open_track_channel(&track).unwrap();
+            channel.grant_audio_input().unwrap();
+            owners.push((session, track, channel));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while presenter.microphone_requests().len() < 2 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let requests = presenter.microphone_requests();
+        assert_eq!(requests[0].source.context, requests[1].source.context);
+        assert_eq!(requests[0].source.surface, requests[1].source.surface);
+        assert_eq!(requests[0].source.track, requests[1].source.track);
+        let route_b = requests.iter().find(|r| r.pane == 8).unwrap();
+        let pcm = crate::InputPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            pcm: [17; vivid_protocol::audio_input::PCM_BYTES],
+        }
+        .encode()
+        .unwrap();
+        presenter.revoke_pane(7);
+        let received = loop {
+            assert!(Instant::now() < deadline);
+            presenter
+                .queue_microphone(route_b.source, route_b.generation, &pcm)
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+            if let Some(packet) = owners[1].2.take_audio_input().unwrap() {
+                break packet;
+            }
+        };
+        assert_eq!(received.pcm, [17; vivid_protocol::audio_input::PCM_BYTES]);
+        assert!(
+            !presenter
+                .queue_microphone(route_b.source, route_b.generation + 1, &pcm)
+                .unwrap()
+        );
+        assert!(
+            presenter
+                .projection_snapshot(&HashSet::from([8]))
+                .sources
+                .is_empty()
+        );
+        for (mut owner, _, _) in owners {
+            owner.abort().unwrap();
         }
     }
 

@@ -189,6 +189,7 @@ impl PresenterConfig {
             target: Arc::new(TerminalTarget),
             supported_profiles: vec![
                 registry::AUDIO_GAIN.into(),
+                registry::AUDIO_INPUT.into(),
                 registry::CORE_CONTROL.into(),
                 registry::LIVE_MEDIA.into(),
                 registry::OBSERVABILITY.into(),
@@ -377,6 +378,15 @@ pub struct BridgeSourceKey {
     pub context: u64,
     pub surface: u64,
     pub track: u64,
+}
+
+/// A non-visual, pane-owned microphone request. Generation is inner authority only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MicrophoneRequest {
+    pub source: BridgeSourceKey,
+    pub generation: u64,
+    pub pane: PaneId,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

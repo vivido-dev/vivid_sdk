@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audio_input;
 mod channel;
 mod config;
 mod controller;
@@ -68,6 +69,7 @@ pub(crate) use wire::{
     validate_track_owner, validate_track_tuple,
 };
 
+pub use audio_input::AudioInputSender;
 pub use channel::{SendPressure, TrackChannel};
 pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
@@ -102,6 +104,7 @@ pub use scene::{
 pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
 pub use surface::{Surface, SurfaceStatus};
 pub use track::{Track, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied};
+pub use vivid_protocol::audio_input::InputPacket;
 
 pub use vivid_protocol::messages::LaneClass;
 pub use vivid_protocol::wire::ConnectionKind;
@@ -143,7 +146,8 @@ pub use vivid_protocol::track::{
     MILESTONE_CHANNEL_ACCEPTED, MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED,
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA,
     MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS,
-    MILESTONE_TRACK_LOST, RasterConfiguration, TrackConfiguration, TrackMode, VideoConfiguration,
+    MILESTONE_TRACK_LOST, RasterConfiguration, TrackConfiguration, TrackDirection, TrackMode,
+    VideoConfiguration,
 };
 
 const MAX_CONTROL_EVENTS: usize = 1024;
@@ -206,6 +210,7 @@ mod tests {
 
     fn raster_track(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         TrackConfiguration {
+            direction: Default::default(),
             context_id,
             surface_id,
             track_id,

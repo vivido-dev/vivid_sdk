@@ -342,6 +342,7 @@ mod tests {
     }
     fn vcfg(sid: u64, tid: u64) -> TrackConfiguration {
         TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: sid,
             track_id: tid,
@@ -380,6 +381,7 @@ mod tests {
 
     fn acfg(sid: u64, tid: u64) -> TrackConfiguration {
         TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: sid,
             track_id: tid,

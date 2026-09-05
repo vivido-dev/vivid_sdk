@@ -278,8 +278,22 @@ pub struct TrackWaitSatisfied {
 }
 
 impl Session {
+    fn require_audio_input_profile(&self, configuration: &TrackConfiguration) -> io::Result<()> {
+        if configuration.direction == vivid_protocol::track::TrackDirection::Uplink
+            && !self
+                .info()
+                .accepted_profiles
+                .iter()
+                .any(|p| p == vivid_protocol::registry::AUDIO_INPUT)
+        {
+            return Err(invalid_input("uplink requires negotiated audio-input-v1"));
+        }
+        Ok(())
+    }
+
     pub fn probe_track(&mut self, configuration: &TrackConfiguration) -> io::Result<TrackSupport> {
         configuration.validate(true)?;
+        self.require_audio_input_profile(configuration)?;
         let reply = self.request(
             messages::PROBE_TRACK_CONFIG,
             0,
@@ -314,6 +328,7 @@ impl Session {
         metadata: &RequestMetadata,
     ) -> io::Result<Track> {
         configuration.validate(false)?;
+        self.require_audio_input_profile(&configuration)?;
         if !self
             .surfaces
             .contains_key(&(configuration.context_id, configuration.surface_id))

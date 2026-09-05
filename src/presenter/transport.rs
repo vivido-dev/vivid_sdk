@@ -125,6 +125,10 @@ impl Reader {
         self.writer.clone()
     }
 
+    pub fn cancel(&self) -> ConnectionCancel {
+        self._cancel.clone()
+    }
+
     pub fn set_maximum(&mut self, maximum: u32) -> io::Result<()> {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(

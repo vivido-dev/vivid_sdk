@@ -415,6 +415,7 @@ mod tests {
             )
             .unwrap();
         let cfg = crate::TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id: 7,
@@ -497,6 +498,7 @@ mod tests {
             )
             .unwrap();
         let cfg = crate::TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id: 7,

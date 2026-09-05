@@ -761,6 +761,7 @@ fn parse_track(config: &Bound<'_, PyDict>) -> PyResult<TrackConfiguration> {
     let lane = LaneClass::try_from(optional(config, "lane")?.unwrap_or(3))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: required(config, "context_id")?,
         surface_id: required(config, "surface_id")?,
         track_id: required(config, "track_id")?,
