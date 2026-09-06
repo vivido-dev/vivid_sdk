@@ -4014,6 +4014,7 @@ fn handle_track(
                 "track channel is busy",
             ));
         }
+        reader.set_maximum(track.configuration.maximum_record_body)?;
         if track.configuration.direction == crate::TrackDirection::Uplink {
             let configuration = track.configuration.clone();
             track.state.milestones = MILESTONE_CHANNEL_ACCEPTED;
@@ -4077,7 +4078,6 @@ fn handle_track(
             )
             .encode()?,
         )?;
-        reader.set_maximum(track.configuration.maximum_record_body)?;
     }
     reader.clear_read_deadline()?;
     let result = track_loop(reader, shared, changed, key, generation);
@@ -6206,6 +6206,125 @@ mod tests {
             target_latency_us: 0,
             maximum_latency_us: 1_000_000,
             retained_pixel_charge: 0,
+        }
+    }
+
+    #[test]
+    fn microphone_rejects_oversized_header_before_reading_body_and_preserves_other_owner() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use vivid_protocol::wire::{Connection, RecordHeader};
+
+        struct RawTrackFactory {
+            address: String,
+            track: Mutex<Option<TcpStream>>,
+        }
+        impl crate::ConnectionFactory for RawTrackFactory {
+            fn open(&self, kind: ConnectionKind, _: Option<LaneClass>) -> io::Result<Connection> {
+                let stream = TcpStream::connect(&self.address)?;
+                if kind == ConnectionKind::Track {
+                    *lock(&self.track) = Some(stream.try_clone()?);
+                }
+                Connection::from_streams(Box::new(stream.try_clone()?), Box::new(stream), kind)
+            }
+        }
+
+        let presenter = VirtualVivid::start(
+            crate::presenter::SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        let factory = Arc::new(RawTrackFactory {
+            address: presenter
+                .endpoint()
+                .strip_prefix("tcp:")
+                .unwrap()
+                .to_owned(),
+            track: Mutex::new(None),
+        });
+        let mut owners = Vec::new();
+        for pane in [7, 8] {
+            presenter.update_metrics(pane, 80, 24, (8, 16));
+            let secret = presenter.issue_pane_capability(pane).unwrap();
+            let mut config = producer(presenter.endpoint(), &secret);
+            config.optional_profiles.push(registry::AUDIO_INPUT.into());
+            config.optional_profiles.sort();
+            let mut session = if pane == 7 {
+                crate::Session::connect_with_factory(config, factory.clone()).unwrap()
+            } else {
+                crate::Session::connect(config).unwrap()
+            };
+            let context = session.info().root_context_id;
+            session
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = session
+                .create_track(
+                    vivid_protocol::audio_input::configuration(context, 9, 11),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let channel = session.open_track_channel(&track).unwrap();
+            owners.push((session, track, channel));
+        }
+        // Only CHANNEL_OPEN has been written on this transport. Send the next header without
+        // its body: rejection must happen before allocating or waiting for the claimed bytes.
+        lock(&factory.track)
+            .as_mut()
+            .unwrap()
+            .write_all(
+                &RecordHeader {
+                    body_length: vivid_protocol::audio_input::BODY_BYTES + 1,
+                    record_type: messages::MAX_CHANNEL_DATA,
+                    flags: 0,
+                    object_id: 11,
+                    sequence: 2,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let rejected = loop {
+            if owners[0].2.take_audio_input().is_err() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        // Close the raw transport even if the regression still waits for the missing body.
+        let _ = lock(&factory.track)
+            .as_ref()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both);
+        assert!(rejected, "oversized microphone header waited for its body");
+
+        owners[1].2.grant_audio_input().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let packet = crate::InputPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            pcm: [23; vivid_protocol::audio_input::PCM_BYTES],
+        }
+        .encode()
+        .unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "unrelated microphone stopped");
+            if let Some(route) = presenter.microphone_requests().iter().find(|r| r.pane == 8) {
+                presenter
+                    .queue_microphone(route.source, route.generation, &packet)
+                    .unwrap();
+            }
+            thread::sleep(Duration::from_millis(5));
+            if let Some(received) = owners[1].2.take_audio_input().unwrap() {
+                assert_eq!(received.pcm, [23; vivid_protocol::audio_input::PCM_BYTES]);
+                break;
+            }
+        }
+        for (mut session, _, _) in owners {
+            session.abort().unwrap();
         }
     }
 

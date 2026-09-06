@@ -297,6 +297,14 @@ impl PaneSession {
             )?;
             let channel = self.session.open_track_channel(&track)?;
             send(&channel, &track)?;
+            // Media and control use independent connections: submitting the bytes does not
+            // establish the presenter's readiness for slot activation.
+            self.session.wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                30_000_000,
+            )?;
             self.session.activate_tracks(
                 &surface,
                 &[SlotBinding {
