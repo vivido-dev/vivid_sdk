@@ -137,6 +137,10 @@ pub enum ProducerAuthentication {
 /// The carrier remains byte-transparent: the SDK still performs the Vivid handshake, derives
 /// session and channel keys, authenticates track channels, and enforces sequencing and flow.
 pub trait ConnectionFactory: Send + Sync {
+    /// Cancel pending carrier opens and active I/O when the factory belongs to a retiring route.
+    /// Custom blocking carriers should override this; native sockets are cancelled separately.
+    fn cancel(&self) {}
+
     fn open(&self, kind: ConnectionKind, lane: Option<LaneClass>) -> io::Result<Connection>;
 
     /// Channel binding shared by every Vivid connection opened by this factory generation.

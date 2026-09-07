@@ -460,4 +460,107 @@ mod tests {
         assert!(!debug.contains("secret"));
         assert!(!debug.contains("endpoint"));
     }
+
+    #[test]
+    #[cfg(feature = "presenter")]
+    fn cancelling_one_session_preserves_another_owners_tracks_and_nodes() {
+        use crate::presenter::{
+            MediaConfig, PresenterConfig, PresenterListener, SocketListener, VirtualVivid,
+        };
+        use std::time::{Duration, Instant};
+        use vivid_protocol::cbor::Value;
+        let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
+        let endpoint = listener.endpoint();
+        let presenter = VirtualVivid::start_configured(
+            listener,
+            PresenterConfig::terminal(MediaConfig::default()),
+            None,
+        )
+        .unwrap();
+        let mut panes = Vec::new();
+        let mut cancels = Vec::new();
+        for owner in [1, 2] {
+            presenter.update_metrics(owner, 80, 24, (8, 16));
+            let secret = presenter.issue_pane_capability(owner).unwrap();
+            let session = Session::connect(ProducerConfig {
+                endpoint_control: Some(endpoint.clone()),
+                endpoint_bulk: Some(endpoint.clone()),
+                authentication: ProducerAuthentication::root_hex(&secret).unwrap(),
+                ..ProducerConfig::default()
+            })
+            .unwrap();
+            cancels.push(session.cancel_handle());
+            let mut pane = PaneSession::from_session(session).unwrap();
+            pane.show_rgba(1, 1, &[255; 4]).unwrap();
+            panes.push(pane);
+        }
+        assert_eq!(
+            panes[0].current.as_ref().unwrap().node_id,
+            panes[1].current.as_ref().unwrap().node_id
+        );
+        let status = |owner| {
+            presenter.pane_status(
+                owner,
+                crate::presenter::OuterMediaProjection {
+                    compatibility_revision: 0,
+                    apply_sequence: 0,
+                    bridge_instance_id: None,
+                    bridge_local_revision: 0,
+                    attachment_generations: &std::collections::HashMap::new(),
+                },
+                crate::presenter::RelayMetrics::default(),
+            )
+        };
+        let before = status(2);
+        let first = status(1);
+        assert_eq!(first.tracks[0].track_id, before.tracks[0].track_id);
+        cancels[0]();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !status(1).tracks.is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = status(2);
+        assert_eq!(after.tracks.len(), 1);
+        assert_eq!(after.nodes.len(), 1);
+        assert_eq!(before.nodes[0].node_id, after.nodes[0].node_id);
+        let pane = &mut panes[1];
+        let presentation = pane.current.as_ref().unwrap();
+        let revision = pane
+            .session
+            .query_surface(&presentation.surface)
+            .unwrap()
+            .revision;
+        let node = SceneNode {
+            owning_context_id: presentation.context_id,
+            node_id: presentation.node_id,
+            surface_context_id: presentation.context_id,
+            surface_id: presentation.surface.id(),
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(1 << 32)),
+                (2, Value::Unsigned(0)),
+                (3, Value::Unsigned(1 << 32)),
+                (4, Value::Unsigned(1 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        };
+        pane.session
+            .update_node(&node, &RequestMetadata::default())
+            .unwrap();
+        assert_eq!(
+            pane.session
+                .query_surface(&presentation.surface)
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert_eq!(status(2).nodes[0].x, 1 << 32);
+    }
 }

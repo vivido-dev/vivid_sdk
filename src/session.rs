@@ -414,6 +414,22 @@ impl EstablishmentAttempt {
 }
 
 impl Session {
+    /// A cloneable unclean shutdown operation usable while another thread owns this session.
+    /// Carrier factories must cancel their custom blocking I/O before invoking this operation.
+    pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let lifecycle = self.lifecycle.clone();
+        let writer = match &self.control {
+            ControlPlane::Live { writer, .. } => Some(writer.clone()),
+            ControlPlane::Offline { .. } => None,
+        };
+        Arc::new(move || {
+            lifecycle.close("Vivid session cancelled");
+            if let Some(writer) = &writer {
+                let _ = writer.shutdown();
+            }
+        })
+    }
+
     pub fn connect(config: ProducerConfig) -> io::Result<Self> {
         config.validate()?;
         if config.is_offline() {
