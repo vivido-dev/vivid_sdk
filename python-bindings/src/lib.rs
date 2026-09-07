@@ -278,6 +278,7 @@ fn connect(
         ..ProducerConfig::default()
     };
     if let Some(secret) = root_secret {
+        let secret = zeroize::Zeroizing::new(secret);
         config.authentication = ProducerAuthentication::root_hex(&secret).map_err(value_error)?;
     }
     if let Some(profiles) = required_profiles {

@@ -57,9 +57,9 @@ impl FileDropBindingGuard {
         acceptance_timeout_us: u64,
         idle_timeout_us: u64,
     ) -> io::Result<FileDropBinding> {
-        self.epoch = self.epoch.advance()?;
+        let epoch = self.epoch.advance()?;
         let binding = FileDropBinding {
-            producer_epoch: self.epoch,
+            producer_epoch: epoch,
             context_id,
             surface_id,
             surface_generation,
@@ -72,6 +72,7 @@ impl FileDropBindingGuard {
             idle_timeout_us,
         };
         binding.validate(surface_id)?;
+        self.epoch = epoch;
         self.requested = Some(binding.clone());
         self.grant = None;
         Ok(binding)
@@ -83,9 +84,9 @@ impl FileDropBindingGuard {
             .as_ref()
             .filter(|binding| !binding.disabled())
             .ok_or_else(|| invalid_data("file-drop binding is not enabled"))?;
-        self.epoch = self.epoch.advance()?;
+        let epoch = self.epoch.advance()?;
         let binding = FileDropBinding {
-            producer_epoch: self.epoch,
+            producer_epoch: epoch,
             context_id: current.context_id,
             surface_id: current.surface_id,
             surface_generation: current.surface_generation,
@@ -97,6 +98,7 @@ impl FileDropBindingGuard {
             acceptance_timeout_us: 0,
             idle_timeout_us: 0,
         };
+        self.epoch = epoch;
         self.requested = Some(binding.clone());
         self.grant = None;
         Ok(binding)
@@ -525,7 +527,7 @@ impl Session {
         let mut connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
                 &directory.join(format!(
-                    "file-drop-{}-{}-{}.vivid",
+                    "file-drop-{}-{}-{}.ndjson",
                     request.drop_id,
                     request.transfer_id,
                     request.transfer_generation.get()
@@ -550,7 +552,7 @@ impl Session {
             records::FILE_TRANSFER_OPEN,
             0,
             request.transfer_id,
-            &open.encode()?,
+            &zeroize::Zeroizing::new(open.encode()?),
         )?;
         let offline = matches!(&self.control, ControlPlane::Offline { .. });
         let (reader, writer) = if offline {

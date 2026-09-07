@@ -35,6 +35,40 @@ readiness and recovery. A leased session can prepare its next secret-redacted
 old handles, reconcile them, then call `adopt_surface()` followed by `adopt_track()` before
 advancing and reopening channels.
 
+## Establishment retries and connection lifetime
+
+Use `EstablishmentAttempt::new(config, retry_timeout)` when a leased activation or resume must
+survive a lost WELCOME. Retry `attempt.connect()` (or `connect_with_factory` on the same carrier)
+on that same object after a transport failure. It retains the exact authenticated HELLO and
+allows a timeout up to 300 seconds; the presenter may enforce a shorter activation/grace window.
+A successful attempt cannot be reused and releases its handshake secrets. Expired attempts reject
+further connects and release their prepared buffers; dropping an attempt also releases them.
+Root authentication requires a fresh attempt after failure because accepted root nonces cannot
+be replayed. Ordinary `Session::connect` still performs one attempt.
+
+Dropping a session or input lane shuts down its transport, including native readers retained by
+background workers. `Session::close` performs graceful GOODBYE; dropping is unclean loss and allows
+a leased presenter to suspend. `abort` continues to close the local lifecycle so callers can stop
+media workers before a graceful close.
+
+The presenter's `Writer` admits records to a bounded per-connection queue; success means queued,
+not delivered. Its worker performs the socket writes independently of presenter state locks.
+There are at most 64 queued items plus the current write. Outstanding bytes, including the current
+write, are bounded by four negotiated maximum records (at least 1 MiB, at most the 64 MiB hard
+record limit plus its header). Saturation or a write failure closes that connection. Use `flush`
+outside shared state locks when delivery must complete; its wait is bounded to three seconds.
+Custom accepted transports must implement `ConnectionCancel` so cancellation interrupts blocked
+I/O. Root replay tracking retains at most 4096 accepted principal/nonces for five minutes and
+fails closed at capacity without evicting live entries.
+
+## Offline tracing
+
+Offline sessions produce metadata-only `control.ndjson`, `track-*.ndjson`, and lane/transfer
+NDJSON files. These replace the former binary `.vivid` traces and cannot be replayed as wire
+traffic. The offline session uses synthetic authentication. Trace files contain no record bodies;
+new paths are required and Unix permissions are `0600`. Close all sessions and channel handles
+before reading the final files so their bounded asynchronous trace writers can drain.
+
 ## Rust example
 
 ```rust,no_run

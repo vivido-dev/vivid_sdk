@@ -30,6 +30,8 @@ vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features
   "native-transport",
 ] }
 
+zeroize = "1.9"
+
 [dev-dependencies]
 tempfile = "3"
 

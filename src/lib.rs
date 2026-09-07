@@ -101,7 +101,9 @@ pub use scene::{
     COORDINATE_SPACE_GRID_CELL, SceneCommit, SlotBinding, TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
     TerminalDisplay, TerminalPlacement,
 };
-pub use session::{AnchorStatus, ChannelEvent, Session, SessionEvent, SessionInfo};
+pub use session::{
+    AnchorStatus, ChannelEvent, EstablishmentAttempt, Session, SessionEvent, SessionInfo,
+};
 pub use surface::{Surface, SurfaceStatus};
 pub use track::{Track, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied};
 pub use vivid_protocol::audio_input::InputPacket;

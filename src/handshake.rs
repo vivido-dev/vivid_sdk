@@ -52,12 +52,14 @@ pub(crate) fn build_hello(
     random_bytes(&mut client_nonce)?;
     let (authentication, session_secret) = match &config.authentication {
         ProducerAuthentication::RootFromEnvironment => {
-            let value = env::var(vivid_protocol::discovery::ROOT_SECRET).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "VIVID_ROOT_SECRET is required for root authentication",
-                )
-            })?;
+            let value = zeroize::Zeroizing::new(
+                env::var(vivid_protocol::discovery::ROOT_SECRET).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "VIVID_ROOT_SECRET is required for root authentication",
+                    )
+                })?,
+            );
             let secret =
                 Secret32::from_hex(&value).map_err(|error| invalid_input(error.to_string()))?;
             (HelloAuthentication::Root { proof: [0; 32] }, secret)

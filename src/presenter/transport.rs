@@ -1,7 +1,9 @@
 //! Accepted-side Vivid 1.5 framing for the per-session private presenter endpoint.
 
-use std::io::{self, IoSlice, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use vivid_protocol::wire::{
     ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
@@ -42,17 +44,16 @@ impl Reader {
             }
         };
         let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
-        let writer = Arc::new(Writer {
-            inner: Mutex::new(WriterInner {
-                stream: stream.writer,
-                maximum: if preface.kind == ConnectionKind::Control {
-                    CONTROL_MAX_RECORD_BODY
-                } else {
-                    HARD_MAX_RECORD_BODY
-                },
-                sequence: 0,
-            }),
-        });
+        let writer = Arc::new(Writer::new(
+            stream.writer,
+            cancel.clone(),
+            if preface.kind == ConnectionKind::Control {
+                CONTROL_MAX_RECORD_BODY
+            } else {
+                HARD_MAX_RECORD_BODY
+            },
+        )?);
+
         Ok((
             Self {
                 reader: stream.reader,
@@ -149,28 +150,108 @@ impl Reader {
     }
 }
 
+/// Bounded, ordered outbound admission. Socket I/O runs on one independent worker.
+/// A successful write means queued; use `flush` outside shared state locks when delivery is needed.
 pub struct Writer {
     inner: Mutex<WriterInner>,
+    closed: Arc<AtomicBool>,
+    cancel: ConnectionCancel,
+    bytes: Arc<AtomicUsize>,
 }
+const MAX_QUEUED_RECORDS: usize = 64;
+const MAX_QUEUED_BYTES: usize = HARD_MAX_RECORD_BODY as usize + HEADER_SIZE;
 
 struct WriterInner {
-    stream: Box<dyn Write + Send>,
+    sender: mpsc::SyncSender<Outbound>,
     maximum: u32,
     sequence: u64,
 }
+enum Outbound {
+    Record(zeroize::Zeroizing<Vec<u8>>),
+    Barrier(mpsc::SyncSender<()>),
+}
 
 impl Writer {
+    fn new(
+        mut stream: Box<dyn Write + Send>,
+        cancel: ConnectionCancel,
+        maximum: u32,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_RECORDS);
+        let closed = Arc::new(AtomicBool::new(false));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let worker_closed = closed.clone();
+        let worker_bytes = bytes.clone();
+        let worker_cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("vivid-presenter-writer".into())
+            .spawn(move || {
+                while !worker_closed.load(Ordering::Acquire) {
+                    let item = match receiver.recv_timeout(Duration::from_millis(100)) {
+                        Ok(item) => item,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    match item {
+                        Outbound::Record(body) => {
+                            let result =
+                                write_complete(stream.as_mut(), &body).and_then(|_| stream.flush());
+                            worker_bytes.fetch_sub(body.len(), Ordering::AcqRel);
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        Outbound::Barrier(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+                worker_closed.store(true, Ordering::Release);
+                worker_cancel.cancel();
+            })?;
+        Ok(Self {
+            inner: Mutex::new(WriterInner {
+                sender,
+                maximum,
+                sequence: 0,
+            }),
+            closed,
+            cancel,
+            bytes,
+        })
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.cancel.cancel();
+    }
+
+    /// Wait for queued records outside any presenter state lock. Silent peers are bounded.
+    pub fn flush(&self) -> io::Result<()> {
+        let (send, receive) = mpsc::sync_channel(1);
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closed.load(Ordering::Acquire)
+                || inner.sender.try_send(Outbound::Barrier(send)).is_err()
+            {
+                self.close();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "presenter writer closed or saturated",
+                ));
+            }
+        }
+        receive.recv_timeout(Duration::from_secs(3)).map_err(|_| {
+            self.close();
+            io::Error::new(io::ErrorKind::TimedOut, "presenter write deadline expired")
+        })
+    }
+
     pub fn set_maximum(&self, maximum: u32) -> io::Result<()> {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid outgoing record limit",
-            ));
+            return Err(invalid_input("invalid outgoing record limit"));
         }
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .maximum = maximum;
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).maximum = maximum;
         Ok(())
     }
 
@@ -184,71 +265,78 @@ impl Writer {
         object_id: u64,
         parts: &[&[u8]],
     ) -> io::Result<u64> {
-        let body_length = parts.iter().try_fold(0_usize, |total, part| {
+        let body_length = parts.iter().try_fold(0usize, |total, part| {
             total
                 .checked_add(part.len())
                 .ok_or_else(|| invalid_input("record body length overflows"))
         })?;
         let body_length =
             u32::try_from(body_length).map_err(|_| invalid_input("record body exceeds u32"))?;
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
             return Err(invalid_input(
                 "outgoing Vivid record exceeds the accepted body limit",
             ));
         }
-        inner.sequence = inner
+        let sequence = inner
             .sequence
             .checked_add(1)
             .ok_or_else(|| invalid("outgoing sequence exhausted"))?;
-        let sequence = inner.sequence;
-        let header = RecordHeader {
-            body_length,
-            record_type,
-            flags: 0,
-            object_id,
-            sequence,
-        };
-        write_parts(inner.stream.as_mut(), &header.encode(), parts)?;
-        inner.stream.flush()?;
+        let size = HEADER_SIZE + body_length as usize;
+        let byte_budget = (inner.maximum as usize + HEADER_SIZE)
+            .saturating_mul(4)
+            .clamp(1024 * 1024, MAX_QUEUED_BYTES);
+        if self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(size).filter(|next| *next <= byte_budget)
+            })
+            .is_err()
+        {
+            self.close();
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "presenter output byte budget exhausted",
+            ));
+        }
+        let mut encoded = zeroize::Zeroizing::new(Vec::with_capacity(size));
+        encoded.extend_from_slice(
+            &RecordHeader {
+                body_length,
+                record_type,
+                flags: 0,
+                object_id,
+                sequence,
+            }
+            .encode(),
+        );
+        for part in parts {
+            encoded.extend_from_slice(part);
+        }
+        if inner.sender.try_send(Outbound::Record(encoded)).is_err() {
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
+            self.close();
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "presenter output queue exhausted",
+            ));
+        }
+        inner.sequence = sequence;
         Ok(sequence)
     }
 }
 
-fn write_parts(stream: &mut dyn Write, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
-    let mut buffers = Vec::with_capacity(parts.len() + 1);
-    buffers.push(IoSlice::new(header));
-    buffers.extend(parts.iter().map(|part| IoSlice::new(part)));
-    let mut index = 0;
-    let mut offset = 0;
-    while index < buffers.len() {
-        let current = &buffers[index..];
-        let mut adjusted = Vec::with_capacity(current.len());
-        adjusted.push(IoSlice::new(&current[0][offset..]));
-        adjusted.extend(current[1..].iter().map(|slice| IoSlice::new(slice)));
-        let written = stream.write_vectored(&adjusted)?;
-        if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write Vivid record",
-            ));
-        }
-        let mut remaining = written;
-        while index < buffers.len() {
-            let available = buffers[index].len() - offset;
-            if remaining < available {
-                offset += remaining;
-                break;
-            }
-            remaining -= available;
-            index += 1;
-            offset = 0;
-            if remaining == 0 {
-                break;
-            }
+fn write_complete(stream: &mut dyn Write, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) if count <= bytes.len() => bytes = &bytes[count..],
+            Ok(_) => return Err(invalid("writer reported more bytes than offered")),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -323,5 +411,83 @@ mod tests {
         client.read_to_end(&mut reply).unwrap();
         service.join().unwrap();
         assert_eq!(reply, vivid_protocol::wire::unsupported_version_record());
+    }
+}
+
+#[cfg(test)]
+mod writer_audit_tests {
+    use super::*;
+    struct BadWriter {
+        calls: usize,
+    }
+    impl Write for BadWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            match self.calls {
+                1 => Ok(1),
+                _ => Ok(bytes.len() + 1),
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn partial_write_error_poisons_connection() {
+        let writer = Writer::new(
+            Box::new(BadWriter { calls: 0 }),
+            ConnectionCancel::inert(),
+            1024,
+        )
+        .unwrap();
+        writer.write_record(3, 0, &[1]).unwrap();
+        assert!(writer.flush().is_err());
+        assert!(writer.write_record(3, 0, &[2]).is_err());
+    }
+    struct Blocked {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for Blocked {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn saturation_is_bounded_and_cancels_without_waiting_for_writer() {
+        for body_size in [1, 1024 * 1024] {
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::channel();
+            let cancel = ConnectionCancel::new(move || {
+                let _ = release_tx.send(());
+            });
+            let writer = Writer::new(
+                Box::new(Blocked {
+                    entered: entered_tx,
+                    release: release_rx,
+                }),
+                cancel,
+                HARD_MAX_RECORD_BODY,
+            )
+            .unwrap();
+            let body = vec![0; body_size];
+            writer.write_record(3, 0, &body).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let mut refused = false;
+            for _ in 0..=MAX_QUEUED_RECORDS {
+                if writer.write_record(3, 0, &body).is_err() {
+                    refused = true;
+                    break;
+                }
+            }
+            assert!(refused);
+            assert!(writer.closed.load(Ordering::Acquire));
+            assert!(writer.bytes.load(Ordering::Acquire) <= MAX_QUEUED_BYTES);
+        }
     }
 }

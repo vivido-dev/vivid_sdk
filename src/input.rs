@@ -237,6 +237,7 @@ impl InputLane {
 
 impl Drop for InputLane {
     fn drop(&mut self) {
+        let _ = self.writer.shutdown();
         close_input_lane(&self.shared, "interactive lane dropped");
     }
 }
@@ -272,11 +273,11 @@ impl Session {
             client_nonce: nonce,
             authentication_tag: tag,
         };
-        let body = Envelope::correlated(1, open.payload())?.encode()?;
+        let body = zeroize::Zeroizing::new(messages::encode_payload(1, open.payload())?);
         let offline = matches!(&self.control, ControlPlane::Offline { .. });
         let mut connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
-                &directory.join(format!("interactive-{lane_generation}.vivid")),
+                &directory.join(format!("interactive-{lane_generation}.ndjson")),
                 ConnectionKind::Lane,
             )?
         } else if offline {
@@ -363,7 +364,28 @@ pub(crate) fn spawn_input_reader(
             let result = (|| -> io::Result<()> {
                 loop {
                     let record = reader.read_record()?;
+                    if !matches!(
+                        record.record_type,
+                        messages::PING
+                            | messages::PONG
+                            | messages::ERROR
+                            | messages::INPUT_BOUND
+                            | messages::INPUT_REVOKED
+                            | messages::INPUT_RESET
+                            | messages::INPUT_LEASE_RENEW
+                            | messages::KEY_INPUT
+                            | messages::POINTER_MOTION
+                            | messages::POINTER_BUTTON
+                            | messages::POINTER_AXIS
+                    ) {
+                        if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 {
+                            continue;
+                        }
+                        return Err(invalid_data("unexpected required interactive record"));
+                    }
                     let envelope = messages::decode_control(&record.body)?;
+                    let fatal = record.record_type == messages::ERROR
+                        && messages::parse_error_reply(&record.body)?.fatal;
                     if record.record_type == messages::PING {
                         if record.object_id != 0 {
                             return Err(invalid_data("interactive PING has a nonzero object ID"));
@@ -385,7 +407,13 @@ pub(crate) fn spawn_input_reader(
                             ));
                         };
                         let _ = sender.send(Ok(record));
+                        if fatal {
+                            return Err(invalid_data("presenter sent a fatal interactive error"));
+                        }
                         continue;
+                    }
+                    if fatal {
+                        return Err(invalid_data("presenter sent a fatal interactive error"));
                     }
                     let event = match record.record_type {
                         messages::KEY_INPUT
@@ -435,6 +463,7 @@ pub(crate) fn spawn_input_reader(
                 || "interactive lane closed".into(),
                 |error| error.to_string(),
             );
+            let _ = writer.shutdown();
             close_input_lane(&pending, &message);
         })
         .map(|_| ())
@@ -521,4 +550,76 @@ pub(crate) fn decode_input_termination(
         binding: decode_input_tuple(schema, object_id, payload)?,
         reason,
     })
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn interactive_optional_and_fatal_records_are_handled_before_dispatch() {
+        use std::{io::Cursor, time::Duration};
+        use vivid_protocol::wire::RecordHeader;
+        let fatal = messages::ErrorReply {
+            code: messages::ERROR_BAD_MESSAGE,
+            request_id: 0,
+            detail: messages::ErrorDetail::new(vec![]).unwrap(),
+            fatal: true,
+            diagnostic: String::new(),
+        }
+        .encode()
+        .unwrap();
+        for (kind, flags, body, accepted) in [
+            (
+                0x6fff,
+                vivid_protocol::wire::RECORD_OPTIONAL,
+                vec![0xff],
+                true,
+            ),
+            (messages::ERROR, 0, fatal, false),
+        ] {
+            let mut input = Vec::new();
+            for (index, (record_type, flags, body)) in [
+                (messages::LANE_ACCEPTED, 0, vec![]),
+                (kind, flags, body),
+                (messages::PONG, 0, messages::empty(7)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                input.extend_from_slice(
+                    &RecordHeader {
+                        body_length: body.len() as u32,
+                        record_type,
+                        flags,
+                        object_id: 0,
+                        sequence: index as u64 + 1,
+                    }
+                    .encode(),
+                );
+                input.extend_from_slice(&body);
+            }
+            let mut connection = Connection::from_streams(
+                Box::new(Cursor::new(input)),
+                Box::new(std::io::sink()),
+                ConnectionKind::Lane,
+            )
+            .unwrap();
+            connection.read_record().unwrap();
+            let (reader, writer) = connection.split().unwrap();
+            let (send, receive) = mpsc::channel();
+            let pending = Arc::new(PendingInput {
+                requests: Mutex::new(HashMap::from([(7, send)])),
+                events: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+            });
+            spawn_input_reader(reader, writer, pending).unwrap();
+            assert_eq!(
+                receive
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_ok(),
+                accepted
+            );
+        }
+    }
 }

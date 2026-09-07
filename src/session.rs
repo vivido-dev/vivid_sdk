@@ -313,6 +313,106 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// One bounded establishment attempt. Retains identical authenticated HELLO bytes across
+/// transport failures; never reuse it for a fresh logical attempt. Contains secrets, no Debug.
+pub struct EstablishmentAttempt {
+    config: ProducerConfig,
+    prepared: Option<(Hello, Secret32, zeroize::Zeroizing<Vec<u8>>)>,
+    deadline: std::time::Instant,
+    carrier_key: Option<Secret32>,
+    tried: bool,
+}
+
+impl EstablishmentAttempt {
+    pub fn new(mut config: ProducerConfig, retry_timeout: std::time::Duration) -> io::Result<Self> {
+        config.validate()?;
+        if config.is_offline()
+            || retry_timeout.is_zero()
+            || retry_timeout > std::time::Duration::from_secs(300)
+        {
+            return Err(invalid_input(
+                "live establishment retry timeout must be in (0, 300 seconds]",
+            ));
+        }
+        let preface = vivid_protocol::wire::encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY,
+        );
+        let (hello, secret) = build_hello(&config, &preface)?;
+        let body = zeroize::Zeroizing::new(hello.encode(1)?);
+        // The prepared HELLO/secret now own the authentication data, not the retained options.
+        if let ProducerAuthentication::LeaseActivation {
+            proof_of_possession: Some(proof),
+            ..
+        } = &mut config.authentication
+        {
+            zeroize::Zeroize::zeroize(proof);
+        }
+        config.authentication = ProducerAuthentication::RootFromEnvironment;
+        Ok(Self {
+            config,
+            prepared: Some((hello, secret, body)),
+            deadline: std::time::Instant::now() + retry_timeout,
+            carrier_key: None,
+            tried: false,
+        })
+    }
+
+    pub fn connect(&mut self) -> io::Result<Session> {
+        self.connect_using(None)
+    }
+
+    pub fn connect_with_factory(
+        &mut self,
+        factory: Arc<dyn ConnectionFactory>,
+    ) -> io::Result<Session> {
+        self.connect_using(Some(factory))
+    }
+
+    fn connect_using(
+        &mut self,
+        factory: Option<Arc<dyn ConnectionFactory>>,
+    ) -> io::Result<Session> {
+        if std::time::Instant::now() >= self.deadline {
+            self.prepared = None;
+            self.carrier_key = None;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "establishment attempt expired",
+            ));
+        }
+        let (hello, secret, body) = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| invalid_input("establishment attempt already completed"))?;
+        if self.tried && matches!(hello.authentication, HelloAuthentication::Root { .. }) {
+            return Err(invalid_input(
+                "root authentication requires a fresh attempt",
+            ));
+        }
+        let binding = Secret32::new(
+            factory
+                .as_ref()
+                .map_or([0; 32], |factory| factory.carrier_binding_key()),
+        );
+        if self
+            .carrier_key
+            .as_ref()
+            .is_some_and(|previous| !auth::verify_proof(previous.expose(), binding.expose()))
+        {
+            return Err(invalid_input("establishment retry changed carrier binding"));
+        }
+        self.carrier_key = Some(binding);
+        self.tried = true;
+        let result = Session::connect_prepared(&self.config, factory, hello, secret, body);
+        if result.is_ok() {
+            self.prepared = None;
+            self.carrier_key = None;
+        }
+        result
+    }
+}
+
 impl Session {
     pub fn connect(config: ProducerConfig) -> io::Result<Self> {
         config.validate()?;
@@ -342,6 +442,17 @@ impl Session {
     pub(crate) fn connect_live(
         config: ProducerConfig,
         connection_factory: Option<Arc<dyn ConnectionFactory>>,
+    ) -> io::Result<Self> {
+        EstablishmentAttempt::new(config, std::time::Duration::from_secs(30))?
+            .connect_using(connection_factory)
+    }
+
+    fn connect_prepared(
+        config: &ProducerConfig,
+        connection_factory: Option<Arc<dyn ConnectionFactory>>,
+        hello: &Hello,
+        session_secret: &Secret32,
+        hello_body: &[u8],
     ) -> io::Result<Self> {
         let control_endpoint = if connection_factory.is_some() {
             optional_endpoint(
@@ -384,13 +495,7 @@ impl Session {
                 ConnectionKind::Control,
             )?,
         };
-        let preface = vivid_protocol::wire::encode_preface(
-            ConnectionKind::Control,
-            vivid_protocol::CONTROL_MAX_RECORD_BODY,
-        );
-        let (hello, session_secret) = build_hello(&config, &preface)?;
-        let hello_body = hello.encode(1)?;
-        connection.write_record(messages::HELLO, 0, 0, &hello_body)?;
+        connection.write_record(messages::HELLO, 0, 0, hello_body)?;
         let reply = connection.read_record()?;
         if reply.record_type == messages::ERROR {
             return Err(presenter_error(&reply.body)?);
@@ -467,12 +572,12 @@ impl Session {
             _ => {}
         }
         let prk = auth::extract_handshake_prk(
-            &session_secret,
+            session_secret,
             &hello.client_nonce,
             &welcome.server_nonce,
             &carrier_binding_key,
         );
-        let unconfirmed = welcome.unconfirmed_payload()?;
+        let unconfirmed = zeroize::Zeroizing::new(welcome.unconfirmed_payload()?);
         if !auth::verify_welcome_confirmation(
             &prk,
             &unconfirmed,
@@ -492,7 +597,7 @@ impl Session {
         let channel_key = Secret32::new(*keys.channel_key());
         let resume_key =
             (auth_kind != messages::AUTHENTICATION_ROOT).then(|| Secret32::new(*keys.resume_key()));
-        let lease_identity = hello_lease_identity(&hello);
+        let lease_identity = hello_lease_identity(hello);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         connection.set_receive_body_limit(config.maximum_control_body)?;
         let info = session_info(&welcome);
@@ -539,7 +644,7 @@ impl Session {
         let resumable = lease_identity.is_some();
         let mut connection = match &config.trace_dir {
             Some(directory) => {
-                Connection::trace(&directory.join("control.vivid"), ConnectionKind::Control)?
+                Connection::trace(&directory.join("control.ndjson"), ConnectionKind::Control)?
             }
             None => Connection::sink(ConnectionKind::Control)?,
         };
@@ -772,6 +877,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let ControlPlane::Live { writer, .. } = &self.control {
+            let _ = writer.shutdown();
+        }
         if !self.closed {
             // Dropping is cancellation/unclean loss, not a clean GOODBYE. This is intentional:
             // resumable sessions must be allowed to suspend rather than being silently destroyed.
@@ -797,7 +905,33 @@ pub(crate) fn spawn_control_reader(
             let result = (|| -> io::Result<()> {
                 loop {
                     let record = reader.read_record()?;
+                    if !supported_control_record(record.record_type) {
+                        if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 {
+                            continue;
+                        }
+                        if let Ok(envelope) = messages::decode_control(&record.body) {
+                            let error = messages::ErrorReply {
+                                code: messages::ERROR_UNSUPPORTED_PROFILE,
+                                request_id: envelope.request_id,
+                                detail: messages::ErrorDetail::new(vec![])?,
+                                fatal: true,
+                                diagnostic: "unsupported required control record".into(),
+                            };
+                            let _ = writer.write_record(
+                                messages::ERROR,
+                                0,
+                                record.object_id,
+                                &error.encode()?,
+                            );
+                        }
+                        return Err(invalid_data("unsupported required control record"));
+                    }
                     let envelope = messages::decode_control(&record.body)?;
+                    let fatal = if record.record_type == messages::ERROR {
+                        messages::parse_error_reply(&record.body)?.fatal
+                    } else {
+                        false
+                    };
                     if record.record_type == messages::PING {
                         writer.write_record(
                             messages::PONG,
@@ -816,7 +950,13 @@ pub(crate) fn spawn_control_reader(
                             ));
                         };
                         let _ = sender.send(Ok(record));
+                        if fatal {
+                            return Err(invalid_data("presenter sent a fatal control error"));
+                        }
                         continue;
+                    }
+                    if fatal {
+                        return Err(invalid_data("presenter sent a fatal control error"));
                     }
                     if record.record_type == messages::TRACK_LOST {
                         apply_track_lost(record.object_id, &envelope.payload, &tracks)?;
@@ -830,6 +970,7 @@ pub(crate) fn spawn_control_reader(
                     events.push_back(event);
                 }
             })();
+            let _ = writer.shutdown();
             pending.closed.store(true, Ordering::Release);
             let message = result.err().map_or_else(
                 || "control connection closed".into(),
@@ -894,4 +1035,209 @@ pub(crate) fn apply_track_lost(
         close_track_flow(active_flow.as_ref(), diagnostic);
     }
     Ok(())
+}
+
+// Assigned control records understood by the SDK; unknown OPTIONAL bodies are opaque.
+fn supported_control_record(kind: u16) -> bool {
+    use vivid_protocol::registry::record::*;
+    matches!(
+        kind,
+        HELLO
+            | WELCOME
+            | OK
+            | ERROR
+            | PING
+            | PONG
+            | GOODBYE
+            | QUERY_SESSION
+            | SESSION_STATUS
+            | LANE_OPEN
+            | LANE_ACCEPTED
+            | TARGET_CHANGED
+            | CAPS_CHANGED
+            | SET_OBSERVATION
+            | OBSERVATION_GAP
+            | CREATE_SURFACE
+            | SURFACE_READY
+            | UPDATE_SURFACE
+            | DESTROY_SURFACE
+            | QUERY_SURFACE
+            | SURFACE_STATUS
+            | SURFACE_CHANGED
+            | PROBE_TRACK_CONFIG
+            | TRACK_SUPPORT
+            | CREATE_TRACK
+            | TRACK_READY
+            | DESTROY_TRACK
+            | TRACK_LOST
+            | ACTIVATE_TRACK
+            | TRACK_ACTIVATED
+            | ADVANCE_CHANNEL
+            | CHANNEL_ADVANCED
+            | QUERY_TRACK
+            | TRACK_STATUS
+            | WAIT_TRACK
+            | WAIT_SATISFIED
+            | CANCEL_WAIT
+            | TRACK_CHANGED
+            | BEGIN_TXN
+            | CREATE_NODE
+            | UPDATE_NODE
+            | DELETE_NODE
+            | COMMIT_TXN
+            | ABORT_TXN
+            | SCENE_PRESENTED
+            | QUERY_SCENE
+            | SCENE_STATUS
+            | SCENE_CHANGED
+            | ANCHOR_READY
+            | ANCHOR_GONE
+            | QUERY_ANCHOR
+            | ANCHOR_STATUS
+            | PLAY
+            | PAUSE
+            | FLUSH
+            | DRAIN
+            | PLAYBACK_STATE
+            | SET_AUDIO_GAIN
+            | CREATE_CONTEXT
+            | CONTEXT_READY
+            | REVOKE_CONTEXT
+            | CONTEXT_CHANGED
+            | CREATE_SESSION_LEASE
+            | SESSION_LEASE_READY
+            | REVOKE_SESSION_LEASE
+            | SESSION_LEASE_CHANGED
+            | SET_FILE_DROP_BINDING
+            | FILE_DROP_BOUND
+            | FILE_DROP_OFFER
+            | ACCEPT_FILE_DROP
+            | FILE_DROP_ACCEPTED
+            | CANCEL_FILE_DROP
+            | FILE_DROP_CANCELLED
+            | ADVANCE_FILE_TRANSFER
+            | FILE_TRANSFER_ADVANCED
+            | QUERY_FILE_DROP
+            | FILE_DROP_STATUS
+    )
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use std::time::Duration;
+    use vivid_protocol::cbor::Value;
+
+    fn dispatch_fixture(kind: u16, flags: u16, body: Vec<u8>) -> Result<Record, String> {
+        use std::io::Cursor;
+        use vivid_protocol::wire::RecordHeader;
+        let mut input = Vec::new();
+        for (index, (record_type, flags, body)) in [
+            (messages::WELCOME, 0, vec![]),
+            (kind, flags, body),
+            (messages::PONG, 0, messages::empty(7)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            input.extend_from_slice(
+                &RecordHeader {
+                    body_length: body.len() as u32,
+                    record_type,
+                    flags,
+                    object_id: 0,
+                    sequence: index as u64 + 1,
+                }
+                .encode(),
+            );
+            input.extend_from_slice(&body);
+        }
+        let mut connection = Connection::from_streams(
+            Box::new(Cursor::new(input)),
+            Box::new(std::io::sink()),
+            ConnectionKind::Control,
+        )
+        .unwrap();
+        connection.read_record().unwrap();
+        let (reader, writer) = connection.split().unwrap();
+        let (send, receive) = mpsc::channel();
+        let pending = Arc::new(PendingControl {
+            requests: Mutex::new(HashMap::from([(7, send)])),
+            events: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+        });
+        spawn_control_reader(
+            reader,
+            writer,
+            pending,
+            Arc::new(SessionLifecycle::new()),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .unwrap();
+        receive.recv_timeout(Duration::from_secs(1)).unwrap()
+    }
+    #[test]
+    fn optional_opaque_records_do_not_consume_requests() {
+        assert_eq!(
+            dispatch_fixture(0x6fff, vivid_protocol::wire::RECORD_OPTIONAL, vec![0xff])
+                .unwrap()
+                .record_type,
+            messages::PONG
+        );
+        assert!(dispatch_fixture(0x6fff, 0, vec![0xff]).is_err());
+    }
+    #[test]
+    fn every_unsolicited_error_is_validated_and_fatal_closes() {
+        let valid = messages::ErrorReply {
+            code: messages::ERROR_BAD_MESSAGE,
+            request_id: 0,
+            detail: messages::ErrorDetail::new(vec![]).unwrap(),
+            fatal: false,
+            diagnostic: String::new(),
+        };
+        assert!(dispatch_fixture(messages::ERROR, 0, valid.encode().unwrap()).is_ok());
+        let fatal = messages::ErrorReply {
+            fatal: true,
+            ..valid
+        };
+        assert!(dispatch_fixture(messages::ERROR, 0, fatal.encode().unwrap()).is_err());
+        for (code, detail) in [
+            (0, vec![]),
+            (messages::ERROR_BAD_MESSAGE, vec![(10, Value::Unsigned(1))]),
+        ] {
+            let body = messages::encode_payload(
+                0,
+                vec![
+                    (0, Value::Unsigned(code)),
+                    (1, Value::Unsigned(0)),
+                    (2, Value::Map(detail)),
+                    (3, Value::Bool(false)),
+                    (4, Value::Text(String::new())),
+                ],
+            )
+            .unwrap();
+            assert!(dispatch_fixture(messages::ERROR, 0, body).is_err());
+        }
+    }
+    #[test]
+    fn expired_attempt_releases_owned_authentication() {
+        let config = ProducerConfig {
+            authentication: ProducerAuthentication::Root {
+                root_secret: Secret32::new([1; 32]),
+            },
+            ..ProducerConfig::default()
+        };
+        let mut attempt = EstablishmentAttempt::new(config, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            attempt.config.authentication,
+            ProducerAuthentication::RootFromEnvironment
+        ));
+        attempt.deadline = std::time::Instant::now();
+        assert_eq!(
+            attempt.connect().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(attempt.prepared.is_none());
+        assert!(attempt.carrier_key.is_none());
+    }
 }

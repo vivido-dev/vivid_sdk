@@ -41,6 +41,7 @@ use vivid_protocol::track::{
     VideoConfiguration,
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
+use zeroize::Zeroizing;
 
 use super::config::{
     BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
@@ -586,6 +587,15 @@ struct SessionRuntime {
     resume_generation: u64,
 }
 
+// An exact authenticated transcript can recognize a lost-response retry after old keys
+// have been erased. No activation secret or previous resume key is retained here.
+struct EstablishmentRetry {
+    transcript_hash: [u8; 32],
+    profile_fingerprint: [u8; 32],
+    deadline: Instant,
+    maximum: u32,
+}
+
 struct LeaseEntry {
     pane: PaneId,
     definition: SessionLeaseDefinition,
@@ -596,6 +606,7 @@ struct LeaseEntry {
     machine: LeaseMachine,
     resume_key: Option<Secret32>,
     grace_deadline: Option<Instant>,
+    retry: Option<EstablishmentRetry>,
 }
 
 struct SurfaceEntry {
@@ -684,6 +695,7 @@ struct State {
     config: PresenterConfig,
     presenter: PresenterInstanceId,
     capabilities: HashMap<PaneId, Secret32>,
+    root_nonces: HashMap<(PaneId, [u8; 32]), Instant>,
     leases: HashMap<(u64, u64), LeaseEntry>,
     metrics: HashMap<PaneId, Metrics>,
     targets: HashMap<PaneId, TargetState>,
@@ -860,6 +872,7 @@ impl VirtualVivid {
             config,
             presenter: PresenterInstanceId(presenter),
             capabilities: HashMap::new(),
+            root_nonces: HashMap::new(),
             leases: HashMap::new(),
             metrics: HashMap::new(),
             targets: HashMap::new(),
@@ -1012,6 +1025,7 @@ impl VirtualVivid {
             active_session: None,
             resume_key: None,
             grace_deadline: None,
+            retry: None,
         };
         let ready = GatewayLeaseReady::from_entry(&entry);
         state.leases.insert(key, entry);
@@ -2361,63 +2375,67 @@ fn handle_control(
     let first = reader
         .read_record(ConnectionKind::Control)
         .map_err(|error| with_context(error, "reading HELLO"))?;
-    let (request_id, hello) = Hello::decode(&first.body)
+    let body = Zeroizing::new(first.body);
+    let (request_id, hello) = Hello::decode(&body)
         .map_err(|error| io::Error::other(format!("decoding HELLO: {error}")))?;
     let (session_id, maximum) =
-        establish_session(shared, writer.clone(), preface, &hello, request_id)
+        establish_session(shared, writer.clone(), preface, &hello, request_id, &body)
             .map_err(|error| with_context(error, "establishing root session"))?;
-    reader
-        .set_maximum(maximum)
-        .map_err(|error| with_context(error, "setting control receive maximum"))?;
-    writer
-        .set_maximum(maximum)
-        .map_err(|error| with_context(error, "setting control send maximum"))?;
-    reader
-        .clear_read_deadline()
-        .map_err(|error| with_context(error, "clearing handshake deadline"))?;
+    drop(hello);
+    drop(body);
     let mut clean = false;
     let mut terminal_error = None;
-    loop {
-        let record = match reader.read_record(ConnectionKind::Control) {
-            Ok(record) => record,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => {
-                terminal_error = Some(error);
-                break;
-            }
-        };
-        match dispatch_control(shared, session_id, &record) {
-            Ok(Some((record_type, object_id, body))) => {
-                writer.write_record(record_type, object_id, &body)?;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let request = messages::decode_control(&record.body)
-                    .map(|envelope| envelope.request_id)
-                    .unwrap_or(0);
-                let fatal = request == 0;
-                writer.write_record(
-                    messages::ERROR,
-                    record.object_id,
-                    &protocol_error(request, error.code, fatal, error.message)?,
-                )?;
-                if fatal {
+    let run_result = (|| -> io::Result<()> {
+        reader.set_maximum(maximum)?;
+        writer.set_maximum(maximum)?;
+        reader.clear_read_deadline()?;
+        loop {
+            let record = match reader.read_record(ConnectionKind::Control) {
+                Ok(record) => record,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => {
+                    terminal_error = Some(error);
                     break;
                 }
+            };
+            match dispatch_control(shared, session_id, &record) {
+                Ok(Some((record_type, object_id, body))) => {
+                    writer.write_record(record_type, object_id, &body)?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let request = messages::decode_control(&record.body)
+                        .map(|envelope| envelope.request_id)
+                        .unwrap_or(0);
+                    let fatal = request == 0;
+                    writer.write_record(
+                        messages::ERROR,
+                        record.object_id,
+                        &protocol_error(request, error.code, fatal, error.message)?,
+                    )?;
+                    if fatal {
+                        break;
+                    }
+                }
+            }
+            if record.record_type == messages::ADVANCE_CHANNEL {
+                // A timed channel can be parked behind projection or linked-video recovery while the
+                // producer advances it. Wake the retired worker after the mutation is visible so it
+                // observes the generation mismatch and exits; otherwise a producer that synchronously
+                // retires its old audio worker during a seek can wait forever.
+                changed.notify_all();
+            }
+            if record.record_type == messages::GOODBYE {
+                clean = true;
+                break;
             }
         }
-        if record.record_type == messages::ADVANCE_CHANNEL {
-            // A timed channel can be parked behind projection or linked-video recovery while the
-            // producer advances it. Wake the retired worker after the mutation is visible so it
-            // observes the generation mismatch and exits; otherwise a producer that synchronously
-            // retires its old audio worker during a seek can wait forever.
-            changed.notify_all();
-        }
-        if record.record_type == messages::GOODBYE {
-            clean = true;
-            break;
-        }
-    }
+        Ok(())
+    })();
+    // Drain the final response without holding global state, then terminate the old transport
+    // before marking it eligible for replacement.
+    let drain_result = writer.flush();
+    reader.cancel().cancel();
     let expiry = {
         let mut state = lock(shared);
         let lease = state
@@ -2451,7 +2469,120 @@ fn handle_control(
     // A timed channel can be parked behind projection backpressure when its control session is
     // torn down. Wake it so it observes that its owner-scoped track disappeared and exits.
     changed.notify_all();
-    terminal_error.map_or(Ok(()), Err)
+    run_result
+        .and(drain_result)
+        .and(terminal_error.map_or(Ok(()), Err))
+}
+
+fn establishment_hash(preface: &[u8; 16], body: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(preface)
+        .chain_update(body)
+        .finalize()
+        .into()
+}
+
+fn admit_session_post_hello(state: &mut State, session_id: u64) {
+    let key = state
+        .sessions
+        .get(&session_id)
+        .and_then(|session| session.lease);
+    if let Some(lease) = key.and_then(|key| state.leases.get_mut(&key)) {
+        let _ = lease.machine.admit_post_hello();
+        lease.retry = None;
+    }
+}
+
+fn retry_establishment(
+    state: &mut State,
+    writer: &Arc<Writer>,
+    preface: &[u8; 16],
+    hello: &Hello,
+    body: &[u8],
+) -> Option<io::Result<(u64, u32)>> {
+    let (key, attempt_id) = match &hello.authentication {
+        HelloAuthentication::LeaseActivation {
+            context_id,
+            lease_id,
+            attempt_id,
+            ..
+        }
+        | HelloAuthentication::Resume {
+            context_id,
+            lease_id,
+            attempt_id,
+            ..
+        } => ((*context_id, *lease_id), *attempt_id),
+        HelloAuthentication::Root { .. } => return None,
+    };
+    let lease = state.leases.get_mut(&key)?;
+    let retry = lease.retry.as_ref()?;
+    let session_id = lease.active_session?;
+    let session = state.sessions.get(&session_id)?;
+    if !session.closed
+        || retry.deadline <= Instant::now()
+        || !auth::verify_proof(&retry.transcript_hash, &establishment_hash(preface, body))
+    {
+        return Some(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "establishment retry rejected",
+        )));
+    }
+    let maximum = retry.maximum;
+    let decision = match &hello.authentication {
+        HelloAuthentication::LeaseActivation { .. } => lease.machine.begin_activation(
+            attempt_id,
+            hello.client_nonce,
+            body,
+            retry.profile_fingerprint,
+            session_id,
+            [0; 32],
+            Vec::new(),
+        ),
+        HelloAuthentication::Resume {
+            resume_generation, ..
+        } => lease.machine.begin_resume(
+            ResumeGeneration::new(*resume_generation),
+            attempt_id,
+            hello.client_nonce,
+            body,
+            retry.profile_fingerprint,
+            session_id,
+            [0; 32],
+            Vec::new(),
+        ),
+        HelloAuthentication::Root { .. } => unreachable!(),
+    };
+    Some((|| {
+        let AttemptDecision::ExactReplay { welcome, .. } = decision.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "establishment retry rejected",
+            )
+        })?
+        else {
+            return Err(io::Error::other("retry unexpectedly created a new session"));
+        };
+        if lease.machine.state() == LeaseState::Reserved {
+            lease
+                .machine
+                .commit_welcome()
+                .map_err(|_| io::Error::other("retry commit failed"))?;
+        }
+        // The old control transport was cancelled before its session was marked closed.
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("retry session exists");
+        session.writer = writer.clone();
+        session.closed = false;
+        if let Err(error) = writer.write_record(messages::WELCOME, 0, &welcome) {
+            session.closed = true;
+            let _ = lease.machine.confirm_transport_lost(false);
+            return Err(error);
+        }
+        Ok((session_id, maximum))
+    })())
 }
 
 fn establish_session(
@@ -2460,6 +2591,7 @@ fn establish_session(
     preface: &[u8; 16],
     hello: &Hello,
     request_id: u64,
+    hello_body: &[u8],
 ) -> io::Result<(u64, u32)> {
     enum Principal {
         Root {
@@ -2481,6 +2613,9 @@ fn establish_session(
     }
 
     let mut state = lock(shared);
+    if let Some(result) = retry_establishment(&mut state, &writer, preface, hello, hello_body) {
+        return result;
+    }
     let root_contract =
         state.config.resource_contract.clone().unwrap_or_else(|| {
             presenter_contract(&state.config.media, state.config.target.as_ref())
@@ -2505,6 +2640,24 @@ fn establish_session(
                 ));
             }
             let pane = matches[0];
+            let now = Instant::now();
+            state.root_nonces.retain(|_, deadline| *deadline > now);
+            if state.root_nonces.contains_key(&(pane, hello.client_nonce)) {
+                return Err(send_fatal(
+                    &writer,
+                    request_id,
+                    messages::ERROR_AUTH_FAILED,
+                    "root authentication replay rejected",
+                ));
+            }
+            if state.root_nonces.len() >= 4096 {
+                return Err(send_fatal(
+                    &writer,
+                    request_id,
+                    messages::ERROR_LIMIT_EXCEEDED,
+                    "root authentication capacity exhausted",
+                ));
+            }
             let secret = state
                 .capabilities
                 .get(&pane)
@@ -2793,7 +2946,7 @@ fn establish_session(
                 .begin_activation(
                     *attempt_id,
                     hello.client_nonce,
-                    &hello.authless_payload()?,
+                    hello_body,
                     fingerprint,
                     session_id,
                     server_nonce,
@@ -2802,9 +2955,6 @@ fn establish_session(
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::PermissionDenied, "lease activation failed")
                 })?;
-            lease.machine.commit_welcome().map_err(|error| {
-                io::Error::other(format!("lease activation commit failed: {error:?}"))
-            })?;
             match decision {
                 AttemptDecision::Fresh {
                     server_nonce,
@@ -2834,7 +2984,7 @@ fn establish_session(
                     ResumeGeneration::new(*generation),
                     *attempt_id,
                     hello.client_nonce,
-                    &hello.authless_payload()?,
+                    hello_body,
                     fingerprint,
                     session_id,
                     server_nonce,
@@ -2843,11 +2993,7 @@ fn establish_session(
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::PermissionDenied, "lease resume failed")
                 })?;
-            lease.machine.commit_welcome().map_err(|error| {
-                io::Error::other(format!("lease resume commit failed: {error:?}"))
-            })?;
             lease.resume_key = None;
-            lease.grace_deadline = None;
             match decision {
                 AttemptDecision::Fresh {
                     server_nonce,
@@ -2868,7 +3014,6 @@ fn establish_session(
     let prk = auth::extract_handshake_prk(secret, &hello.client_nonce, &decided_nonce, &[0; 32]);
     let (keys, anchor_key) =
         auth::derive_session_keys(&prk, session_id, resume_generation, &session_tag);
-    writer.write_record(messages::WELCOME, 0, &decided_welcome)?;
     let (scene_revision, target_generation) = state
         .sessions
         .get(&session_id)
@@ -2878,6 +3023,12 @@ fn establish_session(
             TargetGeneration::new(target.generation),
         ));
     let alternate_screen = state.alternate_panes.contains(&pane);
+    if matches!(principal, Principal::Root { .. }) {
+        state.root_nonces.insert(
+            (pane, hello.client_nonce),
+            Instant::now() + Duration::from_secs(300),
+        );
+    }
     state.sessions.insert(
         session_id,
         SessionRuntime {
@@ -2887,7 +3038,7 @@ fn establish_session(
             session_tag,
             channel_key: Secret32::new(*keys.channel_key()),
             anchor_key,
-            writer,
+            writer: writer.clone(),
             root_context,
             scene_revision,
             target_generation,
@@ -2905,8 +3056,31 @@ fn establish_session(
         && let Some(lease) = state.leases.get_mut(&key)
     {
         lease.active_session = Some(session_id);
-        let _ = lease.machine.admit_post_hello();
+        let deadline = lease.grace_deadline.unwrap_or_else(|| {
+            lease.issued_at + Duration::from_micros(lease.definition.activation_timeout_us)
+        });
+        lease.retry = Some(EstablishmentRetry {
+            transcript_hash: establishment_hash(preface, hello_body),
+            profile_fingerprint: fingerprint,
+            deadline,
+            maximum,
+        });
+        lease.grace_deadline = None;
+        lease.machine.commit_welcome().map_err(|error| {
+            io::Error::other(format!("lease establishment commit failed: {error:?}"))
+        })?;
         lease.revision = lease.revision.saturating_add(1);
+    }
+    if let Err(error) = writer.write_record(messages::WELCOME, 0, &decided_welcome) {
+        if let Some(key) = lease_key {
+            if let Some((key, generation, deadline)) = suspend_session(&mut state, session_id, key)
+            {
+                spawn_lease_expiry(shared.clone(), key, session_id, generation, deadline);
+            }
+        } else {
+            cleanup_session(&mut state, session_id);
+        }
+        return Err(error);
     }
     Ok((session_id, maximum))
 }
@@ -3003,6 +3177,7 @@ fn dispatch_control(
     if !state.sessions.contains_key(&session_id) {
         return Err(ControlError::missing("session does not exist"));
     }
+    admit_session_post_hello(&mut state, session_id);
     let projection_revision_before = state.projection_revision;
     let mutation_cache = if is_idempotent_mutation(record.record_type) {
         envelope.idempotency_key.map(|key| {
@@ -3975,6 +4150,7 @@ fn handle_track(
                 "channel authentication failed",
             ));
         }
+        admit_session_post_hello(&mut state, open.session_id);
         let track = state
             .tracks
             .get_mut(&key)
@@ -5413,7 +5589,9 @@ fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
 }
 
 fn cleanup_session(state: &mut State, session: u64) {
-    state.sessions.remove(&session);
+    if let Some(runtime) = state.sessions.remove(&session) {
+        runtime.writer.close();
+    }
     let surfaces = state
         .surfaces
         .keys()
@@ -5450,10 +5628,17 @@ fn suspend_session(
     })?;
     let deadline = {
         let lease = state.leases.get_mut(&lease_key)?;
-        if lease.definition.cleanup_policy != CleanupPolicy::SuspendOnUncleanLoss
-            || lease.definition.requested_disconnect_grace_us == 0
-            || lease.machine.confirm_transport_lost(false).ok() != Some(LeaseState::Suspended)
+        let next_state = lease.machine.confirm_transport_lost(false).ok();
+        if matches!(next_state, Some(LeaseState::Active | LeaseState::Reserved))
+            && let Some(retry) = &lease.retry
         {
+            let deadline = retry.deadline;
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                session.closed = true;
+            }
+            return Some((lease_key, generation, deadline));
+        }
+        if next_state != Some(LeaseState::Suspended) {
             cleanup_session(state, session_id);
             state.leases.remove(&lease_key);
             return None;
@@ -5516,11 +5701,15 @@ fn spawn_lease_expiry(
             let mut state = lock(&shared);
             let expired = state.leases.get(&lease_key).is_some_and(|lease| {
                 lease.active_session == Some(session_id)
-                    && lease.machine.state() == LeaseState::Suspended
                     && lease.machine.resume_generation().get() == generation
-                    && lease
-                        .grace_deadline
-                        .is_some_and(|value| value <= Instant::now())
+                    && ((lease.machine.state() == LeaseState::Suspended
+                        && lease
+                            .grace_deadline
+                            .is_some_and(|value| value <= Instant::now()))
+                        || lease
+                            .retry
+                            .as_ref()
+                            .is_some_and(|retry| retry.deadline <= Instant::now()))
             });
             if expired {
                 cleanup_session(&mut state, session_id);
@@ -6207,6 +6396,48 @@ mod tests {
             maximum_latency_us: 1_000_000,
             retained_pixel_charge: 0,
         }
+    }
+
+    #[test]
+    fn root_nonce_capacity_expires_without_evicting_live_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("root-capacity.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        presenter.update_metrics(1, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(1).unwrap();
+        {
+            let mut state = lock(&presenter.state);
+            for index in 0u64..4096 {
+                let mut nonce = [0; 32];
+                nonce[..8].copy_from_slice(&index.to_be_bytes());
+                state
+                    .root_nonces
+                    .insert((1, nonce), Instant::now() + Duration::from_secs(30));
+            }
+        }
+        let error = crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<crate::PresenterError>()
+                .unwrap()
+                .code,
+            messages::ERROR_LIMIT_EXCEEDED
+        );
+        {
+            let mut state = lock(&presenter.state);
+            assert_eq!(state.root_nonces.len(), 4096);
+            for deadline in state.root_nonces.values_mut() {
+                *deadline = Instant::now();
+            }
+        }
+        let session = crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        assert_eq!(lock(&presenter.state).root_nonces.len(), 1);
+        session.close().unwrap();
     }
 
     #[test]
@@ -8884,6 +9115,192 @@ mod tests {
         assert!(snapshot.sources[0].retained.is_none());
 
         client.close().unwrap();
+    }
+
+    #[test]
+    fn lost_resume_welcome_replays_without_old_keys_and_preserves_other_owner() {
+        use vivid_protocol::wire::{Connection, Endpoint, encode_preface};
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("retry.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        let mut clients = Vec::new();
+        for owner in [41, 42] {
+            presenter.update_metrics(owner, 80, 24, (8, 16));
+            let mut config = producer(presenter.endpoint(), &"11".repeat(32));
+            let mut profiles = config.required_profiles.clone();
+            profiles.extend(config.optional_profiles.clone());
+            profiles.sort();
+            let (definition, mut activation) = SessionLeaseBuilder::new(owner, 9)
+                .permitted_profiles(profiles)
+                .contract(ResourceContract::new(
+                    [u64::MAX / 4; vivid_protocol::resource::RESOURCE_COUNT],
+                ))
+                .cleanup_policy(CleanupPolicy::SuspendOnUncleanLoss)
+                .disconnect_grace_us(5_000_000)
+                .build()
+                .unwrap();
+            presenter.issue_lease(owner, definition).unwrap();
+            config.authentication = ProducerAuthentication::lease_activation_bytes(
+                owner,
+                9,
+                activation.take().unwrap(),
+            )
+            .unwrap();
+            let mut client = crate::Session::connect(config).unwrap();
+            client
+                .create_surface(surface(owner, 9), &RequestMetadata::default())
+                .unwrap();
+            client
+                .create_track(raster(owner, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            clients.push(client);
+        }
+        let first = clients.remove(0);
+        let second = clients.remove(0);
+        let session_id = first.info().session_id;
+        let other_id = second.info().session_id;
+        if let crate::session::ControlPlane::Live { writer, .. } = &first.control {
+            writer.shutdown().unwrap();
+        }
+        drop(first);
+        let wait = |predicate: &dyn Fn(&State) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if predicate(&lock(&presenter.state)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "presenter transition timed out");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait(&|state| {
+            state
+                .leases
+                .get(&(41, 9))
+                .is_some_and(|lease| lease.machine.state() == LeaseState::Suspended)
+        });
+        let prior = Secret32::new(
+            *lock(&presenter.state).leases[&(41, 9)]
+                .resume_key
+                .as_ref()
+                .unwrap()
+                .expose(),
+        );
+        let config = producer(presenter.endpoint(), &"11".repeat(32));
+        let mut hello = Hello {
+            producer_name: config.producer_name,
+            producer_version: config.producer_version,
+            required_profiles: config.required_profiles,
+            optional_profiles: config.optional_profiles,
+            maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+            client_nonce: [0x71; 32],
+            target_profile: config.target_profile,
+            authentication: HelloAuthentication::Resume {
+                context_id: 41,
+                lease_id: 9,
+                session_id,
+                resume_generation: 0,
+                attempt_id: [0x72; 16],
+                proof: [0; 32],
+            },
+            extensions: vec![],
+        };
+        let preface = encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY,
+        );
+        hello.authenticate_resume(prior.expose(), &preface).unwrap();
+        let body = hello.encode(1).unwrap();
+        let endpoint = Endpoint::parse(&presenter.endpoint()).unwrap();
+        let connect = || {
+            let mut connection = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+            connection
+                .write_record(messages::HELLO, 0, 0, &body)
+                .unwrap();
+            connection
+        };
+        let lost = connect();
+        wait(&|state| state.leases[&(41, 9)].machine.resume_generation() == ResumeGeneration::ONE);
+        // Close without reading WELCOME: the response never reaches the producer handshake.
+        lost.writer().shutdown().unwrap();
+        drop(lost);
+        wait(&|state| state.sessions[&session_id].closed);
+        {
+            let state = lock(&presenter.state);
+            assert!(
+                state.leases[&(41, 9)].resume_key.is_none(),
+                "old resume key must be erased"
+            );
+            assert_eq!(state.leases[&(41, 9)].machine.state(), LeaseState::Active);
+            assert!(!state.sessions[&other_id].closed);
+        }
+        // A changed proof is not an exact retry, even with the same identity and nonce.
+        let mut altered = Hello::decode(&body).unwrap().1;
+        if let HelloAuthentication::Resume { proof, .. } = &mut altered.authentication {
+            proof[0] ^= 1;
+        }
+        let mut wrong = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        wrong
+            .write_record(messages::HELLO, 0, 0, &altered.encode(1).unwrap())
+            .unwrap();
+        assert!(wrong.read_record().is_err());
+        let mut replay = connect();
+        let welcome = replay.read_record().unwrap();
+        assert_eq!(welcome.record_type, messages::WELCOME);
+        assert_eq!(
+            Welcome::decode(&welcome.body).unwrap().1.resume_generation,
+            1
+        );
+        let mut competing = connect();
+        assert!(
+            competing.read_record().is_err(),
+            "a live replacement excludes another retry"
+        );
+        replay.writer().shutdown().unwrap();
+        drop(replay);
+        wait(&|state| state.sessions[&session_id].closed);
+        let mut repeated = connect();
+        assert_eq!(repeated.read_record().unwrap().body, welcome.body);
+        repeated
+            .write_record(messages::PING, 0, 0, &messages::empty(2))
+            .unwrap();
+        assert_eq!(repeated.read_record().unwrap().record_type, messages::PONG);
+        assert!(lock(&presenter.state).leases[&(41, 9)].retry.is_none());
+        repeated.writer().shutdown().unwrap();
+        drop(repeated);
+        wait(&|state| state.leases[&(41, 9)].machine.state() == LeaseState::Suspended);
+        let mut stale = connect();
+        let rejection = stale.read_record().unwrap();
+        assert_eq!(rejection.record_type, messages::ERROR);
+        // Expire only the resumed owner's suspension, without a wall-clock grace sleep.
+        let deadline = Instant::now();
+        lock(&presenter.state)
+            .leases
+            .get_mut(&(41, 9))
+            .unwrap()
+            .grace_deadline = Some(deadline);
+        spawn_lease_expiry(presenter.state.clone(), (41, 9), session_id, 1, deadline);
+        wait(&|state| !state.sessions.contains_key(&session_id));
+        let state = lock(&presenter.state);
+        assert!(state.surfaces.contains_key(&SurfaceKey {
+            session: other_id,
+            context: 42,
+            surface: 9
+        }));
+        assert!(state.tracks.contains_key(&TrackKey {
+            surface: SurfaceKey {
+                session: other_id,
+                context: 42,
+                surface: 9
+            },
+            track: 11
+        }));
+        assert!(!state.sessions[&other_id].closed);
+        drop(state);
+        second.close().unwrap();
     }
 
     #[test]

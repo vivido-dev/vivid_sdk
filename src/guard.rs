@@ -52,6 +52,8 @@ pub struct InputBindingGuard {
     surface_generation: SurfaceGeneration,
     watchdog_deadline: Option<Monotonic>,
     last_renewal_sequence: u64,
+    requested_classes: u64,
+    requested_watchdog_us: u64,
     preconditions: DesktopPreconditions,
 }
 impl InputBindingGuard {
@@ -64,6 +66,8 @@ impl InputBindingGuard {
             surface_generation: SurfaceGeneration::ZERO,
             watchdog_deadline: None,
             last_renewal_sequence: 0,
+            requested_classes: 0,
+            requested_watchdog_us: 0,
             preconditions: DesktopPreconditions::none(),
         }
     }
@@ -153,7 +157,17 @@ impl InputBindingGuard {
         if classes & self.preconditions.capability_mask == 0 {
             return Err(err("no requested class within capability mask"));
         }
-        let epoch = self.advance_epoch();
+        if surface_id == 0 {
+            return Err(err("input surface is zero"));
+        }
+        let epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| err("input epoch exhausted"))?;
+        self.release();
+        self.epoch = epoch;
+        self.requested_classes = classes;
+        self.requested_watchdog_us = watchdog_us;
         self.context_id = context_id;
         self.surface_id = surface_id;
         self.surface_generation = surface_generation;
@@ -169,8 +183,12 @@ impl InputBindingGuard {
     }
     pub fn disable(&mut self, reason: u64) -> InputBinding {
         let epoch = self.advance_epoch();
-        self.state = GuardState::Inactive;
-        self.watchdog_deadline = None;
+        self.release();
+        self.context_id = 0;
+        self.surface_id = 0;
+        self.surface_generation = SurfaceGeneration::ZERO;
+        self.requested_classes = 0;
+        self.requested_watchdog_us = 0;
         InputBinding {
             producer_epoch: InputEpoch::new(epoch),
             context_id: 0,
@@ -184,6 +202,17 @@ impl InputBindingGuard {
     pub fn handle_bound(&mut self, status: &InputBindingStatus) -> io::Result<()> {
         if status.producer_epoch != self.epoch {
             return Err(err("INPUT_BOUND returned a different epoch"));
+        }
+        if status.context_id != self.context_id
+            || status.surface_id != self.surface_id
+            || status.surface_generation != self.surface_generation.get()
+        {
+            return Err(err("INPUT_BOUND returned a different binding identity"));
+        }
+        if status.effective_classes & !self.requested_classes != 0
+            || status.watchdog_timeout_us > self.requested_watchdog_us
+        {
+            return Err(err("INPUT_BOUND broadened the requested grant"));
         }
         if status.state > 2 {
             return Err(err("INPUT_BOUND returned an unregistered state"));
@@ -225,6 +254,9 @@ impl InputBindingGuard {
         let grant = self
             .grant()
             .ok_or_else(|| err("a renewal arrived without an active grant"))?;
+        if self.current_tag() != Some(renewal.binding) {
+            return Err(err("renewal belongs to a different grant"));
+        }
         if renewal.renewal_sequence == 0 {
             return Err(err("a renewal sequence is zero"));
         }
@@ -249,11 +281,15 @@ impl InputBindingGuard {
         self.watchdog_deadline = Some(deadline);
         Ok(())
     }
-    pub fn handle_revocation(&mut self, _termination: &InputGrantTermination) -> io::Result<()> {
+    pub fn handle_revocation(&mut self, termination: &InputGrantTermination) -> io::Result<()> {
+        if self.current_tag() != Some(termination.binding) {
+            return Err(err("revocation belongs to a different grant"));
+        }
         self.release();
         Ok(())
     }
     pub fn release(&mut self) {
+        self.last_renewal_sequence = 0;
         self.state = GuardState::Inactive;
         self.watchdog_deadline = None;
     }

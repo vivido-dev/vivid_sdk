@@ -128,6 +128,7 @@ impl TrackChannel {
         lifecycle: Arc<SessionLifecycle>,
         offline: bool,
     ) -> io::Result<Self> {
+        let open_body = zeroize::Zeroizing::new(open_body);
         let snapshot = lock(&track.inner, "track")?.clone();
         let uplink = snapshot.configuration.direction == TrackDirection::Uplink;
         if uplink && (!vivid_protocol::audio_input::supports(&snapshot.configuration) || offline) {
@@ -971,11 +972,11 @@ impl Session {
             client_nonce: nonce,
             authentication_tag: tag,
         };
-        let open_body = Envelope::correlated(1, open.payload())?.encode()?;
+        let open_body = messages::encode_payload(1, open.payload())?;
         let connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
                 &directory.join(format!(
-                    "track-{}-{}-{}-{}.vivid",
+                    "track-{}-{}-{}-{}.ndjson",
                     state.configuration.context_id,
                     state.configuration.surface_id,
                     state.configuration.track_id,

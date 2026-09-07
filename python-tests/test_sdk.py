@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -127,7 +128,7 @@ def test_encoded_image_track_is_immutable_and_one_shot() -> None:
         vivid.close(session)
 
 
-def test_trace_uses_1_5_control_and_track_prefaces(tmp_path: Path) -> None:
+def test_trace_contains_metadata_without_record_bodies(tmp_path: Path) -> None:
     session = vivid.connect(trace_dir=tmp_path)
     surface = vivid.create_surface(
         session, vivid.SurfaceConfig(logical_width=2, logical_height=2)
@@ -138,11 +139,16 @@ def test_trace_uses_1_5_control_and_track_prefaces(tmp_path: Path) -> None:
     marker = vivid.anchor_marker(session, anchor_id=7)
     vivid.close(session)
 
-    control = (tmp_path / "control.vivid").read_bytes()
-    track_files = tuple(tmp_path.glob("track-*.vivid"))
-    assert control[:7] == b"VIVD\x01\x05\x00"
+    vivid.close_channel(channel)
+    control = [json.loads(line) for line in (tmp_path / "control.ndjson").read_text().splitlines()]
+    track_files = tuple(tmp_path.glob("track-*.ndjson"))
+    assert control[0]["record_type"] == 1
+    assert all(record["version"] == 1 and "body" not in record for record in control)
     assert len(track_files) == 1
-    assert track_files[0].read_bytes()[:7] == b"VIVD\x01\x05\x02"
+    track_records = [json.loads(line) for line in track_files[0].read_text().splitlines()]
+    assert track_records[0]["record_type"] == 0x8000
+    assert any(record["record_type"] == 0x8003 for record in track_records)
+    assert all("body" not in record for record in track_records)
     assert "VIVID;3;A;" in marker
     assert ";0000000000000001;0000000000000007;" in marker
 
