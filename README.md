@@ -159,3 +159,19 @@ current surface dimensions, then apply `InputGate` immediately before the OS inj
 held keys and buttons. Queue overflow closes the affected lane rather than discarding transitions.
 
 See [MIGRATING-1.1-TO-1.5.md](MIGRATING-1.1-TO-1.5.md) for the old-to-new API mapping.
+
+## Physical playback observations
+
+`Session::track_query_handle()` provides a read-only handle for a bounded background observer.
+It shares request correlation and session cancellation but never reconciles mutable local track
+state from a late reply. Keep one query in flight and qualify observations against the expected
+owner, track and channel generation.
+
+The presenter role accepts owner-scoped `BridgePositionSnapshot` feedback from a terminating
+outer bridge. Decoder-reset and playback-request mismatches are ignored. Timed-video status and
+PTS presentation waits use physical presentation IDs/timestamps, never the last admitted packet.
+The existing optional TRACK_STATUS playback map carries the physical clock when available;
+absence of feedback remains unknown rather than a synthetic advancing clock.
+
+Virtual-presenter channel/epoch replacement clears EOS. `apply_outer_playback` requires the
+source decoder reset serial from the outer snapshot and ignores retired-generation completion.

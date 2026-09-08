@@ -156,7 +156,16 @@ impl TrackChannel {
                 None,
             )
         } else {
-            let reply = connection.read_record()?;
+            let reply = connection.read_record().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "reading CHANNEL_ACCEPTED for track {} generation {}: {error}",
+                        snapshot.configuration.track_id,
+                        snapshot.channel_generation.get()
+                    ),
+                )
+            })?;
             if reply.record_type == messages::ERROR {
                 return Err(presenter_error(&reply.body)?);
             }

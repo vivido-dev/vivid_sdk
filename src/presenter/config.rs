@@ -522,3 +522,17 @@ pub struct BridgeNode {
     pub visible: bool,
     pub clip: BridgeClipRect,
 }
+
+/// Physical output feedback, qualified by the projected decoder and playback request.
+/// Hop-local presentation IDs remain observations; they never become inner media IDs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgePositionSnapshot {
+    pub decoder_reset_serial: u64,
+    pub playing: bool,
+    pub start_pts_us: i64,
+    pub state: u64,
+    pub clock_pts_us: Option<i64>,
+    pub decoded_pts_us: i64,
+    pub presented_pts_us: i64,
+    pub presentation_id: u64,
+}

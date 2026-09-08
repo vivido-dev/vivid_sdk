@@ -105,7 +105,9 @@ pub use session::{
     AnchorStatus, ChannelEvent, EstablishmentAttempt, Session, SessionEvent, SessionInfo,
 };
 pub use surface::{Surface, SurfaceStatus};
-pub use track::{Track, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied};
+pub use track::{
+    Track, TrackQueryHandle, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied,
+};
 pub use vivid_protocol::audio_input::InputPacket;
 
 pub use vivid_protocol::messages::LaneClass;

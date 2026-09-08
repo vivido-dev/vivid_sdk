@@ -293,7 +293,7 @@ pub struct Session {
     pub(crate) anchor_key: AnchorKey,
     pub(crate) info: SessionInfo,
     pub(crate) next_id: AtomicU64,
-    pub(crate) next_request_id: AtomicU64,
+    pub(crate) next_request_id: Arc<AtomicU64>,
     pub(crate) surfaces: HashMap<(u64, u64), Arc<Mutex<SurfaceLocal>>>,
     pub(crate) tracks: Arc<Mutex<TrackRegistry>>,
     pub(crate) closed: bool,
@@ -647,7 +647,7 @@ impl Session {
             anchor_key,
             info,
             next_id: AtomicU64::new(1),
-            next_request_id: AtomicU64::new(2),
+            next_request_id: Arc::new(AtomicU64::new(2)),
             surfaces: HashMap::new(),
             tracks,
             closed: false,
@@ -732,7 +732,7 @@ impl Session {
             anchor_key,
             info,
             next_id: AtomicU64::new(1),
-            next_request_id: AtomicU64::new(2),
+            next_request_id: Arc::new(AtomicU64::new(2)),
             surfaces: HashMap::new(),
             tracks: Arc::new(Mutex::new(HashMap::new())),
             closed: false,
@@ -861,7 +861,10 @@ impl Session {
         metadata.apply(&mut envelope)?;
         let reply =
             self.control
-                .request(request_id, record_type, object_id, &envelope.encode()?)?;
+                .request(request_id, record_type, object_id, &envelope.encode()?)
+                .map_err(|error| io::Error::new(error.kind(), format!(
+                    "control request {request_id} type {record_type:#06x} object {object_id}: {error}"
+                )))?;
         if let Some(record) = &reply {
             if record.record_type == messages::ERROR {
                 return Err(presenter_error(&record.body)?);

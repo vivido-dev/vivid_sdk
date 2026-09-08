@@ -631,6 +631,7 @@ struct TrackEntry {
     last_record_sequence: u64,
     last_pts_us: i64,
     outer_presented: bool,
+    outer_position: Option<super::BridgePositionSnapshot>,
     recovery_pending: bool,
     recovery_requested: bool,
     recovery_minimum_epoch: u32,
@@ -1905,10 +1906,34 @@ impl VirtualVivid {
         }
     }
 
-    pub fn apply_outer_playback(&self, source: SourceKey, state_value: u64, eos_state: u64) {
+    pub fn apply_outer_position(&self, source: SourceKey, position: super::BridgePositionSnapshot) {
+        let mut state = lock(&self.state);
+        let Some(track) = state.tracks.get_mut(&inner_track_key(source)) else {
+            return;
+        };
+        if position.decoder_reset_serial != track.decoder_reset_serial
+            || position.playing != track.playing
+            || position.start_pts_us != track.play_request.start_pts_us
+            || position.state > 5
+        {
+            return;
+        }
+        track.outer_position = Some(position);
+    }
+
+    pub fn apply_outer_playback(
+        &self,
+        source: SourceKey,
+        decoder_reset_serial: u64,
+        state_value: u64,
+        eos_state: u64,
+    ) {
         let mut state = lock(&self.state);
         let key = inner_track_key(source);
         if let Some(track) = state.tracks.get_mut(&key) {
+            if track.decoder_reset_serial != decoder_reset_serial {
+                return;
+            }
             if state_value >= 2 {
                 track.state.milestones |= MILESTONE_CLOCK_STARTED;
             }
@@ -3409,6 +3434,7 @@ fn dispatch_control(
                     last_record_sequence: 0,
                     last_pts_us: 0,
                     outer_presented: false,
+                    outer_position: None,
                     recovery_pending: true,
                     recovery_requested: false,
                     recovery_minimum_epoch: 0,
@@ -3476,6 +3502,8 @@ fn dispatch_control(
                     track.channel_advance_pending_flush = true;
                 }
                 track.channel_writer = None;
+                track.eos_epoch = None;
+                track.outer_position = None;
                 track.microphone.take();
                 track.recovery_pending = true;
                 track.recovery_requested = false;
@@ -3867,6 +3895,7 @@ fn dispatch_control(
                     {
                         return Err(ControlError::state("PLAY policy or generation is invalid"));
                     }
+                    track.outer_position = None;
                     track.playing = true;
                     track.play_request = request;
                     track.state.milestones |= MILESTONE_CLOCK_STARTED;
@@ -3875,6 +3904,7 @@ fn dispatch_control(
                     state.play_commands.push(bridge_track_key(key));
                 }
                 messages::PAUSE => {
+                    track.outer_position = None;
                     track.playing = false;
                     linked_pause = true;
                 }
@@ -3888,6 +3918,13 @@ fn dispatch_control(
                     }
                     track.state.media_epoch = epoch;
                     track.state.last_media_id = 0;
+                    track.eos_epoch = None;
+                    track.outer_position = None;
+                    track.state.milestones &= !(MILESTONE_EOS_ACCEPTED
+                        | MILESTONE_BUFFERED_ENDED
+                        | MILESTONE_OUTPUT_READY
+                        | MILESTONE_PRESENTED
+                        | MILESTONE_CLOCK_STARTED);
                     track.recovery_pending = true;
                     track.recovery_requested = false;
                     track.recovery_minimum_epoch = epoch;
@@ -3926,6 +3963,7 @@ fn dispatch_control(
                     let Some(track) = state.tracks.get_mut(&member) else {
                         continue;
                     };
+                    track.outer_position = None;
                     if let Some(request) = linked_play {
                         track.playing = true;
                         track.play_request = request;
@@ -5035,8 +5073,11 @@ fn evaluate_wait(track: &TrackEntry, condition: u64, value: Option<u64>) -> Opti
             .then_some(track.state.last_media_id),
         4 => {
             let pts = i64::try_from(value?).ok()?;
-            (track.outer_presented && track.last_pts_us >= pts)
-                .then_some(track.last_pts_us.max(0) as u64)
+            let position = track
+                .outer_position
+                .filter(|p| p.decoder_reset_serial == track.decoder_reset_serial)?;
+            (position.presentation_id != 0 && position.presented_pts_us >= pts)
+                .then_some(position.presented_pts_us.max(0) as u64)
         }
         5 => track.playing.then_some(1),
         6 => (track.state.milestones & MILESTONE_BUFFERED_ENDED != 0).then_some(1),
@@ -5448,6 +5489,10 @@ fn track_status_payload(
     track: &TrackEntry,
     gain_supported: bool,
 ) -> Vec<(u64, Value)> {
+    let position = track
+        .outer_position
+        .filter(|p| p.decoder_reset_serial == track.decoder_reset_serial);
+    let timed_video = matches!(track.configuration.kind, KindConfiguration::Video(_));
     let mut payload = vec![
         (0, Value::Unsigned(key.surface.context)),
         (1, Value::Unsigned(key.surface.surface)),
@@ -5465,22 +5510,38 @@ fn track_status_payload(
         (10, Value::Unsigned(u64::from(track.state.media_epoch))),
         (11, Value::Unsigned(track.state.last_media_id)),
         (12, Value::Unsigned(track.last_record_sequence)),
-        (13, signed(track.last_pts_us)),
+        (13, signed(position.map_or(0, |p| p.decoded_pts_us))),
+        (14, signed(position.map_or(0, |p| p.presented_pts_us))),
         (
-            14,
-            signed(if track.outer_presented {
-                track.last_pts_us
-            } else {
-                0
-            }),
+            15,
+            Value::Unsigned(position.map_or(
+                if timed_video {
+                    0
+                } else {
+                    u64::from(track.outer_presented)
+                },
+                |p| p.presentation_id,
+            )),
         ),
-        (15, Value::Unsigned(u64::from(track.outer_presented))),
         (16, Value::Unsigned(track.state.flow.sent_body_bytes)),
         (17, Value::Unsigned(track.state.flow.sent_media_records)),
         (18, Value::Unsigned(track.state.flow.maximum_body_bytes)),
         (19, Value::Unsigned(track.state.flow.maximum_media_records)),
         (20, Value::Unsigned(0)),
     ];
+    if let Some(position) = position
+        && let Some(pts) = position.clock_pts_us
+    {
+        payload.push((
+            21,
+            Value::Map(vec![
+                (3, Value::Unsigned(position.state)),
+                (4, signed(pts)),
+                (5, Value::Unsigned(u64::from(track.state.media_epoch))),
+                (10, Value::Unsigned(track.state.revision.get())),
+            ]),
+        ));
+    }
     if gain_supported && matches!(track.configuration.kind, KindConfiguration::Audio(_)) {
         payload.push((23, Value::Unsigned(track.audio_gain.raw())));
     }
@@ -7192,11 +7253,42 @@ mod tests {
             session.play(track, 0, 1, 1_000_000).unwrap();
         }
 
+        let source = BridgeSourceKey {
+            producer: seeking.info().session_id,
+            context: seeking_context,
+            surface: 9,
+            track: 11,
+        };
+        let old_reset =
+            lock(&presenter.state).tracks[&inner_track_key(source)].decoder_reset_serial;
+        seeking_old_channel.eos().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&presenter.state).tracks[&inner_track_key(source)]
+            .eos_epoch
+            .is_none()
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
         seeking.pause(&seeking_track).unwrap();
-        seeking.flush(&seeking_track, 2).unwrap();
         seeking
             .advance_channel(&seeking_track, 1, &RequestMetadata::default())
             .unwrap();
+        // A producer seeking during a blocked write cancels that write after retiring its
+        // generation, before flushing or opening its replacement. Force EOF to win this race.
+        seeking_old_channel.close().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(seeking.query_track(&seeking_track).unwrap().lifecycle, 1);
+        seeking.flush(&seeking_track, 2).unwrap();
+        presenter.apply_outer_playback(source, old_reset, 2, 2);
+        let reset_state = lock(&presenter.state);
+        let reset_track = &reset_state.tracks[&inner_track_key(source)];
+        assert!(reset_track.eos_epoch.is_none());
+        assert_eq!(
+            reset_track.state.milestones & (MILESTONE_EOS_ACCEPTED | MILESTONE_BUFFERED_ENDED),
+            0
+        );
+        drop(reset_state);
         let seeking_new_channel = seeking.open_track_channel(&seeking_track).unwrap();
         // The replacement decoder is not eligible to deliver until the outer presenter has
         // acknowledged a projection carrying this exact reset serial.
@@ -7566,6 +7658,106 @@ mod tests {
         );
         first.close().unwrap();
         second.close().unwrap();
+    }
+
+    #[test]
+    fn physical_position_feedback_is_generation_and_owner_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("positions.sock")).unwrap(),
+            MediaConfig::default(),
+            None,
+        )
+        .unwrap();
+        let mut owners = Vec::new();
+        for pane in [7, 8] {
+            presenter.update_metrics(pane, 80, 24, (8, 16));
+            let secret = presenter.issue_pane_capability(pane).unwrap();
+            let mut client =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let context = client.info().root_context_id;
+            client
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = client
+                .create_track(video(context, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            let snapshot = presenter.projection_snapshot(&HashSet::from([pane]));
+            let key = snapshot.sources[0].key;
+            {
+                let mut state = lock(&presenter.state);
+                let entry = state.tracks.get_mut(&inner_track_key(key)).unwrap();
+                entry.outer_presented = true;
+                entry.last_pts_us = 9_000_000; // Admitted/delivered is not physically presented.
+            }
+            owners.push((client, track, key, snapshot.sources[0].decoder_reset_serial));
+        }
+        assert_ne!(owners[0].2, owners[1].2);
+        let position = super::super::BridgePositionSnapshot {
+            decoder_reset_serial: owners[0].3,
+            playing: false,
+            start_pts_us: 0,
+            state: 3,
+            clock_pts_us: Some(1_000_000),
+            decoded_pts_us: 1_040_000,
+            presented_pts_us: 1_000_000,
+            presentation_id: 25,
+        };
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .last_presentation_id,
+            0
+        );
+        presenter.apply_outer_position(owners[0].2, position);
+        let observed = owners[0].0.track_query_handle().unwrap()(&owners[0].1).unwrap();
+        assert_eq!(observed.last_presented_pts_us, 1_000_000);
+        presenter.apply_outer_position(
+            owners[0].2,
+            super::super::BridgePositionSnapshot {
+                decoder_reset_serial: position.decoder_reset_serial + 1,
+                presented_pts_us: 8_000_000,
+                ..position
+            },
+        );
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .last_presented_pts_us,
+            1_000_000
+        );
+        assert_eq!(
+            owners[1]
+                .0
+                .query_track(&owners[1].1)
+                .unwrap()
+                .last_presentation_id,
+            0
+        );
+        presenter.apply_outer_position(
+            owners[1].2,
+            super::super::BridgePositionSnapshot {
+                decoder_reset_serial: owners[1].3,
+                presented_pts_us: 2_000_000,
+                ..position
+            },
+        );
+        assert_eq!(
+            owners[1]
+                .0
+                .query_track(&owners[1].1)
+                .unwrap()
+                .last_presented_pts_us,
+            2_000_000
+        );
+        let state = lock(&presenter.state);
+        let first = &state.tracks[&inner_track_key(owners[0].2)];
+        assert!(evaluate_wait(first, 4, Some(2_000_000)).is_none());
+        assert_eq!(evaluate_wait(first, 4, Some(1_000_000)), Some(1_000_000));
     }
 
     #[test]

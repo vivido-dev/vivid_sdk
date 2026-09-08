@@ -425,6 +425,54 @@ impl Session {
         Ok(Track { inner })
     }
 
+    /// Read-only track observations for a bounded background observer. Unlike query_track this
+    /// handle never reconciles mutable track state, so a late response cannot retire a new channel.
+    /// Dropping/cancelling the owning session interrupts outstanding queries.
+    pub fn track_query_handle(&self) -> Option<TrackQueryHandle> {
+        let crate::session::ControlPlane::Live { writer, pending } = &self.control else {
+            return None;
+        };
+        let control = crate::session::ControlPlane::Live {
+            writer: writer.clone(),
+            pending: pending.clone(),
+        };
+        let ids = self.next_request_id.clone();
+        let gain = self.supports(AUDIO_GAIN);
+        Some(Arc::new(move |track| {
+            let snapshot = lock(&track.inner, "track")?.clone();
+            let request_id = ids
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |id| id.checked_add(1),
+                )
+                .map_err(|_| invalid_data("request ID space exhausted"))?;
+            let envelope = messages::Envelope::correlated(
+                request_id,
+                vec![
+                    (0, Value::Unsigned(snapshot.configuration.context_id)),
+                    (1, Value::Unsigned(snapshot.configuration.surface_id)),
+                    (2, Value::Unsigned(snapshot.configuration.track_id)),
+                ],
+            )?;
+            let reply = control.request(
+                request_id,
+                messages::QUERY_TRACK,
+                snapshot.configuration.track_id,
+                &envelope.encode()?,
+            )?;
+            if let Some(record) = &reply {
+                if record.record_type == messages::ERROR {
+                    return Err(presenter_error(&record.body)?);
+                }
+                if messages::decode_control(&record.body)?.request_id != request_id {
+                    return Err(invalid_data("reply request ID does not match observation"));
+                }
+            }
+            parse_track_status(&snapshot, reply, gain)
+        }))
+    }
+
     pub fn query_track(&self, track: &Track) -> io::Result<TrackStatus> {
         let snapshot = lock(&track.inner, "track")?.clone();
         let reply = self.request(
@@ -439,114 +487,7 @@ impl Session {
             None,
             None,
         )?;
-        let status = if let Some(record) = reply {
-            expect_record(
-                &record,
-                messages::TRACK_STATUS,
-                snapshot.configuration.track_id,
-            )?;
-            let payload = decoded_payload(&record)?;
-            validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22, 23])?;
-            validate_track_tuple(&payload, &snapshot.configuration)?;
-            let kind = TrackKind::try_from(required_u64(&payload, 4)?).map_err(io::Error::other)?;
-            let mode = TrackMode::try_from(required_u64(&payload, 5)?).map_err(io::Error::other)?;
-            let lifecycle = required_u64(&payload, 6)?;
-            let attachment_state = required_u64(&payload, 8)?;
-            let milestones = required_u64(&payload, 9)?;
-            if lifecycle > 7 || attachment_state > 2 || milestones & !MILESTONE_KNOWN_MASK != 0 {
-                return Err(invalid_data("TRACK_STATUS contains an unknown state bit"));
-            }
-            let audio_gain = optional_u64(&payload, 23)?
-                .map(|raw| AudioGain::new(raw).ok_or_else(|| invalid_data("invalid audio gain")))
-                .transpose()?;
-            if audio_gain.is_some() && (!self.supports(AUDIO_GAIN) || kind != TrackKind::Audio) {
-                return Err(invalid_data(
-                    "TRACK_STATUS reports audio gain without a negotiated audio track",
-                ));
-            }
-            TrackStatus {
-                context_id: required_u64(&payload, 0)?,
-                surface_id: required_u64(&payload, 1)?,
-                track_id: required_u64(&payload, 2)?,
-                revision: TrackRevision::new(required_u64(&payload, 3)?),
-                kind,
-                mode,
-                lifecycle,
-                channel_generation: ChannelGeneration::new(required_u64(&payload, 7)?),
-                attachment_state,
-                milestones,
-                media_epoch: required_u32(&payload, 10)?,
-                last_media_id: required_u64(&payload, 11)?,
-                last_media_record_sequence: required_u64(&payload, 12)?,
-                last_decoded_pts_us: required_i64(&payload, 13)?,
-                last_presented_pts_us: required_i64(&payload, 14)?,
-                last_presentation_id: required_u64(&payload, 15)?,
-                cumulative_body_bytes: required_u64(&payload, 16)?,
-                cumulative_media_records: required_u64(&payload, 17)?,
-                maximum_body_bytes: required_u64(&payload, 18)?,
-                maximum_media_records: required_u64(&payload, 19)?,
-                ingress_depth_bucket: required_u64(&payload, 20)?,
-                playback_state: optional_map(&payload, 21)?.cloned(),
-                terminal_loss_code: optional_u64(&payload, 22)?,
-                audio_gain,
-            }
-        } else {
-            let media = *lock(&snapshot.media_sequence, "track media sequence")?;
-            let (lifecycle, attachment_state, milestones, flow) =
-                if let Some(flow) = snapshot.active_flow.as_ref().and_then(Weak::upgrade) {
-                    let state = lock(&flow.state, "channel flow state")?;
-                    if state.closed {
-                        (4, 2, MILESTONE_CHANNEL_DETACHED, Some(state.flow))
-                    } else {
-                        (1, 1, MILESTONE_CHANNEL_ACCEPTED, Some(state.flow))
-                    }
-                } else if snapshot.destroyed {
-                    (7, 2, 0, None)
-                } else {
-                    (0, 0, 0, None)
-                };
-            let flow = flow.unwrap_or_default();
-            TrackStatus {
-                context_id: snapshot.configuration.context_id,
-                surface_id: snapshot.configuration.surface_id,
-                track_id: snapshot.configuration.track_id,
-                revision: snapshot.revision,
-                kind: snapshot.configuration.kind.kind(),
-                mode: snapshot.configuration.mode,
-                lifecycle,
-                channel_generation: snapshot.channel_generation,
-                attachment_state,
-                milestones,
-                media_epoch: media.last_epoch,
-                last_media_id: media.last_id,
-                last_media_record_sequence: media.last_record_sequence,
-                last_decoded_pts_us: 0,
-                last_presented_pts_us: 0,
-                last_presentation_id: 0,
-                cumulative_body_bytes: flow.sent_body_bytes,
-                cumulative_media_records: flow.sent_media_records,
-                maximum_body_bytes: flow.maximum_body_bytes,
-                maximum_media_records: flow.maximum_media_records,
-                ingress_depth_bucket: 0,
-                playback_state: None,
-                terminal_loss_code: None,
-                audio_gain: (self.supports(AUDIO_GAIN)
-                    && matches!(snapshot.configuration.kind, KindConfiguration::Audio(_)))
-                .then_some(AudioGain::UNITY),
-            }
-        };
-        status.revision.require_nonzero()?;
-        status.channel_generation.require_nonzero()?;
-        if status.kind != snapshot.configuration.kind.kind()
-            || status.mode != snapshot.configuration.mode
-            || status.cumulative_body_bytes > status.maximum_body_bytes
-            || status.cumulative_media_records > status.maximum_media_records
-        {
-            return Err(invalid_data(
-                "TRACK_STATUS changed immutable state or contains invalid flow progress",
-            ));
-        }
-
+        let status = parse_track_status(&snapshot, reply, self.supports(AUDIO_GAIN))?;
         let mut state = lock(&track.inner, "track")?;
         let generation_changed = status.channel_generation != state.channel_generation;
         if generation_changed {
@@ -789,3 +730,122 @@ impl Session {
         )
     }
 }
+
+fn parse_track_status(
+    snapshot: &TrackLocal,
+    reply: Option<vivid_protocol::wire::Record>,
+    gain_supported: bool,
+) -> io::Result<TrackStatus> {
+    let status = if let Some(record) = reply {
+        expect_record(
+            &record,
+            messages::TRACK_STATUS,
+            snapshot.configuration.track_id,
+        )?;
+        let payload = decoded_payload(&record)?;
+        validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22, 23])?;
+        validate_track_tuple(&payload, &snapshot.configuration)?;
+        let kind = TrackKind::try_from(required_u64(&payload, 4)?).map_err(io::Error::other)?;
+        let mode = TrackMode::try_from(required_u64(&payload, 5)?).map_err(io::Error::other)?;
+        let lifecycle = required_u64(&payload, 6)?;
+        let attachment_state = required_u64(&payload, 8)?;
+        let milestones = required_u64(&payload, 9)?;
+        if lifecycle > 7 || attachment_state > 2 || milestones & !MILESTONE_KNOWN_MASK != 0 {
+            return Err(invalid_data("TRACK_STATUS contains an unknown state bit"));
+        }
+        let audio_gain = optional_u64(&payload, 23)?
+            .map(|raw| AudioGain::new(raw).ok_or_else(|| invalid_data("invalid audio gain")))
+            .transpose()?;
+        if audio_gain.is_some() && (!gain_supported || kind != TrackKind::Audio) {
+            return Err(invalid_data(
+                "TRACK_STATUS reports audio gain without a negotiated audio track",
+            ));
+        }
+        TrackStatus {
+            context_id: required_u64(&payload, 0)?,
+            surface_id: required_u64(&payload, 1)?,
+            track_id: required_u64(&payload, 2)?,
+            revision: TrackRevision::new(required_u64(&payload, 3)?),
+            kind,
+            mode,
+            lifecycle,
+            channel_generation: ChannelGeneration::new(required_u64(&payload, 7)?),
+            attachment_state,
+            milestones,
+            media_epoch: required_u32(&payload, 10)?,
+            last_media_id: required_u64(&payload, 11)?,
+            last_media_record_sequence: required_u64(&payload, 12)?,
+            last_decoded_pts_us: required_i64(&payload, 13)?,
+            last_presented_pts_us: required_i64(&payload, 14)?,
+            last_presentation_id: required_u64(&payload, 15)?,
+            cumulative_body_bytes: required_u64(&payload, 16)?,
+            cumulative_media_records: required_u64(&payload, 17)?,
+            maximum_body_bytes: required_u64(&payload, 18)?,
+            maximum_media_records: required_u64(&payload, 19)?,
+            ingress_depth_bucket: required_u64(&payload, 20)?,
+            playback_state: optional_map(&payload, 21)?.cloned(),
+            terminal_loss_code: optional_u64(&payload, 22)?,
+            audio_gain,
+        }
+    } else {
+        let media = *lock(&snapshot.media_sequence, "track media sequence")?;
+        let (lifecycle, attachment_state, milestones, flow) =
+            if let Some(flow) = snapshot.active_flow.as_ref().and_then(Weak::upgrade) {
+                let state = lock(&flow.state, "channel flow state")?;
+                if state.closed {
+                    (4, 2, MILESTONE_CHANNEL_DETACHED, Some(state.flow))
+                } else {
+                    (1, 1, MILESTONE_CHANNEL_ACCEPTED, Some(state.flow))
+                }
+            } else if snapshot.destroyed {
+                (7, 2, 0, None)
+            } else {
+                (0, 0, 0, None)
+            };
+        let flow = flow.unwrap_or_default();
+        TrackStatus {
+            context_id: snapshot.configuration.context_id,
+            surface_id: snapshot.configuration.surface_id,
+            track_id: snapshot.configuration.track_id,
+            revision: snapshot.revision,
+            kind: snapshot.configuration.kind.kind(),
+            mode: snapshot.configuration.mode,
+            lifecycle,
+            channel_generation: snapshot.channel_generation,
+            attachment_state,
+            milestones,
+            media_epoch: media.last_epoch,
+            last_media_id: media.last_id,
+            last_media_record_sequence: media.last_record_sequence,
+            last_decoded_pts_us: 0,
+            last_presented_pts_us: 0,
+            last_presentation_id: 0,
+            cumulative_body_bytes: flow.sent_body_bytes,
+            cumulative_media_records: flow.sent_media_records,
+            maximum_body_bytes: flow.maximum_body_bytes,
+            maximum_media_records: flow.maximum_media_records,
+            ingress_depth_bucket: 0,
+            playback_state: None,
+            terminal_loss_code: None,
+            audio_gain: (gain_supported
+                && matches!(snapshot.configuration.kind, KindConfiguration::Audio(_)))
+            .then_some(AudioGain::UNITY),
+        }
+    };
+    status.revision.require_nonzero()?;
+    status.channel_generation.require_nonzero()?;
+    if status.kind != snapshot.configuration.kind.kind()
+        || status.mode != snapshot.configuration.mode
+        || status.cumulative_body_bytes > status.maximum_body_bytes
+        || status.cumulative_media_records > status.maximum_media_records
+    {
+        return Err(invalid_data(
+            "TRACK_STATUS changed immutable state or contains invalid flow progress",
+        ));
+    }
+
+    Ok(status)
+}
+
+/// A cloneable read-only observer; callers must bound concurrent requests and queued observations.
+pub type TrackQueryHandle = Arc<dyn Fn(&Track) -> io::Result<TrackStatus> + Send + Sync>;
