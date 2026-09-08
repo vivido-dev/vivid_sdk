@@ -113,3 +113,92 @@ fn two_owners_reusing_local_ids_capture_only_their_own_pixels_over_a_socket() {
     first.close().expect("close first");
     second.close().expect("close second");
 }
+
+/// The connection was already gone, so failing is right — but the session knows *why* it went, and
+/// answering with the writer's generic "writer is closed" throws that away. A caller left holding a
+/// bare `BrokenPipe` has to reconstruct from timing alone what the reader recorded exactly.
+#[test]
+fn closing_after_the_connection_is_lost_reports_the_reason_it_was_lost() {
+    let (presenter, endpoint) = start();
+    presenter.update_metrics(PANE, 80, 24, (8, 16));
+    let secret = presenter.issue_pane_capability(PANE).expect("capability");
+
+    let mut pane = PaneSession::from_session(connect(&endpoint, &secret)).expect("pane session");
+    pane.show_rgba(2, 2, &PIXELS).expect("show");
+    assert!(presenter.wait_for_retained_media(PANE, Duration::from_secs(5)));
+
+    // The presenter drops every session bound to the pane, which is what a revocation, a restart,
+    // or a lost network does to a producer that is not watching for it.
+    presenter.revoke_pane(PANE);
+    let error = wait_for_close_to_fail(pane, Duration::from_secs(5));
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected,
+        "a connection that ended is not a broken pipe on this write: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("ended before it was closed"),
+        "close did not say the connection had ended: {message}"
+    );
+    assert!(
+        !message.contains("Vivid connection writer is closed"),
+        "close answered with the writer's generic error instead of the recorded reason: {message}"
+    );
+}
+
+/// `cancel_handle` shuts the writer down, so a later close cannot round-trip either — but it ended
+/// for a different reason, and a caller that cancelled deliberately should not have to tell that
+/// apart from a connection that died on its own.
+#[test]
+fn closing_after_cancelling_says_it_was_cancelled() {
+    let (presenter, endpoint) = start();
+    presenter.update_metrics(PANE, 80, 24, (8, 16));
+    let secret = presenter.issue_pane_capability(PANE).expect("capability");
+
+    let session = connect(&endpoint, &secret);
+    let cancel = session.cancel_handle();
+    cancel();
+
+    let error = session
+        .close()
+        .expect_err("a cancelled session cannot be closed cleanly");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    assert!(
+        error.to_string().contains("cancelled"),
+        "close did not distinguish cancellation from loss: {error}"
+    );
+}
+
+/// `abort` closes the lifecycle without touching the control connection, and its documentation
+/// promises the session may still be closed normally afterwards. That `GOODBYE` must still happen:
+/// the quit path aborts to wake blocked media senders, then closes.
+#[test]
+fn closing_after_aborting_still_performs_the_goodbye() {
+    let (presenter, endpoint) = start();
+    presenter.update_metrics(PANE, 80, 24, (8, 16));
+    let secret = presenter.issue_pane_capability(PANE).expect("capability");
+
+    let mut session = connect(&endpoint, &secret);
+    session.abort().expect("abort");
+    session
+        .close()
+        .expect("an aborted session still closes cleanly");
+}
+
+/// The control reader runs on its own thread, so a revocation lands asynchronously. Sending until a
+/// send fails is the producer-side observation that the connection has gone, using only what any
+/// caller has: the reader records the reason before it shuts the writer down, so by the time a send
+/// fails the reason is already stored.
+fn wait_for_close_to_fail(mut pane: PaneSession, timeout: Duration) -> std::io::Error {
+    let deadline = std::time::Instant::now() + timeout;
+    while pane.show_rgba(2, 2, &PIXELS).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the producer never noticed the revoked pane"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pane.close()
+        .expect_err("a revoked pane's session closed cleanly")
+}

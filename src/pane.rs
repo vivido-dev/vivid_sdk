@@ -210,6 +210,14 @@ impl PaneSession {
 
     /// Clear the presentation and close the underlying producer session.
     pub fn close(mut self) -> io::Result<()> {
+        // Nothing to clear over a connection that has ended: the presenter released this pane's
+        // surface when the session did. Attempting it anyway would answer with whichever teardown
+        // request failed first rather than with why the connection went, which is the one thing
+        // the caller cannot work out for itself.
+        if self.session.connection_ended().is_some() {
+            self.current = None;
+            return self.session.close();
+        }
         let clear = self.clear();
         let close = self.session.close();
         clear.and(close)

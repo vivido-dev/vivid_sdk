@@ -127,9 +127,24 @@ pub(crate) struct PendingInput {
     pub(crate) closed: AtomicBool,
 }
 
+/// What ended a session, kept beside the diagnostic so callers are not left matching on its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseCause {
+    /// The control reader saw the connection end. Nothing more can be written.
+    Lost,
+    /// [`Session::cancel_handle`] fired, which shuts the writer down. Nothing more can be written.
+    Cancelled,
+    /// [`Session::close`], [`Session::abort`], or a drop. The control connection may still be live,
+    /// so a `GOODBYE` remains possible — `abort` documents exactly that follow-up.
+    Local,
+}
+
 pub(crate) struct SessionLifecycle {
     pub(crate) closed: AtomicBool,
     pub(crate) diagnostic: Mutex<Option<String>>,
+    /// Set with `diagnostic`, under the same first-close-wins rule: the first cause is the real one,
+    /// and a later local close is only the caller catching up to it.
+    pub(crate) cause: Mutex<Option<CloseCause>>,
     pub(crate) track_flows: Mutex<Vec<Weak<FlowSync>>>,
     pub(crate) input_lanes: Mutex<Vec<Weak<PendingInput>>>,
 }
@@ -139,9 +154,31 @@ impl SessionLifecycle {
         Self {
             closed: AtomicBool::new(false),
             diagnostic: Mutex::new(None),
+            cause: Mutex::new(None),
             track_flows: Mutex::new(Vec::new()),
             input_lanes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Why the connection ended, when it ended in a way that makes writing pointless.
+    ///
+    /// `Local` is deliberately not reported: it means this side closed the lifecycle while the
+    /// control connection may still be usable.
+    pub(crate) fn unwritable(&self) -> Option<(CloseCause, String)> {
+        if !self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let cause = (*self.cause.lock().ok()?)?;
+        if matches!(cause, CloseCause::Local) {
+            return None;
+        }
+        let diagnostic = self
+            .diagnostic
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+            .unwrap_or_else(|| "Vivid session is closed".into());
+        Some((cause, diagnostic))
     }
 
     pub(crate) fn ensure_active(&self) -> io::Result<()> {
@@ -176,10 +213,13 @@ impl SessionLifecycle {
         Ok(())
     }
 
-    pub(crate) fn close(&self, message: &str) {
+    pub(crate) fn close(&self, cause: CloseCause, message: &str) {
         self.closed.store(true, Ordering::Release);
         if let Ok(mut diagnostic) = self.diagnostic.lock() {
             diagnostic.get_or_insert_with(|| message.to_owned());
+        }
+        if let Ok(mut stored) = self.cause.lock() {
+            stored.get_or_insert(cause);
         }
         if let Ok(mut flows) = self.track_flows.lock() {
             flows.retain(|pending| {
@@ -423,7 +463,7 @@ impl Session {
             ControlPlane::Offline { .. } => None,
         };
         Arc::new(move || {
-            lifecycle.close("Vivid session cancelled");
+            lifecycle.close(CloseCause::Cancelled, "Vivid session cancelled");
             if let Some(writer) = &writer {
                 let _ = writer.shutdown();
             }
@@ -778,7 +818,8 @@ impl Session {
     /// media worker threads. The session may still be closed normally
     /// afterwards, which sends the `GOODBYE` over the live control connection.
     pub fn abort(&mut self) -> io::Result<()> {
-        self.lifecycle.close("Vivid session aborted");
+        self.lifecycle
+            .close(CloseCause::Local, "Vivid session aborted");
         Ok(())
     }
 
@@ -786,13 +827,38 @@ impl Session {
         self.close_inner()
     }
 
+    /// Why the control connection can no longer be written to, if it cannot.
+    pub(crate) fn connection_ended(&self) -> Option<io::Error> {
+        self.lifecycle.unwritable().map(|(cause, diagnostic)| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                match cause {
+                    CloseCause::Cancelled => {
+                        format!("Vivid session was cancelled before it was closed: {diagnostic}")
+                    }
+                    _ => format!("Vivid connection ended before it was closed: {diagnostic}"),
+                },
+            )
+        })
+    }
+
     pub(crate) fn close_inner(&mut self) -> io::Result<()> {
         if self.closed {
             return Ok(());
         }
         self.closed = true;
-        self.lifecycle.close("Vivid session closed");
-        let result = self.request_ok(messages::GOODBYE, 0, vec![], &RequestMetadata::default());
+        // A connection the reader has already seen end, or one `cancel_handle` shut down, cannot
+        // carry a `GOODBYE`. Attempting it anyway answers with the writer's generic "writer is
+        // closed", which is the least informative thing this stack knows: the reason the reader
+        // recorded is right here. Local teardown below still runs — the close is complete, and
+        // only the report of it changes.
+        let ended = self.connection_ended();
+        self.lifecycle
+            .close(CloseCause::Local, "Vivid session closed");
+        let result = match ended {
+            Some(error) => Err(error),
+            None => self.request_ok(messages::GOODBYE, 0, vec![], &RequestMetadata::default()),
+        };
         for state in self.surfaces.values() {
             if let Ok(mut state) = state.lock() {
                 state.destroyed = true;
@@ -902,7 +968,8 @@ impl Drop for Session {
         if !self.closed {
             // Dropping is cancellation/unclean loss, not a clean GOODBYE. This is intentional:
             // resumable sessions must be allowed to suspend rather than being silently destroyed.
-            self.lifecycle.close("Vivid control session dropped");
+            self.lifecycle
+                .close(CloseCause::Local, "Vivid control session dropped");
             self.surfaces.clear();
             if let Ok(mut tracks) = self.tracks.lock() {
                 tracks.clear();
@@ -989,13 +1056,16 @@ pub(crate) fn spawn_control_reader(
                     events.push_back(event);
                 }
             })();
-            let _ = writer.shutdown();
-            pending.closed.store(true, Ordering::Release);
             let message = result.err().map_or_else(
                 || "control connection closed".into(),
                 |error| error.to_string(),
             );
-            lifecycle.close(&message);
+            // Recorded before the writer is shut down. The other order leaves a window in which a
+            // concurrent send fails with the writer's generic "writer is closed" while the reason
+            // for it is a moment away from being stored.
+            lifecycle.close(CloseCause::Lost, &message);
+            let _ = writer.shutdown();
+            pending.closed.store(true, Ordering::Release);
             if let Ok(mut events) = pending.events.lock() {
                 events.clear();
                 events.push_back(SessionEvent::ConnectionClosed {
@@ -1144,7 +1214,7 @@ fn supported_control_record(kind: u16) -> bool {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use vivid_protocol::cbor::Value;
 
     fn dispatch_fixture(kind: u16, flags: u16, body: Vec<u8>) -> Result<Record, String> {
@@ -1195,6 +1265,65 @@ mod audit_tests {
         .unwrap();
         receive.recv_timeout(Duration::from_secs(1)).unwrap()
     }
+    /// The reader is the only thing that knows why a connection ended, and the writer's generic
+    /// "writer is closed" is what a caller gets instead whenever that knowledge is not recorded
+    /// first. Recording it before the shutdown is what removes the window between the two.
+    #[test]
+    fn the_reader_records_why_the_connection_ended_before_it_shuts_the_writer() {
+        use std::io::Cursor;
+        use vivid_protocol::wire::RecordHeader;
+        let mut input = RecordHeader {
+            body_length: 0,
+            record_type: messages::WELCOME,
+            flags: 0,
+            object_id: 0,
+            sequence: 1,
+        }
+        .encode()
+        .to_vec();
+        // A record header cut short mid-stream, which is what a peer that goes away leaves behind.
+        input.extend_from_slice(&[0, 0, 0]);
+        let mut connection = Connection::from_streams(
+            Box::new(Cursor::new(input)),
+            Box::new(std::io::sink()),
+            ConnectionKind::Control,
+        )
+        .unwrap();
+        connection.read_record().unwrap();
+        let (reader, writer) = connection.split().unwrap();
+        let lifecycle = Arc::new(SessionLifecycle::new());
+        let pending = Arc::new(PendingControl {
+            requests: Mutex::new(HashMap::new()),
+            events: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+        });
+        spawn_control_reader(
+            reader,
+            writer.clone(),
+            pending.clone(),
+            lifecycle.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.closed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the reader never finished");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // The writer is unusable by now, so a caller reaching it gets the generic error. The point
+        // is that it no longer has to: the cause and the reader's own words are already stored.
+        assert!(writer.write_record(messages::GOODBYE, 0, 0, &[]).is_err());
+        let (cause, diagnostic) = lifecycle.unwritable().expect("no reason was recorded");
+        assert_eq!(cause, CloseCause::Lost);
+        assert!(
+            !diagnostic.contains("Vivid connection writer is closed"),
+            "the recorded reason is the writer's own error, not the reader's: {diagnostic}"
+        );
+        assert!(!diagnostic.is_empty());
+    }
+
     #[test]
     fn optional_opaque_records_do_not_consume_requests() {
         assert_eq!(
