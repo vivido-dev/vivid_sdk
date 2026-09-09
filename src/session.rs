@@ -458,13 +458,21 @@ impl Session {
     /// Carrier factories must cancel their custom blocking I/O before invoking this operation.
     pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
         let lifecycle = self.lifecycle.clone();
-        let writer = match &self.control {
-            ControlPlane::Live { writer, .. } => Some(writer.clone()),
+        let control = match &self.control {
+            ControlPlane::Live { writer, pending } => Some((writer.clone(), pending.clone())),
             ControlPlane::Offline { .. } => None,
         };
         Arc::new(move || {
             lifecycle.close(CloseCause::Cancelled, "Vivid session cancelled");
-            if let Some(writer) = &writer {
+            if let Some((writer, pending)) = &control {
+                // Wake request waiters directly; cancelling transport I/O need not synchronously
+                // finish the control reader (in particular on Windows).
+                pending.closed.store(true, Ordering::Release);
+                if let Ok(mut requests) = pending.requests.lock() {
+                    for (_, sender) in requests.drain() {
+                        let _ = sender.send(Err("Vivid session cancelled".to_owned()));
+                    }
+                }
                 let _ = writer.shutdown();
             }
         })
@@ -1216,6 +1224,67 @@ mod audit_tests {
     use super::*;
     use std::time::{Duration, Instant};
     use vivid_protocol::cbor::Value;
+
+    #[test]
+    fn cancellation_wakes_pending_requests_without_waiting_for_the_reader() {
+        fn pending_session() -> (Session, mpsc::Receiver<Result<Record, String>>) {
+            let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+            let connection = Connection::from_streams(
+                Box::new(io::empty()),
+                Box::new(io::sink()),
+                ConnectionKind::Control,
+            )
+            .unwrap();
+            let (send, receive) = mpsc::channel();
+            // No control reader runs: cancellation must release this waiter itself.
+            session.control = ControlPlane::Live {
+                writer: connection.writer(),
+                pending: Arc::new(PendingControl {
+                    requests: Mutex::new(HashMap::from([(7, send)])),
+                    events: Mutex::new(VecDeque::new()),
+                    closed: AtomicBool::new(false),
+                }),
+            };
+            (session, receive)
+        }
+
+        let (first, first_reply) = pending_session();
+        let (second, second_reply) = pending_session();
+        let cancel = first.cancel_handle();
+        cancel();
+        cancel();
+        assert_eq!(
+            first_reply
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "Vivid session cancelled"
+        );
+        assert!(first.control.request(8, messages::PING, 0, &[]).is_err());
+
+        // The other session reuses the same request ID and remains open with its waiter intact.
+        assert!(matches!(
+            second_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let ControlPlane::Live { pending, .. } = &second.control else {
+            unreachable!();
+        };
+        assert!(!pending.closed.load(Ordering::Acquire));
+        pending
+            .requests
+            .lock()
+            .unwrap()
+            .remove(&7)
+            .unwrap()
+            .send(Err("other session reply".to_owned()))
+            .unwrap();
+        assert_eq!(
+            second_reply.recv().unwrap().err().unwrap(),
+            "other session reply"
+        );
+    }
 
     fn dispatch_fixture(kind: u16, flags: u16, body: Vec<u8>) -> Result<Record, String> {
         use std::io::Cursor;
