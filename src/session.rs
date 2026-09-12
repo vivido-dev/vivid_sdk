@@ -7,7 +7,8 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
+use std::time::{Duration, Instant};
 use std::{io, thread};
 
 use vivid_protocol::anchor::AnchorKey;
@@ -118,12 +119,17 @@ pub(crate) struct Endpoints {
 pub(crate) struct PendingControl {
     pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
     pub(crate) events: Mutex<VecDeque<SessionEvent>>,
+    /// Signalled whenever the reader queues an event or records the connection ending, so a
+    /// bounded waiter is woken instead of polling the queue.
+    pub(crate) events_ready: Condvar,
     pub(crate) closed: AtomicBool,
 }
 
 pub(crate) struct PendingInput {
     pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
     pub(crate) events: Mutex<VecDeque<InputLaneEvent>>,
+    /// Signalled whenever the lane reader queues an event or the lane ends.
+    pub(crate) events_ready: Condvar,
     pub(crate) closed: AtomicBool,
 }
 
@@ -317,6 +323,39 @@ impl ControlPlane {
                 Ok(lock(&pending.events, "control event queue")?.pop_front())
             }
             Self::Offline { .. } => Ok(None),
+        }
+    }
+
+    pub(crate) fn wait_event(&self, timeout: Duration) -> io::Result<Option<SessionEvent>> {
+        match self {
+            Self::Live { pending, .. } => {
+                let mut events = lock(&pending.events, "control event queue")?;
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if let Some(event) = events.pop_front() {
+                        return Ok(Some(event));
+                    }
+                    // The reader clears the queue and pushes `ConnectionClosed` before it sets
+                    // this, so a closed session still delivers its final event above.
+                    if pending.closed.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return Ok(None);
+                    };
+                    let (guard, _) = pending
+                        .events_ready
+                        .wait_timeout(events, remaining)
+                        .map_err(|_| invalid_data("control event queue lock was poisoned"))?;
+                    events = guard;
+                }
+            }
+            // A dry-run session has no reader and will never produce an event. Waiting out the
+            // timeout keeps a caller's event loop honest instead of turning it into a spin.
+            Self::Offline { .. } => {
+                thread::sleep(timeout);
+                Ok(None)
+            }
         }
     }
 }
@@ -669,6 +708,7 @@ impl Session {
         let pending = Arc::new(PendingControl {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
             closed: AtomicBool::new(false),
         });
         let lifecycle = Arc::new(SessionLifecycle::new());
@@ -817,6 +857,19 @@ impl Session {
 
     pub fn take_event(&self) -> io::Result<Option<SessionEvent>> {
         self.control.take_event()
+    }
+
+    /// Take the next session event, waiting up to `timeout` for one to arrive.
+    ///
+    /// Returns `None` when the timeout elapses with no event, and `None` once the session has
+    /// delivered [`SessionEvent::ConnectionClosed`] and can produce nothing further, which is what
+    /// ends an event loop. Unlike [`Session::take_event`] this parks the calling thread, so a
+    /// binding can drive an async iterator from a worker without polling.
+    ///
+    /// The wait is bounded by `timeout` even when the session is closing, so a caller holding a
+    /// cancellation flag always regains control.
+    pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<SessionEvent>> {
+        self.control.wait_event(timeout)
     }
 
     /// Close the session lifecycle without a `GOODBYE` round trip.
@@ -1062,6 +1115,8 @@ pub(crate) fn spawn_control_reader(
                         return Err(invalid_data("control event queue exceeded its bound"));
                     }
                     events.push_back(event);
+                    drop(events);
+                    pending.events_ready.notify_all();
                 }
             })();
             let message = result.err().map_or_else(
@@ -1080,6 +1135,7 @@ pub(crate) fn spawn_control_reader(
                     diagnostic: message.clone(),
                 });
             }
+            pending.events_ready.notify_all();
             if let Ok(mut requests) = pending.requests.lock() {
                 for (_, sender) in requests.drain() {
                     let _ = sender.send(Err(message.clone()));
@@ -1242,6 +1298,7 @@ mod audit_tests {
                 pending: Arc::new(PendingControl {
                     requests: Mutex::new(HashMap::from([(7, send)])),
                     events: Mutex::new(VecDeque::new()),
+                    events_ready: Condvar::new(),
                     closed: AtomicBool::new(false),
                 }),
             };
@@ -1322,6 +1379,7 @@ mod audit_tests {
         let pending = Arc::new(PendingControl {
             requests: Mutex::new(HashMap::from([(7, send)])),
             events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
             closed: AtomicBool::new(false),
         });
         spawn_control_reader(
@@ -1334,6 +1392,95 @@ mod audit_tests {
         .unwrap();
         receive.recv_timeout(Duration::from_secs(1)).unwrap()
     }
+    /// A bounded wait is the primitive every binding's event loop is built on, so it has to do
+    /// three things exactly: park until an event exists rather than spin, come back on its own
+    /// when nothing arrives, and stop for good once the session is closed. A wait that returned
+    /// early would turn an async iterator into a busy loop; one that parked past its deadline
+    /// would strand a caller holding a cancellation flag.
+    #[test]
+    fn waiting_for_an_event_parks_wakes_and_stops_at_the_close() {
+        let pending = Arc::new(PendingControl {
+            requests: Mutex::new(HashMap::new()),
+            events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        });
+        let control = ControlPlane::Live {
+            writer: Connection::from_streams(
+                Box::new(io::empty()),
+                Box::new(io::sink()),
+                ConnectionKind::Control,
+            )
+            .unwrap()
+            .writer(),
+            pending: Arc::clone(&pending),
+        };
+
+        // Nothing queued: the wait returns on its own deadline rather than hanging.
+        let started = Instant::now();
+        assert!(
+            control
+                .wait_event(Duration::from_millis(120))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the wait returned early, which makes an event loop a spin"
+        );
+
+        // An event queued from another thread wakes the waiter well inside its timeout.
+        let writer = Arc::clone(&pending);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            writer
+                .events
+                .lock()
+                .unwrap()
+                .push_back(SessionEvent::AnchorReady {
+                    context_id: 1,
+                    anchor_id: 2,
+                    payload: Vec::new(),
+                });
+            writer.events_ready.notify_all();
+        });
+        let started = Instant::now();
+        assert!(matches!(
+            control.wait_event(Duration::from_secs(5)).unwrap(),
+            Some(SessionEvent::AnchorReady { anchor_id: 2, .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the waiter slept through a queued event instead of being woken"
+        );
+
+        // The close path queues its final event before it sets the flag, so that event is still
+        // delivered and only then does the stream end.
+        pending
+            .events
+            .lock()
+            .unwrap()
+            .push_back(SessionEvent::ConnectionClosed {
+                diagnostic: "peer went away".into(),
+            });
+        pending.closed.store(true, Ordering::Release);
+        assert!(matches!(
+            control.wait_event(Duration::from_secs(5)).unwrap(),
+            Some(SessionEvent::ConnectionClosed { diagnostic }) if diagnostic == "peer went away"
+        ));
+        let started = Instant::now();
+        assert!(
+            control
+                .wait_event(Duration::from_secs(30))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a closed session must end the stream instead of waiting out the timeout"
+        );
+    }
+
     /// The reader is the only thing that knows why a connection ended, and the writer's generic
     /// "writer is closed" is what a caller gets instead whenever that knowledge is not recorded
     /// first. Recording it before the shutdown is what removes the window between the two.
@@ -1364,6 +1511,7 @@ mod audit_tests {
         let pending = Arc::new(PendingControl {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
             closed: AtomicBool::new(false),
         });
         spawn_control_reader(

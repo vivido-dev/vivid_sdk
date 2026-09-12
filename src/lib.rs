@@ -22,6 +22,7 @@
 mod audio_input;
 mod channel;
 mod config;
+mod constants;
 mod controller;
 mod desktop;
 mod file_drop;
@@ -29,6 +30,7 @@ mod guard;
 mod handshake;
 mod input;
 mod lease;
+mod media_info;
 mod offline;
 mod orch;
 mod pane;
@@ -75,6 +77,11 @@ pub use config::{
     ConnectionFactory, PresenterError, ProducerAuthentication, ProducerConfig, RequestMetadata,
     TrackLostError,
 };
+pub use constants::{
+    ConstantValue, IMAGE_ENCODING_JPEG, IMAGE_ENCODING_PNG, SLOT_AUDIO, SLOT_NONE, SLOT_POSTER,
+    SLOT_PRIMARY_VIDEO, SLOT_RASTER, TRACK_KIND_AUDIO, TRACK_KIND_IMAGE, TRACK_KIND_RASTER,
+    TRACK_KIND_VIDEO, constant_table,
+};
 pub use controller::{
     ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
     LaneEndpoints, LeaseGrant, LeaseHandle, LeaseRequest, MAX_ACTIVATION_TIMEOUT_US,
@@ -91,7 +98,8 @@ pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
 };
 pub use lease::{ContextReady, SessionLeaseReady};
-pub use orch::{DeskMutation, DesktopSurface, SurfaceSlots, TrackBuilder};
+pub use media_info::probe_encoded_image;
+pub use orch::{DeskMutation, DesktopSurface, SurfaceBuilder, SurfaceSlots, TrackBuilder};
 pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
     AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, MINIMUM_TARGET_BITS_PER_SECOND,
@@ -169,12 +177,13 @@ mod tests {
     use super::*;
 
     // The tests reach into crate internals, so they take the same imports the modules take.
+    use crate::channel::ChannelEvents;
     use crate::channel::push_channel_event;
     use crate::session::apply_track_lost;
     use std::collections::{HashMap, VecDeque};
     use std::io;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     use vivid_protocol::anchor;
     use vivid_protocol::auth::{self, Secret32};
@@ -754,6 +763,7 @@ mod tests {
                 surface_id: 7,
                 payload: vec![],
             }])),
+            events_ready: Condvar::new(),
             closed: AtomicBool::new(false),
         };
         close_input_lane(&pending, "test lane loss");
@@ -767,13 +777,16 @@ mod tests {
         ));
         drop(events);
 
-        let channel_events = Mutex::new(VecDeque::from(vec![
-            ChannelEvent::NeedKeyframe(vec![]);
-            MAX_CHANNEL_EVENTS
-        ]));
+        let channel_events = ChannelEvents {
+            queue: Mutex::new(VecDeque::from(vec![
+                ChannelEvent::NeedKeyframe(vec![]);
+                MAX_CHANNEL_EVENTS
+            ])),
+            ready: Condvar::new(),
+        };
         assert!(push_channel_event(&channel_events, ChannelEvent::NeedFullFrame(vec![])).is_err());
         assert_eq!(
-            lock(&channel_events, "channel events").unwrap().len(),
+            lock(&channel_events.queue, "channel events").unwrap().len(),
             MAX_CHANNEL_EVENTS
         );
     }

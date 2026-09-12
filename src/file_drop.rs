@@ -1,6 +1,7 @@
 //! Producer-side file-drop binding and receiver connection APIs.
 
 use std::io;
+use std::time::Duration;
 
 use vivid_protocol::cbor::Value;
 use vivid_protocol::file_drop::{
@@ -204,6 +205,21 @@ impl IncomingFileTransfer {
 
     pub const fn next_offset(&self) -> u64 {
         self.flow.next_offset()
+    }
+
+    /// Bound every subsequent read to a timeout, or `None` for unbounded reads.
+    ///
+    /// A transfer connection is read from a dedicated worker by every binding, and a peer that
+    /// stops sending must not pin that worker forever. Native socket transports honour the
+    /// deadline at the socket; anything else reports `Unsupported`.
+    pub fn set_read_deadline(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        let reader = self.reader.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "offline file-transfer connections have no incoming records",
+            )
+        })?;
+        reader.set_read_deadline(timeout)
     }
 
     pub fn read_event(&mut self) -> io::Result<IncomingFileTransferEvent> {

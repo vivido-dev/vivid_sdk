@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
 use std::{io, thread};
 
 use vivid_protocol::cbor::Value;
@@ -229,6 +230,35 @@ impl InputLane {
         Ok(lock(&self.shared.events, "input event queue")?.pop_front())
     }
 
+    /// Take the next lane event, waiting up to `timeout` for one to arrive.
+    ///
+    /// Returns `None` on timeout, and `None` once [`InputLaneEvent::LaneClosed`] has been taken.
+    /// Input is the one stream where polling is genuinely costly — a pointer-motion burst arrives
+    /// far faster than any sensible poll interval, and a slow reader is what overruns
+    /// `MAX_INPUT_EVENTS` — so a binding should drive its lane from here rather than
+    /// [`InputLane::take_event`].
+    pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<InputLaneEvent>> {
+        let mut events = lock(&self.shared.events, "input event queue")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(event) = events.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            let (guard, _) = self
+                .shared
+                .events_ready
+                .wait_timeout(events, remaining)
+                .map_err(|_| invalid_data("input event queue lock was poisoned"))?;
+            events = guard;
+        }
+    }
+
     pub fn close(&self) -> io::Result<()> {
         close_input_lane(&self.shared, "interactive lane closed");
         Ok(())
@@ -332,6 +362,7 @@ impl Session {
         let shared = Arc::new(PendingInput {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
             closed: AtomicBool::new(false),
         });
         self.lifecycle.register_input_lane(&shared)?;
@@ -457,6 +488,8 @@ pub(crate) fn spawn_input_reader(
                         ));
                     }
                     events.push_back(event);
+                    drop(events);
+                    pending.events_ready.notify_all();
                 }
             })();
             let message = result.err().map_or_else(
@@ -477,6 +510,7 @@ pub(crate) fn close_input_lane(pending: &PendingInput, message: &str) {
             diagnostic: message.to_owned(),
         });
     }
+    pending.events_ready.notify_all();
     fail_pending_input(pending, message);
 }
 
@@ -610,6 +644,7 @@ mod audit_tests {
             let pending = Arc::new(PendingInput {
                 requests: Mutex::new(HashMap::from([(7, send)])),
                 events: Mutex::new(VecDeque::new()),
+                events_ready: Condvar::new(),
                 closed: AtomicBool::new(false),
             });
             spawn_input_reader(reader, writer, pending).unwrap();

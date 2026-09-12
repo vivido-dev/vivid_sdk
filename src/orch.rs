@@ -1,10 +1,15 @@
 //! Orchestration types a desktop producer layers over the raw `Session` API.
 use std::io;
 
+use vivid_protocol::messages::PayloadMap;
 use vivid_protocol::resource::{Resource, ResourceContract};
 use vivid_protocol::revision::{ChannelGeneration, SurfaceGeneration, SurfaceRevision};
-use vivid_protocol::surface::{DesktopSurfaceParameters, SurfaceDefinition};
-use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
+use vivid_protocol::surface::{
+    CoordinateModel, DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor, SurfaceRole,
+};
+use vivid_protocol::track::{
+    ImageConfiguration, KindConfiguration, TrackConfiguration, TrackDirection, TrackMode,
+};
 
 use crate::{LaneClass, RequestMetadata, Session, SlotBinding, Surface, Track};
 
@@ -79,11 +84,127 @@ impl DeskMutation {
     }
 }
 
+/// Builds a [`SurfaceDefinition`], defaulting the identity from a session.
+///
+/// A surface needs a context and an identifier before anything else can be said about it, and the
+/// answer is almost always "the session's root context" and "the next allocated id". Leaving that
+/// to each binding is how the Python package ended up owning the defaults; they belong here, where
+/// every language gets the same ones.
+pub struct SurfaceBuilder {
+    definition: SurfaceDefinition,
+}
+
+impl SurfaceBuilder {
+    /// Start from the session's root context and a freshly allocated surface id.
+    ///
+    /// The surface is a generic-content surface in desktop logical pixels until told otherwise,
+    /// which is what a producer showing an image or a figure wants.
+    pub fn new(session: &Session, logical_width: u64, logical_height: u64) -> io::Result<Self> {
+        Ok(Self {
+            definition: SurfaceDefinition {
+                context_id: session.info().root_context_id,
+                surface_id: session.allocate_id()?,
+                semantic_profile: crate::GENERIC_CONTENT.into(),
+                coordinate_model: CoordinateModel::DesktopLogicalPixels,
+                logical_width,
+                logical_height,
+                scale_numerator: 1,
+                scale_denominator: 1,
+                rotation: 0,
+                descriptor: SurfaceDescriptor {
+                    role: SurfaceRole::Unspecified,
+                    title: String::new(),
+                    semantic_content_revision: 0,
+                    semantic_availability: 0,
+                    locator_hint: String::new(),
+                },
+                policy: 0,
+                profile_parameters: Vec::new(),
+            },
+        })
+    }
+
+    /// Place the surface in a context other than the session root, such as a delegated worker
+    /// context.
+    pub fn context(mut self, context_id: u64) -> Self {
+        self.definition.context_id = context_id;
+        self
+    }
+
+    /// Use a specific surface id instead of the allocated one, which is what adopting a surface
+    /// across a resume requires.
+    pub fn surface_id(mut self, surface_id: u64) -> Self {
+        self.definition.surface_id = surface_id;
+        self
+    }
+
+    /// Set the semantic profile and the coordinate model its geometry is expressed in.
+    pub fn semantic(mut self, profile: &str, coordinate_model: CoordinateModel) -> Self {
+        self.definition.semantic_profile = profile.into();
+        self.definition.coordinate_model = coordinate_model;
+        self
+    }
+
+    /// Set the descriptor a presenter shows and exports, subject to the surface policy.
+    pub fn descriptor(mut self, descriptor: SurfaceDescriptor) -> Self {
+        self.definition.descriptor = descriptor;
+        self
+    }
+
+    /// Set the role and title without replacing the rest of the descriptor.
+    pub fn titled(mut self, role: SurfaceRole, title: impl Into<String>) -> Self {
+        self.definition.descriptor.role = role;
+        self.definition.descriptor.title = title.into();
+        self
+    }
+
+    /// Apply capture, export, retention, and diagnostic policy bits.
+    pub fn policy(mut self, policy: u64) -> Self {
+        self.definition.policy = policy;
+        self
+    }
+
+    /// Set the pixel scale and rotation the logical geometry is presented at.
+    pub fn scale(mut self, numerator: u64, denominator: u64, rotation: u16) -> Self {
+        self.definition.scale_numerator = numerator;
+        self.definition.scale_denominator = denominator;
+        self.definition.rotation = rotation;
+        self
+    }
+
+    /// Attach typed desktop parameters, which is what makes a surface a desktop surface.
+    ///
+    /// Without this a desktop-profile surface carries no captured origin, topology, or input
+    /// capabilities, and a presenter has nothing to map input back onto.
+    pub fn desktop(mut self, parameters: &DesktopSurfaceParameters) -> Self {
+        self.definition.profile_parameters = parameters.encode();
+        self
+    }
+
+    /// Attach already-encoded profile parameters, for a profile this crate does not model.
+    ///
+    /// Unknown canonical entries must survive a relay byte for byte, so a caller carrying
+    /// parameters forward passes them through here rather than rebuilding them.
+    pub fn profile_parameters(mut self, parameters: PayloadMap) -> Self {
+        self.definition.profile_parameters = parameters;
+        self
+    }
+
+    /// The definition, validated against the protocol before it reaches the wire.
+    pub fn build(self) -> io::Result<SurfaceDefinition> {
+        self.definition
+            .validate()
+            .map_err(|error| err(error.to_string()))?;
+        Ok(self.definition)
+    }
+}
+
 pub struct TrackBuilder {
     surface: Surface,
     slot: u64,
     mode: TrackMode,
     lane: LaneClass,
+    direction: TrackDirection,
     kind: Option<KindConfiguration>,
     max_rate_millihertz: u64,
     max_encoded_bits_per_second: u64,
@@ -102,6 +223,7 @@ impl TrackBuilder {
             slot,
             mode,
             lane,
+            direction: TrackDirection::Downlink,
             kind: None,
             max_rate_millihertz: 60_000,
             max_encoded_bits_per_second: 0,
@@ -171,6 +293,103 @@ impl TrackBuilder {
         self
     }
 
+    /// A retained raster track that carries whole RGBA frames, and optionally deltas against a
+    /// previously accepted frame.
+    ///
+    /// A full frame is a fixed size, so the claims follow from the geometry: one record must hold
+    /// the packet header and `width * height * 4` bytes of pixels, and the surface retains one
+    /// frame's worth of pixels. Both are computed with checked arithmetic — a geometry that
+    /// overflows a claim is rejected here rather than silently wrapping into a small one.
+    pub fn raster(mut self, width: u32, height: u32) -> io::Result<Self> {
+        /// Raster packet header, ahead of the pixels.
+        const RASTER_PACKET_OVERHEAD: u64 = 72;
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| err("raster geometry overflows a resource claim"))?;
+        let body = pixels
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(RASTER_PACKET_OVERHEAD))
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| err("raster geometry overflows a single media record"))?;
+
+        self.kind = Some(KindConfiguration::Raster(
+            vivid_protocol::track::RasterConfiguration {
+                width,
+                height,
+                alpha_mode: 1,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            },
+        ));
+        self.maximum_record_body = self.maximum_record_body.max(body);
+        self.maximum_inflight_body_bytes = self
+            .maximum_inflight_body_bytes
+            .max(u64::from(body).saturating_mul(2));
+        self.max_encoded_bits_per_second = self.max_encoded_bits_per_second.max(
+            u64::from(body)
+                .saturating_mul(8)
+                .saturating_mul(self.max_records_per_second),
+        );
+        self.decoded_pixels_per_second = self
+            .decoded_pixels_per_second
+            .max(pixels.saturating_mul(self.max_records_per_second));
+        self.retained_pixel_charge = self.retained_pixel_charge.max(pixels);
+        self.target_latency_us = self.target_latency_us.min(16_000);
+        Ok(self)
+    }
+
+    /// Enable raster delta frames against a previously accepted base frame.
+    ///
+    /// Only meaningful after [`TrackBuilder::raster`]; on any other kind this is ignored, because
+    /// the kind is what decides whether deltas exist at all.
+    pub fn raster_deltas(mut self, maximum_operations: u8, zstd_enabled: bool) -> Self {
+        if let Some(KindConfiguration::Raster(raster)) = &mut self.kind {
+            raster.delta_enabled = maximum_operations > 0;
+            raster.maximum_delta_operations = maximum_operations.max(1);
+            raster.zstd_enabled = zstd_enabled;
+        }
+        self
+    }
+
+    /// A one-shot encoded-image track carrying exactly one PNG or JPEG.
+    ///
+    /// The configuration comes from [`probe_encoded_image`](crate::probe_encoded_image), so the
+    /// declared length is the container's real length and the image is sent once, whole.
+    pub fn image(mut self, image: ImageConfiguration) -> io::Result<Self> {
+        let pixels = u64::from(image.width)
+            .checked_mul(u64::from(image.height))
+            .ok_or_else(|| err("image geometry overflows a resource claim"))?;
+        let encoded_length = image.encoded_length;
+
+        self.maximum_record_body = self.maximum_record_body.max(encoded_length);
+        self.maximum_inflight_body_bytes = self
+            .maximum_inflight_body_bytes
+            .max(u64::from(encoded_length));
+        self.max_encoded_bits_per_second = self
+            .max_encoded_bits_per_second
+            .max(u64::from(encoded_length).saturating_mul(8));
+        self.retained_pixel_charge = self.retained_pixel_charge.max(pixels);
+        // One record, once. A rate claim above one buys nothing and only raises the admission
+        // cost of a track that can never send a second frame.
+        self.max_rate_millihertz = 1;
+        self.max_records_per_second = 1;
+        self.target_latency_us = 0;
+        self.maximum_latency_us = 0;
+        self.kind = Some(KindConfiguration::EncodedImage(image));
+        Ok(self)
+    }
+
+    /// Declare the track as uplink — microphone audio toward the producer side of the surface.
+    ///
+    /// The protocol restricts uplink to live realtime audio in slot zero, and
+    /// [`TrackBuilder::build`] lets the protocol's own validation enforce that, so this only sets
+    /// the direction and leaves the rest to the kind the caller attaches.
+    pub fn uplink(mut self) -> Self {
+        self.direction = TrackDirection::Uplink;
+        self
+    }
+
     pub fn max_rate_millihertz(mut self, v: u64) -> Self {
         self.max_rate_millihertz = v;
         self
@@ -221,7 +440,7 @@ impl TrackBuilder {
             .min(inflight_ceiling);
         checks(&self, contract)?;
         Ok(TrackConfiguration {
-            direction: Default::default(),
+            direction: self.direction,
             context_id: self.surface.context_id(),
             surface_id: self.surface.id(),
             track_id,
@@ -434,6 +653,187 @@ mod tests {
             .unwrap();
         assert_eq!(t.surface_id, 1);
         assert_eq!(t.slot, 1);
+    }
+
+    /// The claim defaults a retained raster track needs follow from its geometry, and they used
+    /// to be recomputed by hand in every language binding. The builder is the one place now, so
+    /// these pin the arithmetic the bindings inherit.
+    #[test]
+    fn raster_claims_follow_from_geometry() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let contract = big_contract();
+        let surface = session
+            .create_surface(
+                SurfaceBuilder::new(&session, 640, 480)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = TrackBuilder::new(
+            &surface,
+            crate::SLOT_RASTER,
+            TrackMode::Live,
+            LaneClass::Bulk,
+        )
+        .raster(640, 480)
+        .unwrap()
+        .build(&contract, 7)
+        .unwrap();
+        // 72 bytes of packet header ahead of width * height * 4 bytes of pixels.
+        assert_eq!(track.maximum_record_body, 72 + 640 * 480 * 4);
+        assert_eq!(track.maximum_inflight_body_bytes, 2 * (72 + 640 * 480 * 4));
+        assert_eq!(track.retained_pixel_charge, 640 * 480);
+        assert!(matches!(
+            track.kind,
+            KindConfiguration::Raster(raster)
+                if raster.width == 640 && raster.height == 480 && !raster.delta_enabled
+        ));
+    }
+
+    #[test]
+    fn raster_deltas_and_geometry_overflow() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let contract = big_contract();
+        let surface = session
+            .create_surface(
+                SurfaceBuilder::new(&session, 64, 64)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = TrackBuilder::new(
+            &surface,
+            crate::SLOT_RASTER,
+            TrackMode::Live,
+            LaneClass::Bulk,
+        )
+        .raster(64, 64)
+        .unwrap()
+        .raster_deltas(8, true)
+        .build(&contract, 7)
+        .unwrap();
+        assert!(matches!(
+            track.kind,
+            KindConfiguration::Raster(raster)
+                if raster.delta_enabled
+                    && raster.maximum_delta_operations == 8
+                    && raster.zstd_enabled
+        ));
+
+        // A geometry whose pixel count leaves u32 record territory must be refused at the call
+        // rather than wrapping into a small claim the contract would happily admit.
+        assert!(
+            TrackBuilder::new(
+                &surface,
+                crate::SLOT_RASTER,
+                TrackMode::Live,
+                LaneClass::Bulk
+            )
+            .raster(u32::MAX, u32::MAX)
+            .is_err()
+        );
+    }
+
+    /// An image track exists to send exactly one container once, so its claims and rate are the
+    /// minimum that admits a single record.
+    #[test]
+    fn image_track_claims_one_record_once() {
+        let mut session = Session::connect(ProducerConfig::offline()).unwrap();
+        let contract = session.info().resource_contract.clone();
+        let surface = session
+            .create_surface(
+                SurfaceBuilder::new(&session, 32, 32)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        png.extend_from_slice(&13_u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&32_u32.to_be_bytes());
+        png.extend_from_slice(&32_u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let image = crate::probe_encoded_image(&png).unwrap();
+        let track = TrackBuilder::new(
+            &surface,
+            crate::SLOT_POSTER,
+            TrackMode::Live,
+            LaneClass::Bulk,
+        )
+        .image(image)
+        .unwrap()
+        .build(&contract, 9)
+        .unwrap();
+        assert_eq!(track.maximum_record_body as usize, png.len());
+        assert_eq!(track.maximum_rate_millihertz, 1);
+        assert_eq!(track.maximum_records_per_second, 1);
+        assert_eq!(track.retained_pixel_charge, 32 * 32);
+        assert!(matches!(
+            track.kind,
+            KindConfiguration::EncodedImage(image) if image.encoded_length as usize == png.len()
+        ));
+    }
+
+    /// The builder owns the identity defaults so bindings do not have to: root context, next
+    /// allocated id, generic content, desktop logical pixels. Everything else is opt-in.
+    #[test]
+    fn surface_builder_defaults_and_desktop_parameters() {
+        let session = Session::connect(ProducerConfig::offline()).unwrap();
+        let surface = SurfaceBuilder::new(&session, 800, 600)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(surface.context_id, session.info().root_context_id);
+        assert!(session.info().root_context_id > 0);
+        assert_eq!(surface.semantic_profile, crate::GENERIC_CONTENT);
+        assert_eq!(
+            surface.coordinate_model,
+            CoordinateModel::DesktopLogicalPixels
+        );
+        assert_eq!((surface.logical_width, surface.logical_height), (800, 600));
+        assert_eq!(surface.descriptor.role, SurfaceRole::Unspecified);
+        assert_eq!(surface.profile_parameters, Vec::new());
+
+        let topology = crate::OutputDescriptor {
+            output_id: 1,
+            origin_x: 0,
+            origin_y: 0,
+            width: 1920,
+            height: 1080,
+            scale_numerator: 2,
+            scale_denominator: 1,
+            rotation: crate::Rotation::None,
+            primary: true,
+        };
+        let parameters = DesktopSurfaceParameters {
+            captured_origin_x: -1920,
+            captured_origin_y: 0,
+            topology: vec![topology],
+            semantic_generation: 4,
+            input_capabilities: 3,
+        };
+        let desktop = SurfaceBuilder::new(&session, 1920, 1080)
+            .unwrap()
+            .titled(SurfaceRole::Desktop, "screen")
+            .desktop(&parameters)
+            .build()
+            .unwrap();
+        let decoded = crate::DesktopSurfaceParameters::decode(&desktop.profile_parameters)
+            .expect("desktop parameters must round-trip");
+        assert_eq!(decoded.captured_origin_x, -1920);
+        assert_eq!(decoded.semantic_generation, 4);
+        assert_eq!(decoded.topology.len(), 1);
+
+        // An invalid surface is refused by the builder, before it can become a request.
+        let broken = SurfaceBuilder::new(&session, 0, 600).unwrap().build();
+        assert!(broken.is_err());
     }
 
     #[test]

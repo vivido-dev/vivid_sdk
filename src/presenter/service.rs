@@ -748,11 +748,18 @@ fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
     }
 }
 
+/// Events the runtime queues for a pull-mode [`VirtualVivid::wait_media_event`] caller before it
+/// backpressures media into recovery, matching the depth push consumers typically choose.
+const MEDIA_EVENT_QUEUE_BOUND: usize = 16;
+
 pub struct VirtualVivid {
     endpoint: String,
     state: Arc<Mutex<State>>,
     delivery_changed: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
+    /// Present in pull mode, where the runtime owns the media event channel and a caller drains
+    /// it with [`VirtualVivid::wait_media_event`]. Push mode keeps the caller's receiver instead.
+    media_events: Mutex<Option<mpsc::Receiver<MediaEvent>>>,
 }
 
 impl VirtualVivid {
@@ -860,6 +867,16 @@ impl VirtualVivid {
                 "supported profiles must contain core and the selected target profile",
             ));
         }
+        // Pull mode: the runtime owns the queue so a language binding can park a worker on
+        // `wait_media_event` without supplying a Rust channel or a callback. The bound is what
+        // keeps a stalled reader from growing retention without limit; overflow takes the same
+        // recovery path as a busy push consumer.
+        let (media_events, events) = if let Some(caller) = events {
+            (Mutex::new(None), Some(caller))
+        } else {
+            let (sender, receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE_BOUND);
+            (Mutex::new(Some(receiver)), Some(sender))
+        };
         registry::validate_profile_set(config.supported_profiles.iter().map(String::as_str))
             .map_err(io::Error::other)?;
         config
@@ -907,6 +924,7 @@ impl VirtualVivid {
             state: state.clone(),
             delivery_changed: delivery_changed.clone(),
             shutdown: shutdown.clone(),
+            media_events,
         };
         thread::Builder::new()
             .name("vivid-presenter-listener".into())
@@ -920,6 +938,35 @@ impl VirtualVivid {
 
     pub fn set_media_wakeup(&self, wakeup: Arc<dyn Fn() + Send + Sync>) {
         lock(&self.state).media_wakeup = Some(wakeup);
+    }
+
+    /// Take the next media event, waiting up to `timeout` for one to arrive.
+    ///
+    /// This is the pull-mode counterpart of [`VirtualVivid::set_media_wakeup`]: instead of a
+    /// wakeup callback reaching into a host scheduler, a binding parks a worker here and turns
+    /// each returned event into work on its own terms. Available only when the runtime was started
+    /// without a caller-supplied event channel; in push mode this reports `Unsupported` because
+    /// the events are already going to the caller's receiver.
+    ///
+    /// Returns `Ok(None)` once the runtime has been dropped and the queue is drained, which ends
+    /// a caller's event loop. The wait is bounded regardless, so a worker holding a shutdown flag
+    /// always regains control.
+    pub fn wait_media_event(&self, timeout: Duration) -> io::Result<Option<MediaEvent>> {
+        let receiver = self
+            .media_events
+            .lock()
+            .map_err(|_| io::Error::other("media event queue lock was poisoned"))?;
+        let Some(receiver) = receiver.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this runtime delivers media events through the channel given at startup",
+            ));
+        };
+        match receiver.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+        }
     }
 
     pub fn issue_pane_capability(&self, pane: PaneId) -> io::Result<String> {
@@ -9711,5 +9758,86 @@ mod tests {
         wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
         let wrong = String::from_utf8(wrong).unwrap();
         assert!(crate::Session::connect(producer(presenter.endpoint(), &wrong)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod media_event_tests {
+    use super::*;
+    use crate::presenter::SocketListener;
+
+    fn idle_source() -> SourceKey {
+        BridgeSourceKey {
+            producer: 1,
+            context: 1,
+            surface: 1,
+            track: 1,
+        }
+    }
+
+    /// Pull mode is what a language binding uses, so the two behaviours that matter are: the wait
+    /// returns on its own deadline when nothing arrives, and a queued event is delivered the
+    /// moment one exists.
+    #[test]
+    fn wait_media_event_parks_until_the_deadline_and_delivers_when_queued() {
+        use std::time::Instant;
+
+        let presenter = VirtualVivid::start(
+            SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        assert!(
+            presenter
+                .wait_media_event(Duration::from_millis(80))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "the wait returned early, which makes an event loop a spin"
+        );
+
+        let sender = lock(&presenter.state).events.clone().unwrap();
+        let event = MediaEvent {
+            delivery_id: 1,
+            source: idle_source(),
+            record_type: 0x8000,
+            recovered_keyframe: None,
+            body: vec![1, 2, 3],
+        };
+        sender.try_send(event).unwrap();
+        let started = Instant::now();
+        let received = presenter
+            .wait_media_event(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.delivery_id, 1);
+        assert_eq!(received.body, vec![1, 2, 3]);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the waiter slept through a queued event"
+        );
+    }
+
+    /// Push mode keeps events for the caller's receiver and says so, rather than silently
+    /// splitting the stream between two consumers.
+    #[test]
+    fn wait_media_event_is_unavailable_in_push_mode() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            MediaConfig::default(),
+            Some(sender),
+        )
+        .unwrap();
+        assert!(
+            presenter
+                .wait_media_event(Duration::from_millis(50))
+                .is_err()
+        );
+        drop(receiver);
     }
 }

@@ -40,6 +40,14 @@ impl Drop for ChannelHandleLifetime {
     }
 }
 
+/// The reverse-channel event queue and the signal that wakes a bounded waiter.
+#[derive(Default)]
+pub(crate) struct ChannelEvents {
+    pub(crate) queue: Mutex<VecDeque<ChannelEvent>>,
+    /// Signalled when an event is queued and when the reverse reader ends.
+    pub(crate) ready: Condvar,
+}
+
 pub(crate) struct FlowLocal {
     pub(crate) flow: ChannelFlow,
     pub(crate) initial_maximum_body_bytes: u64,
@@ -104,7 +112,7 @@ pub struct TrackChannel {
     pub(crate) send_order: Arc<Mutex<()>>,
     pub(crate) track_sequence: Arc<Mutex<TrackMediaSequence>>,
     pub(crate) media: Arc<Mutex<ChannelMediaState>>,
-    pub(crate) events: Arc<Mutex<VecDeque<ChannelEvent>>>,
+    pub(crate) events: Arc<ChannelEvents>,
     pub(crate) rate: Option<Arc<Mutex<ChannelRateState>>>,
     pub(crate) pressure: Arc<Mutex<SendPressure>>,
     _handle_lifetime: Arc<ChannelHandleLifetime>,
@@ -259,7 +267,7 @@ impl TrackChannel {
             state.active_flow = Some(Arc::downgrade(&flow));
             state.active_media = Some(Arc::downgrade(&media));
         }
-        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let events = Arc::new(ChannelEvents::default());
         let input = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(reader) = reader {
             spawn_channel_reader(
@@ -400,7 +408,35 @@ impl TrackChannel {
     }
 
     pub fn take_event(&self) -> io::Result<Option<ChannelEvent>> {
-        Ok(lock(&self.events, "channel event queue")?.pop_front())
+        Ok(lock(&self.events.queue, "channel event queue")?.pop_front())
+    }
+
+    /// Take the next reverse-channel event, waiting up to `timeout` for one to arrive.
+    ///
+    /// Returns `None` on timeout and `None` once the channel's transport has ended and its queue
+    /// is drained. A keyframe request that arrives while nobody is looking is the difference
+    /// between a fast recovery and a frozen picture, so a video sender should park here rather
+    /// than poll [`TrackChannel::take_event`] between frames.
+    pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<ChannelEvent>> {
+        let mut queue = lock(&self.events.queue, "channel event queue")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(event) = queue.pop_front() {
+                return Ok(Some(event));
+            }
+            if lock(&self.flow.state, "channel flow state")?.closed {
+                return Ok(None);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            let (guard, _) = self
+                .events
+                .ready
+                .wait_timeout(queue, remaining)
+                .map_err(|_| invalid_data("channel event queue lock was poisoned"))?;
+            queue = guard;
+        }
     }
 
     /// Wait until the presenter has made the ingress capacity used by every media record already
@@ -1084,7 +1120,7 @@ pub(crate) fn spawn_channel_reader(
     generation: ChannelGeneration,
     flow: Arc<FlowSync>,
     media: Arc<Mutex<ChannelMediaState>>,
-    events: Arc<Mutex<VecDeque<ChannelEvent>>>,
+    events: Arc<ChannelEvents>,
     input: Arc<Mutex<VecDeque<(Instant, crate::InputPacket)>>>,
     input_sequence: Arc<Mutex<TrackMediaSequence>>,
 ) -> io::Result<()> {
@@ -1214,19 +1250,19 @@ pub(crate) fn spawn_channel_reader(
                 state.diagnostic = result.err().map(|error| error.to_string());
                 flow.changed.notify_all();
             }
+            events.ready.notify_all();
         })
         .map(|_| ())
 }
 
-pub(crate) fn push_channel_event(
-    events: &Mutex<VecDeque<ChannelEvent>>,
-    event: ChannelEvent,
-) -> io::Result<()> {
-    let mut events = lock(events, "channel event queue")?;
-    if events.len() == MAX_CHANNEL_EVENTS {
+pub(crate) fn push_channel_event(events: &ChannelEvents, event: ChannelEvent) -> io::Result<()> {
+    let mut queue = lock(&events.queue, "channel event queue")?;
+    if queue.len() == MAX_CHANNEL_EVENTS {
         return Err(invalid_data("track event queue exceeded its bound"));
     }
-    events.push_back(event);
+    queue.push_back(event);
+    drop(queue);
+    events.ready.notify_all();
     Ok(())
 }
 
