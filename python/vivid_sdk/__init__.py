@@ -16,6 +16,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 from . import _native
 from ._native import (
     ClosedHandleError,
+    IncomingFileTransfer,
+    InputLane,
+    TrackSender,
+    VideoRateControl,
     Session,
     Surface,
     Track,
@@ -28,64 +32,133 @@ try:
 except PackageNotFoundError:  # pragma: no cover
     __version__ = "1.5.0"
 
-# Negotiated profiles.
-PROFILE_CORE = "vivid-core-control-v1"
-PROFILE_TERMINAL_SURFACE = "terminal-surface-v1"
-PROFILE_DESKTOP_SURFACE = "desktop-surface-v1"
-PROFILE_CANVAS_SURFACE = "canvas-surface-v1"
-PROFILE_LIVE_MEDIA = "live-media-v1"
-PROFILE_TIMED_MEDIA = "timed-media-v1"
-PROFILE_DESKTOP_INPUT = "desktop-input-v1"
-PROFILE_OBSERVABILITY = "observability-v1"
+# Protocol constants, read from the Rust table that owns them.
+#
+# The names are this module's API; the values are not. Declaring them explicitly is what
+# lets a type checker see them, and reading them from `_native` is what keeps them from
+# drifting from `vivid_protocol`: a rename there fails this import instead of silently
+# changing a wire value here.
+_CONSTANTS: Dict[str, Tuple[Optional[str], Optional[int]]] = {
+    name: (text, number)
+    for name, text, number in _native.constant_table()
+}
 
-# Surface semantic profiles and coordinate models.
-SURFACE_GENERIC = "generic-content-v1"
-SURFACE_TERMINAL = "terminal-content-v1"
-SURFACE_DESKTOP = "desktop-content-v1"
-SURFACE_CANVAS = "canvas-content-v1"
-COORDINATE_DESKTOP_LOGICAL_PIXELS = 1
-COORDINATE_NORMALIZED = 2
-COORDINATE_CANVAS_LOGICAL_UNITS = 3
-COORDINATE_TERMINAL_CONTENT_CELLS = 4
 
-# Descriptor roles.
-ROLE_UNSPECIFIED = 0
-ROLE_DOCUMENT = 1
-ROLE_DESKTOP = 2
-ROLE_TIMED_MEDIA = 3
-ROLE_FIGURE = 4
-ROLE_TERMINAL = 5
-ROLE_CANVAS = 6
+def _constant_text(name: str) -> str:
+    """The wire name of a profile or semantic-profile constant."""
+    text, _ = _CONSTANTS[name]
+    if text is None:
+        raise KeyError(f"{name} is not a profile constant")
+    return text
 
-# Capture/export policies.
-POLICY_DENY_CAPTURE = 1 << 0
-POLICY_DENY_DESCRIPTOR_EXPORT = 1 << 1
-POLICY_DENY_POSTER_RETENTION = 1 << 2
-POLICY_DENY_IMAGE_CACHE = 1 << 3
-POLICY_REDUCED_DIAGNOSTICS = 1 << 4
 
-# Track modes, lanes, and slots.
-TRACK_MODE_LIVE = 1
-TRACK_MODE_TIMED = 2
-LANE_REALTIME = 2
-LANE_BULK = 3
-SLOT_PRIMARY_VIDEO = 1
-SLOT_AUDIO = 2
-SLOT_RASTER = 3
-SLOT_POSTER = 4
+def _constant_number(name: str) -> int:
+    """The numeric assignment of a bit, bound, or identifier constant."""
+    _, number = _CONSTANTS[name]
+    if number is None:
+        raise KeyError(f"{name} is not a numeric constant")
+    return number
 
-IMAGE_PNG = 1
-IMAGE_JPEG = 2
-MILESTONE_OUTPUT_READY = 1 << 4
-WAIT_REVISION_GREATER = 1
-WAIT_MILESTONE_SET = 2
-WAIT_RASTER_FRAME_PRESENTED = 3
-WAIT_VIDEO_PTS_PRESENTED = 4
-WAIT_PLAYBACK_STARTED = 5
-WAIT_PLAYBACK_ENDED = 6
-WAIT_CHANNEL_ACCEPTED = 7
-WAIT_CHANNEL_CLOSED = 8
-WAIT_TRACK_LOST = 9
+
+PROFILE_CORE: str = _constant_text("PROFILE_CORE")
+PROFILE_TERMINAL_SURFACE: str = _constant_text("PROFILE_TERMINAL_SURFACE")
+PROFILE_DESKTOP_SURFACE: str = _constant_text("PROFILE_DESKTOP_SURFACE")
+PROFILE_CANVAS_SURFACE: str = _constant_text("PROFILE_CANVAS_SURFACE")
+PROFILE_LIVE_MEDIA: str = _constant_text("PROFILE_LIVE_MEDIA")
+PROFILE_TIMED_MEDIA: str = _constant_text("PROFILE_TIMED_MEDIA")
+PROFILE_AUDIO_GAIN: str = _constant_text("PROFILE_AUDIO_GAIN")
+PROFILE_AUDIO_INPUT: str = _constant_text("PROFILE_AUDIO_INPUT")
+PROFILE_DESKTOP_INPUT: str = _constant_text("PROFILE_DESKTOP_INPUT")
+PROFILE_FILE_DROP: str = _constant_text("PROFILE_FILE_DROP")
+PROFILE_FILE_DROP_PATH: str = _constant_text("PROFILE_FILE_DROP_PATH")
+PROFILE_OBSERVABILITY: str = _constant_text("PROFILE_OBSERVABILITY")
+PROFILE_WEB_CARRIER: str = _constant_text("PROFILE_WEB_CARRIER")
+SURFACE_GENERIC: str = _constant_text("SURFACE_GENERIC")
+SURFACE_TERMINAL: str = _constant_text("SURFACE_TERMINAL")
+SURFACE_DESKTOP: str = _constant_text("SURFACE_DESKTOP")
+SURFACE_CANVAS: str = _constant_text("SURFACE_CANVAS")
+COORDINATE_DESKTOP_LOGICAL_PIXELS: int = _constant_number("COORDINATE_DESKTOP_LOGICAL_PIXELS")
+COORDINATE_NORMALIZED: int = _constant_number("COORDINATE_NORMALIZED")
+COORDINATE_CANVAS_LOGICAL_UNITS: int = _constant_number("COORDINATE_CANVAS_LOGICAL_UNITS")
+COORDINATE_TERMINAL_CONTENT_CELLS: int = _constant_number("COORDINATE_TERMINAL_CONTENT_CELLS")
+ROLE_UNSPECIFIED: int = _constant_number("ROLE_UNSPECIFIED")
+ROLE_DOCUMENT: int = _constant_number("ROLE_DOCUMENT")
+ROLE_DESKTOP: int = _constant_number("ROLE_DESKTOP")
+ROLE_TIMED_MEDIA: int = _constant_number("ROLE_TIMED_MEDIA")
+ROLE_FIGURE: int = _constant_number("ROLE_FIGURE")
+ROLE_TERMINAL: int = _constant_number("ROLE_TERMINAL")
+ROLE_CANVAS: int = _constant_number("ROLE_CANVAS")
+POLICY_DENY_CAPTURE: int = _constant_number("POLICY_DENY_CAPTURE")
+POLICY_DENY_DESCRIPTOR_EXPORT: int = _constant_number("POLICY_DENY_DESCRIPTOR_EXPORT")
+POLICY_DENY_POSTER_RETENTION: int = _constant_number("POLICY_DENY_POSTER_RETENTION")
+POLICY_DENY_IMAGE_CACHE: int = _constant_number("POLICY_DENY_IMAGE_CACHE")
+POLICY_REDUCED_DIAGNOSTICS: int = _constant_number("POLICY_REDUCED_DIAGNOSTICS")
+POLICY_KNOWN_MASK: int = _constant_number("POLICY_KNOWN_MASK")
+TRACK_MODE_LIVE: int = _constant_number("TRACK_MODE_LIVE")
+TRACK_MODE_TIMED: int = _constant_number("TRACK_MODE_TIMED")
+TRACK_DIRECTION_DOWNLINK: int = _constant_number("TRACK_DIRECTION_DOWNLINK")
+TRACK_DIRECTION_UPLINK: int = _constant_number("TRACK_DIRECTION_UPLINK")
+TRACK_KIND_VIDEO: int = _constant_number("TRACK_KIND_VIDEO")
+TRACK_KIND_AUDIO: int = _constant_number("TRACK_KIND_AUDIO")
+TRACK_KIND_RASTER: int = _constant_number("TRACK_KIND_RASTER")
+TRACK_KIND_IMAGE: int = _constant_number("TRACK_KIND_IMAGE")
+LANE_CONTROL: int = _constant_number("LANE_CONTROL")
+LANE_INTERACTIVE: int = _constant_number("LANE_INTERACTIVE")
+LANE_REALTIME: int = _constant_number("LANE_REALTIME")
+LANE_BULK: int = _constant_number("LANE_BULK")
+SLOT_NONE: int = _constant_number("SLOT_NONE")
+SLOT_PRIMARY_VIDEO: int = _constant_number("SLOT_PRIMARY_VIDEO")
+SLOT_AUDIO: int = _constant_number("SLOT_AUDIO")
+SLOT_RASTER: int = _constant_number("SLOT_RASTER")
+SLOT_POSTER: int = _constant_number("SLOT_POSTER")
+FIT_FILL: int = _constant_number("FIT_FILL")
+FIT_CONTAIN: int = _constant_number("FIT_CONTAIN")
+FIT_COVER: int = _constant_number("FIT_COVER")
+FIT_NONE: int = _constant_number("FIT_NONE")
+IMAGE_PNG: int = _constant_number("IMAGE_PNG")
+IMAGE_JPEG: int = _constant_number("IMAGE_JPEG")
+MILESTONE_CHANNEL_ACCEPTED: int = _constant_number("MILESTONE_CHANNEL_ACCEPTED")
+MILESTONE_FIRST_MEDIA: int = _constant_number("MILESTONE_FIRST_MEDIA")
+MILESTONE_DECODER_INITIALIZED: int = _constant_number("MILESTONE_DECODER_INITIALIZED")
+MILESTONE_RANDOM_ACCESS: int = _constant_number("MILESTONE_RANDOM_ACCESS")
+MILESTONE_OUTPUT_READY: int = _constant_number("MILESTONE_OUTPUT_READY")
+MILESTONE_PRESENTED: int = _constant_number("MILESTONE_PRESENTED")
+MILESTONE_CLOCK_STARTED: int = _constant_number("MILESTONE_CLOCK_STARTED")
+MILESTONE_EOS_ACCEPTED: int = _constant_number("MILESTONE_EOS_ACCEPTED")
+MILESTONE_BUFFERED_ENDED: int = _constant_number("MILESTONE_BUFFERED_ENDED")
+MILESTONE_CHANNEL_DETACHED: int = _constant_number("MILESTONE_CHANNEL_DETACHED")
+MILESTONE_TRACK_LOST: int = _constant_number("MILESTONE_TRACK_LOST")
+MILESTONE_KNOWN_MASK: int = _constant_number("MILESTONE_KNOWN_MASK")
+WAIT_REVISION_GREATER: int = _constant_number("WAIT_REVISION_GREATER")
+WAIT_MILESTONE_SET: int = _constant_number("WAIT_MILESTONE_SET")
+WAIT_RASTER_FRAME_PRESENTED: int = _constant_number("WAIT_RASTER_FRAME_PRESENTED")
+WAIT_VIDEO_PTS_PRESENTED: int = _constant_number("WAIT_VIDEO_PTS_PRESENTED")
+WAIT_PLAYBACK_STARTED: int = _constant_number("WAIT_PLAYBACK_STARTED")
+WAIT_PLAYBACK_ENDED: int = _constant_number("WAIT_PLAYBACK_ENDED")
+WAIT_CHANNEL_ACCEPTED: int = _constant_number("WAIT_CHANNEL_ACCEPTED")
+WAIT_CHANNEL_CLOSED: int = _constant_number("WAIT_CHANNEL_CLOSED")
+WAIT_TRACK_LOST: int = _constant_number("WAIT_TRACK_LOST")
+MAX_TRACK_WAIT_TIMEOUT_US: int = _constant_number("MAX_TRACK_WAIT_TIMEOUT_US")
+OP_OBSERVE: int = _constant_number("OP_OBSERVE")
+OP_SURFACE_TRACK_MEDIA: int = _constant_number("OP_SURFACE_TRACK_MEDIA")
+OP_SCENE: int = _constant_number("OP_SCENE")
+OP_TERMINAL_ANCHOR: int = _constant_number("OP_TERMINAL_ANCHOR")
+OP_DESKTOP_INPUT: int = _constant_number("OP_DESKTOP_INPUT")
+OP_DELEGATE: int = _constant_number("OP_DELEGATE")
+OP_RECEIVE_FILE_DROP: int = _constant_number("OP_RECEIVE_FILE_DROP")
+OP_KNOWN_MASK: int = _constant_number("OP_KNOWN_MASK")
+INPUT_CLASS_KEYBOARD: int = _constant_number("INPUT_CLASS_KEYBOARD")
+INPUT_CLASS_POINTER_MOTION: int = _constant_number("INPUT_CLASS_POINTER_MOTION")
+INPUT_CLASS_POINTER_BUTTON: int = _constant_number("INPUT_CLASS_POINTER_BUTTON")
+INPUT_CLASS_POINTER_AXIS: int = _constant_number("INPUT_CLASS_POINTER_AXIS")
+INPUT_CLASS_KNOWN_MASK: int = _constant_number("INPUT_CLASS_KNOWN_MASK")
+MIN_WATCHDOG_US: int = _constant_number("MIN_WATCHDOG_US")
+MAX_WATCHDOG_US: int = _constant_number("MAX_WATCHDOG_US")
+COORDINATE_SPACE_GRID_CELL: int = _constant_number("COORDINATE_SPACE_GRID_CELL")
+TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH: int = _constant_number("TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH")
+MINIMUM_TARGET_BITS_PER_SECOND: int = _constant_number("MINIMUM_TARGET_BITS_PER_SECOND")
+DEFAULT_ACTIVATION_TIMEOUT_US: int = _constant_number("DEFAULT_ACTIVATION_TIMEOUT_US")
+MAX_ACTIVATION_TIMEOUT_US: int = _constant_number("MAX_ACTIVATION_TIMEOUT_US")
 
 BytesLike = Union[bytes, bytearray, memoryview]
 
@@ -116,6 +189,129 @@ class WaitSatisfied:
 
 
 @dataclass(frozen=True)
+class SceneNode:
+    """One node in a surface's retained scene.
+
+    `geometry` is the protocol's integer-keyed map; pass the keys the surface's coordinate model
+    defines. `fit` decides how content that does not match the geometry is placed.
+    """
+
+    node_id: int
+    geometry: Dict[int, Union[int, str, bool]]
+    fit: int = FIT_CONTAIN
+    linear_sampling: bool = True
+    z_index: int = 0
+    visible: bool = True
+    opacity: int = 255
+
+    def native(self, session: Session, surface: object) -> Dict[str, object]:
+        del session, surface  # Identity defaults come from the Rust scene builder.
+        return {
+            "node_id": self.node_id,
+            "geometry": dict(self.geometry),
+            "fit": self.fit,
+            "linear_sampling": self.linear_sampling,
+            "z_index": self.z_index,
+            "visible": self.visible,
+            "opacity": self.opacity,
+        }
+
+
+@dataclass(frozen=True)
+class SlotBinding:
+    """One slot's activation binding, naming the exact channel generation it expects."""
+
+    slot: int
+    track_id: int
+    expected_channel_generation: int
+    required_milestone: int = MILESTONE_OUTPUT_READY
+
+    def native(self) -> Dict[str, int]:
+        return {
+            "slot": self.slot,
+            "track_id": self.track_id,
+            "expected_channel_generation": self.expected_channel_generation,
+            "required_milestone": self.required_milestone,
+        }
+
+
+@dataclass(frozen=True)
+class InputBinding:
+    """A request to inject input on a surface, as a class mask with a watchdog bound."""
+
+    producer_epoch: int
+    context_id: int
+    surface_id: int
+    surface_generation: int
+    requested_classes: int
+    reason: int = 1
+    requested_watchdog_us: int = 1_000_000
+
+    def native(self) -> Dict[str, int]:
+        return {
+            "producer_epoch": self.producer_epoch,
+            "context_id": self.context_id,
+            "surface_id": self.surface_id,
+            "surface_generation": self.surface_generation,
+            "requested_classes": self.requested_classes,
+            "reason": self.reason,
+            "requested_watchdog_us": self.requested_watchdog_us,
+        }
+
+
+@dataclass(frozen=True)
+class OutputConfig:
+    """One captured output in a desktop topology."""
+
+    output_id: int
+    origin_x: int
+    origin_y: int
+    width: int
+    height: int
+    scale_numerator: int = 1
+    scale_denominator: int = 1
+    rotation: int = 0
+    primary: bool = False
+
+    def native(self) -> Dict[str, object]:
+        return {
+            "output_id": self.output_id,
+            "origin_x": self.origin_x,
+            "origin_y": self.origin_y,
+            "width": self.width,
+            "height": self.height,
+            "scale_numerator": self.scale_numerator,
+            "scale_denominator": self.scale_denominator,
+            "rotation": self.rotation,
+            "primary": self.primary,
+        }
+
+
+@dataclass(frozen=True)
+class DesktopParameters:
+    """Typed parameters that make a surface a desktop surface.
+
+    Without these a `desktop-content-v1` surface carries no captured origin, topology, or input
+    capabilities, and a presenter has nothing to map input back onto.
+    """
+
+    captured_origin_x: int
+    captured_origin_y: int
+    topology: Tuple[OutputConfig, ...]
+    semantic_generation: int
+    input_capabilities: int = 0
+
+    def native(self) -> Dict[str, object]:
+        return {
+            "captured_origin_x": self.captured_origin_x,
+            "captured_origin_y": self.captured_origin_y,
+            "topology": [output.native() for output in self.topology],
+            "semantic_generation": self.semantic_generation,
+            "input_capabilities": self.input_capabilities,
+        }
+
+
+@dataclass(frozen=True)
 class SurfaceConfig:
     logical_width: int
     logical_height: int
@@ -133,39 +329,47 @@ class SurfaceConfig:
     context_id: Optional[int] = None
     surface_id: Optional[int] = None
 
+    desktop_parameters: Optional["DesktopParameters"] = None
+
     def native(self, session: Session) -> Dict[str, object]:
-        return {
-            "context_id": (
-                self.context_id
-                if self.context_id is not None
-                else session_info(session).root_context_id
-            ),
-            "surface_id": (
-                self.surface_id
-                if self.surface_id is not None
-                else allocate_id(session)
-            ),
-            "semantic_profile": self.semantic_profile,
-            "coordinate_model": self.coordinate_model,
+        """The configuration dict `create_surface` takes, from the Rust surface builder.
+
+        Identity, profile, and geometry defaults live in `vivid_sdk::SurfaceBuilder`, so a
+        binding cannot disagree with the SDK about what an unspecified field means.
+        """
+        request: Dict[str, object] = {
             "logical_width": self.logical_width,
             "logical_height": self.logical_height,
-            "scale_numerator": self.scale_numerator,
-            "scale_denominator": self.scale_denominator,
-            "rotation": self.rotation,
+            "semantic_profile": self.semantic_profile,
+            "coordinate_model": self.coordinate_model,
             "role": self.role,
             "title": self.title,
-            "semantic_content_revision": self.semantic_content_revision,
-            "semantic_availability": self.semantic_availability,
-            "locator_hint": self.locator_hint,
             "policy": self.policy,
         }
+        if (self.scale_numerator, self.scale_denominator, self.rotation) != (1, 1, 0):
+            request["scale_numerator"] = self.scale_numerator
+            request["scale_denominator"] = self.scale_denominator
+            request["rotation"] = self.rotation
+        if self.context_id is not None:
+            request["context_id"] = self.context_id
+        if self.surface_id is not None:
+            request["surface_id"] = self.surface_id
+        if self.desktop_parameters is not None:
+            request["desktop_parameters"] = self.desktop_parameters.native()
+        return _native.build_surface_config(session, request)
 
 
 @dataclass(frozen=True)
 class RasterTrackConfig:
+    """A retained raster track.
+
+    A full frame is a fixed size, so the record-body, in-flight, and retained-pixel claims all
+    follow from the geometry and are computed in Rust. State them only to narrow them.
+    """
+
     width: int
     height: int
-    maximum_rate_millihertz: int = 60_000
+    maximum_rate_millihertz: Optional[int] = None
     alpha_mode: int = 1
     delta_enabled: bool = False
     maximum_delta_operations: int = 1
@@ -174,43 +378,19 @@ class RasterTrackConfig:
     mode: int = TRACK_MODE_LIVE
     lane: int = LANE_BULK
     maximum_encoded_bits_per_second: Optional[int] = None
-    maximum_records_per_second: int = 60
-    maximum_inflight_body_bytes: Optional[int] = None
-    target_latency_us: int = 16_000
-    maximum_latency_us: int = 100_000
-    retained_pixel_charge: Optional[int] = None
     track_id: Optional[int] = None
 
-    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
-        body = _checked_add(72, _checked_mul(_checked_mul(self.width, self.height), 4))
-        return _track_common(
+    def native(self, session: Session, surface: object) -> Dict[str, object]:
+        return _track_native(
             session,
             surface,
-            self.track_id,
             "raster",
-            self.slot,
-            self.mode,
-            self.lane,
-            body,
-            self.maximum_rate_millihertz,
-            (
-                self.maximum_encoded_bits_per_second
-                if self.maximum_encoded_bits_per_second is not None
-                else _checked_mul(body, 8 * self.maximum_records_per_second)
-            ),
-            self.maximum_records_per_second,
-            (
-                self.maximum_inflight_body_bytes
-                if self.maximum_inflight_body_bytes is not None
-                else _checked_mul(body, 2)
-            ),
-            self.target_latency_us,
-            self.maximum_latency_us,
-            (
-                self.retained_pixel_charge
-                if self.retained_pixel_charge is not None
-                else _checked_mul(self.width, self.height)
-            ),
+            slot=self.slot,
+            lane=self.lane,
+            mode=self.mode,
+            track_id=self.track_id,
+            maximum_rate_millihertz=self.maximum_rate_millihertz,
+            maximum_encoded_bits_per_second=self.maximum_encoded_bits_per_second,
             width=self.width,
             height=self.height,
             alpha_mode=self.alpha_mode,
@@ -222,37 +402,29 @@ class RasterTrackConfig:
 
 @dataclass(frozen=True)
 class ImageTrackConfig:
-    width: int
-    height: int
-    encoded_length: int
-    encoding: int
+    """A one-shot encoded-image track.
+
+    The container is inspected by `probe_encoded_image`, so the declared dimensions and length
+    are the file's real ones; pass `sha256` to let a presenter cache the image across
+    presentations.
+    """
+
+    encoded: bytes
     sha256: Optional[bytes] = None
     cache_lookup: bool = False
     slot: int = SLOT_POSTER
     lane: int = LANE_BULK
     track_id: Optional[int] = None
 
-    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
-        return _track_common(
+    def native(self, session: Session, surface: object) -> Dict[str, object]:
+        return _track_native(
             session,
             surface,
-            self.track_id,
             "image",
-            self.slot,
-            TRACK_MODE_LIVE,
-            self.lane,
-            self.encoded_length,
-            1,
-            _checked_mul(self.encoded_length, 8),
-            1,
-            self.encoded_length,
-            0,
-            0,
-            _checked_mul(self.width, self.height),
-            width=self.width,
-            height=self.height,
-            encoding=self.encoding,
-            encoded_length=self.encoded_length,
+            slot=self.slot,
+            lane=self.lane,
+            track_id=self.track_id,
+            encoded=self.encoded,
             sha256=self.sha256,
             cache_lookup=self.cache_lookup,
         )
@@ -260,14 +432,20 @@ class ImageTrackConfig:
 
 @dataclass(frozen=True)
 class VideoTrackConfig:
+    """A live or timed video track.
+
+    Packetization defaults to `<codec>-annexb-au-v1`; state it only for a codec that spells its
+    framing differently. The record-body, in-flight, and decoded-pixel claims follow from the
+    coded size.
+    """
+
     codec: str
-    packetization: str
     width: int
     height: int
-    maximum_access_unit_bytes: int
-    maximum_rate_millihertz: int
-    maximum_encoded_bits_per_second: int
-    maximum_records_per_second: int
+    packetization: Optional[str] = None
+    maximum_access_unit_bytes: Optional[int] = None
+    maximum_rate_millihertz: Optional[int] = None
+    maximum_encoded_bits_per_second: Optional[int] = None
     extradata: bytes = b""
     profile: int = 0
     level: int = 0
@@ -283,43 +461,24 @@ class VideoTrackConfig:
     slot: int = SLOT_PRIMARY_VIDEO
     mode: int = TRACK_MODE_LIVE
     lane: int = LANE_BULK
-    maximum_inflight_body_bytes: Optional[int] = None
-    target_latency_us: int = 100_000
-    maximum_latency_us: int = 500_000
-    retained_pixel_charge: Optional[int] = None
     track_id: Optional[int] = None
 
-    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
-        body = _checked_add(48, self.maximum_access_unit_bytes)
-        return _track_common(
+    def native(self, session: Session, surface: object) -> Dict[str, object]:
+        return _track_native(
             session,
             surface,
-            self.track_id,
             "video",
-            self.slot,
-            self.mode,
-            self.lane,
-            body,
-            self.maximum_rate_millihertz,
-            self.maximum_encoded_bits_per_second,
-            self.maximum_records_per_second,
-            (
-                self.maximum_inflight_body_bytes
-                if self.maximum_inflight_body_bytes is not None
-                else _checked_mul(body, 4)
-            ),
-            self.target_latency_us,
-            self.maximum_latency_us,
-            (
-                self.retained_pixel_charge
-                if self.retained_pixel_charge is not None
-                else _checked_mul(self.width, self.height)
-            ),
+            slot=self.slot,
+            lane=self.lane,
+            mode=self.mode,
+            track_id=self.track_id,
+            maximum_rate_millihertz=self.maximum_rate_millihertz,
+            maximum_encoded_bits_per_second=self.maximum_encoded_bits_per_second,
+            width=self.width,
+            height=self.height,
             codec=self.codec,
             packetization=self.packetization,
             extradata=self.extradata,
-            width=self.width,
-            height=self.height,
             profile=self.profile,
             level=self.level,
             maximum_reorder_depth=self.maximum_reorder_depth,
@@ -337,47 +496,36 @@ class VideoTrackConfig:
 
 @dataclass(frozen=True)
 class AudioTrackConfig:
-    codec: str
-    packetization: str
+    """An audio track. Defaults to Opus in 20 ms packets on the realtime lane."""
+
     sample_rate: int
     channels: int
-    maximum_access_unit_bytes: int
-    maximum_encoded_bits_per_second: int
-    maximum_records_per_second: int
+    codec: str = "opus"
+    packetization: Optional[str] = None
+    maximum_access_unit_bytes: Optional[int] = None
+    maximum_encoded_bits_per_second: Optional[int] = None
+    maximum_rate_millihertz: Optional[int] = None
     extradata: bytes = b""
     channel_mask: int = 0
     codec_string: Optional[str] = None
     slot: int = SLOT_AUDIO
     mode: int = TRACK_MODE_LIVE
     lane: int = LANE_REALTIME
-    maximum_rate_millihertz: int = 50_000
-    maximum_inflight_body_bytes: Optional[int] = None
-    target_latency_us: int = 40_000
-    maximum_latency_us: int = 200_000
+    uplink: bool = False
     track_id: Optional[int] = None
 
-    def native(self, session: Session, surface: Surface) -> Dict[str, object]:
-        body = _checked_add(48, self.maximum_access_unit_bytes)
-        return _track_common(
+    def native(self, session: Session, surface: object) -> Dict[str, object]:
+        return _track_native(
             session,
             surface,
-            self.track_id,
             "audio",
-            self.slot,
-            self.mode,
-            self.lane,
-            body,
-            self.maximum_rate_millihertz,
-            self.maximum_encoded_bits_per_second,
-            self.maximum_records_per_second,
-            (
-                self.maximum_inflight_body_bytes
-                if self.maximum_inflight_body_bytes is not None
-                else _checked_mul(body, 8)
-            ),
-            self.target_latency_us,
-            self.maximum_latency_us,
-            0,
+            slot=self.slot,
+            lane=self.lane,
+            mode=self.mode,
+            track_id=self.track_id,
+            maximum_rate_millihertz=self.maximum_rate_millihertz,
+            maximum_encoded_bits_per_second=self.maximum_encoded_bits_per_second,
+            uplink=self.uplink,
             codec=self.codec,
             packetization=self.packetization,
             extradata=self.extradata,
@@ -421,36 +569,51 @@ class ImagePresentation:
         self.close()
 
 
-@dataclass
-class _PanePresentation:
-    context_id: int
-    node_id: int
-    surface: Surface
-    track: Track
-    channel: TrackChannel
+def _pane_options(
+    title: str,
+    columns: Optional[int],
+    rows: Optional[int],
+    text_layer: int,
+) -> Dict[str, object]:
+    """Pane image options with unset entries left out, which is how the SDK reads "use the default"."""
+    options: Dict[str, object] = {"title": title, "text_layer": text_layer}
+    if columns is not None:
+        options["columns"] = columns
+    if rows is not None:
+        options["rows"] = rows
+    return options
 
 
 class PaneSession:
-    """Stateful, secret-safe image presentation for a terminal pane.
+    """One image in one terminal pane, over the SDK's own pane state machine.
 
-    ``from_env()`` consumes the standard Vivid discovery environment. A new
-    image replaces the previous owner-scoped node and surface, and ``clear()``
-    is idempotent.
+    The node/surface/track lifecycle, the fixed-point cell geometry, and the 80x24 defaults all
+    live in `vivid_sdk::PaneSession`; this class adds the connect options and the repr a Python
+    caller expects, and nothing else.
     """
 
     def __init__(self, session: Session) -> None:
-        if not supports(session, PROFILE_TERMINAL_SURFACE):
-            raise ValueError("pane presentation requires terminal-surface-v1")
-        self._session = session
-        self._current: Optional[_PanePresentation] = None
-        self._next_frame_id = 1
+        """Adopt an established session, which the pane then owns."""
+        self._pane = _native.PaneSession.from_session(session)
 
     @classmethod
     def from_env(cls, **connect_options: Any) -> "PaneSession":
-        return cls(connect(**connect_options))
+        """Connect through the standard discovery environment, or a dry run for tests."""
+        session = connect(**connect_options)
+        try:
+            return cls(session)
+        except BaseException:
+            close(session)
+            raise
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._pane.closed)
 
     def __repr__(self) -> str:
-        return f"PaneSession(has_presentation={self._current is not None})"
+        # Deliberately says whether a presentation exists and nothing about the endpoint or the
+        # capability behind it.
+        return f"PaneSession(has_presentation={bool(self._pane.has_presentation)})"
 
     def show_encoded_image(
         self,
@@ -459,33 +622,14 @@ class PaneSession:
         title: str = "image",
         columns: Optional[int] = None,
         rows: Optional[int] = None,
+        text_layer: int = TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
     ) -> None:
-        data = bytes(encoded)
-        encoding, width, height = _image_info(data)
-        if width <= 0 or height <= 0:
-            raise ValueError("pane image dimensions must be positive")
-        self.clear()
-        presentation = self._create(
-            width,
-            height,
-            title=title,
-            columns=columns,
-            rows=rows,
-            config=ImageTrackConfig(
-                width=width,
-                height=height,
-                encoded_length=len(data),
-                encoding=encoding,
-                sha256=hashlib.sha256(data).digest(),
-            ),
+        """Present one complete PNG or JPEG, replacing any current presentation."""
+        _native.pane_show_encoded_image(
+            self._pane,
+            bytes(encoded),
+            _pane_options(title, columns, rows, text_layer),
         )
-        try:
-            send_image(presentation.channel, data)
-            activate_track(self._session, presentation.surface, presentation.track)
-        except BaseException:
-            self._discard(presentation)
-            raise
-        self._current = presentation
 
     def show_rgba(
         self,
@@ -496,119 +640,36 @@ class PaneSession:
         title: str = "image",
         columns: Optional[int] = None,
         rows: Optional[int] = None,
+        text_layer: int = TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH,
     ) -> None:
-        data = bytes(rgba)
-        if width <= 0 or height <= 0:
-            raise ValueError("pane image dimensions must be positive")
-        expected = _checked_mul(_checked_mul(width, height), 4)
-        if len(data) != expected:
-            raise ValueError("RGBA input length does not equal width * height * 4")
-        self.clear()
-        presentation = self._create(
+        """Present one tightly packed sRGB RGBA8 frame, replacing any current presentation."""
+        _native.pane_show_rgba(
+            self._pane,
             width,
             height,
-            title=title,
-            columns=columns,
-            rows=rows,
-            config=RasterTrackConfig(
-                width=width,
-                height=height,
-                maximum_rate_millihertz=1,
-                maximum_records_per_second=1,
-            ),
+            bytes(rgba),
+            _pane_options(title, columns, rows, text_layer),
         )
-        frame_id = self._next_frame_id
-        self._next_frame_id += 1
-        try:
-            send_raster(presentation.channel, data, frame_id=frame_id)
-            activate_track(self._session, presentation.surface, presentation.track)
-        except BaseException:
-            self._discard(presentation)
-            raise
-        self._current = presentation
 
     def clear(self) -> None:
-        presentation = self._current
-        self._current = None
-        if presentation is not None:
-            self._discard(presentation)
+        """Remove the current presentation; idempotent."""
+        _native.pane_clear(self._pane)
 
     def close(self) -> None:
-        try:
-            self.clear()
-        finally:
-            if not self._session.closed:
-                close(self._session)
+        _native.pane_close(self._pane)
 
     def __enter__(self) -> "PaneSession":
         return self
 
     def __exit__(self, *_: object) -> None:
+        self.clear()
         self.close()
-
-    def _create(
-        self,
-        width: int,
-        height: int,
-        *,
-        title: str,
-        columns: Optional[int],
-        rows: Optional[int],
-        config: TrackConfig,
-    ) -> _PanePresentation:
-        if width <= 0 or height <= 0:
-            raise ValueError("pane image dimensions must be positive")
-        actual_columns = min(width, 80) if columns is None else columns
-        actual_rows = min(height, 24) if rows is None else rows
-        if actual_columns <= 0 or actual_rows <= 0:
-            raise ValueError("pane placement dimensions must be positive")
-        info = session_info(self._session)
-        node_id = allocate_id(self._session)
-        surface = create_surface(
-            self._session,
-            SurfaceConfig(
-                logical_width=width,
-                logical_height=height,
-                role=ROLE_FIGURE,
-                title=title,
-            ),
-        )
-        try:
-            place_terminal_surface(
-                self._session,
-                surface,
-                node_id=node_id,
-                width=actual_columns << 32,
-                height=actual_rows << 32,
-            )
-            track = create_track(self._session, surface, config)
-            channel = open_track_channel(self._session, track)
-            return _PanePresentation(
-                context_id=info.root_context_id,
-                node_id=node_id,
-                surface=surface,
-                track=track,
-                channel=channel,
-            )
-        except BaseException:
-            try:
-                delete_node(self._session, info.root_context_id, node_id)
-            finally:
-                destroy_surface(self._session, surface)
-            raise
-
-    def _discard(self, presentation: _PanePresentation) -> None:
-        if not presentation.channel.closed:
-            close_channel(presentation.channel)
-        try:
-            delete_node(self._session, presentation.context_id, presentation.node_id)
-        finally:
-            destroy_surface(self._session, presentation.surface)
 
 
 def connect(
     *,
     dry_run: bool = False,
+    desktop: bool = False,
     trace_dir: Optional[Union[str, Path]] = None,
     endpoint_control: Optional[str] = None,
     endpoint_interactive: Optional[str] = None,
@@ -641,6 +702,7 @@ def connect(
     )
     return _native.connect(
         dry_run=dry_run,
+        desktop=desktop,
         trace_dir=trace_dir,
         endpoint_control=endpoint_control,
         endpoint_interactive=endpoint_interactive,
@@ -865,7 +927,9 @@ def display_image(
     """
 
     encoded = Path(path).read_bytes()
-    encoding, width, height = _image_info(encoded)
+    # The container is read once, in Rust, so the surface geometry, the track's declared
+    # dimensions, and the bytes that are sent all come from the same parse.
+    _, width, height, _ = probe_encoded_image(encoded)
     session = connect(**connect_options)
     try:
         surface = create_surface(
@@ -887,10 +951,7 @@ def display_image(
             session,
             surface,
             ImageTrackConfig(
-                width=width,
-                height=height,
-                encoded_length=len(encoded),
-                encoding=encoding,
+                encoded=encoded,
                 sha256=hashlib.sha256(encoded).digest(),
             ),
         )
@@ -902,91 +963,232 @@ def display_image(
         raise
 
 
-def _track_common(
+def _surface_identity(surface: object) -> Dict[str, int]:
+    """The context and surface a track configuration should name.
+
+    Accepts either a surface configuration, for a track being described before its surface
+    exists, or a live surface handle, for one that already does.
+    """
+    if isinstance(surface, dict):
+        return {
+            "context_id": int(surface["context_id"]),
+            "surface_id": int(surface["surface_id"]),
+        }
+    return {"context_id": int(surface.context_id), "surface_id": int(surface.id)}  # type: ignore[attr-defined]
+
+
+def _track_native(
     session: Session,
-    surface: Surface,
-    track_id: Optional[int],
+    surface: object,
     kind: str,
+    *,
     slot: int,
-    mode: int,
     lane: int,
-    maximum_record_body: int,
-    maximum_rate_millihertz: int,
-    maximum_encoded_bits_per_second: int,
-    maximum_records_per_second: int,
-    maximum_inflight_body_bytes: int,
-    target_latency_us: int,
-    maximum_latency_us: int,
-    retained_pixel_charge: int,
-    **kind_values: object,
+    mode: int = TRACK_MODE_LIVE,
+    track_id: Optional[int] = None,
+    maximum_rate_millihertz: Optional[int] = None,
+    maximum_encoded_bits_per_second: Optional[int] = None,
+    uplink: bool = False,
+    **details: object,
 ) -> Dict[str, object]:
-    result: Dict[str, object] = {
-        "context_id": surface.context_id,
-        "surface_id": surface.id,
-        "track_id": allocate_id(session) if track_id is None else track_id,
-        "kind": kind,
-        "slot": slot,
-        "mode": mode,
-        "lane": lane,
-        "maximum_record_body": maximum_record_body,
-        "maximum_rate_millihertz": maximum_rate_millihertz,
-        "maximum_encoded_bits_per_second": maximum_encoded_bits_per_second,
-        "maximum_records_per_second": maximum_records_per_second,
-        "maximum_inflight_body_bytes": maximum_inflight_body_bytes,
-        "target_latency_us": target_latency_us,
-        "maximum_latency_us": maximum_latency_us,
-        "retained_pixel_charge": retained_pixel_charge,
-    }
-    result.update(kind_values)
-    return result
+    """Build one track configuration through the Rust track builder.
+
+    Every claim the protocol bounds — record body, in-flight bytes, retained pixels, decoded
+    pixels, and the rate defaults that follow from them — is computed by `vivid_sdk`, with
+    checked arithmetic. This layer states only what the caller asked for, so an unset claim
+    keeps the builder's default for that kind instead of a number copied here.
+    """
+    request: Dict[str, object] = {"kind": kind, "slot": slot, "lane": lane, "mode": mode}
+    # Absence is what tells the builder to keep its own default, so an unset field is left out
+    # rather than sent as None.
+    request.update({name: value for name, value in details.items() if value is not None})
+    if track_id is not None:
+        request["track_id"] = track_id
+    if maximum_rate_millihertz is not None:
+        request["maximum_rate_millihertz"] = maximum_rate_millihertz
+    if maximum_encoded_bits_per_second is not None:
+        request["maximum_encoded_bits_per_second"] = maximum_encoded_bits_per_second
+    if uplink:
+        request["uplink"] = True
+    return _native.build_track_config(session, _surface_identity(surface), request)
 
 
-def _checked_mul(left: int, right: int) -> int:
-    value = left * right
-    if left < 0 or right < 0 or value > (1 << 64) - 1:
-        raise ValueError("resource claim overflows u64")
-    return value
+def probe_encoded_image(data: BytesLike) -> Tuple[int, int, int, int]:
+    """`(encoding, width, height, encoded_length)` for a complete PNG or JPEG.
+
+    The container is walked in Rust, beside the configuration it produces, so the dimensions a
+    track declares and the pixels it later sends cannot come from two different parsers.
+    """
+    return _native.probe_encoded_image(bytes(data))
 
 
-def _checked_add(left: int, right: int) -> int:
-    value = left + right
-    if left < 0 or right < 0 or value > (1 << 64) - 1:
-        raise ValueError("resource claim overflows u64")
-    return value
+
+def take_event(session: Session) -> Optional[Dict[str, object]]:
+    """The next session event, or `None` when the queue is empty."""
+    return _native.take_event(session)
 
 
-def _image_info(data: bytes) -> Tuple[int, int, int]:
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
-        width, height = struct.unpack(">II", data[16:24])
-        return IMAGE_PNG, width, height
-    if data.startswith(b"\xff\xd8"):
-        offset = 2
-        while offset + 4 <= len(data):
-            if data[offset] != 0xFF:
-                raise ValueError("invalid JPEG marker stream")
-            marker = data[offset + 1]
-            offset += 2
-            if marker in (0xD8, 0xD9):
-                continue
-            length = int.from_bytes(data[offset : offset + 2], "big")
-            if length < 2 or offset + length > len(data):
-                raise ValueError("truncated JPEG segment")
-            if marker in range(0xC0, 0xC4):
-                if length < 7:
-                    raise ValueError("invalid JPEG frame header")
-                height = int.from_bytes(data[offset + 3 : offset + 5], "big")
-                width = int.from_bytes(data[offset + 5 : offset + 7], "big")
-                return IMAGE_JPEG, width, height
-            offset += length
-    raise ValueError("only complete PNG and JPEG images are supported")
+def wait_event(session: Session, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US) -> Optional[Dict[str, object]]:
+    """The next session event, waiting up to `timeout_us`.
+
+    Returns `None` both on timeout and once the final `connection_closed` event has been taken,
+    which is what ends an event loop.
+    """
+    return _native.wait_event(session, timeout_us=timeout_us)
+
+
+def abort(session: Session) -> None:
+    """Close the lifecycle without a `GOODBYE` round trip, releasing blocked senders."""
+    _native.abort(session)
+
+
+def query_surface(session: Session, surface: Surface) -> Dict[str, object]:
+    return _native.query_surface(session, surface)
+
+
+def query_track(session: Session, track: Track) -> Dict[str, object]:
+    return _native.query_track(session, track)
+
+
+def probe_track(
+    session: Session, surface: Surface, config: TrackConfig
+) -> Dict[str, object]:
+    """Whether the presenter would admit this track, without creating it."""
+    return _native.probe_track(
+        session, surface, config.native(session, _surface_identity(surface))
+    )
+
+
+def query_anchor(session: Session, context_id: int, anchor_id: int) -> Dict[str, object]:
+    return _native.query_anchor(session, context_id, anchor_id)
+
+
+def query_session(session: Session) -> Dict[int, Any]:
+    return _native.query_session(session)
+
+
+def play(
+    session: Session,
+    track: Track,
+    *,
+    start_pts_us: int = 0,
+    minimum_buffer_us: int = 0,
+    maximum_latency_us: int = 0,
+) -> None:
+    """Start a timed track. Requires `timed-media-v1`."""
+    _native.play(session, track, start_pts_us, minimum_buffer_us, maximum_latency_us)
+
+
+def pause(session: Session, track: Track) -> None:
+    _native.pause(session, track)
+
+
+def set_audio_gain(session: Session, track: Track, raw: int) -> None:
+    """Set track gain as a micropercent, where `2^32` is unity and `2^33` the protocol maximum."""
+    _native.set_audio_gain(session, track, raw)
+
+
+def flush(session: Session, track: Track, new_epoch: int) -> None:
+    """Discard media below a new epoch and keep the channel open."""
+    _native.flush(session, track, new_epoch)
+
+
+def drain(session: Session, track: Track) -> None:
+    """Wait until the presenter has consumed everything sent so far."""
+    _native.drain(session, track)
+
+
+def create_node(
+    session: Session, surface: Surface, node: SceneNode
+) -> Dict[str, object]:
+    return _native.create_node(session, surface, node.native(session, surface))
+
+
+def update_node(
+    session: Session, surface: Surface, node: SceneNode
+) -> Dict[str, object]:
+    return _native.update_node(session, surface, node.native(session, surface))
+
+
+def activate_tracks(
+    session: Session, surface: Surface, bindings: Sequence[SlotBinding]
+) -> int:
+    """Activate a slot set atomically at a compositor boundary."""
+    return _native.activate_tracks(
+        session, surface, [binding.native() for binding in bindings]
+    )
+
+
+def conpty_anchor_marker(session: Session, context_id: int, anchor_id: int) -> str:
+    """The marker spelling a ConPTY host prints for this anchor."""
+    return _native.conpty_anchor_marker(session, context_id, anchor_id)
+
+
+def send_raster_adaptive(
+    channel: TrackChannel,
+    rgba: BytesLike,
+    *,
+    epoch: int = 0,
+    frame_id: int = 1,
+) -> int:
+    """Send a frame, compressing only when the result is actually smaller than raw."""
+    return _native.send_raster_adaptive(channel, bytes(rgba), epoch=epoch, frame_id=frame_id)
+
+
+def take_send_pressure(channel: TrackChannel) -> Dict[str, int]:
+    """How long the last sends waited, split by cause.
+
+    The three causes have opposite remedies — lower the encoder's output, wait for the presenter
+    to return channel-flow capacity, or shrink the transport writes — so they stay separate.
+    """
+    return _native.take_send_pressure(channel)
+
+
+def media_credit_available(channel: TrackChannel, body_length: int) -> bool:
+    """Whether a record of `body_length` bytes fits the channel's flow window right now."""
+    return _native.media_credit_available(channel, body_length)
+
+
+def advance_channel(session: Session, track: Track, reason: int) -> TrackChannel:
+    """Start a fresh authenticated channel generation and return its channel."""
+    return _native.advance_channel(session, track, reason)
+
+
+def channel_take_event(channel: TrackChannel) -> Optional[Dict[str, object]]:
+    return _native.channel_take_event(channel)
+
+
+def channel_wait_event(
+    channel: TrackChannel, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US
+) -> Optional[Dict[str, object]]:
+    """The next reverse-channel event, waiting up to `timeout_us`.
+
+    A keyframe request that arrives while nobody is looking is the difference between a fast
+    recovery and a frozen picture, so a video sender parks here rather than polling.
+    """
+    return _native.channel_wait_event(channel, timeout_us=timeout_us)
 
 
 from . import aio as aio  # noqa: E402
 from . import automation as automation  # noqa: E402
+from . import desktop as desktop  # noqa: E402
+from . import file_drop as file_drop  # noqa: E402
+from . import input as input  # noqa: E402
+from . import lease as lease  # noqa: E402
+from . import pipeline as pipeline  # noqa: E402
 from . import presenter as presenter  # noqa: E402
 
 __all__ = [
     "AudioTrackConfig",
+    "DesktopParameters",
+    "InputBinding",
+    "InputLane",
+    "IncomingFileTransfer",
+    "OutputConfig",
+    "SceneNode",
+    "SlotBinding",
+    "TrackSender",
+    "VideoRateControl",
     "ClosedHandleError",
     "ImagePresentation",
     "ImageTrackConfig",
@@ -1000,9 +1202,38 @@ __all__ = [
     "TrackChannel",
     "VideoTrackConfig",
     "VividError",
+    "abort",
     "activate_track",
+    "activate_tracks",
+    "advance_channel",
+    "channel_take_event",
+    "channel_wait_event",
+    "conpty_anchor_marker",
+    "create_node",
+    "drain",
+    "flush",
+    "media_credit_available",
+    "pause",
+    "play",
+    "probe_encoded_image",
+    "probe_track",
+    "query_anchor",
+    "query_session",
+    "query_surface",
+    "query_track",
+    "send_raster_adaptive",
+    "set_audio_gain",
+    "take_event",
+    "take_send_pressure",
+    "update_node",
+    "wait_event",
     "aio",
     "automation",
+    "desktop",
+    "file_drop",
+    "input",
+    "lease",
+    "pipeline",
     "presenter",
     "allocate_id",
     "anchor_marker",

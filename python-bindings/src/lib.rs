@@ -843,6 +843,365 @@ fn with_delta_operations<T>(
 }
 
 // ---------------------------------------------------------------------------
+// Constants and builders
+// ---------------------------------------------------------------------------
+
+/// Every protocol constant the SDK exposes, as `(name, text, number)` triples.
+///
+/// The host layer builds its namespace from this at import time, so a value that changes in
+/// `vivid_protocol` changes here too without anybody copying a number.
+#[pyfunction]
+fn constant_table(py: Python<'_>) -> PyResult<Py<PyList>> {
+    let entries = PyList::empty(py);
+    for (name, value) in vivid_sdk::constant_table() {
+        entries.append((*name, value.as_text(), value.as_number()))?;
+    }
+    Ok(entries.unbind())
+}
+
+/// Inspect a complete PNG or JPEG and return `(encoding, width, height, encoded_length)`.
+#[pyfunction]
+fn probe_encoded_image(data: Vec<u8>) -> PyResult<(u64, u32, u32, u32)> {
+    let image = vivid_sdk::probe_encoded_image(&data).map_err(io_error)?;
+    Ok((image.encoding, image.width, image.height, image.encoded_length))
+}
+
+/// Build a track configuration from a builder spec, so bindings do not compute resource claims.
+///
+/// `kind` selects the builder method; the remaining keys are the claims a caller wants to
+/// override. Everything unset keeps the builder's own default for that kind.
+#[pyfunction]
+fn build_track_config(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    surface: &Bound<'_, PyDict>,
+    config: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyDict>> {
+    let guard = lock(&session.inner, "session")?;
+    let session = guard.as_ref().ok_or_else(closed_session)?;
+    let context_id: u64 = required(surface, "context_id")?;
+    let surface_id: u64 = required(surface, "surface_id")?;
+    let contract = session.info().resource_contract.clone();
+
+    let slot = optional(config, "slot")?.unwrap_or_else(|| match required::<String>(config, "kind").as_deref() {
+        Ok("video") => vivid_sdk::SLOT_PRIMARY_VIDEO,
+        Ok("audio") => vivid_sdk::SLOT_AUDIO,
+        Ok("image") => vivid_sdk::SLOT_POSTER,
+        _ => vivid_sdk::SLOT_RASTER,
+    });
+    let mode = TrackMode::try_from(optional(config, "mode")?.unwrap_or(1))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let lane = LaneClass::try_from(optional(config, "lane")?.unwrap_or(3))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+
+    let kind_name: String = required(config, "kind")?;
+    let mut builder = vivid_sdk::TrackBuilder::detached(context_id, surface_id, slot, mode, lane);
+    match kind_name.as_str() {
+        "video" => {
+            builder = builder.video(
+                required(config, "width")?,
+                required(config, "height")?,
+                &required::<String>(config, "codec")?,
+            );
+        }
+        "audio" => {
+            builder = builder.audio(
+                required(config, "sample_rate")?,
+                required::<u64>(config, "channels")? as u8,
+            );
+        }
+        "raster" => {
+            builder = builder
+                .raster(required(config, "width")?, required(config, "height")?)
+                .map_err(io_error)?;
+        }
+        "image" => {
+            let encoded: Vec<u8> = required(config, "encoded")?;
+            let mut image = vivid_sdk::probe_encoded_image(&encoded).map_err(io_error)?;
+            if let Some(sha256) = optional::<Vec<u8>>(config, "sha256")? {
+                image.sha256 = Some(
+                    sha256
+                        .try_into()
+                        .map_err(|_| PyValueError::new_err("sha256 must contain 32 bytes"))?,
+                );
+            }
+            image.cache_lookup = optional(config, "cache_lookup")?.unwrap_or(false);
+            // Keep the probed container so `send_image` can validate against it without a
+            // second container walk in the host layer.
+            builder = builder.image(image).map_err(io_error)?;
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "track kind must be video, audio, raster, or image, not {other:?}"
+            )));
+        }
+    }
+
+    if optional::<bool>(config, "uplink")?.unwrap_or(false) {
+        builder = builder.uplink();
+    }
+    if let Some(value) = optional(config, "maximum_rate_millihertz")? {
+        builder = builder.max_rate_millihertz(value);
+    }
+    if let Some(value) = optional(config, "maximum_encoded_bits_per_second")? {
+        builder = builder.max_encoded_bps(value);
+    }
+
+    let track_id = optional(config, "track_id")?
+        .unwrap_or(session.allocate_id().map_err(io_error)?);
+    let mut configuration = builder.build(&contract, track_id).map_err(io_error)?;
+    debug_assert_eq!(configuration.context_id, context_id);
+    debug_assert_eq!(configuration.surface_id, surface_id);
+
+    // The builder owns the claims; these are the codec details a caller may state explicitly.
+    // Applying them after the build keeps the arithmetic in one place while preserving every
+    // field the wire carries.
+    match &mut configuration.kind {
+        vivid_protocol::track::KindConfiguration::Video(video) => {
+            if let Some(value) = optional::<String>(config, "packetization")? {
+                video.packetization = value;
+            }
+            if let Some(value) = optional::<Vec<u8>>(config, "extradata")? {
+                video.extradata = value;
+            }
+            if let Some(value) = optional(config, "profile")? {
+                video.profile = value;
+            }
+            if let Some(value) = optional(config, "level")? {
+                video.level = value;
+            }
+            if let Some(value) = optional(config, "maximum_reorder_depth")? {
+                video.maximum_reorder_depth = value;
+            }
+            if let Some(value) = optional(config, "color_primaries")? {
+                video.color_primaries = value;
+            }
+            if let Some(value) = optional(config, "transfer")? {
+                video.transfer = value;
+            }
+            if let Some(value) = optional(config, "matrix")? {
+                video.matrix = value;
+            }
+            if let Some(value) = optional(config, "signal_range")? {
+                video.signal_range = value;
+            }
+            if let Some(value) = optional(config, "aspect_numerator")? {
+                video.aspect_numerator = value;
+            }
+            if let Some(value) = optional(config, "aspect_denominator")? {
+                video.aspect_denominator = value;
+            }
+            if let Some(value) = optional(config, "maximum_access_unit_bytes")? {
+                video.maximum_access_unit_bytes = value;
+            }
+            if let Some(value) = optional::<String>(config, "codec_string")? {
+                video.codec_string = Some(value);
+            }
+            if let Some(value) = optional::<Vec<u8>>(config, "decoder_configuration")? {
+                video.decoder_configuration = Some(value);
+            }
+        }
+        vivid_protocol::track::KindConfiguration::Audio(audio) => {
+            if let Some(value) = optional::<String>(config, "packetization")? {
+                audio.packetization = value;
+            }
+            if let Some(value) = optional::<Vec<u8>>(config, "extradata")? {
+                audio.extradata = value;
+            }
+            if let Some(value) = optional(config, "channel_mask")? {
+                audio.channel_mask = value;
+            }
+            if let Some(value) = optional(config, "maximum_access_unit_bytes")? {
+                audio.maximum_access_unit_bytes = value;
+            }
+            if let Some(value) = optional::<String>(config, "codec_string")? {
+                audio.codec_string = Some(value);
+            }
+        }
+        vivid_protocol::track::KindConfiguration::Raster(raster) => {
+            if let Some(value) = optional(config, "alpha_mode")? {
+                raster.alpha_mode = value;
+            }
+            if let Some(value) = optional(config, "delta_enabled")? {
+                raster.delta_enabled = value;
+            }
+            if let Some(value) = optional(config, "maximum_delta_operations")? {
+                raster.maximum_delta_operations = value;
+            }
+            if let Some(value) = optional(config, "zstd_enabled")? {
+                raster.zstd_enabled = value;
+            }
+        }
+        vivid_protocol::track::KindConfiguration::EncodedImage(image) => {
+            if let Some(value) = optional::<Vec<u8>>(config, "sha256")? {
+                image.sha256 = Some(
+                    value
+                        .try_into()
+                        .map_err(|_| PyValueError::new_err("sha256 must contain 32 bytes"))?,
+                );
+            }
+            if let Some(value) = optional(config, "cache_lookup")? {
+                image.cache_lookup = value;
+            }
+        }
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("context_id", configuration.context_id)?;
+    dict.set_item("surface_id", configuration.surface_id)?;
+    dict.set_item("track_id", configuration.track_id)?;
+    dict.set_item("slot", configuration.slot)?;
+    dict.set_item("mode", configuration.mode as u64)?;
+    dict.set_item("lane", configuration.lane as u64)?;
+    dict.set_item("direction", configuration.direction as u64)?;
+    dict.set_item("maximum_record_body", configuration.maximum_record_body)?;
+    dict.set_item("maximum_rate_millihertz", configuration.maximum_rate_millihertz)?;
+    dict.set_item(
+        "maximum_encoded_bits_per_second",
+        configuration.maximum_encoded_bits_per_second,
+    )?;
+    dict.set_item(
+        "maximum_records_per_second",
+        configuration.maximum_records_per_second,
+    )?;
+    dict.set_item(
+        "maximum_inflight_body_bytes",
+        configuration.maximum_inflight_body_bytes,
+    )?;
+    dict.set_item("target_latency_us", configuration.target_latency_us)?;
+    dict.set_item("maximum_latency_us", configuration.maximum_latency_us)?;
+    dict.set_item("retained_pixel_charge", configuration.retained_pixel_charge)?;
+    match &configuration.kind {
+        vivid_protocol::track::KindConfiguration::Video(video) => {
+            dict.set_item("kind", "video")?;
+            dict.set_item("codec", &video.codec)?;
+            dict.set_item("packetization", &video.packetization)?;
+            dict.set_item("extradata", PyBytes::new(py, &video.extradata))?;
+            dict.set_item("width", video.coded_width)?;
+            dict.set_item("height", video.coded_height)?;
+            dict.set_item("profile", video.profile)?;
+            dict.set_item("level", video.level)?;
+            dict.set_item("maximum_reorder_depth", video.maximum_reorder_depth)?;
+            dict.set_item("color_primaries", video.color_primaries)?;
+            dict.set_item("transfer", video.transfer)?;
+            dict.set_item("matrix", video.matrix)?;
+            dict.set_item("signal_range", video.signal_range)?;
+            dict.set_item("aspect_numerator", video.aspect_numerator)?;
+            dict.set_item("aspect_denominator", video.aspect_denominator)?;
+            dict.set_item("maximum_access_unit_bytes", video.maximum_access_unit_bytes)?;
+            dict.set_item("codec_string", video.codec_string.clone())?;
+            dict.set_item(
+                "decoder_configuration",
+                video
+                    .decoder_configuration
+                    .as_ref()
+                    .map(|value| PyBytes::new(py, value)),
+            )?;
+        }
+        vivid_protocol::track::KindConfiguration::Audio(audio) => {
+            dict.set_item("kind", "audio")?;
+            dict.set_item("codec", &audio.codec)?;
+            dict.set_item("packetization", &audio.packetization)?;
+            dict.set_item("extradata", PyBytes::new(py, &audio.extradata))?;
+            dict.set_item("sample_rate", audio.sample_rate)?;
+            dict.set_item("channels", audio.channels)?;
+            dict.set_item("channel_mask", audio.channel_mask)?;
+            dict.set_item("maximum_access_unit_bytes", audio.maximum_access_unit_bytes)?;
+            dict.set_item("codec_string", audio.codec_string.clone())?;
+        }
+        vivid_protocol::track::KindConfiguration::Raster(raster) => {
+            dict.set_item("kind", "raster")?;
+            dict.set_item("width", raster.width)?;
+            dict.set_item("height", raster.height)?;
+            dict.set_item("alpha_mode", raster.alpha_mode)?;
+            dict.set_item("delta_enabled", raster.delta_enabled)?;
+            dict.set_item("maximum_delta_operations", raster.maximum_delta_operations)?;
+            dict.set_item("zstd_enabled", raster.zstd_enabled)?;
+        }
+        vivid_protocol::track::KindConfiguration::EncodedImage(image) => {
+            dict.set_item("kind", "image")?;
+            dict.set_item("encoding", image.encoding)?;
+            dict.set_item("width", image.width)?;
+            dict.set_item("height", image.height)?;
+            dict.set_item("encoded_length", image.encoded_length)?;
+            dict.set_item(
+                "sha256",
+                image.sha256.map(|value| PyBytes::new(py, &value)),
+            )?;
+            dict.set_item("cache_lookup", image.cache_lookup)?;
+        }
+    }
+    Ok(dict.unbind())
+}
+
+/// Build a surface definition from a builder spec, defaulting identity from the session.
+#[pyfunction]
+fn build_surface_config(
+    py: Python<'_>,
+    session: PyRef<'_, PySession>,
+    config: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyDict>> {
+    let guard = lock(&session.inner, "session")?;
+    let session = guard.as_ref().ok_or_else(closed_session)?;
+    let mut builder = vivid_sdk::SurfaceBuilder::new(
+        session,
+        required(config, "logical_width")?,
+        required(config, "logical_height")?,
+    )
+    .map_err(io_error)?;
+    if let Some(context_id) = optional(config, "context_id")? {
+        builder = builder.context(context_id);
+    }
+    if let Some(surface_id) = optional(config, "surface_id")? {
+        builder = builder.surface_id(surface_id);
+    }
+    let semantic_profile =
+        optional::<String>(config, "semantic_profile")?.unwrap_or_else(|| vivid_sdk::GENERIC_CONTENT.into());
+    let coordinate_model = CoordinateModel::try_from(optional::<u64>(config, "coordinate_model")?.unwrap_or(1))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    builder = builder.semantic(&semantic_profile, coordinate_model);
+    let role = SurfaceRole::try_from(optional::<u64>(config, "role")?.unwrap_or(0))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    builder = builder.titled(role, optional::<String>(config, "title")?.unwrap_or_default());
+    if let Some(policy) = optional(config, "policy")? {
+        builder = builder.policy(policy);
+    }
+    if let Some(parameters) = config.get_item("desktop_parameters")? {
+        if !parameters.is_none() {
+            let parameters = parameters
+                .cast::<PyDict>()
+                .map_err(|_| PyValueError::new_err("desktop_parameters must be a dict"))?;
+            let encoded = parse_desktop_parameters(Some(parameters.clone().into_any()))?;
+            builder = builder.profile_parameters(encoded);
+        }
+    }
+    let definition = builder.build().map_err(io_error)?;
+    let dict = PyDict::new(py);
+    dict.set_item("context_id", definition.context_id)?;
+    dict.set_item("surface_id", definition.surface_id)?;
+    dict.set_item("semantic_profile", &definition.semantic_profile)?;
+    dict.set_item("coordinate_model", definition.coordinate_model as u64)?;
+    dict.set_item("logical_width", definition.logical_width)?;
+    dict.set_item("logical_height", definition.logical_height)?;
+    dict.set_item("scale_numerator", definition.scale_numerator)?;
+    dict.set_item("scale_denominator", definition.scale_denominator)?;
+    dict.set_item("rotation", definition.rotation)?;
+    dict.set_item("role", definition.descriptor.role as u64)?;
+    dict.set_item("title", &definition.descriptor.title)?;
+    dict.set_item(
+        "semantic_content_revision",
+        definition.descriptor.semantic_content_revision,
+    )?;
+    dict.set_item(
+        "semantic_availability",
+        definition.descriptor.semantic_availability,
+    )?;
+    dict.set_item("locator_hint", &definition.descriptor.locator_hint)?;
+    dict.set_item("policy", definition.policy)?;
+    Ok(dict.unbind())
+}
+
+// ---------------------------------------------------------------------------
 // Events, abort, and queries
 // ---------------------------------------------------------------------------
 
@@ -2523,15 +2882,40 @@ impl PyPaneSession {
         })
     }
 
+        /// Wrap an existing session, so a host layer can apply its own connect options first.
+    #[staticmethod]
+    fn from_session(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<PyPaneSession> {
+        let owned = lock(&session.inner, "session")?
+            .take()
+            .ok_or_else(closed_session)?;
+        let pane = py
+            .detach(move || SdkPaneSession::from_session(owned))
+            .map_err(io_error)?;
+        Ok(PyPaneSession {
+            inner: Mutex::new(Some(pane)),
+        })
+    }
+
     #[getter]
     fn closed(&self) -> PyResult<bool> {
         Ok(lock(&self.inner, "pane session")?.is_none())
     }
 
+    /// Whether a presentation is currently retained.
+    #[getter]
+    fn has_presentation(&self) -> PyResult<bool> {
+        Ok(lock(&self.inner, "pane session")?
+            .as_ref()
+            .is_some_and(|pane| pane.has_presentation()))
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         let guard = lock(&self.inner, "pane session")?;
         Ok(match guard.as_ref() {
-            Some(_) => "<vivid_sdk.PaneSession closed=False>".into(),
+            Some(pane) => format!(
+                "<vivid_sdk.PaneSession has_presentation={}>",
+                pane.has_presentation()
+            ),
             None => "<vivid_sdk.PaneSession closed=True>".into(),
         })
     }
@@ -3537,6 +3921,10 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(revoke_session_lease, module)?)?;
     module.add_function(wrap_pyfunction!(set_observation, module)?)?;
     module.add_function(wrap_pyfunction!(prepare_resume, module)?)?;
+    module.add_function(wrap_pyfunction!(constant_table, module)?)?;
+    module.add_function(wrap_pyfunction!(probe_encoded_image, module)?)?;
+    module.add_function(wrap_pyfunction!(build_track_config, module)?)?;
+    module.add_function(wrap_pyfunction!(build_surface_config, module)?)?;
     module.add_function(wrap_pyfunction!(sender_send_video, module)?)?;
     module.add_function(wrap_pyfunction!(sender_send_audio, module)?)?;
     module.add_function(wrap_pyfunction!(recover_channel, module)?)?;

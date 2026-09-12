@@ -22,6 +22,7 @@ use vivid_protocol::registry::{
     DESKTOP_INPUT, DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA,
     OBSERVABILITY, TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA, WEB_CARRIER,
 };
+use vivid_protocol::scene::Fit;
 use vivid_protocol::surface::{
     CoordinateModel, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT, POLICY_DENY_IMAGE_CACHE,
     POLICY_DENY_POSTER_RETENTION, POLICY_KNOWN_MASK, POLICY_REDUCED_DIAGNOSTICS, SurfaceRole,
@@ -191,6 +192,11 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("SLOT_AUDIO", Number(SLOT_AUDIO)),
     ("SLOT_RASTER", Number(SLOT_RASTER)),
     ("SLOT_POSTER", Number(SLOT_POSTER)),
+    // Scene node fit modes.
+    ("FIT_FILL", Number(Fit::Fill as u64)),
+    ("FIT_CONTAIN", Number(Fit::Contain as u64)),
+    ("FIT_COVER", Number(Fit::Cover as u64)),
+    ("FIT_NONE", Number(Fit::None as u64)),
     // Encoded-image encodings.
     ("IMAGE_PNG", Number(IMAGE_ENCODING_PNG)),
     ("IMAGE_JPEG", Number(IMAGE_ENCODING_JPEG)),

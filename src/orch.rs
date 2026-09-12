@@ -200,7 +200,8 @@ impl SurfaceBuilder {
 }
 
 pub struct TrackBuilder {
-    surface: Surface,
+    context_id: u64,
+    surface_id: u64,
     slot: u64,
     mode: TrackMode,
     lane: LaneClass,
@@ -218,8 +219,24 @@ pub struct TrackBuilder {
 }
 impl TrackBuilder {
     pub fn new(surface: &Surface, slot: u64, mode: TrackMode, lane: LaneClass) -> Self {
+        Self::detached(surface.context_id(), surface.id(), slot, mode, lane)
+    }
+
+    /// A builder for a surface that is not yet created.
+    ///
+    /// A caller that is still assembling configuration — a binding building both a surface and
+    /// its tracks before either exists — has the identity in hand and nothing to point at yet.
+    /// The identity is what the configuration carries, so naming it directly is enough.
+    pub fn detached(
+        context_id: u64,
+        surface_id: u64,
+        slot: u64,
+        mode: TrackMode,
+        lane: LaneClass,
+    ) -> Self {
         Self {
-            surface: surface.clone(),
+            context_id,
+            surface_id,
             slot,
             mode,
             lane,
@@ -441,8 +458,8 @@ impl TrackBuilder {
         checks(&self, contract)?;
         Ok(TrackConfiguration {
             direction: self.direction,
-            context_id: self.surface.context_id(),
-            surface_id: self.surface.id(),
+            context_id: self.context_id,
+            surface_id: self.surface_id,
             track_id,
             slot: self.slot,
             mode: self.mode,

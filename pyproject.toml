@@ -39,5 +39,6 @@ strict = true
 files = ["python/vivid_sdk", "python-tests"]
 
 [[tool.mypy.overrides]]
-module = ["pytest", "pytest.*"]
+module = ["pytest", "pytest.*", "vivid_sdk._native"]
 follow_imports = "skip"
+ignore_missing_imports = true

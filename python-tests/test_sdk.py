@@ -103,7 +103,15 @@ def test_track_replacement_keeps_surface_generation() -> None:
 
 
 def test_encoded_image_track_is_immutable_and_one_shot() -> None:
-    encoded = b"\x89PNG\r\n\x1a\n" + b"example"
+    # A well-formed IHDR: the prober validates the container rather than trusting a declared
+    # length, so a bare signature with trailing bytes is correctly refused.
+    encoded = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\0\0\0\rIHDR"
+        + (1).to_bytes(4, "big")
+        + (1).to_bytes(4, "big")
+        + b"\x08\x06\0\0\0"
+    )
     session = vivid.connect(dry_run=True)
     try:
         surface = vivid.create_surface(
@@ -113,10 +121,7 @@ def test_encoded_image_track_is_immutable_and_one_shot() -> None:
             session,
             surface,
             vivid.ImageTrackConfig(
-                width=1,
-                height=1,
-                encoded_length=len(encoded),
-                encoding=vivid.IMAGE_PNG,
+                encoded=encoded,
                 sha256=hashlib.sha256(encoded).digest(),
             ),
         )
@@ -237,5 +242,69 @@ def test_pane_session_rejects_invalid_replacement_without_clearing() -> None:
         with pytest.raises(ValueError, match="dimensions"):
             pane.show_rgba(0, 1, b"")
         assert repr(pane) == "PaneSession(has_presentation=True)"
+    finally:
+        pane.close()
+
+
+def test_lease_secret_never_reaches_a_repr() -> None:
+    """A lease's activation secret is its whole capability.
+
+    Dataclasses include every field in their repr by default, so the leak this guards against is
+    a single missing `repr=False`: one traceback or log line away from handing the capability to
+    whoever reads it.
+    """
+    from vivid_sdk import lease
+
+    session = vivid.connect(dry_run=True)
+    try:
+        ready = lease.create_session_lease(
+            session,
+            context_id=1,
+            lease_id=2,
+            permitted_profiles=[vivid.PROFILE_CORE, vivid.PROFILE_TERMINAL_SURFACE],
+        )
+        assert len(ready.activation_secret_hex) == 64
+        assert ready.activation_secret_hex not in repr(ready)
+        assert "secret" not in repr(ready).lower()
+    finally:
+        vivid.close(session)
+
+
+def test_track_claims_come_from_the_rust_builder() -> None:
+    """The bindings no longer compute resource claims, so these are the SDK's numbers.
+
+    A 2x2 raster frame is 72 bytes of packet header plus 16 bytes of pixels; the builder derives
+    the in-flight and retained-pixel claims from that rather than a number written in Python.
+    """
+    session = vivid.connect(dry_run=True)
+    try:
+        surface = vivid.create_surface(
+            session,
+            vivid.SurfaceConfig(logical_width=2, logical_height=2, role=vivid.ROLE_FIGURE),
+        )
+        config = vivid.RasterTrackConfig(width=2, height=2).native(session, surface)
+        assert config["maximum_record_body"] == 72 + 2 * 2 * 4
+        assert config["maximum_inflight_body_bytes"] == 2 * (72 + 2 * 2 * 4)
+        assert config["retained_pixel_charge"] == 2 * 2
+    finally:
+        vivid.close(session)
+
+
+def test_pane_session_delegates_to_the_sdk_state_machine() -> None:
+    """The pane wrapper adds connect options and a repr, not a second state machine.
+
+    Its presentation flag comes from `vivid_sdk::PaneSession`, so a replacement that fails
+    leaves the previous presentation standing exactly as the Rust side leaves it.
+    """
+    pane = vivid.PaneSession.from_env(dry_run=True)
+    try:
+        assert pane.closed is False
+        pane.show_rgba(1, 1, b"\0\0\0\xff")
+        assert "has_presentation=True" in repr(pane)
+        with pytest.raises(ValueError, match="dimensions"):
+            pane.show_rgba(0, 1, b"")
+        assert "has_presentation=True" in repr(pane)
+        pane.clear()
+        assert "has_presentation=False" in repr(pane)
     finally:
         pane.close()

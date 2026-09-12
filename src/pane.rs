@@ -183,6 +183,11 @@ impl PaneSession {
         )
     }
 
+    /// Whether a presentation is currently retained.
+    pub fn has_presentation(&self) -> bool {
+        self.current.is_some()
+    }
+
     /// Remove the current scene node and destroy its complete owner-scoped surface.
     pub fn clear(&mut self) -> io::Result<()> {
         let Some(presentation) = self.current.take() else {

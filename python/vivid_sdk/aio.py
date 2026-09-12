@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, AsyncIterator, Callable, Dict, Optional, TypeVar, Union
 
 from . import (
     AudioTrackConfig,
@@ -48,6 +48,32 @@ from . import supports as _supports
 from . import update_surface as _update_surface
 from . import presenter as _presenter_module
 from . import wait_track as _wait_track
+from . import abort as _abort
+from . import activate_tracks as _activate_tracks
+from . import advance_channel as _advance_channel
+from . import channel_take_event as _channel_take_event
+from . import channel_wait_event as _channel_wait_event
+from . import conpty_anchor_marker as _conpty_anchor_marker
+from . import create_node as _create_node
+from . import display_image as _display_image
+from . import drain as _drain
+from . import flush as _flush
+from . import media_credit_available as _media_credit_available
+from . import open_track_channel as _open_track_channel_again
+from . import pause as _pause
+from . import play as _play
+from . import probe_track as _probe_track
+from . import query_anchor as _query_anchor
+from . import query_session as _query_session
+from . import query_surface as _query_surface
+from . import query_track as _query_track
+from . import send_raster_adaptive as _send_raster_adaptive
+from . import set_audio_gain as _set_audio_gain
+from . import take_event as _take_event
+from . import take_send_pressure as _take_send_pressure
+from . import update_node as _update_node
+from . import wait_event as _wait_event
+from . import MAX_TRACK_WAIT_TIMEOUT_US
 from .presenter import PaneCapture, PaneMediaSummary, Presenter
 
 
@@ -320,3 +346,144 @@ class _PresenterFacade:
 
 
 presenter = _PresenterFacade()
+
+
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
+
+
+async def take_event(session: Session) -> Optional[Dict[str, Any]]:
+    """The next session event, or `None` when the queue is empty."""
+    return await _run(_take_event, session)
+
+
+async def wait_event(
+    session: Session, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US
+) -> Optional[Dict[str, Any]]:
+    """The next session event, waiting up to `timeout_us`."""
+    return await _run(_wait_event, session, timeout_us=timeout_us)
+
+
+async def events(
+    session: Session, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US
+) -> "AsyncIterator[Dict[str, Any]]":
+    """Iterate a session's events until it closes.
+
+    Each step parks a worker on a bounded wait, so the loop costs nothing while the session is
+    quiet and the event loop stays free. The iterator ends when the session reports
+    `connection_closed`, which is the last event it will ever produce.
+    """
+    while True:
+        event = await wait_event(session, timeout_us=timeout_us)
+        if event is None or event.get("kind") == "connection_closed":
+            return
+        yield event
+
+
+async def channel_events(
+    channel: TrackChannel, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US
+) -> "AsyncIterator[Dict[str, Any]]":
+    """Iterate a track channel's reverse events until the transport ends."""
+    while True:
+        event = await _run(_channel_wait_event, channel, timeout_us=timeout_us)
+        if event is None:
+            return
+        yield event
+
+
+# ---------------------------------------------------------------------------
+# Queries, playback, and scene
+# ---------------------------------------------------------------------------
+
+
+async def query_surface(session: Session, surface: Surface) -> Dict[str, Any]:
+    return await _run(_query_surface, session, surface)
+
+
+async def query_track(session: Session, track: Track) -> Dict[str, Any]:
+    return await _run(_query_track, session, track)
+
+
+async def probe_track(session: Session, surface: Surface, config: Any) -> Dict[str, Any]:
+    return await _run(_probe_track, session, surface, config)
+
+
+async def query_anchor(session: Session, context_id: int, anchor_id: int) -> Dict[str, Any]:
+    return await _run(_query_anchor, session, context_id, anchor_id)
+
+
+async def query_session(session: Session) -> Dict[int, Any]:
+    return await _run(_query_session, session)
+
+
+async def abort(session: Session) -> None:
+    """Close the lifecycle without a `GOODBYE`, waking senders blocked on a stalled presenter."""
+    await _run(_abort, session)
+
+
+async def play(session: Session, track: Track, **options: Any) -> None:
+    await _run(_play, session, track, **options)
+
+
+async def pause(session: Session, track: Track) -> None:
+    await _run(_pause, session, track)
+
+
+async def set_audio_gain(session: Session, track: Track, raw: int) -> None:
+    await _run(_set_audio_gain, session, track, raw)
+
+
+async def flush(session: Session, track: Track, new_epoch: int) -> None:
+    await _run(_flush, session, track, new_epoch)
+
+
+async def drain(session: Session, track: Track) -> None:
+    await _run(_drain, session, track)
+
+
+async def create_node(session: Session, surface: Surface, node: Any) -> Dict[str, Any]:
+    return await _run(_create_node, session, surface, node)
+
+
+async def update_node(session: Session, surface: Surface, node: Any) -> Dict[str, Any]:
+    return await _run(_update_node, session, surface, node)
+
+
+async def activate_tracks(session: Session, surface: Surface, bindings: Any) -> int:
+    return await _run(_activate_tracks, session, surface, bindings)
+
+
+async def conpty_anchor_marker(session: Session, context_id: int, anchor_id: int) -> str:
+    return await _run(_conpty_anchor_marker, session, context_id, anchor_id)
+
+
+async def send_raster_adaptive(channel: TrackChannel, rgba: BytesLike, **options: Any) -> int:
+    return await _run(_send_raster_adaptive, channel, rgba, **options)
+
+
+async def take_send_pressure(channel: TrackChannel) -> Dict[str, Any]:
+    """How long the last sends waited, split by cause."""
+    return await _run(_take_send_pressure, channel)
+
+
+async def media_credit_available(channel: TrackChannel, body_length: int) -> bool:
+    return await _run(_media_credit_available, channel, body_length)
+
+
+async def channel_take_event(channel: TrackChannel) -> Optional[Dict[str, Any]]:
+    return await _run(_channel_take_event, channel)
+
+
+async def channel_wait_event(
+    channel: TrackChannel, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US
+) -> Optional[Dict[str, Any]]:
+    return await _run(_channel_wait_event, channel, timeout_us=timeout_us)
+
+
+async def advance_channel(session: Session, track: Track, reason: int) -> TrackChannel:
+    return await _run(_advance_channel, session, track, reason)
+
+
+async def display_image(path: Union[str, Path], **options: Any) -> Any:
+    return await _run(_display_image, path, **options)
