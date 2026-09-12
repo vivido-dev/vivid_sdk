@@ -1,0 +1,33 @@
+name: conformance
+
+# The point of this job is that it needs all three toolchains at once. Every binding runs the
+# same scenarios and their reports must be byte-identical, so a drift in any one of them — or in
+# the shared Rust SDK underneath all three — fails here rather than surfacing as a subtly
+# different wire value at runtime.
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: uv run --with maturin maturin develop --release
+      - run: npm ci
+      - run: npm run build
+      - run: node conformance/compare.mjs

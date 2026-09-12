@@ -1,0 +1,24 @@
+name: rust
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      # `--all-features` is the point: the presenter and testing modules are off by default and
+      # are most of what the bindings call.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features --all-targets

@@ -1,0 +1,30 @@
+name: python
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # maturin is what links the extension; a bare `cargo build` of the bindings crate cannot,
+      # because the module is built to be loaded by a Python host.
+      - run: uv run --with maturin maturin develop --release
+      - run: uv run --with pytest python -m pytest python-tests -q
+        env:
+          # A Unix-socket test needs a short path; the runner's temp root is long enough to
+          # overflow `sun_path`, which reads as a failure rather than as a skip.
+          TMPDIR: /tmp
+      - run: uv run --with mypy python -m mypy

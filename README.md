@@ -7,6 +7,26 @@ feature — is the terminating presenter that accepts one.
 A presenter is namespaced rather than flattened into the crate root, because the two roles name some
 things alike: a presenter's `SceneNode` is its own projection of a node, not the producer's.
 
+## Bindings
+
+Two language bindings are built on this crate, each carrying both roles in one artifact:
+
+| Package | README | Target |
+|---|---|---|
+| `vivid-sdk` (PyPI) | [README-python.md](README-python.md) | Python 3.9+, via a PyO3 extension |
+| `@vivido/vivid-sdk` (npm) | [README-typescript.md](README-typescript.md) | Node 20+, via a napi-rs addon |
+
+They marshal; they do not decide. Constants, resource claims, and image container parsing come from
+this crate, so a binding cannot disagree with the SDK about a wire value — and
+[conformance/](conformance/README.md) proves the three agree rather than assuming it:
+
+```sh
+node conformance/compare.mjs
+```
+
+Add a protocol constant to `constants.rs` and both bindings gain it at import, with no edit in
+either; the table's own tests fail first if a new bit goes unnamed.
+
 `SocketListener` binds the endpoint spellings a producer already understands — `unix:/absolute/path`
 or `tcp:127.0.0.1:PORT`, loopback only, with port 0 binding an ephemeral port. A product that owns
 its own transport implements `PresenterListener` instead.

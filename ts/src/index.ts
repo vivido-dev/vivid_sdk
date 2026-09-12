@@ -628,6 +628,15 @@ export class Track {
 /** One authenticated transport generation for a track. */
 export class TrackChannel {
   readonly raw: Raw;
+  /**
+   * The next frame ID this channel will stamp on a raster frame.
+   *
+   * The SDK requires media IDs to be nonzero and strictly increasing within a channel
+   * generation, so a caller that has to remember the last one is a caller that will eventually
+   * forget. Tracking it here means the first frame and the thousandth are both just `sendRaster`.
+   * Pass `frameId` explicitly to drive the sequence yourself.
+   */
+  #nextFrameId = 1;
 
   private constructor(raw: Raw) {
     this.raw = raw;
@@ -666,14 +675,17 @@ export class TrackChannel {
     rgba: Uint8Array,
     options: { readonly epoch?: number; readonly frameId?: number; readonly compress?: boolean } = {},
   ): Promise<number> {
+    const frameId = options.frameId ?? this.#takeFrameId();
     return (await call(
-      this.raw.sendRaster(
-        Buffer.from(rgba),
-        options.epoch,
-        options.frameId,
-        options.compress,
-      ),
+      this.raw.sendRaster(Buffer.from(rgba), options.epoch, frameId, options.compress),
     )) as number;
+  }
+
+  /** Claim the next frame ID, advancing the sequence past the one just used. */
+  #takeFrameId(): number {
+    const frameId = this.#nextFrameId;
+    this.#nextFrameId += 1;
+    return frameId;
   }
 
   /** Send a frame, compressing only when the result is actually smaller than raw. */
@@ -681,12 +693,9 @@ export class TrackChannel {
     rgba: Uint8Array,
     options: { readonly epoch?: number; readonly frameId?: number } = {},
   ): Promise<number> {
+    const frameId = options.frameId ?? this.#takeFrameId();
     return (await call(
-      this.raw.sendRasterAdaptive(
-        Buffer.from(rgba),
-        options.epoch ?? undefined,
-        options.frameId ?? undefined,
-      ),
+      this.raw.sendRasterAdaptive(Buffer.from(rgba), options.epoch, frameId),
     )) as number;
   }
 

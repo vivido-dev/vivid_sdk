@@ -126,3 +126,25 @@ test("events iterate and end when the session closes", async () => {
   await pump;
   assert.ok(Array.isArray(seen));
 });
+
+test("a channel stamps its own frame ids", async () => {
+  // The SDK requires media IDs to be nonzero and strictly increasing, so a wrapper that made
+  // every call without an explicit id send frame 1 would work once and then fail confusingly.
+  const session = await connect({ offline: true });
+  try {
+    const surface = await session.createSurface({ logicalWidth: 2, logicalHeight: 2 });
+    const track = await session.createTrack(surface, { kind: "raster", width: 2, height: 2 });
+    const channel = await session.openTrackChannel(track);
+    const frame = Buffer.alloc(2 * 2 * 4);
+    const first = await channel.sendRaster(frame);
+    const second = await channel.sendRaster(frame);
+    const third = await channel.sendRasterAdaptive(frame);
+    assert.ok(second > first, `${second} must follow ${first}`);
+    assert.ok(third > second, `${third} must follow ${second}`);
+    // An explicit id still wins, and the sequence continues past it.
+    const explicit = await channel.sendRaster(frame, { frameId: 100 });
+    assert.ok(explicit > third);
+  } finally {
+    await session.close();
+  }
+});

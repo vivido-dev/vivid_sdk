@@ -59,8 +59,30 @@ finally:
 `display_image()` returns live handles because a clean 1.5 `GOODBYE` destroys the logical session;
 the function cannot close immediately while claiming the retained image remains live.
 
+**State only the claims you want to narrow.** `maximum_record_body`, the in-flight bound, and the
+retained-pixel charge all follow from the geometry and are computed in Rust with checked
+arithmetic, so a track configuration here is the intent rather than a transcription of the SDK's
+own numbers.
+
 `vivid_sdk.aio` mirrors the blocking lifecycle and media calls with cancellation-safe worker
 threads. Native calls release Python while waiting for replies or channel flow.
+
+Session and channel events are async iterators over a bounded wait, so a loop costs nothing while
+the session is quiet:
+
+```python
+async for event in aio.events(session):
+    if event["kind"] == "anchor_ready":
+        ...
+```
+
+The iteration ends at `connection_closed`, the last event a session produces.
+
+Beyond the producer core the package covers the same surface the Rust SDK does, in modules of its
+own: `vivid_sdk.input` (desktop input lanes and their renewals and revocations),
+`vivid_sdk.file_drop` (offers, transfers, results), `vivid_sdk.pipeline` (channel recovery and
+encoder pacing), `vivid_sdk.desktop` (desktop presentation orchestration), and `vivid_sdk.lease`
+(contexts, bounded session leases, and resumable identity).
 
 By default, discovery reads `VIVID_ENDPOINT_CONTROL`, optional interactive/realtime/bulk endpoint
 variables, and `VIVID_ROOT_SECRET`. Explicit values are keyword-only. Secrets, channel tags, and
@@ -96,7 +118,8 @@ finally:
 `presenter.endpoint()` then reports. A Unix path is created owner-only and removed on close.
 
 A pane capability is capability material: hand it to one producer over something that is not a
-command line, and do not log it. It never appears in a handle's `repr`.
+command line, and do not log it. It never appears in a handle's `repr`, and a minted lease's
+activation secret is excluded from its own for the same reason.
 
 `capture_pane` composes the producer's own retained surfaces. It is not a screenshot — terminal text
 belongs to a renderer, and the SDK presenter has none. A capture that produced nothing says why in
@@ -106,6 +129,9 @@ retrying.
 `vivid_sdk.aio.presenter` mirrors all of it as coroutines, over the same cancellation-safe worker
 threads as the producer facade. `wait_for_media` is the one that matters: it blocks for its whole
 timeout, and running it on the event loop thread would stall every other task.
+
+The presenter role goes further than capture: microphones, desktop-target updates, anchored
+terminal markers, keyframe requests, outer playback feedback, and media resources are all here.
 
 ## Automation client
 
@@ -145,3 +171,15 @@ Unix only, and one operating-system account of trust: every socket is owner-chec
 is written and peer-credential-checked after connect; registries are only read from a plain,
 owner-only runtime directory, and identity is derived from the session name rather than taken from
 the registry. The module is pure standard library.
+
+## Conformance
+
+`python-tests` covers this package. The check that it agrees with the Rust SDK and the TypeScript
+SDK is separate, and compares the three against each other rather than against a written-down
+expectation:
+
+```sh
+node conformance/compare.mjs
+```
+
+See [conformance/README.md](conformance/README.md).
