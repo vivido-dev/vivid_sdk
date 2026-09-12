@@ -419,7 +419,9 @@ impl TrackChannel {
     /// than poll [`TrackChannel::take_event`] between frames.
     pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<ChannelEvent>> {
         let mut queue = lock(&self.events.queue, "channel event queue")?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| crate::invalid_input("event timeout is out of range"))?;
         loop {
             if let Some(event) = queue.pop_front() {
                 return Ok(Some(event));

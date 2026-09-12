@@ -1,8 +1,8 @@
 //! The single naming table for the protocol constants every language binding exposes.
 //!
 //! Bindings do not hardcode values. Python and TypeScript build their constant namespaces by
-//! iterating [`constant_table`] at import time, so a name that appears here appears in every SDK
-//! and a value that changes here changes everywhere at once. Before this table existed the Python
+//! reading [`constant_table`] at import time. Explicit declarations expose the names in each
+//! language; values come from this table. Before this table existed the Python
 //! package carried a hand-copied list that a TypeScript package would have copied a third time.
 //!
 //! Names are the binding-facing spelling, which is not always the Rust spelling: the crate calls a
@@ -13,10 +13,12 @@ use vivid_protocol::context::{
     OP_DELEGATE, OP_DESKTOP_INPUT, OP_KNOWN_MASK, OP_OBSERVE, OP_RECEIVE_FILE_DROP, OP_SCENE,
     OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
+use vivid_protocol::file_drop::{FileDropDestination, FileDropState};
 use vivid_protocol::input::{
     INPUT_CLASS_KEYBOARD, INPUT_CLASS_KNOWN_MASK, INPUT_CLASS_POINTER_AXIS,
     INPUT_CLASS_POINTER_BUTTON, INPUT_CLASS_POINTER_MOTION, MAX_WATCHDOG_US, MIN_WATCHDOG_US,
 };
+use vivid_protocol::lease::CleanupPolicy;
 use vivid_protocol::registry::{
     AUDIO_GAIN, AUDIO_INPUT, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT,
     DESKTOP_INPUT, DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA,
@@ -286,6 +288,37 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("INPUT_CLASS_KNOWN_MASK", Number(INPUT_CLASS_KNOWN_MASK)),
     ("MIN_WATCHDOG_US", Number(MIN_WATCHDOG_US)),
     ("MAX_WATCHDOG_US", Number(MAX_WATCHDOG_US)),
+    // Delegation, file drop, and microphone packet shape.
+    ("CLEANUP_IMMEDIATE", Number(CleanupPolicy::Immediate as u64)),
+    (
+        "CLEANUP_SUSPEND_ON_UNCLEAN_LOSS",
+        Number(CleanupPolicy::SuspendOnUncleanLoss as u64),
+    ),
+    (
+        "DESTINATION_SHELL_CWD",
+        Number(FileDropDestination::ShellCwd as u64),
+    ),
+    (
+        "DESTINATION_DESKTOP_FOLDER",
+        Number(FileDropDestination::DesktopFolder as u64),
+    ),
+    ("DROP_OFFERED", Number(FileDropState::Offered as u64)),
+    ("DROP_ACCEPTED", Number(FileDropState::Accepted as u64)),
+    (
+        "DROP_TRANSFERRING",
+        Number(FileDropState::Transferring as u64),
+    ),
+    ("DROP_COMMITTED", Number(FileDropState::Committed as u64)),
+    ("DROP_CANCELLED", Number(FileDropState::Cancelled as u64)),
+    ("DROP_FAILED", Number(FileDropState::Failed as u64)),
+    (
+        "MIC_PACKET_US",
+        Number(vivid_protocol::audio_input::PACKET_US),
+    ),
+    (
+        "MIC_PACKET_BYTES",
+        Number(vivid_protocol::audio_input::PCM_BYTES as u64),
+    ),
     // Terminal placement and rate control.
     (
         "COORDINATE_SPACE_GRID_CELL",
@@ -313,6 +346,12 @@ static TABLE: &[(&str, ConstantValue)] = &[
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn microphone_packet_is_twenty_milliseconds_of_mono_s16le() {
+        assert_eq!(number("MIC_PACKET_US"), 20_000);
+        assert_eq!(number("MIC_PACKET_BYTES"), 48_000 * 20 / 1000 * 2);
+    }
 
     fn number(name: &str) -> u64 {
         constant_table()

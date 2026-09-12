@@ -330,7 +330,9 @@ impl ControlPlane {
         match self {
             Self::Live { pending, .. } => {
                 let mut events = lock(&pending.events, "control event queue")?;
-                let deadline = Instant::now() + timeout;
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| crate::invalid_input("event timeout is out of range"))?;
                 loop {
                     if let Some(event) = events.pop_front() {
                         return Ok(Some(event));
@@ -1415,6 +1417,11 @@ mod audit_tests {
             .writer(),
             pending: Arc::clone(&pending),
         };
+
+        assert_eq!(
+            control.wait_event(Duration::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
 
         // Nothing queued: the wait returns on its own deadline rather than hanging.
         let started = Instant::now();

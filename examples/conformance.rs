@@ -25,7 +25,7 @@ use vivid_sdk::{
 
 /// The frame every binding presents and reads back.
 const PIXELS: [u8; 16] = [
-    200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255,
+    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
 ];
 const PANE: u64 = 1;
 
@@ -33,6 +33,7 @@ fn main() {
     let mut report: BTreeMap<&str, String> = BTreeMap::new();
     report.insert("constants", constants());
     report.insert("raster", raster());
+    report.insert("validation", validation());
     let body = report
         .iter()
         .map(|(key, value)| format!("  {key:?}: {value}"))
@@ -163,4 +164,20 @@ fn raster() -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn validation() -> String {
+    let session = Session::connect(ProducerConfig::offline()).expect("offline session");
+    let rejected = |width| {
+        TrackBuilder::detached(1, 2, SLOT_RASTER, TrackMode::Live, LaneClass::Bulk)
+            .raster(width, 2)
+            .and_then(|builder| builder.build(&session.info().resource_contract, 3))
+            .and_then(|config| config.validate(false).map_err(std::io::Error::other))
+            .is_err()
+    };
+    serde_json::json!({
+        "zeroRasterWidth": rejected(0),
+        "oversizedRasterWidth": rejected(8193),
+    })
+    .to_string()
 }

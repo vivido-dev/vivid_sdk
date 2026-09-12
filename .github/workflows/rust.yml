@@ -2,23 +2,36 @@ name: rust
 
 on:
   push:
-    branches: [dev, master]
+    branches: [dev, master, sdk-language-bindings]
   pull_request:
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vivid_sdk
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          path: vivid_sdk
+      # These branches are coupled until the protocol prerequisite is merged/released.
+      - uses: actions/checkout@v4
+        with:
+          repository: vivido-dev/vivid_protocol
+          ref: e8ae56565c7064e7263c4993d3979f67038912e1
+          path: vivid_protocol
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vivid_sdk -> target
 
       - run: cargo fmt --all --check
       # `--all-features` is the point: the presenter and testing modules are off by default and
       # are most of what the bindings call.
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features --all-targets
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features --all-targets
+      - run: cargo test --all-targets

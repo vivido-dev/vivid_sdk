@@ -9,6 +9,6 @@
 export { TrackSender, VideoRateControl } from "./index.js";
 
 /** One microphone packet: 20 ms of 48 kHz mono s16LE. */
-export const MIC_PACKET_US = 20_000;
+export { MIC_PACKET_US } from "./constants.js";
 /** Bytes in one microphone packet. */
-export const MIC_PACKET_BYTES = 960;
+export { MIC_PACKET_BYTES } from "./constants.js";

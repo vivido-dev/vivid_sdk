@@ -2,10 +2,8 @@
 //!
 //! The mirror of `python-bindings/`: opaque handle classes with getters, verbs as methods, and no
 //! protocol logic — constants, claim arithmetic, and image inspection all come from `vivid_sdk`.
-//! Every blocking SDK call is exposed twice: an async method that runs the call on a worker thread
-//! and never blocks the JS event loop, and a `Sync` twin for short scripts. That is the napi
-//! analogue of the Python binding's `py.detach`, and it exists for the same reason the Python
-//! binding has no callbacks: presenter and reader threads are pure Rust and never enter JavaScript.
+//! Blocking operations use async worker methods. Opaque handle reads and selected presenter
+//! methods are synchronous. Presenter and reader threads are pure Rust and never enter JavaScript.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -103,27 +101,45 @@ where
         .map_err(|join_error| tagged(VIVID, format!("worker failed: {join_error}")))?
 }
 
+/// JavaScript numbers carry integers exactly only within this inclusive bound.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
 fn duration_ms(timeout_ms: f64, name: &str) -> Result<Duration> {
     if !timeout_ms.is_finite() || timeout_ms < 0.0 {
         return Err(value_error(format!(
             "{name} must be finite and non-negative"
         )));
     }
-    Ok(Duration::from_secs_f64(timeout_ms / 1000.0))
+    let duration = Duration::try_from_secs_f64(timeout_ms / 1000.0)
+        .map_err(|_| value_error(format!("{name} is out of range")))?;
+    if std::time::Instant::now().checked_add(duration).is_none()
+        || u64::try_from(duration.as_micros()).is_err()
+    {
+        return Err(value_error(format!("{name} is out of range")));
+    }
+    Ok(duration)
 }
 
 fn opt_u64(value: Option<f64>, name: &str) -> Result<u64> {
-    match value {
-        None | Some(0.0) => Ok(0),
-        Some(value)
-            if value.is_finite() && value.fract() == 0.0 && value <= 9_007_199_254_740_992.0 =>
-        {
-            Ok(value as u64)
-        }
-        Some(_) => Err(value_error(format!(
+    let value = value.unwrap_or(0.0);
+    if value.is_finite() && value.fract() == 0.0 && (0.0..=MAX_SAFE_INTEGER).contains(&value) {
+        Ok(value as u64)
+    } else {
+        Err(value_error(format!(
             "{name} must be a non-negative safe integer"
-        ))),
+        )))
     }
+}
+
+fn unsigned<T: TryFrom<u64>>(value: Option<f64>, name: &str) -> Result<T> {
+    T::try_from(opt_u64(value, name)?).map_err(|_| value_error(format!("{name} is out of range")))
+}
+
+fn signed<T: TryFrom<i64>>(value: f64, name: &str) -> Result<T> {
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > MAX_SAFE_INTEGER {
+        return Err(value_error(format!("{name} must be a safe integer")));
+    }
+    T::try_from(value as i64).map_err(|_| value_error(format!("{name} is out of range")))
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +172,7 @@ pub fn constant_table() -> Vec<ConstantEntry> {
         .collect()
 }
 
-/// Inspect a complete PNG or JPEG image and return its encoding and dimensions.
+/// Inspect PNG or JPEG header metadata and return its encoding and dimensions.
 #[napi]
 pub fn probe_encoded_image(data: Buffer) -> Result<EncodedImageInfo> {
     let image = vivid_sdk::probe_encoded_image(&data).map_err(io_error)?;
@@ -800,7 +816,7 @@ fn fixed_of(value: f64, name: &str) -> Result<i64> {
     match value {
         value if value.is_finite() => {
             let scaled = value * FIXED_ONE;
-            if scaled >= i64::MIN as f64 && scaled <= i64::MAX as f64 {
+            if scaled >= i64::MIN as f64 && scaled < -(i64::MIN as f64) {
                 Ok(scaled as i64)
             } else {
                 Err(value_error(format!(
@@ -870,15 +886,10 @@ fn surface_definition(config: &SurfaceConfig, session: &SdkSession) -> Result<Su
             opt_u64(Some(surface_id), "surfaceId")?,
         ),
         (context_id, surface_id) => (
-            opt_u64(context_id, "contextId")
-                .map(|value| {
-                    if value == 0 {
-                        session.info().root_context_id
-                    } else {
-                        value
-                    }
-                })
-                .unwrap_or(session.info().root_context_id),
+            match opt_u64(context_id, "contextId")? {
+                0 => session.info().root_context_id,
+                value => value,
+            },
             match opt_u64(surface_id, "surfaceId")? {
                 0 => session.allocate_id().map_err(io_error)?,
                 value => value,
@@ -905,9 +916,9 @@ fn surface_definition(config: &SurfaceConfig, session: &SdkSession) -> Result<Su
         coordinate_model,
         logical_width: opt_u64(Some(config.logical_width), "logicalWidth")?,
         logical_height: opt_u64(Some(config.logical_height), "logicalHeight")?,
-        scale_numerator: opt_u64(config.scale_numerator, "scaleNumerator")?.max(1),
-        scale_denominator: opt_u64(config.scale_denominator, "scaleDenominator")?.max(1),
-        rotation: opt_u64(config.rotation, "rotation")? as u16,
+        scale_numerator: opt_u64(config.scale_numerator.or(Some(1.0)), "scaleNumerator")?,
+        scale_denominator: opt_u64(config.scale_denominator.or(Some(1.0)), "scaleDenominator")?,
+        rotation: unsigned::<u16>(config.rotation, "rotation")?,
         descriptor: SurfaceDescriptor {
             role,
             title: config.title.clone().unwrap_or_default(),
@@ -921,8 +932,14 @@ fn surface_definition(config: &SurfaceConfig, session: &SdkSession) -> Result<Su
         policy: opt_u64(config.policy, "policy")?,
         profile_parameters: match &config.desktop_parameters {
             Some(parameters) => vivid_protocol::surface::DesktopSurfaceParameters {
-                captured_origin_x: parameters.captured_origin_x as i32,
-                captured_origin_y: parameters.captured_origin_y as i32,
+                captured_origin_x: signed::<i32>(
+                    parameters.captured_origin_x,
+                    "captured_origin_x",
+                )?,
+                captured_origin_y: signed::<i32>(
+                    parameters.captured_origin_y,
+                    "captured_origin_y",
+                )?,
                 topology: parameters
                     .topology
                     .iter()
@@ -930,18 +947,18 @@ fn surface_definition(config: &SurfaceConfig, session: &SdkSession) -> Result<Su
                         |output| -> Result<vivid_protocol::target::OutputDescriptor> {
                             Ok(vivid_protocol::target::OutputDescriptor {
                                 output_id: opt_u64(Some(output.output_id), "outputId")?,
-                                origin_x: output.origin_x as i32,
-                                origin_y: output.origin_y as i32,
-                                width: opt_u64(Some(output.width), "width")? as u32,
-                                height: opt_u64(Some(output.height), "height")? as u32,
-                                scale_numerator: opt_u64(
+                                origin_x: signed::<i32>(output.origin_x, "origin_x")?,
+                                origin_y: signed::<i32>(output.origin_y, "origin_y")?,
+                                width: unsigned::<u32>(Some(output.width), "width")?,
+                                height: unsigned::<u32>(Some(output.height), "height")?,
+                                scale_numerator: unsigned::<u32>(
                                     Some(output.scale_numerator),
                                     "scaleNumerator",
-                                )? as u32,
-                                scale_denominator: opt_u64(
+                                )?,
+                                scale_denominator: unsigned::<u32>(
                                     Some(output.scale_denominator),
                                     "scaleDenominator",
-                                )? as u32,
+                                )?,
                                 rotation: vivid_protocol::geometry::Rotation::try_from(opt_u64(
                                     Some(output.rotation),
                                     "rotation",
@@ -1082,6 +1099,7 @@ fn track_configuration(
             .map_err(|error| value_error(error.to_string()))?,
     };
     let lane = match config.lane {
+        None if config.kind == "audio" => LaneClass::Realtime,
         None => LaneClass::Bulk,
         Some(value) => LaneClass::try_from(opt_u64(Some(value), "lane")?)
             .map_err(|error| value_error(error.to_string()))?,
@@ -1093,8 +1111,8 @@ fn track_configuration(
     match config.kind.as_str() {
         "video" => {
             builder = builder.video(
-                opt_u64(config.width, "width")? as u32,
-                opt_u64(config.height, "height")? as u32,
+                unsigned::<u32>(config.width, "width")?,
+                unsigned::<u32>(config.height, "height")?,
                 &config
                     .codec
                     .clone()
@@ -1103,15 +1121,15 @@ fn track_configuration(
         }
         "audio" => {
             builder = builder.audio(
-                opt_u64(config.sample_rate, "sampleRate")? as u32,
-                opt_u64(config.channels, "channels")? as u8,
+                unsigned::<u32>(config.sample_rate, "sampleRate")?,
+                unsigned::<u8>(config.channels, "channels")?,
             );
         }
         "raster" => {
             builder = builder
                 .raster(
-                    opt_u64(config.width, "width")? as u32,
-                    opt_u64(config.height, "height")? as u32,
+                    unsigned::<u32>(config.width, "width")?,
+                    unsigned::<u32>(config.height, "height")?,
                 )
                 .map_err(io_error)?;
         }
@@ -1142,20 +1160,11 @@ fn track_configuration(
     if config.uplink.unwrap_or(false) {
         builder = builder.uplink();
     }
-    if let Some(value) = opt_u64(config.maximum_rate_millihertz, "maximumRateMillihertz")
-        .ok()
-        .filter(|value| *value > 0)
-    {
-        builder = builder.max_rate_millihertz(value);
+    if let Some(value) = config.maximum_rate_millihertz {
+        builder = builder.max_rate_millihertz(opt_u64(Some(value), "maximumRateMillihertz")?);
     }
-    if let Some(value) = opt_u64(
-        config.maximum_encoded_bits_per_second,
-        "maximumEncodedBitsPerSecond",
-    )
-    .ok()
-    .filter(|value| *value > 0)
-    {
-        builder = builder.max_encoded_bps(value);
+    if let Some(value) = config.maximum_encoded_bits_per_second {
+        builder = builder.max_encoded_bps(opt_u64(Some(value), "maximumEncodedBitsPerSecond")?);
     }
 
     let track_id = match config.track_id {
@@ -1174,34 +1183,35 @@ fn track_configuration(
                 video.extradata = value.to_vec();
             }
             if let Some(value) = config.profile {
-                video.profile = value as i32;
+                video.profile = signed::<i32>(value, "profile")?;
             }
             if let Some(value) = config.level {
-                video.level = value as i32;
+                video.level = signed::<i32>(value, "level")?;
             }
             if let Some(value) = config.maximum_reorder_depth {
-                video.maximum_reorder_depth = value as u8;
+                video.maximum_reorder_depth = unsigned::<u8>(Some(value), "maximum_reorder_depth")?;
             }
             if let Some(value) = config.color_primaries {
-                video.color_primaries = value as u64;
+                video.color_primaries = unsigned::<u64>(Some(value), "color_primaries")?;
             }
             if let Some(value) = config.transfer {
-                video.transfer = value as u64;
+                video.transfer = unsigned::<u64>(Some(value), "transfer")?;
             }
             if let Some(value) = config.matrix {
-                video.matrix = value as u64;
+                video.matrix = unsigned::<u64>(Some(value), "matrix")?;
             }
             if let Some(value) = config.signal_range {
-                video.signal_range = value as u64;
+                video.signal_range = unsigned::<u64>(Some(value), "signal_range")?;
             }
             if let Some(value) = config.aspect_numerator {
-                video.aspect_numerator = value as u64;
+                video.aspect_numerator = unsigned::<u64>(Some(value), "aspect_numerator")?;
             }
             if let Some(value) = config.aspect_denominator {
-                video.aspect_denominator = value as u64;
+                video.aspect_denominator = unsigned::<u64>(Some(value), "aspect_denominator")?;
             }
             if let Some(value) = config.maximum_access_unit_bytes {
-                video.maximum_access_unit_bytes = value as u32;
+                video.maximum_access_unit_bytes =
+                    unsigned::<u32>(Some(value), "maximum_access_unit_bytes")?;
             }
             video.codec_string = config.codec_string.clone();
             video.decoder_configuration = config
@@ -1220,22 +1230,24 @@ fn track_configuration(
                 audio.extradata = value.to_vec();
             }
             if let Some(value) = config.channel_mask {
-                audio.channel_mask = value as u64;
+                audio.channel_mask = unsigned::<u64>(Some(value), "channel_mask")?;
             }
             if let Some(value) = config.maximum_access_unit_bytes {
-                audio.maximum_access_unit_bytes = value as u32;
+                audio.maximum_access_unit_bytes =
+                    unsigned::<u32>(Some(value), "maximum_access_unit_bytes")?;
             }
             audio.codec_string = config.codec_string.clone();
         }
         KindConfiguration::Raster(raster) => {
             if let Some(value) = config.alpha_mode {
-                raster.alpha_mode = value as u64;
+                raster.alpha_mode = unsigned::<u64>(Some(value), "alpha_mode")?;
             }
             if let Some(value) = config.delta_enabled {
                 raster.delta_enabled = value;
             }
             if let Some(value) = config.maximum_delta_operations {
-                raster.maximum_delta_operations = value as u8;
+                raster.maximum_delta_operations =
+                    unsigned::<u8>(Some(value), "maximum_delta_operations")?;
             }
             if let Some(value) = config.zstd_enabled {
                 raster.zstd_enabled = value;
@@ -1243,7 +1255,7 @@ fn track_configuration(
         }
         KindConfiguration::EncodedImage(image) => {
             if let Some(value) = config.encoded_length {
-                image.encoded_length = value as u32;
+                image.encoded_length = unsigned::<u32>(Some(value), "encoded_length")?;
             }
         }
     }
@@ -1440,7 +1452,7 @@ impl TrackChannel {
         frame_id: Option<f64>,
         compress: Option<bool>,
     ) -> Result<f64> {
-        let epoch = opt_u64(epoch, "epoch")? as u32;
+        let epoch = unsigned::<u32>(epoch, "epoch")?;
         let frame_id = opt_u64(frame_id, "frameId")?;
         let compress = compress.unwrap_or(false);
         let inner = Arc::clone(&self.inner);
@@ -1464,7 +1476,7 @@ impl TrackChannel {
         epoch: Option<f64>,
         frame_id: Option<f64>,
     ) -> Result<f64> {
-        let epoch = opt_u64(epoch, "epoch")? as u32;
+        let epoch = unsigned::<u32>(epoch, "epoch")?;
         let frame_id = opt_u64(frame_id, "frameId")?;
         let inner = Arc::clone(&self.inner);
         blocking(move || {
@@ -1497,10 +1509,10 @@ impl TrackChannel {
 
     #[napi(ts_return_type = "Promise<number>")]
     pub async fn send_video(&self, data: Buffer, options: VideoPacketOptions) -> Result<f64> {
-        let epoch = opt_u64(options.epoch, "epoch")? as u32;
+        let epoch = unsigned::<u32>(options.epoch, "epoch")?;
         let packet_id = opt_u64(Some(options.packet_id), "packetId")?;
-        let pts_us = options.pts_us as i64;
-        let dts_us = options.dts_us as i64;
+        let pts_us = signed::<i64>(options.pts_us, "pts_us")?;
+        let dts_us = signed::<i64>(options.dts_us, "dts_us")?;
         let duration_us = opt_u64(Some(options.duration_us), "durationUs")?;
         let key = options.key;
         let data = data.to_vec();
@@ -1527,13 +1539,13 @@ impl TrackChannel {
 
     #[napi(ts_return_type = "Promise<number>")]
     pub async fn send_audio(&self, data: Buffer, options: AudioPacketOptions) -> Result<f64> {
-        let epoch = opt_u64(options.epoch, "epoch")? as u32;
+        let epoch = unsigned::<u32>(options.epoch, "epoch")?;
         let packet_id = opt_u64(Some(options.packet_id), "packetId")?;
-        let pts_us = options.pts_us as i64;
-        let dts_us = options.dts_us as i64;
+        let pts_us = signed::<i64>(options.pts_us, "pts_us")?;
+        let dts_us = signed::<i64>(options.dts_us, "dts_us")?;
         let duration_us = opt_u64(Some(options.duration_us), "durationUs")?;
-        let trim_start_samples = opt_u64(options.trim_start_samples, "trimStartSamples")? as u32;
-        let trim_end_samples = opt_u64(options.trim_end_samples, "trimEndSamples")? as u32;
+        let trim_start_samples = unsigned::<u32>(options.trim_start_samples, "trimStartSamples")?;
+        let trim_end_samples = unsigned::<u32>(options.trim_end_samples, "trimEndSamples")?;
         let data = data.to_vec();
         let inner = Arc::clone(&self.inner);
         blocking(move || {
@@ -1630,7 +1642,7 @@ impl TrackChannel {
     /// Whether a record body of `body_length` bytes fits in the channel's flow window now.
     #[napi]
     pub fn media_credit_available(&self, body_length: f64) -> Result<bool> {
-        let body_length = opt_u64(Some(body_length), "bodyLength")? as u32;
+        let body_length = unsigned::<u32>(Some(body_length), "bodyLength")?;
         let guard = locked(&self.inner, "track channel")?;
         let available = guard
             .as_ref()
@@ -1811,7 +1823,7 @@ impl Session {
     /// Discard all media below a new epoch and keep the channel open.
     #[napi(ts_return_type = "Promise<void>")]
     pub async fn flush(&self, track: &Track, new_epoch: f64) -> Result<()> {
-        let new_epoch = opt_u64(Some(new_epoch), "newEpoch")? as u32;
+        let new_epoch = unsigned::<u32>(Some(new_epoch), "newEpoch")?;
         let inner = Arc::clone(&self.inner);
         let handle = track.inner.clone();
         blocking(move || {
@@ -2114,11 +2126,23 @@ fn scene_node(surface: &Surface, node_id: f64, spec: Option<SceneNodeSpec>) -> R
         Some(payload) => {
             let mut geometry = Vec::new();
             for scalar in &payload.scalars {
-                if let Some(unsigned) = scalar.unsigned {
-                    geometry.push((scalar.key as u64, Value::Unsigned(unsigned as u64)));
-                } else if let Some(text) = &scalar.text {
-                    geometry.push((scalar.key as u64, Value::Text(text.clone())));
-                }
+                let value = match (&scalar.unsigned, &scalar.text) {
+                    (Some(unsigned), None) => {
+                        Value::Unsigned(opt_u64(Some(*unsigned), "unsigned")?)
+                    }
+                    (None, Some(text)) => Value::Text(text.clone()),
+                    _ => return Err(value_error("payload scalar must contain exactly one value")),
+                };
+                geometry.push((opt_u64(Some(scalar.key), "key")?, value));
+            }
+            for raw in &payload.raw {
+                let value = vivid_protocol::cbor::decode(&raw.value)
+                    .map_err(|error| value_error(error.to_string()))?;
+                geometry.push((opt_u64(Some(raw.key), "key")?, value));
+            }
+            geometry.sort_by_key(|(key, _)| *key);
+            if geometry.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(value_error("payload contains a duplicate key"));
             }
             geometry
         }
@@ -2136,9 +2160,9 @@ fn scene_node(surface: &Surface, node_id: f64, spec: Option<SceneNodeSpec>) -> R
                 .map_err(|error| value_error(error.to_string()))?,
         },
         linear_sampling: spec.linear_sampling.unwrap_or(true),
-        z_index: spec.z_index.map(|value| value as i64).unwrap_or(0),
+        z_index: signed(spec.z_index.unwrap_or(0.0), "zIndex")?,
         visible: spec.visible.unwrap_or(true),
-        opacity: spec.opacity.map(|value| value as u16).unwrap_or(255),
+        opacity: unsigned(spec.opacity.or(Some(255.0)), "opacity")?,
         clip: None,
     })
 }
@@ -2183,18 +2207,18 @@ impl TrackChannel {
         duration_us: Option<f64>,
         compress: Option<bool>,
     ) -> Result<f64> {
-        let epoch = opt_u64(epoch, "epoch")? as u32;
+        let epoch = unsigned::<u32>(epoch, "epoch")?;
         let frame_id = opt_u64(frame_id, "frameId")?;
         let base_frame_id = opt_u64(Some(base_frame_id), "baseFrameId")?;
-        let pts_us = pts_us.unwrap_or(0.0) as i64;
+        let pts_us = signed(pts_us.unwrap_or(0.0), "ptsUs")?;
         let duration_us = opt_u64(duration_us, "durationUs")?;
         let compress = compress.unwrap_or(false);
         // Two owned stores keep the borrows stable for the duration of the call.
         let rgbas: Vec<Vec<u8>> = overwrites
             .iter()
             .map(|op| {
-                let width = op.width as usize;
-                let height = op.height as usize;
+                let width = unsigned::<usize>(Some(op.width), "width")?;
+                let height = unsigned::<usize>(Some(op.height), "height")?;
                 let expected = width
                     .checked_mul(height)
                     .and_then(|pixels| pixels.checked_mul(4))
@@ -2212,28 +2236,23 @@ impl TrackChannel {
             let guard = locked(&inner, "track channel")?;
             let channel = guard.as_ref().ok_or_else(closed_channel)?;
             let mut operations = Vec::with_capacity(overwrites.len() + copies.len());
-            for ((overwrite, rgba), copy) in overwrites
-                .iter()
-                .zip(rgbas.iter())
-                .zip(copies.iter().map(Some).chain(std::iter::repeat(None)))
-            {
-                let _ = copy;
+            for (overwrite, rgba) in overwrites.iter().zip(&rgbas) {
                 operations.push(RasterDeltaOperation::Overwrite {
-                    x: overwrite.x as u32,
-                    y: overwrite.y as u32,
-                    width: overwrite.width as u32,
-                    height: overwrite.height as u32,
+                    x: unsigned::<u32>(Some(overwrite.x), "x")?,
+                    y: unsigned::<u32>(Some(overwrite.y), "y")?,
+                    width: unsigned::<u32>(Some(overwrite.width), "width")?,
+                    height: unsigned::<u32>(Some(overwrite.height), "height")?,
                     rgba,
                 });
             }
             for copy in &copies {
                 operations.push(RasterDeltaOperation::Copy {
-                    destination_x: copy.destination_x as u32,
-                    destination_y: copy.destination_y as u32,
-                    width: copy.width as u32,
-                    height: copy.height as u32,
-                    source_x: copy.source_x as u32,
-                    source_y: copy.source_y as u32,
+                    destination_x: unsigned::<u32>(Some(copy.destination_x), "destination_x")?,
+                    destination_y: unsigned::<u32>(Some(copy.destination_y), "destination_y")?,
+                    width: unsigned::<u32>(Some(copy.width), "width")?,
+                    height: unsigned::<u32>(Some(copy.height), "height")?,
+                    source_x: unsigned::<u32>(Some(copy.source_x), "source_x")?,
+                    source_y: unsigned::<u32>(Some(copy.source_y), "source_y")?,
                 });
             }
             channel
@@ -2669,7 +2688,7 @@ fn binding_from_spec(spec: FileDropBindingSpec) -> Result<FileDropBinding> {
             .unwrap_or(8),
         maximum_active_transfers: opt_u64(spec.maximum_active_transfers, "maximumActiveTransfers")
             .unwrap_or(4),
-        maximum_record_body: opt_u64(Some(spec.maximum_record_body), "maximumRecordBody")? as u32,
+        maximum_record_body: unsigned::<u32>(Some(spec.maximum_record_body), "maximumRecordBody")?,
         acceptance_timeout_us: opt_u64(spec.acceptance_timeout_us, "acceptanceTimeoutUs")
             .unwrap_or(20_000_000),
         idle_timeout_us: opt_u64(spec.idle_timeout_us, "idleTimeoutUs").unwrap_or(5_000_000),
@@ -2913,7 +2932,7 @@ impl Session {
                 Some(transfer_generation),
                 "transferGeneration",
             )?),
-            maximum_record_body: opt_u64(Some(maximum_record_body), "maximumRecordBody")? as u32,
+            maximum_record_body: unsigned::<u32>(Some(maximum_record_body), "maximumRecordBody")?,
             initial_maximum_body_bytes: opt_u64(
                 Some(initial_maximum_body_bytes),
                 "initialMaximumBodyBytes",
@@ -3051,8 +3070,10 @@ impl Session {
             )?),
             resume_offset: opt_u64(spec.resume_offset, "resumeOffset")?,
             declared_length: opt_u64(Some(spec.declared_length), "declaredLength")?,
-            maximum_record_body: opt_u64(Some(spec.maximum_record_body), "maximumRecordBody")?
-                as u32,
+            maximum_record_body: unsigned::<u32>(
+                Some(spec.maximum_record_body),
+                "maximumRecordBody",
+            )?,
             maximum_body_bytes: opt_u64(Some(spec.maximum_body_bytes), "maximumBodyBytes")?,
             maximum_records: opt_u64(Some(spec.maximum_records), "maximumRecords")?,
         };
@@ -3381,18 +3402,19 @@ impl TrackSender {
                 None => sender.next_packet_id(),
             };
             let epoch = match spec.epoch {
-                Some(value) => opt_u64(Some(value), "epoch")? as u32,
+                Some(value) => unsigned::<u32>(Some(value), "epoch")?,
                 None => sender.current_epoch(),
             };
             sender
                 .send(&EncodedPacket::Video(VideoPacketData {
                     epoch,
                     packet_id,
-                    pts_us: spec.pts_us as i64,
+                    pts_us: signed::<i64>(spec.pts_us, "pts_us")?,
                     dts_us: spec
                         .dts_us
-                        .map(|value| value as i64)
-                        .unwrap_or(spec.pts_us as i64),
+                        .map(|value| signed::<i64>(value, "dtsUs"))
+                        .transpose()?
+                        .unwrap_or(signed::<i64>(spec.pts_us, "pts_us")?),
                     duration_us: opt_u64(spec.duration_us, "durationUs")?,
                     key: spec.key.unwrap_or(false),
                     data,
@@ -3415,15 +3437,15 @@ impl TrackSender {
                 None => sender.next_packet_id(),
             };
             let epoch = match spec.epoch {
-                Some(value) => opt_u64(Some(value), "epoch")? as u32,
+                Some(value) => unsigned::<u32>(Some(value), "epoch")?,
                 None => sender.current_epoch(),
             };
             sender
                 .send(&EncodedPacket::Audio(AudioPacketData {
                     epoch,
                     packet_id,
-                    pts_us: spec.pts_us as i64,
-                    dts_us: spec.pts_us as i64,
+                    pts_us: signed::<i64>(spec.pts_us, "pts_us")?,
+                    dts_us: signed::<i64>(spec.pts_us, "pts_us")?,
                     duration_us: opt_u64(Some(spec.duration_us), "durationUs")?,
                     data,
                 }))
@@ -3511,7 +3533,7 @@ pub struct MicPacketPayload {
     pub epoch: f64,
     pub packet_id: f64,
     pub pts_us: f64,
-    /// Exactly `PCM_BYTES` (960) bytes of little-endian s16LE mono at 48 kHz, 20 ms.
+    /// Exactly `PCM_BYTES` (1920) bytes of little-endian s16LE mono at 48 kHz, 20 ms.
     pub pcm: Buffer,
 }
 
@@ -3562,7 +3584,7 @@ impl VideoRateControl {
             records: opt_u64(Some(records), "records")?,
         };
         let guard = locked(&self.inner, "rate control")?;
-        guard.observe_send(bytes as usize, pressure);
+        guard.observe_send(unsigned(Some(bytes), "bytes")?, pressure);
         Ok(())
     }
 
@@ -3649,8 +3671,12 @@ impl PaneSession {
     ) -> Result<()> {
         let options = PaneImageOptions {
             title: title.unwrap_or_else(|| "image".into()),
-            columns: columns.map(|value| value as u32),
-            rows: rows.map(|value| value as u32),
+            columns: columns
+                .map(|value| unsigned(Some(value), "columns"))
+                .transpose()?,
+            rows: rows
+                .map(|value| unsigned(Some(value), "rows"))
+                .transpose()?,
             text_layer: text_layer
                 .map(|value| opt_u64(Some(value), "textLayer").unwrap_or(1))
                 .unwrap_or(1),
@@ -3679,12 +3705,16 @@ impl PaneSession {
         rows: Option<f64>,
         text_layer: Option<f64>,
     ) -> Result<()> {
-        let width = opt_u64(Some(width), "width")? as u32;
-        let height = opt_u64(Some(height), "height")? as u32;
+        let width = unsigned::<u32>(Some(width), "width")?;
+        let height = unsigned::<u32>(Some(height), "height")?;
         let options = PaneImageOptions {
             title: title.unwrap_or_else(|| "image".into()),
-            columns: columns.map(|value| value as u32),
-            rows: rows.map(|value| value as u32),
+            columns: columns
+                .map(|value| unsigned(Some(value), "columns"))
+                .transpose()?,
+            rows: rows
+                .map(|value| unsigned(Some(value), "rows"))
+                .transpose()?,
             text_layer: text_layer
                 .map(|value| opt_u64(Some(value), "textLayer").unwrap_or(1))
                 .unwrap_or(1),
@@ -3816,8 +3846,11 @@ impl DesktopSession {
     pub async fn send_video(&self, spec: VideoSendSpec) -> Result<f64> {
         let data = spec.data.to_vec();
         let packet_id = spec.packet_id;
-        let pts_us = spec.pts_us as i64;
-        let dts_us = spec.dts_us.map(|value| value as i64);
+        let pts_us = signed::<i64>(spec.pts_us, "pts_us")?;
+        let dts_us = spec
+            .dts_us
+            .map(|value| signed::<i64>(value, "dtsUs"))
+            .transpose()?;
         let duration_us = opt_u64(spec.duration_us, "durationUs")?;
         let key = spec.key.unwrap_or(false);
         let epoch = spec.epoch;
@@ -3831,7 +3864,7 @@ impl DesktopSession {
                 None => sender.next_packet_id(),
             };
             let epoch = match epoch {
-                Some(value) => opt_u64(Some(value), "epoch")? as u32,
+                Some(value) => unsigned::<u32>(Some(value), "epoch")?,
                 None => sender.current_epoch(),
             };
             sender
@@ -3855,7 +3888,7 @@ impl DesktopSession {
     pub async fn send_audio(&self, spec: AudioSendSpec) -> Result<f64> {
         let data = spec.data.to_vec();
         let packet_id = opt_u64(Some(spec.packet_id.unwrap_or(0.0)), "packetId")?;
-        let pts_us = spec.pts_us as i64;
+        let pts_us = signed::<i64>(spec.pts_us, "pts_us")?;
         let duration_us = opt_u64(Some(spec.duration_us), "durationUs")?;
         let inner = Arc::clone(&self.inner);
         blocking(move || {
@@ -3931,13 +3964,13 @@ pub struct SourceKeyPayload {
     pub track: f64,
 }
 
-fn source_key_from(key: &SourceKeyPayload) -> vivid_sdk::presenter::SourceKey {
-    vivid_sdk::presenter::SourceKey {
-        producer: key.producer as u64,
-        context: key.context as u64,
-        surface: key.surface as u64,
-        track: key.track as u64,
-    }
+fn source_key_from(key: &SourceKeyPayload) -> Result<vivid_sdk::presenter::SourceKey> {
+    Ok(vivid_sdk::presenter::SourceKey {
+        producer: opt_u64(Some(key.producer), "producer")?,
+        context: opt_u64(Some(key.context), "context")?,
+        surface: opt_u64(Some(key.surface), "surface")?,
+        track: opt_u64(Some(key.track), "track")?,
+    })
 }
 
 fn source_key(key: &vivid_sdk::presenter::SourceKey) -> SourceKeyPayload {
@@ -4049,10 +4082,10 @@ impl Presenter {
         cell_height: f64,
     ) -> Result<()> {
         let pane = opt_u64(Some(pane), "pane")?;
-        let columns = opt_u64(Some(columns), "columns")? as u16;
-        let rows = opt_u64(Some(rows), "rows")? as u16;
-        let cell_width = opt_u64(Some(cell_width), "cellWidth")? as u16;
-        let cell_height = opt_u64(Some(cell_height), "cellHeight")? as u16;
+        let columns = unsigned::<u16>(Some(columns), "columns")?;
+        let rows = unsigned::<u16>(Some(rows), "rows")?;
+        let cell_width = unsigned::<u16>(Some(cell_width), "cellWidth")?;
+        let cell_height = unsigned::<u16>(Some(cell_height), "cellHeight")?;
         let guard = locked(&self.inner, "presenter")?;
         guard.as_ref().ok_or_else(closed_presenter)?.update_metrics(
             pane,
@@ -4090,7 +4123,7 @@ impl Presenter {
         viewport_offset: Option<f64>,
     ) -> Result<PaneCapturePayload> {
         let pane = opt_u64(Some(pane), "pane")?;
-        let viewport_offset = opt_u64(viewport_offset, "viewportOffset")? as usize;
+        let viewport_offset = unsigned::<usize>(viewport_offset, "viewportOffset")?;
         let inner = Arc::clone(&self.inner);
         blocking(move || {
             let guard = locked(&inner, "presenter")?;
@@ -4225,7 +4258,7 @@ impl Presenter {
             guard
                 .as_ref()
                 .ok_or_else(closed_presenter)?
-                .queue_microphone(source_key_from(&source), generation, &bytes)
+                .queue_microphone(source_key_from(&source)?, generation, &bytes)
                 .map_err(io_error)
         })
         .await
@@ -4264,8 +4297,8 @@ impl Presenter {
         reason_mask: f64,
     ) -> Result<f64> {
         let pane = opt_u64(Some(pane), "pane")?;
-        let width = opt_u64(Some(width), "width")? as u32;
-        let height = opt_u64(Some(height), "height")? as u32;
+        let width = unsigned::<u32>(Some(width), "width")?;
+        let height = unsigned::<u32>(Some(height), "height")?;
         let reason_mask = opt_u64(Some(reason_mask), "reasonMask")?;
         let guard = locked(&self.inner, "presenter")?;
         guard
@@ -4290,8 +4323,8 @@ impl Presenter {
         guard.as_ref().ok_or_else(closed_presenter)?.observe_marker(
             pane,
             &value,
-            row as i32,
-            column as usize,
+            signed(row, "row")?,
+            unsigned(Some(column), "column")?,
             alternate,
         );
         Ok(())
@@ -4301,10 +4334,11 @@ impl Presenter {
     pub fn scroll_anchors(&self, pane: f64, lines: f64, alternate: bool) -> Result<()> {
         let pane = opt_u64(Some(pane), "pane")?;
         let guard = locked(&self.inner, "presenter")?;
-        guard
-            .as_ref()
-            .ok_or_else(closed_presenter)?
-            .scroll_anchors(pane, lines as i32, alternate);
+        guard.as_ref().ok_or_else(closed_presenter)?.scroll_anchors(
+            pane,
+            signed(lines, "lines")?,
+            alternate,
+        );
         Ok(())
     }
 
@@ -4337,7 +4371,7 @@ impl Presenter {
         Ok(guard
             .as_ref()
             .ok_or_else(closed_presenter)?
-            .pane_for_source(source_key_from(&source))
+            .pane_for_source(source_key_from(&source)?)
             .map(|pane| pane as f64))
     }
 
@@ -4356,15 +4390,15 @@ impl Presenter {
         reason: f64,
     ) -> Result<String> {
         let reason = opt_u64(Some(reason), "reason")?;
-        let minimum_epoch = match opt_u64(minimum_epoch, "minimumEpoch")? {
+        let minimum_epoch = match unsigned::<u32>(minimum_epoch, "minimumEpoch")? {
             0 => None,
-            value => Some(value as u32),
+            value => Some(value),
         };
         let guard = locked(&self.inner, "presenter")?;
         let outcome = guard
             .as_ref()
             .ok_or_else(closed_presenter)?
-            .request_keyframe(source_key_from(&source), minimum_epoch, reason);
+            .request_keyframe(source_key_from(&source)?, minimum_epoch, reason);
         Ok(match outcome {
             vivid_sdk::presenter::KeyframeRequestOutcome::Forwarded => "forwarded".into(),
             vivid_sdk::presenter::KeyframeRequestOutcome::Damped => "damped".into(),
@@ -4375,7 +4409,10 @@ impl Presenter {
     #[napi]
     pub fn request_full_frames(&self, sources: Vec<SourceKeyPayload>, reason: f64) -> Result<()> {
         let reason = opt_u64(Some(reason), "reason")?;
-        let keys = sources.iter().map(source_key_from).collect::<Vec<_>>();
+        let keys = sources
+            .iter()
+            .map(source_key_from)
+            .collect::<Result<Vec<_>>>()?;
         let guard = locked(&self.inner, "presenter")?;
         guard
             .as_ref()
@@ -4385,26 +4422,36 @@ impl Presenter {
     }
 
     #[napi]
-    pub fn apply_outer_position(&self, source: SourceKeyPayload, position: PositionSnapshotSpec) {
-        let Ok(guard) = locked(&self.inner, "presenter") else {
-            return;
-        };
-        let Some(presenter) = guard.as_ref() else {
-            return;
-        };
+    pub fn apply_outer_position(
+        &self,
+        source: SourceKeyPayload,
+        position: PositionSnapshotSpec,
+    ) -> Result<()> {
+        let guard = locked(&self.inner, "presenter")?;
+        let presenter = guard.as_ref().ok_or_else(closed_presenter)?;
         presenter.apply_outer_position(
-            source_key_from(&source),
+            source_key_from(&source)?,
             vivid_sdk::presenter::BridgePositionSnapshot {
-                decoder_reset_serial: position.decoder_reset_serial as u64,
+                decoder_reset_serial: unsigned::<u64>(
+                    Some(position.decoder_reset_serial),
+                    "decoder_reset_serial",
+                )?,
                 playing: position.playing,
-                start_pts_us: position.start_pts_us as i64,
-                state: position.state as u64,
-                clock_pts_us: position.clock_pts_us.map(|value| value as i64),
-                decoded_pts_us: position.decoded_pts_us as i64,
-                presented_pts_us: position.presented_pts_us as i64,
-                presentation_id: position.presentation_id as u64,
+                start_pts_us: signed::<i64>(position.start_pts_us, "start_pts_us")?,
+                state: unsigned::<u64>(Some(position.state), "state")?,
+                clock_pts_us: position
+                    .clock_pts_us
+                    .map(|value| signed(value, "clockPtsUs"))
+                    .transpose()?,
+                decoded_pts_us: signed::<i64>(position.decoded_pts_us, "decoded_pts_us")?,
+                presented_pts_us: signed::<i64>(position.presented_pts_us, "presented_pts_us")?,
+                presentation_id: unsigned::<u64>(
+                    Some(position.presentation_id),
+                    "presentation_id",
+                )?,
             },
         );
+        Ok(())
     }
 
     #[napi]
@@ -4414,19 +4461,16 @@ impl Presenter {
         decoder_reset_serial: f64,
         state_value: f64,
         eos_state: f64,
-    ) {
-        let Ok(guard) = locked(&self.inner, "presenter") else {
-            return;
-        };
-        let Some(presenter) = guard.as_ref() else {
-            return;
-        };
+    ) -> Result<()> {
+        let guard = locked(&self.inner, "presenter")?;
+        let presenter = guard.as_ref().ok_or_else(closed_presenter)?;
         presenter.apply_outer_playback(
-            source_key_from(&source),
-            decoder_reset_serial as u64,
-            state_value as u64,
-            eos_state as u64,
+            source_key_from(&source)?,
+            opt_u64(Some(decoder_reset_serial), "decoder_reset_serial")?,
+            opt_u64(Some(state_value), "state_value")?,
+            opt_u64(Some(eos_state), "eos_state")?,
         );
+        Ok(())
     }
 
     /// Mint a media resource id: `pinned` freezes the content, `live` follows the surface.
@@ -4445,7 +4489,7 @@ impl Presenter {
         guard
             .as_ref()
             .ok_or_else(closed_presenter)?
-            .announce_media_resource(source_key_from(&source), binding)
+            .announce_media_resource(source_key_from(&source)?, binding)
             .map_err(|error| tagged(VIVID, error.to_string()))
     }
 
@@ -4529,8 +4573,8 @@ pub async fn presenter_start(options: PresenterStartOptions) -> Result<Presenter
     let endpoint = options.endpoint.clone();
     let desktop = match (options.desktop_width, options.desktop_height) {
         (Some(width), Some(height)) => Some((
-            opt_u64(Some(width), "desktopWidth")? as u32,
-            opt_u64(Some(height), "desktopHeight")? as u32,
+            unsigned::<u32>(Some(width), "desktopWidth")?,
+            unsigned::<u32>(Some(height), "desktopHeight")?,
         )),
         (None, None) => None,
         _ => return Err(value_error("desktop target needs both width and height")),

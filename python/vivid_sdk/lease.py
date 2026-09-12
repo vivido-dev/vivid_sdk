@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import _native
+from . import _constant_number, _native
 from ._native import Session
 
 __all__ = [
@@ -25,14 +25,14 @@ __all__ = [
 ]
 
 #: A lease that is cleaned up as soon as the holder disconnects uncleanly.
-CLEANUP_IMMEDIATE = 0
+CLEANUP_IMMEDIATE = _constant_number("CLEANUP_IMMEDIATE")
 #: A lease that may be resumed within its disconnect grace instead.
-CLEANUP_SUSPEND_ON_UNCLEAN_LOSS = 1
+CLEANUP_SUSPEND_ON_UNCLEAN_LOSS = _constant_number("CLEANUP_SUSPEND_ON_UNCLEAN_LOSS")
 
 #: How long a lease holder has to activate, in microseconds.
-DEFAULT_ACTIVATION_TIMEOUT_US = 20_000_000
+DEFAULT_ACTIVATION_TIMEOUT_US = _constant_number("DEFAULT_ACTIVATION_TIMEOUT_US")
 #: The protocol's ceiling on that window.
-MAX_ACTIVATION_TIMEOUT_US = 60_000_000
+MAX_ACTIVATION_TIMEOUT_US = _constant_number("MAX_ACTIVATION_TIMEOUT_US")
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ use std::time::Duration;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyNone};
 use vivid_protocol::cbor::{self, Value};
 use vivid_protocol::context::ContextDefinition;
@@ -264,13 +265,11 @@ struct PyInputLane {
 #[pymethods]
 impl PyInputLane {
     #[getter]
-    fn generation(&self) -> u64 {
-        self.inner
-            .lock()
-            .map(|guard| guard.as_ref().map(|lane| lane.generation()))
-            .ok()
-            .flatten()
-            .unwrap_or(0)
+    fn generation(&self) -> PyResult<u64> {
+        Ok(lock(&self.inner, "input lane")?
+            .as_ref()
+            .map(|lane| lane.generation())
+            .unwrap_or(0))
     }
 
     #[getter]
@@ -859,7 +858,7 @@ fn constant_table(py: Python<'_>) -> PyResult<Py<PyList>> {
     Ok(entries.unbind())
 }
 
-/// Inspect a complete PNG or JPEG and return `(encoding, width, height, encoded_length)`.
+/// Inspect PNG or JPEG header metadata and return `(encoding, width, height, encoded_length)`.
 #[pyfunction]
 fn probe_encoded_image(data: Vec<u8>) -> PyResult<(u64, u32, u32, u32)> {
     let image = vivid_sdk::probe_encoded_image(&data).map_err(io_error)?;
@@ -914,7 +913,7 @@ fn build_track_config(
         "audio" => {
             builder = builder.audio(
                 required(config, "sample_rate")?,
-                required::<u64>(config, "channels")? as u8,
+                required::<u8>(config, "channels")?,
             );
         }
         "raster" => {
@@ -954,8 +953,10 @@ fn build_track_config(
         builder = builder.max_encoded_bps(value);
     }
 
-    let track_id =
-        optional(config, "track_id")?.unwrap_or(session.allocate_id().map_err(io_error)?);
+    let track_id = match optional(config, "track_id")? {
+        Some(id) => id,
+        None => session.allocate_id().map_err(io_error)?,
+    };
     let mut configuration = builder.build(&contract, track_id).map_err(io_error)?;
     debug_assert_eq!(configuration.context_id, context_id);
     debug_assert_eq!(configuration.surface_id, surface_id);
@@ -1009,6 +1010,9 @@ fn build_track_config(
             }
         }
         vivid_protocol::track::KindConfiguration::Audio(audio) => {
+            if let Some(value) = optional::<String>(config, "codec")? {
+                audio.codec = value;
+            }
             if let Some(value) = optional::<String>(config, "packetization")? {
                 audio.packetization = value;
             }
@@ -1170,10 +1174,19 @@ fn build_surface_config(
     builder = builder.semantic(&semantic_profile, coordinate_model);
     let role = SurfaceRole::try_from(optional::<u64>(config, "role")?.unwrap_or(0))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    builder = builder.titled(
-        role,
-        optional::<String>(config, "title")?.unwrap_or_default(),
-    );
+    builder = builder
+        .descriptor(SurfaceDescriptor {
+            role,
+            title: optional::<String>(config, "title")?.unwrap_or_default(),
+            semantic_content_revision: optional(config, "semantic_content_revision")?.unwrap_or(0),
+            semantic_availability: optional(config, "semantic_availability")?.unwrap_or(0),
+            locator_hint: optional::<String>(config, "locator_hint")?.unwrap_or_default(),
+        })
+        .scale(
+            optional(config, "scale_numerator")?.unwrap_or(1),
+            optional(config, "scale_denominator")?.unwrap_or(1),
+            optional(config, "rotation")?.unwrap_or(0),
+        );
     if let Some(policy) = optional(config, "policy")? {
         builder = builder.policy(policy);
     }
@@ -1331,8 +1344,9 @@ fn wait_event(
 ) -> PyResult<Option<Py<PyDict>>> {
     let guard = lock(&session.inner, "session")?;
     let session_ref = guard.as_ref().ok_or_else(closed_session)?;
-    let event = session_ref.wait_event(Duration::from_micros(timeout_us));
-    let event = py.detach(|| event).map_err(io_error)?;
+    let event = py
+        .detach(|| session_ref.wait_event(Duration::from_micros(timeout_us)))
+        .map_err(io_error)?;
     match event {
         Some(event) => Ok(Some(session_event_to_pydict(py, event)?.unbind())),
         None => Ok(None),
@@ -1654,8 +1668,9 @@ fn channel_wait_event(
 ) -> PyResult<Option<Py<PyDict>>> {
     let guard = lock(&channel.inner, "track channel")?;
     let channel_ref = guard.as_ref().ok_or_else(closed_channel)?;
-    let event = channel_ref.wait_event(Duration::from_micros(timeout_us));
-    let event = py.detach(|| event).map_err(io_error)?;
+    let event = py
+        .detach(|| channel_ref.wait_event(Duration::from_micros(timeout_us)))
+        .map_err(io_error)?;
     match event {
         Some(event) => Ok(Some(channel_event_to_pydict(py, event)?.unbind())),
         None => Ok(None),
@@ -2057,8 +2072,10 @@ fn lane_wait_event(
     let lane_ref = guard
         .as_ref()
         .ok_or_else(|| ClosedHandleError::new_err("input lane is closed"))?;
-    let wait = lane_ref.wait_event(Duration::from_micros(timeout_us));
-    match py.detach(|| wait).map_err(io_error)? {
+    match py
+        .detach(|| lane_ref.wait_event(Duration::from_micros(timeout_us)))
+        .map_err(io_error)?
+    {
         Some(event) => Ok(Some(input_lane_event_to_pydict(py, event)?)),
         None => Ok(None),
     }
@@ -2091,7 +2108,7 @@ fn file_drop_binding_from_config(config: &Bound<'_, PyDict>) -> PyResult<FileDro
         maximum_file_bytes: required(config, "maximum_file_bytes")?,
         maximum_pending_offers: optional(config, "maximum_pending_offers")?.unwrap_or(8),
         maximum_active_transfers: optional(config, "maximum_active_transfers")?.unwrap_or(4),
-        maximum_record_body: required::<u64>(config, "maximum_record_body")? as u32,
+        maximum_record_body: required::<u32>(config, "maximum_record_body")?,
         acceptance_timeout_us: optional(config, "acceptance_timeout_us")?.unwrap_or(20_000_000),
         idle_timeout_us: optional(config, "idle_timeout_us")?.unwrap_or(5_000_000),
     })
@@ -2231,7 +2248,7 @@ fn transfer_request_from_config(
         ),
         resume_offset: optional(config, "resume_offset")?.unwrap_or(0),
         declared_length: required(config, "declared_length")?,
-        maximum_record_body: required::<u64>(config, "maximum_record_body")? as u32,
+        maximum_record_body: required::<u32>(config, "maximum_record_body")?,
         maximum_body_bytes: required(config, "maximum_body_bytes")?,
         maximum_records: required(config, "maximum_records")?,
     })
@@ -2266,7 +2283,7 @@ fn accept_file_drop(
         transfer_generation: vivid_protocol::revision::FileTransferGeneration::new(
             required::<u64>(config, "transfer_generation")?,
         ),
-        maximum_record_body: required::<u64>(config, "maximum_record_body")? as u32,
+        maximum_record_body: required::<u32>(config, "maximum_record_body")?,
         initial_maximum_body_bytes: required(config, "initial_maximum_body_bytes")?,
         initial_maximum_records: required(config, "initial_maximum_records")?,
     };
@@ -2950,8 +2967,7 @@ macro_rules! pane_op {
         let pane = guard
             .as_mut()
             .ok_or_else(|| ClosedHandleError::new_err("pane session is closed"))?;
-        let result = $body(pane);
-        $py.detach(|| result).map_err(io_error)
+        $py.detach(|| $body(pane)).map_err(io_error)
     }};
 }
 
@@ -3559,8 +3575,7 @@ fn closed_presenter() -> PyErr {
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> PyResult<MutexGuard<'a, T>> {
-    mutex
-        .lock()
+    Python::attach(|py| mutex.lock_py_attached(py))
         .map_err(|_| VividError::new_err(format!("{name} lock is poisoned")))
 }
 

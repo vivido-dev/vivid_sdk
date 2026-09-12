@@ -1,7 +1,7 @@
 # vivid-sdk for TypeScript
 
-`@vivido/vivid-sdk` is the TypeScript SDK for Vivid Protocol 1.5, for both roles. Node 20 or newer;
-Bun and Deno load the same addon.
+`@vivido/vivid-sdk` is the TypeScript SDK for Vivid Protocol 1.5, for both roles. The current local build is tested with Node 22 and Bun 1.3.14;
+Deno and the full advertised runtime/platform matrix still need verification.
 
 The package produces media; `vivid-sdk/presenter` (via `import { presenter }`) accepts it. One
 artifact carries both, so a program can be either end of a session — or, as the tests do, both at
@@ -24,8 +24,8 @@ const surface = await session.createSurface({
 });
 await session.placeTerminalSurface(surface, {
   nodeId: 1,
-  width: 2 << 32,
-  height: 1 << 32,
+  width: 2,
+  height: 1,
 });
 const track = await session.createTrack(surface, { kind: "raster", width: 2, height: 2 });
 const channel = await session.openTrackChannel(track);
@@ -33,9 +33,8 @@ const channel = await session.openTrackChannel(track);
 await channel.sendRaster(Buffer.from([200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255]));
 ```
 
-**State only the claims you want to narrow.** `maximumRecordBody`, the in-flight bound, and the
-retained-pixel charge all follow from the geometry and are computed in Rust with checked
-arithmetic. The same is true of `maximumEncodedBitsPerSecond` and the per-kind rate defaults, so a
+The record-body, in-flight, and retained-pixel claims follow from the geometry and are computed
+in Rust with checked arithmetic. The same is true of `maximumEncodedBitsPerSecond` and the per-kind rate defaults, so a
 track configuration here is the intent rather than a transcription of the SDK's own numbers.
 
 Everything blocking is asynchronous. Native calls run on the addon's worker pool, so a flow wait or
@@ -201,3 +200,15 @@ does not; prefer the environment.
 
 Version 2.0 replaces the old subprocess wrapper. See
 [MIGRATING-node-1.5-to-2.0.md](MIGRATING-node-1.5-to-2.0.md).
+
+## Current limits
+
+This is a source-build preview: npm platform prebuild packages and optional dependencies are not
+wired for distribution yet. Run `npm ci` and `npm run build:debug` in this checkout. The sibling
+`vivid_protocol` branch is a build prerequisite.
+
+Integer inputs must be finite safe JavaScript integers and fit their destination field. Invalid
+values reject; they are never narrowed or clamped to another ID. Full-width wire `u64`/`i64`
+values still require a lossless public representation: existing `number` output DTOs are not full
+integer parity with Rust/Python. Lease/resume identity queries also do not yet provide an
+activation/resume connection workflow. Neither area should be treated as complete parity.

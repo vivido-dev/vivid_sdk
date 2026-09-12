@@ -159,6 +159,19 @@ TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH: int = _constant_number("TEXT_LAYER_BETW
 MINIMUM_TARGET_BITS_PER_SECOND: int = _constant_number("MINIMUM_TARGET_BITS_PER_SECOND")
 DEFAULT_ACTIVATION_TIMEOUT_US: int = _constant_number("DEFAULT_ACTIVATION_TIMEOUT_US")
 MAX_ACTIVATION_TIMEOUT_US: int = _constant_number("MAX_ACTIVATION_TIMEOUT_US")
+CLEANUP_IMMEDIATE: int = _constant_number("CLEANUP_IMMEDIATE")
+CLEANUP_SUSPEND_ON_UNCLEAN_LOSS: int = _constant_number("CLEANUP_SUSPEND_ON_UNCLEAN_LOSS")
+DESTINATION_SHELL_CWD: int = _constant_number("DESTINATION_SHELL_CWD")
+DESTINATION_DESKTOP_FOLDER: int = _constant_number("DESTINATION_DESKTOP_FOLDER")
+DROP_OFFERED: int = _constant_number("DROP_OFFERED")
+DROP_ACCEPTED: int = _constant_number("DROP_ACCEPTED")
+DROP_TRANSFERRING: int = _constant_number("DROP_TRANSFERRING")
+DROP_COMMITTED: int = _constant_number("DROP_COMMITTED")
+DROP_CANCELLED: int = _constant_number("DROP_CANCELLED")
+DROP_FAILED: int = _constant_number("DROP_FAILED")
+MIC_PACKET_US: int = _constant_number("MIC_PACKET_US")
+MIC_PACKET_BYTES: int = _constant_number("MIC_PACKET_BYTES")
+
 
 BytesLike = Union[bytes, bytearray, memoryview]
 
@@ -346,6 +359,9 @@ class SurfaceConfig:
             "title": self.title,
             "policy": self.policy,
         }
+        request["semantic_content_revision"] = self.semantic_content_revision
+        request["semantic_availability"] = self.semantic_availability
+        request["locator_hint"] = self.locator_hint
         if (self.scale_numerator, self.scale_denominator, self.rotation) != (1, 1, 0):
             request["scale_numerator"] = self.scale_numerator
             request["scale_denominator"] = self.scale_denominator
@@ -1014,7 +1030,7 @@ def _track_native(
 
 
 def probe_encoded_image(data: BytesLike) -> Tuple[int, int, int, int]:
-    """`(encoding, width, height, encoded_length)` for a complete PNG or JPEG.
+    """`(encoding, width, height, encoded_length)` from PNG or JPEG header metadata.
 
     The container is walked in Rust, beside the configuration it produces, so the dimensions a
     track declares and the pixels it later sends cannot come from two different parsers.

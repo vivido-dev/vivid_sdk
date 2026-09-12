@@ -107,3 +107,15 @@ test("media resources name content without letting ids cross owners", async () =
     await running.close();
   }
 });
+
+test("presenter identities and bounded geometry reject invalid numbers", async () => {
+  const running = await presenter.Presenter.start({ endpoint: "tcp:127.0.0.1:0" });
+  try {
+    for (const producer of [-1, 0.5, NaN, 2 ** 53]) {
+      assert.throws(() => running.paneForSource({ producer, context: 1, surface: 1, track: 1 }), /safe integer/);
+    }
+    assert.throws(() => running.updateMetrics(1, 2 ** 16 + 80, 24, 8, 16), /out of range/);
+    running.updateMetrics(1, 80, 24, 8, 16);
+    assert.throws(() => running.requestKeyframe({ producer: 1, context: 1, surface: 1, track: 1 }, 1, 2 ** 32), /out of range/);
+  } finally { await running.close(); }
+});

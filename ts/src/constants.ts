@@ -159,3 +159,17 @@ export const MAX_ACTIVATION_TIMEOUT_US: number = numberOf("MAX_ACTIVATION_TIMEOU
 export function constantNames(): readonly string[] {
   return table.map((entry) => entry.name);
 }
+
+// Delegation, file drop, and microphone packet shape.
+export const CLEANUP_IMMEDIATE: number = numberOf("CLEANUP_IMMEDIATE");
+export const CLEANUP_SUSPEND_ON_UNCLEAN_LOSS: number = numberOf("CLEANUP_SUSPEND_ON_UNCLEAN_LOSS");
+export const DESTINATION_SHELL_CWD: number = numberOf("DESTINATION_SHELL_CWD");
+export const DESTINATION_DESKTOP_FOLDER: number = numberOf("DESTINATION_DESKTOP_FOLDER");
+export const DROP_OFFERED: number = numberOf("DROP_OFFERED");
+export const DROP_ACCEPTED: number = numberOf("DROP_ACCEPTED");
+export const DROP_TRANSFERRING: number = numberOf("DROP_TRANSFERRING");
+export const DROP_COMMITTED: number = numberOf("DROP_COMMITTED");
+export const DROP_CANCELLED: number = numberOf("DROP_CANCELLED");
+export const DROP_FAILED: number = numberOf("DROP_FAILED");
+export const MIC_PACKET_US: number = numberOf("MIC_PACKET_US");
+export const MIC_PACKET_BYTES: number = numberOf("MIC_PACKET_BYTES");

@@ -18,14 +18,16 @@ Two language bindings are built on this crate, each carrying both roles in one a
 
 They marshal; they do not decide. Constants, resource claims, and image container parsing come from
 this crate, so a binding cannot disagree with the SDK about a wire value — and
-[conformance/](conformance/README.md) proves the three agree rather than assuming it:
+[conformance/](conformance/README.md) checks covered behaviors against both each other and
+independent fixture expectations:
 
 ```sh
-node conformance/compare.mjs
+npm run test:conformance
 ```
 
-Add a protocol constant to `constants.rs` and both bindings gain it at import, with no edit in
-either; the table's own tests fail first if a new bit goes unnamed.
+Add values to `constants.rs` and explicit names to both host packages. Export-coverage tests
+check that public declarations match the table; values are never copied into host modules.
+Full API parity and per-platform binding distribution remain in progress.
 
 `SocketListener` binds the endpoint spellings a producer already understands — `unix:/absolute/path`
 or `tcp:127.0.0.1:PORT`, loopback only, with port 0 binding an ephemeral port. A product that owns

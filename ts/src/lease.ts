@@ -14,9 +14,9 @@ import { DEFAULT_ACTIVATION_TIMEOUT_US, MAX_ACTIVATION_TIMEOUT_US } from "./cons
 export { DEFAULT_ACTIVATION_TIMEOUT_US, MAX_ACTIVATION_TIMEOUT_US };
 
 /** A lease that is cleaned up as soon as the holder disconnects uncleanly. */
-export const CLEANUP_IMMEDIATE = 0;
+export { CLEANUP_IMMEDIATE } from "./constants.js";
 /** A lease that may be resumed within its disconnect grace instead. */
-export const CLEANUP_SUSPEND_ON_UNCLEAN_LOSS = 1;
+export { CLEANUP_SUSPEND_ON_UNCLEAN_LOSS } from "./constants.js";
 
 /** A created child context and the authority it was actually granted. */
 export interface ContextReady {

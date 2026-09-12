@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from . import _native
+from . import _constant_number, _native
 from ._native import Session, Track, TrackChannel, TrackSender
 
 __all__ = [
@@ -24,9 +24,9 @@ __all__ = [
 ]
 
 #: One microphone packet: 20 ms of 48 kHz mono s16LE.
-MIC_PACKET_US = 20_000
+MIC_PACKET_US = _constant_number("MIC_PACKET_US")
 #: Bytes in one microphone packet.
-MIC_PACKET_BYTES = 960
+MIC_PACKET_BYTES = _constant_number("MIC_PACKET_BYTES")
 
 
 @dataclass(frozen=True)

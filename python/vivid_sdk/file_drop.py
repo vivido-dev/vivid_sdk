@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from . import _native
+from . import _constant_number, _native
 from ._native import IncomingFileTransfer, Session
 
 __all__ = [
@@ -34,17 +34,17 @@ __all__ = [
 ]
 
 #: A destination the host is willing to commit into.
-DESTINATION_SHELL_CWD = 1
+DESTINATION_SHELL_CWD = _constant_number("DESTINATION_SHELL_CWD")
 #: The user's desktop folder.
-DESTINATION_DESKTOP_FOLDER = 2
+DESTINATION_DESKTOP_FOLDER = _constant_number("DESTINATION_DESKTOP_FOLDER")
 
 #: Transfer states, from the specification's `FILE_DROP_STATUS`.
-DROP_OFFERED = 1
-DROP_ACCEPTED = 2
-DROP_TRANSFERRING = 3
-DROP_COMMITTED = 4
-DROP_CANCELLED = 5
-DROP_FAILED = 6
+DROP_OFFERED = _constant_number("DROP_OFFERED")
+DROP_ACCEPTED = _constant_number("DROP_ACCEPTED")
+DROP_TRANSFERRING = _constant_number("DROP_TRANSFERRING")
+DROP_COMMITTED = _constant_number("DROP_COMMITTED")
+DROP_CANCELLED = _constant_number("DROP_CANCELLED")
+DROP_FAILED = _constant_number("DROP_FAILED")
 
 
 @dataclass(frozen=True)

@@ -308,3 +308,40 @@ def test_pane_session_delegates_to_the_sdk_state_machine() -> None:
         assert "has_presentation=False" in repr(pane)
     finally:
         pane.close()
+
+
+def test_surface_config_preserves_scale_and_descriptor() -> None:
+    session = vivid.connect(dry_run=True)
+    try:
+        config = vivid.SurfaceConfig(
+            logical_width=20, logical_height=10,
+            scale_numerator=3, scale_denominator=2, rotation=90,
+            semantic_content_revision=7, semantic_availability=1, locator_hint="figure-7",
+        )
+        raw = config.native(session)
+        for name in ["scale_numerator", "scale_denominator", "rotation",
+                     "semantic_content_revision", "semantic_availability", "locator_hint"]:
+            assert raw[name] == getattr(config, name)
+        with pytest.raises(ValueError):
+            vivid.SurfaceConfig(logical_width=2, logical_height=2, scale_denominator=0).native(session)
+    finally:
+        vivid.close(session)
+
+
+def test_audio_channels_do_not_wrap() -> None:
+    session = vivid.connect(dry_run=True)
+    try:
+        surface = vivid.create_surface(session, vivid.SurfaceConfig(logical_width=2, logical_height=2))
+        with pytest.raises(OverflowError):
+            vivid.create_track(session, surface, vivid.AudioTrackConfig(sample_rate=48000, channels=257))
+    finally:
+        vivid.close(session)
+
+
+def test_submodule_constants_match_protocol_table() -> None:
+    from vivid_sdk import file_drop, lease, pipeline
+    assert pipeline.MIC_PACKET_BYTES == 1920
+    for module in (file_drop, lease, pipeline):
+        for name, value in vars(module).items():
+            if name.isupper() and name in vivid._CONSTANTS:
+                assert value == vivid._constant_number(name)

@@ -3,15 +3,16 @@
 // Runs the same scenarios every binding runs and prints the same report, so the comparison is
 // between languages rather than between expectations.
 
+import * as sdk from "../dist/index.js";
 import { PaneSession, connect, constantTable, presenter } from "../dist/index.js";
 
-const PIXELS = Buffer.from([200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 255]);
+const PIXELS = Buffer.from([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
 const PANE = 1;
 
 function constants() {
   const values = {};
   for (const entry of constantTable()) {
-    values[entry.name] = entry.text ?? entry.number;
+    values[entry.name] = sdk[entry.name];
   }
   return values;
 }
@@ -46,7 +47,24 @@ async function raster() {
   }
 }
 
-const report = { constants: constants(), raster: await raster() };
+async function validation() {
+  const session = await connect({ offline: true });
+  try {
+    const surface = await session.createSurface({ logicalWidth: 2, logicalHeight: 2 });
+    const result = {};
+    for (const [name, width] of [["zeroRasterWidth", 0], ["oversizedRasterWidth", 8193]]) {
+      try {
+        await session.createTrack(surface, { kind: "raster", width, height: 2 });
+        result[name] = false;
+      } catch (error) {
+        if (!(error instanceof sdk.VividError)) throw error;
+        result[name] = true;
+      }
+    }
+    return result;
+  } finally { await session.close(); }
+}
+const report = { constants: constants(), raster: await raster(), validation: await validation() };
 // Plain stringify: a key allowlist here would apply at every nesting level and serialize the
 // constant table as `{}`, which compares equal to anything.
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

@@ -2,18 +2,30 @@ name: node
 
 on:
   push:
-    branches: [dev, master]
+    branches: [dev, master, sdk-language-bindings]
   pull_request:
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vivid_sdk
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          path: vivid_sdk
+      # These branches are coupled until the protocol prerequisite is merged/released.
+      - uses: actions/checkout@v4
+        with:
+          repository: vivido-dev/vivid_protocol
+          ref: e8ae56565c7064e7263c4993d3979f67038912e1
+          path: vivid_protocol
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vivid_sdk -> target
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

@@ -12,13 +12,13 @@ import sys
 import vivid_sdk as vivid
 from vivid_sdk import presenter as vp
 
-PIXELS = bytes([200, 0, 0, 255] * 4)
+PIXELS = bytes([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255])
 PANE = 1
 
 
 def constants() -> dict[str, object]:
     return {
-        name: text if text is not None else number
+        name: getattr(vivid, name)
         for name, text, number in vivid._native.constant_table()
     }
 
@@ -61,8 +61,24 @@ def raster() -> dict[str, object]:
         vp.close(running)
 
 
+def validation() -> dict[str, bool]:
+    session = vivid.connect(dry_run=True)
+    try:
+        surface = vivid.create_surface(session, vivid.SurfaceConfig(logical_width=2, logical_height=2))
+        result = {}
+        for name, width in [("zeroRasterWidth", 0), ("oversizedRasterWidth", 8193)]:
+            try:
+                vivid.create_track(session, surface, vivid.RasterTrackConfig(width=width, height=2))
+                result[name] = False
+            except (ValueError, vivid.VividError):
+                result[name] = True
+        return result
+    finally:
+        vivid.close(session)
+
+
 def main() -> None:
-    print(json.dumps({"constants": constants(), "raster": raster()}, sort_keys=True, indent=2))
+    print(json.dumps({"constants": constants(), "raster": raster(), "validation": validation()}, sort_keys=True, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,37 +1,12 @@
-// Run every binding's conformance report and compare them.
-//
-// The reports must be byte-identical. The value of comparing reports rather than comparing each
-// language against a written-down expectation is that a drift in *any* of them shows up, and a
-// drift in the shared Rust SDK shows up in all three at once — which is what makes the shared
-// table meaningful rather than a fourth copy of the same numbers.
+// Compare language reports and assert independent fixture expectations.
 
 import { spawnSync } from "node:child_process";
 import { strict as assert } from "node:assert";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
 
-/**
- * Canonical JSON: keys sorted at every level.
- *
- * `JSON.stringify(value, arrayOfKeys)` is a property allowlist applied at *every* nesting level,
- * not a key ordering — passing the top-level keys there silently serializes every nested object
- * as `{}`, and two reports then compare equal because both are empty. Sorting by hand is longer
- * and is the only version that compares what it says it compares.
- */
-function canonical(value) {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonical).join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    const entries = Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`);
-    return `{${entries.join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-/** Run one producer command and return its parsed report and canonical form. */
+/** Run one producer command and return its parsed report. */
 function report(label, command, args) {
   const result = spawnSync(command, args, {
     cwd: root,
@@ -40,61 +15,45 @@ function report(label, command, args) {
     timeout: 120_000,
   });
   if (result.status !== 0) {
-    process.stderr.write(`${label} failed (${result.status}):\n${result.stderr}\n`);
+    process.stderr.write(`${label} failed (${result.status}): ${result.error?.message ?? ""}\n${result.stderr}\n`);
     process.exit(1);
   }
   const parsed = JSON.parse(result.stdout.slice(result.stdout.indexOf("{")));
-  return { label, parsed, text: canonical(parsed) };
+  return { label, parsed };
 }
 
-/** Prefer the environment's node/uv, falling back to what npm and pip expose. */
-const reports = [
-  report("rust", "cargo", [
-    "run",
-    "--quiet",
-    "--example",
-    "conformance",
-    "--features",
-    "presenter",
-  ]),
-  report("python", "uv", ["run", "python", "conformance/scenario.py"]),
-  report("typescript", "node", ["conformance/scenario.mjs"]),
-];
+/** Agreement alone cannot detect a bug shared by all three implementations. */
+export function validateReport(report) {
+  assert.equal(report.raster.retained, true);
+  assert.equal(report.raster.layers, 1);
+  assert.equal(report.raster.skipped, 0);
+  assert.equal(report.raster.contentKind, "raster");
+  assert.deepEqual(report.raster.pixels, [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+  assert.ok(Object.keys(report.constants).length > 90, "constant table is incomplete");
+  // 48 kHz * 20 ms * one channel * two bytes per sample (audio-input-v1).
+  assert.equal(report.constants.MIC_PACKET_US, 20_000);
+  assert.equal(report.constants.MIC_PACKET_BYTES, 1920);
+  assert.deepEqual(report.validation, { zeroRasterWidth: true, oversizedRasterWidth: true });
+}
 
-const [reference, ...others] = reports;
-let failed = false;
-for (const other of others) {
-  try {
-    assert.equal(other.text, reference.text);
-    console.log(`ok    ${other.label} matches ${reference.label}`);
-  } catch {
-    failed = true;
-    console.error(`FAIL  ${other.label} differs from ${reference.label}`);
-    const left = reference.parsed;
-    const right = other.parsed;
-    for (const section of Object.keys(left)) {
-      if (canonical(left[section]) === canonical(right[section])) {
-        continue;
-      }
-      const a = left[section];
-      const b = right[section];
-      if (typeof a === "object" && a !== null) {
-        for (const key of Object.keys(a)) {
-          if (canonical(a[key]) !== canonical(b?.[key])) {
-            console.error(
-              `  ${section}.${key}: ${reference.label}=${JSON.stringify(a[key])} ${other.label}=${JSON.stringify(b?.[key])}`,
-            );
-          }
-        }
-      } else {
-        console.error(`  ${section}: ${reference.label}=${JSON.stringify(a)} ${other.label}=${JSON.stringify(b)}`);
-      }
-    }
+export function compareReports(reports) {
+  assert.ok(reports.length >= 2, "need at least two language reports");
+  for (const report of reports) validateReport(report.parsed);
+  for (const other of reports.slice(1)) {
+    assert.deepEqual(other.parsed, reports[0].parsed,
+      `${other.label} differs from ${reports[0].label}`);
   }
 }
 
-// The report is only meaningful if it actually carried pixels.
-assert.ok(reference.parsed.raster.retained, "the reference run retained nothing");
-assert.ok(reference.parsed.raster.pixels.length > 0, "the reference run captured no pixels");
-assert.ok(Object.keys(reference.parsed.constants).length > 90, "the constant table is too small");
-process.exit(failed ? 1 : 0);
+function main() {
+  const reports = [
+    report("rust", "cargo", ["run", "--quiet", "--example", "conformance", "--features", "presenter"]),
+    report("python", process.env.VIVID_CONFORMANCE_PYTHON ?? "uv",
+      process.env.VIVID_CONFORMANCE_PYTHON ? ["conformance/scenario.py"] : ["run", "python", "conformance/scenario.py"]),
+    report("typescript", process.execPath, ["conformance/scenario.mjs"]),
+  ];
+  compareReports(reports);
+  for (const other of reports.slice(1)) console.log(`ok    ${other.label} matches rust`);
+}
+
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main();

@@ -239,7 +239,9 @@ impl InputLane {
     /// [`InputLane::take_event`].
     pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<InputLaneEvent>> {
         let mut events = lock(&self.shared.events, "input event queue")?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| crate::invalid_input("event timeout is out of range"))?;
         loop {
             if let Some(event) = events.pop_front() {
                 return Ok(Some(event));

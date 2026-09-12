@@ -183,3 +183,12 @@ node conformance/compare.mjs
 ```
 
 See [conformance/README.md](conformance/README.md).
+
+## Parity status
+
+The bindings cover both roles, but method coverage is not yet proof of full Rust parity.
+In particular, lease/resume identity queries do not yet provide an activation/resume connection
+workflow. Cross-language tests cover public constants, raster capture, and invalid dimensions;
+other workflows still require dedicated acceptance tests. Image probing reads header metadata,
+not pixel data or container completeness. `pipeline.MIC_PACKET_BYTES` is 1920, read from the
+shared protocol table.

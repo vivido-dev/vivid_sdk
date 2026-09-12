@@ -16,14 +16,14 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// Signature, IHDR length and type, then width and height.
 const PNG_HEADER_LENGTH: usize = 24;
 
-/// Read the encoding and dimensions of a complete PNG or JPEG image.
+/// Inspect PNG or JPEG header metadata and return the supplied byte length.
 ///
 /// The returned configuration claims exactly `data.len()` bytes, carries no content hash, and does
 /// not request a cache lookup. Callers that retain images across presentations set
 /// [`ImageConfiguration::sha256`] and [`ImageConfiguration::cache_lookup`] themselves.
 ///
-/// Only complete images are accepted. A truncated container is rejected here rather than becoming
-/// a track whose declared length never arrives.
+/// This is not a decoder or a completeness check: it reads dimensions from the header, but does
+/// not validate image data, checksums, or end markers. Decoding belongs to the presenter.
 pub fn probe_encoded_image(data: &[u8]) -> io::Result<ImageConfiguration> {
     let encoded_length = u32::try_from(data.len())
         .map_err(|_| invalid_input("encoded image is larger than a single record body allows"))?;
@@ -37,7 +37,7 @@ pub fn probe_encoded_image(data: &[u8]) -> io::Result<ImageConfiguration> {
         probe_jpeg(data)?
     } else {
         return Err(invalid_input(
-            "only complete PNG and JPEG images are supported",
+            "only PNG and JPEG image headers are supported",
         ));
     };
 

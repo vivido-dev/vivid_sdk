@@ -1,54 +1,29 @@
 # Cross-language conformance
 
-Every binding runs the same scenarios and prints the same report. `compare.mjs` runs all three and
-asserts the reports are identical.
+Build the Python extension and Node addon, then run from the SDK directory:
 
 ```sh
-# Rust, Python, and TypeScript, in that order
-node conformance/compare.mjs
+npm run test:conformance
 ```
 
-## Why comparison rather than expectation
+The runner executes Rust, Python, and TypeScript scenarios against real loopback presenters.
+`VIVID_CONFORMANCE_PYTHON=/absolute/path/to/python` selects an existing Python environment;
+otherwise the runner uses `uv run python`.
 
-A test that checks each language against a written-down number is three tests that can each be
-wrong in the same way, and three places to update when the protocol moves. Comparing reports
-configures the check the other way round: the languages have to agree with *each other*, so a
-drift in any one of them shows up, and a drift in the shared Rust SDK underneath all three shows
-up once.
+Reports cover public constant exports, an exact four-color raster capture, and rejection of zero
+and oversized raster widths. Submodule-export tests additionally check lease/file-drop/microphone
+constants. Rust/protocol tests remain the authority for cases not included here.
 
-## What the scenarios cover
+Differential comparison catches drift between languages. It cannot detect a bug all three share.
+Independent assertions therefore check the exact fixture pixels, capture shape, invalid-geometry
+results, and the protocol microphone packet shape: 20 ms of 48 kHz mono s16LE is 1920 bytes.
 
-- **`constants`** — every name the SDK's table exposes, with its value. This is where a
-  hand-copied constant table would have diverged, and it is the check that makes the shared table
-  meaningful rather than a fourth copy of the same numbers.
-- **`raster`** — one frame presented through a real socket to a real presenter, then read back.
-  The report carries the captured pixels rather than a summary of them, so the comparison is over
-  bytes.
+Add scenarios in `examples/conformance.rs`, `conformance/scenario.py`, and
+`conformance/scenario.mjs`, plus independent expectations in `validateReport`. Keep waits bounded
+and close handles in teardown. This suite does not establish full API parity, live terminal-pane
+integration, or distribution compatibility.
 
-Both sides of the raster scenario matter: `retained` proves the presenter kept the frame, and
-`pixels` proves it kept *those* pixels.
-
-## Adding a scenario
-
-Add it to all three producers — `examples/conformance.rs`, `conformance/scenario.py`, and
-`conformance/scenario.mjs` — and to no place else. A scenario that exists in one language and not
-the others is not a conformance check; it is a test with extra steps.
-
-## A note on serialization
-
-Reports are compared after canonicalization (keys sorted at every level). Use `JSON.stringify(v)`,
-never `JSON.stringify(v, arrayOfKeys)`: the array form is a property *allowlist* applied at every
-nesting level, so passing the top-level keys there serializes every nested object as `{}` and two
-reports then compare equal because both are empty. That failure mode was real here, and it is why
-the negative case below is worth keeping.
-
-## Verifying the check itself
-
-The comparator is only worth having if it fails when it should. To confirm:
-
-```sh
-cp conformance/scenario.mjs /tmp/backup.mjs
-sed -i '' 's/entry.text ?? entry.number;/entry.name === "SLOT_RASTER" ? 99 : (entry.text ?? entry.number);/' conformance/scenario.mjs
-node conformance/compare.mjs   # must exit non-zero and name constants.SLOT_RASTER
-cp /tmp/backup.mjs conformance/scenario.mjs
-```
+`compare.test.mjs` verifies that comparison rejects changed nested constants, empty reports,
+missing or additional keys, wrong pixels, missing validation, and a shared wrong microphone
+constant. Serialize with ordinary `JSON.stringify`; an array replacer is a recursive property
+allowlist and can silently erase nested data. Structural comparison and negative tests guard that historical error.

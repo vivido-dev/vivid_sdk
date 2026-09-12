@@ -13,17 +13,17 @@ import type { NativeIncomingFileTransfer } from "./native-types.js";
 export { }; // keep this a module even as the surface grows
 
 /** A destination the host is willing to commit into. */
-export const DESTINATION_SHELL_CWD = 1;
+export { DESTINATION_SHELL_CWD } from "./constants.js";
 /** The user's desktop folder. */
-export const DESTINATION_DESKTOP_FOLDER = 2;
+export { DESTINATION_DESKTOP_FOLDER } from "./constants.js";
 
 // The specification's `FILE_DROP_STATUS` states.
-export const DROP_OFFERED = 1;
-export const DROP_ACCEPTED = 2;
-export const DROP_TRANSFERRING = 3;
-export const DROP_COMMITTED = 4;
-export const DROP_CANCELLED = 5;
-export const DROP_FAILED = 6;
+export { DROP_OFFERED } from "./constants.js";
+export { DROP_ACCEPTED } from "./constants.js";
+export { DROP_TRANSFERRING } from "./constants.js";
+export { DROP_COMMITTED } from "./constants.js";
+export { DROP_CANCELLED } from "./constants.js";
+export { DROP_FAILED } from "./constants.js";
 
 /** The presenter's effective file-drop binding. */
 export interface FileDropGrant {

@@ -157,3 +157,44 @@ def test_the_async_facade_drives_the_same_presenter() -> None:
     layers, rgba = asyncio.run(exercise())
     assert layers == 1
     assert rgba == PIXELS
+
+
+def test_event_wait_releases_gil_and_handle_contention_is_safe() -> None:
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    subprocess.run([sys.executable, "-c", textwrap.dedent('''
+        import threading
+        import vivid_sdk as v
+        from vivid_sdk import presenter as p
+        running = p.start("tcp:127.0.0.1:0")
+        p.update_metrics(running, 1, columns=80, rows=24)
+        session = v.connect(endpoint_control=p.endpoint(running), root_secret=p.issue_pane_capability(running, 1))
+        try:
+            while v._native.take_event(session) is not None:
+                pass
+            entered = threading.Event()
+            progressed = threading.Event()
+            finished = threading.Event()
+            seen = []
+            def wait():
+                entered.set()
+                v._native.wait_event(session, timeout_us=300_000)
+                seen.append(progressed.is_set())
+                finished.set()
+            worker = threading.Thread(target=wait)
+            worker.start()
+            assert entered.wait(1)
+            # Event.wait releases the GIL, letting the native wait begin first.
+            finished.wait(0.05)
+            progressed.set()
+            v.session_info(session)  # contends with the waiting worker's session mutex
+            worker.join(2)
+            assert not worker.is_alive()
+            assert seen == [True], "native event wait held the GIL"
+        finally:
+            v.close(session)
+            p.close(running)
+    ''')], check=True, timeout=10, env={**os.environ, "PYTHON_GIL": "1"})

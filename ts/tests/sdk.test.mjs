@@ -39,7 +39,7 @@ test("every table name is reachable from the package", async () => {
   assert.deepEqual(missing, []);
 });
 
-test("image probing rejects a container that is not complete", () => {
+test("image probing reads header metadata and rejects missing headers", () => {
   const info = probeEncodedImage(PNG);
   assert.equal(info.encoding, 1);
   assert.equal(info.width, 128);
@@ -146,5 +146,42 @@ test("a channel stamps its own frame ids", async () => {
     assert.ok(explicit > third);
   } finally {
     await session.close();
+  }
+});
+
+test("invalid numbers are rejected before IDs or geometry can be changed", async () => {
+  const session = await connect({ offline: true });
+  try {
+    for (const contextId of [-1, -0.5, NaN, Infinity, 2 ** 53]) {
+      await assert.rejects(session.createSurface({ logicalWidth: 2, logicalHeight: 2, contextId }), VividError);
+    }
+    await assert.rejects(session.createSurface({ logicalWidth: 2, logicalHeight: 2, scaleDenominator: 0 }), VividError);
+    const surface = await session.createSurface({ logicalWidth: 2, logicalHeight: 2 });
+    for (const config of [
+      { width: 2 ** 32 + 2 },
+      { maximumDeltaOperations: 257 },
+      { maximumRateMillihertz: NaN },
+      { maximumEncodedBitsPerSecond: -1 },
+    ]) {
+      await assert.rejects(session.createTrack(surface, { kind: "raster", width: 2, height: 2, ...config }), VividError);
+    }
+    await assert.rejects(session.createTrack(surface, { kind: "audio", sampleRate: 48000, channels: 257 }), VividError);
+    await assert.rejects(session.waitEvent(Number.MAX_VALUE), VividError);
+    const track = await session.createTrack(surface, { kind: "raster", width: 2, height: 2 });
+    const channel = await session.openTrackChannel(track);
+    try {
+      await assert.rejects(channel.sendRaster(Buffer.alloc(16), { epoch: 2 ** 32 }), VividError);
+      await channel.sendRaster(Buffer.alloc(16), { frameId: 1 });
+    } finally { await channel.close(); }
+  } finally { await session.close(); }
+});
+
+test("submodule constants agree with the root and the microphone wire shape", async () => {
+  const sdk = await import("../../dist/index.js");
+  assert.equal(sdk.pipeline.MIC_PACKET_BYTES, 1920);
+  for (const module of [sdk.pipeline, sdk.lease, sdk.fileDrop]) {
+    for (const [name, value] of Object.entries(module)) {
+      if (/^[A-Z_]+$/.test(name) && name in sdk) assert.equal(value, sdk[name], name);
+    }
   }
 });

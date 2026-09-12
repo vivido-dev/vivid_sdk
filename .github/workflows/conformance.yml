@@ -1,24 +1,35 @@
 name: conformance
 
 # The point of this job is that it needs all three toolchains at once. Every binding runs the
-# same scenarios and their reports must be byte-identical, so a drift in any one of them — or in
-# the shared Rust SDK underneath all three — fails here rather than surfacing as a subtly
-# different wire value at runtime.
+# same scenarios, with independent fixture expectations as well as differential comparison.
+# Agreement alone cannot detect a bug shared by all three languages.
 
 on:
   push:
-    branches: [dev, master]
+    branches: [dev, master, sdk-language-bindings]
   pull_request:
 
 jobs:
   compare:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vivid_sdk
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          path: vivid_sdk
+      # These branches are coupled until the protocol prerequisite is merged/released.
+      - uses: actions/checkout@v4
+        with:
+          repository: vivido-dev/vivid_protocol
+          ref: e8ae56565c7064e7263c4993d3979f67038912e1
+          path: vivid_protocol
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vivid_sdk -> target
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
@@ -30,4 +41,4 @@ jobs:
       - run: uv run --with maturin maturin develop --release
       - run: npm ci
       - run: npm run build
-      - run: node conformance/compare.mjs
+      - run: npm run test:conformance

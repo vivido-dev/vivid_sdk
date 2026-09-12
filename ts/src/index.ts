@@ -958,7 +958,7 @@ export function constantTable(): readonly ConstantEntry[] {
 }
 
 /**
- * `{ encoding, width, height, encodedLength }` for a complete PNG or JPEG.
+ * `{ encoding, width, height, encodedLength }` from PNG or JPEG header metadata.
  *
  * The container is walked in Rust, beside the configuration it produces, so the dimensions a
  * track declares and the pixels it later sends cannot come from two different parsers.
