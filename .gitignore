@@ -26,3 +26,5 @@ __pycache__/
 *.py[cod]
 node-bindings/*.node
 node-bindings/index.d.ts
+dist/
+node_modules/

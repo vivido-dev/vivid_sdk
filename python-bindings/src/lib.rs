@@ -863,7 +863,12 @@ fn constant_table(py: Python<'_>) -> PyResult<Py<PyList>> {
 #[pyfunction]
 fn probe_encoded_image(data: Vec<u8>) -> PyResult<(u64, u32, u32, u32)> {
     let image = vivid_sdk::probe_encoded_image(&data).map_err(io_error)?;
-    Ok((image.encoding, image.width, image.height, image.encoded_length))
+    Ok((
+        image.encoding,
+        image.width,
+        image.height,
+        image.encoded_length,
+    ))
 }
 
 /// Build a track configuration from a builder spec, so bindings do not compute resource claims.
@@ -883,11 +888,13 @@ fn build_track_config(
     let surface_id: u64 = required(surface, "surface_id")?;
     let contract = session.info().resource_contract.clone();
 
-    let slot = optional(config, "slot")?.unwrap_or_else(|| match required::<String>(config, "kind").as_deref() {
-        Ok("video") => vivid_sdk::SLOT_PRIMARY_VIDEO,
-        Ok("audio") => vivid_sdk::SLOT_AUDIO,
-        Ok("image") => vivid_sdk::SLOT_POSTER,
-        _ => vivid_sdk::SLOT_RASTER,
+    let slot = optional(config, "slot")?.unwrap_or_else(|| {
+        match required::<String>(config, "kind").as_deref() {
+            Ok("video") => vivid_sdk::SLOT_PRIMARY_VIDEO,
+            Ok("audio") => vivid_sdk::SLOT_AUDIO,
+            Ok("image") => vivid_sdk::SLOT_POSTER,
+            _ => vivid_sdk::SLOT_RASTER,
+        }
     });
     let mode = TrackMode::try_from(optional(config, "mode")?.unwrap_or(1))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -947,8 +954,8 @@ fn build_track_config(
         builder = builder.max_encoded_bps(value);
     }
 
-    let track_id = optional(config, "track_id")?
-        .unwrap_or(session.allocate_id().map_err(io_error)?);
+    let track_id =
+        optional(config, "track_id")?.unwrap_or(session.allocate_id().map_err(io_error)?);
     let mut configuration = builder.build(&contract, track_id).map_err(io_error)?;
     debug_assert_eq!(configuration.context_id, context_id);
     debug_assert_eq!(configuration.surface_id, surface_id);
@@ -1055,7 +1062,10 @@ fn build_track_config(
     dict.set_item("lane", configuration.lane as u64)?;
     dict.set_item("direction", configuration.direction as u64)?;
     dict.set_item("maximum_record_body", configuration.maximum_record_body)?;
-    dict.set_item("maximum_rate_millihertz", configuration.maximum_rate_millihertz)?;
+    dict.set_item(
+        "maximum_rate_millihertz",
+        configuration.maximum_rate_millihertz,
+    )?;
     dict.set_item(
         "maximum_encoded_bits_per_second",
         configuration.maximum_encoded_bits_per_second,
@@ -1124,10 +1134,7 @@ fn build_track_config(
             dict.set_item("width", image.width)?;
             dict.set_item("height", image.height)?;
             dict.set_item("encoded_length", image.encoded_length)?;
-            dict.set_item(
-                "sha256",
-                image.sha256.map(|value| PyBytes::new(py, &value)),
-            )?;
+            dict.set_item("sha256", image.sha256.map(|value| PyBytes::new(py, &value)))?;
             dict.set_item("cache_lookup", image.cache_lookup)?;
         }
     }
@@ -1155,14 +1162,18 @@ fn build_surface_config(
     if let Some(surface_id) = optional(config, "surface_id")? {
         builder = builder.surface_id(surface_id);
     }
-    let semantic_profile =
-        optional::<String>(config, "semantic_profile")?.unwrap_or_else(|| vivid_sdk::GENERIC_CONTENT.into());
-    let coordinate_model = CoordinateModel::try_from(optional::<u64>(config, "coordinate_model")?.unwrap_or(1))
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let semantic_profile = optional::<String>(config, "semantic_profile")?
+        .unwrap_or_else(|| vivid_sdk::GENERIC_CONTENT.into());
+    let coordinate_model =
+        CoordinateModel::try_from(optional::<u64>(config, "coordinate_model")?.unwrap_or(1))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
     builder = builder.semantic(&semantic_profile, coordinate_model);
     let role = SurfaceRole::try_from(optional::<u64>(config, "role")?.unwrap_or(0))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    builder = builder.titled(role, optional::<String>(config, "title")?.unwrap_or_default());
+    builder = builder.titled(
+        role,
+        optional::<String>(config, "title")?.unwrap_or_default(),
+    );
     if let Some(policy) = optional(config, "policy")? {
         builder = builder.policy(policy);
     }
@@ -2882,7 +2893,7 @@ impl PyPaneSession {
         })
     }
 
-        /// Wrap an existing session, so a host layer can apply its own connect options first.
+    /// Wrap an existing session, so a host layer can apply its own connect options first.
     #[staticmethod]
     fn from_session(py: Python<'_>, session: PyRef<'_, PySession>) -> PyResult<PyPaneSession> {
         let owned = lock(&session.inner, "session")?

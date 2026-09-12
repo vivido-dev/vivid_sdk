@@ -1,0 +1,38 @@
+{
+  "name": "@vivido/vivid-sdk",
+  "version": "2.0.0",
+  "description": "TypeScript SDK for the Vivid Protocol 1.5 producer and presenter roles",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vivido-dev/vivid_sdk"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README-typescript.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "napi build --platform --release --cargo-cwd node-bindings --js false --dts false && tsc -p ts",
+    "build:debug": "napi build --platform --cargo-cwd node-bindings --js false --dts false && tsc -p ts",
+    "typecheck": "tsc -p ts --noEmit",
+    "test": "node --test ts/tests",
+    "test:bun": "bun test ts/tests"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "optionalDependencies": {}
+}

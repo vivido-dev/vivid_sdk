@@ -28,10 +28,7 @@ use vivid_protocol::messages::{LaneClass, TrackKind};
 use vivid_protocol::resource::{RESOURCE_COUNT, ResourceContract};
 use vivid_protocol::scene::Fit;
 use vivid_protocol::scene::SceneNode;
-use vivid_protocol::track::{
-    AudioConfiguration, ImageConfiguration, KindConfiguration, RasterConfiguration,
-    TrackConfiguration, TrackDirection, TrackMode, VideoConfiguration,
-};
+use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
 use vivid_sdk::presenter::{
     Binding, CaptureContent, MediaConfig, PresenterConfig, SocketListener, VirtualVivid,
 };
@@ -1035,10 +1032,13 @@ pub struct TrackConfig {
     pub maximum_delta_operations: Option<f64>,
     pub zstd_enabled: Option<bool>,
     // image
+    pub encoded: Option<Buffer>,
     pub encoding: Option<f64>,
     pub encoded_length: Option<f64>,
     pub sha256: Option<Buffer>,
     pub cache_lookup: Option<bool>,
+    /// Declare the track as microphone audio flowing toward the producer side.
+    pub uplink: Option<bool>,
     // common claims
     pub track_id: Option<f64>,
     pub slot: Option<f64>,
@@ -1055,100 +1055,26 @@ pub struct TrackConfig {
     pub retained_pixel_charge: Option<f64>,
 }
 
+/// Build a track configuration through the SDK's builder.
+///
+/// The claims the protocol bounds — record body, in-flight bytes, retained pixels, decoded
+/// pixels, and the rate defaults that follow from them — are computed in Rust with checked
+/// arithmetic. This function states only what the caller asked for, so an unset claim takes the
+/// builder's default for that kind rather than a number written here.
 fn track_configuration(
     config: &TrackConfig,
     session: &SdkSession,
     context_id: u64,
     surface_id: u64,
 ) -> Result<TrackConfiguration> {
-    let kind = match config.kind.as_str() {
-        "video" => KindConfiguration::Video(VideoConfiguration {
-            codec: config
-                .codec
-                .clone()
-                .ok_or_else(|| value_error("video tracks need a codec"))?,
-            packetization: config.packetization.clone().unwrap_or_else(|| {
-                format!("{}-annexb-au-v1", config.codec.clone().unwrap_or_default())
-            }),
-            extradata: config
-                .extradata
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-            coded_width: opt_u64(config.width, "width")? as u32,
-            coded_height: opt_u64(config.height, "height")? as u32,
-            profile: opt_u64(config.profile, "profile")? as i32,
-            level: opt_u64(config.level, "level")? as i32,
-            maximum_reorder_depth: opt_u64(config.maximum_reorder_depth, "maximumReorderDepth")?
-                as u8,
-            color_primaries: opt_u64(config.color_primaries, "colorPrimaries")?.max(1),
-            transfer: opt_u64(config.transfer, "transfer")?.max(1),
-            matrix: opt_u64(config.matrix, "matrix")?.max(1),
-            signal_range: opt_u64(config.signal_range, "signalRange")
-                .unwrap_or(2)
-                .max(1),
-            aspect_numerator: opt_u64(config.aspect_numerator, "aspectNumerator")?.max(1),
-            aspect_denominator: opt_u64(config.aspect_denominator, "aspectDenominator")?.max(1),
-            maximum_access_unit_bytes: opt_u64(
-                config.maximum_access_unit_bytes,
-                "maximumAccessUnitBytes",
-            )? as u32,
-            codec_string: config.codec_string.clone(),
-            decoder_configuration: config.decoder_configuration.as_ref().map(|b| b.to_vec()),
-        }),
-        "audio" => KindConfiguration::Audio(AudioConfiguration {
-            codec: config.codec.clone().unwrap_or_else(|| "opus".into()),
-            packetization: config
-                .packetization
-                .clone()
-                .unwrap_or_else(|| "opus-packet-v1".into()),
-            extradata: config
-                .extradata
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-            sample_rate: opt_u64(config.sample_rate, "sampleRate")? as u32,
-            channels: opt_u64(config.channels, "channels")? as u8,
-            channel_mask: opt_u64(config.channel_mask, "channelMask")?,
-            maximum_access_unit_bytes: opt_u64(
-                config.maximum_access_unit_bytes,
-                "maximumAccessUnitBytes",
-            )?
-            .max(1) as u32,
-            codec_string: config.codec_string.clone(),
-        }),
-        "raster" => KindConfiguration::Raster(RasterConfiguration {
-            width: opt_u64(config.width, "width")? as u32,
-            height: opt_u64(config.height, "height")? as u32,
-            alpha_mode: opt_u64(config.alpha_mode, "alphaMode")?.max(1),
-            delta_enabled: config.delta_enabled.unwrap_or(false),
-            maximum_delta_operations: opt_u64(
-                config.maximum_delta_operations,
-                "maximumDeltaOperations",
-            )?
-            .max(1) as u8,
-            zstd_enabled: config.zstd_enabled.unwrap_or(false),
-        }),
-        "image" => KindConfiguration::EncodedImage(ImageConfiguration {
-            encoding: opt_u64(config.encoding, "encoding")?,
-            width: opt_u64(config.width, "width")? as u32,
-            height: opt_u64(config.height, "height")? as u32,
-            encoded_length: opt_u64(config.encoded_length, "encodedLength")? as u32,
-            sha256: config
-                .sha256
-                .as_ref()
-                .map(|b| {
-                    <[u8; 32]>::try_from(b.to_vec())
-                        .map_err(|_| value_error("sha256 must contain 32 bytes"))
-                })
-                .transpose()?,
-            cache_lookup: config.cache_lookup.unwrap_or(false),
-        }),
-        other => {
-            return Err(value_error(format!(
-                "track kind must be video, audio, raster, or image, not {other:?}"
-            )));
-        }
+    let slot = match config.slot {
+        Some(value) => opt_u64(Some(value), "slot")?,
+        None => match config.kind.as_str() {
+            "video" => vivid_sdk::SLOT_PRIMARY_VIDEO,
+            "audio" => vivid_sdk::SLOT_AUDIO,
+            "image" => vivid_sdk::SLOT_POSTER,
+            _ => vivid_sdk::SLOT_RASTER,
+        },
     };
     let mode = match config.mode {
         None => TrackMode::Live,
@@ -1160,43 +1086,168 @@ fn track_configuration(
         Some(value) => LaneClass::try_from(opt_u64(Some(value), "lane")?)
             .map_err(|error| value_error(error.to_string()))?,
     };
-    let direction = match config.direction {
-        None => TrackDirection::Downlink,
-        Some(value) => TrackDirection::try_from(opt_u64(Some(value), "direction")?)
-            .map_err(|error| value_error(error.to_string()))?,
+
+    let contract = session.info().resource_contract.clone();
+    let mut builder = vivid_sdk::TrackBuilder::detached(context_id, surface_id, slot, mode, lane);
+
+    match config.kind.as_str() {
+        "video" => {
+            builder = builder.video(
+                opt_u64(config.width, "width")? as u32,
+                opt_u64(config.height, "height")? as u32,
+                &config
+                    .codec
+                    .clone()
+                    .ok_or_else(|| value_error("video tracks need a codec"))?,
+            );
+        }
+        "audio" => {
+            builder = builder.audio(
+                opt_u64(config.sample_rate, "sampleRate")? as u32,
+                opt_u64(config.channels, "channels")? as u8,
+            );
+        }
+        "raster" => {
+            builder = builder
+                .raster(
+                    opt_u64(config.width, "width")? as u32,
+                    opt_u64(config.height, "height")? as u32,
+                )
+                .map_err(io_error)?;
+        }
+        "image" => {
+            let encoded = config
+                .encoded
+                .as_ref()
+                .ok_or_else(|| value_error("image tracks need the encoded container"))?;
+            let mut image = vivid_sdk::probe_encoded_image(encoded).map_err(io_error)?;
+            image.sha256 = config
+                .sha256
+                .as_ref()
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes.to_vec())
+                        .map_err(|_| value_error("sha256 must contain 32 bytes"))
+                })
+                .transpose()?;
+            image.cache_lookup = config.cache_lookup.unwrap_or(false);
+            builder = builder.image(image).map_err(io_error)?;
+        }
+        other => {
+            return Err(value_error(format!(
+                "track kind must be video, audio, raster, or image, not {other:?}"
+            )));
+        }
+    }
+
+    if config.uplink.unwrap_or(false) {
+        builder = builder.uplink();
+    }
+    if let Some(value) = opt_u64(config.maximum_rate_millihertz, "maximumRateMillihertz")
+        .ok()
+        .filter(|value| *value > 0)
+    {
+        builder = builder.max_rate_millihertz(value);
+    }
+    if let Some(value) = opt_u64(
+        config.maximum_encoded_bits_per_second,
+        "maximumEncodedBitsPerSecond",
+    )
+    .ok()
+    .filter(|value| *value > 0)
+    {
+        builder = builder.max_encoded_bps(value);
+    }
+
+    let track_id = match config.track_id {
+        Some(track_id) => opt_u64(Some(track_id), "trackId")?,
+        None => session.allocate_id().map_err(io_error)?,
     };
-    Ok(TrackConfiguration {
-        direction,
-        context_id,
-        surface_id,
-        track_id: match config.track_id {
-            Some(track_id) => opt_u64(Some(track_id), "trackId")?,
-            None => session.allocate_id().map_err(io_error)?,
-        },
-        slot: opt_u64(config.slot, "slot")?,
-        mode,
-        lane,
-        maximum_record_body: opt_u64(config.maximum_record_body, "maximumRecordBody")? as u32,
-        maximum_rate_millihertz: opt_u64(config.maximum_rate_millihertz, "maximumRateMillihertz")?
-            .max(1),
-        maximum_encoded_bits_per_second: opt_u64(
-            config.maximum_encoded_bits_per_second,
-            "maximumEncodedBitsPerSecond",
-        )?,
-        maximum_records_per_second: opt_u64(
-            config.maximum_records_per_second,
-            "maximumRecordsPerSecond",
-        )?
-        .max(1),
-        maximum_inflight_body_bytes: opt_u64(
-            config.maximum_inflight_body_bytes,
-            "maximumInflightBodyBytes",
-        )?,
-        kind,
-        target_latency_us: opt_u64(config.target_latency_us, "targetLatencyUs")?,
-        maximum_latency_us: opt_u64(config.maximum_latency_us, "maximumLatencyUs")?,
-        retained_pixel_charge: opt_u64(config.retained_pixel_charge, "retainedPixelCharge")?,
-    })
+    let mut configuration = builder.build(&contract, track_id).map_err(io_error)?;
+
+    // The builder owns the claims; these are the codec details a caller may state explicitly.
+    match &mut configuration.kind {
+        KindConfiguration::Video(video) => {
+            if let Some(value) = config.packetization.clone() {
+                video.packetization = value;
+            }
+            if let Some(value) = config.extradata.as_ref() {
+                video.extradata = value.to_vec();
+            }
+            if let Some(value) = config.profile {
+                video.profile = value as i32;
+            }
+            if let Some(value) = config.level {
+                video.level = value as i32;
+            }
+            if let Some(value) = config.maximum_reorder_depth {
+                video.maximum_reorder_depth = value as u8;
+            }
+            if let Some(value) = config.color_primaries {
+                video.color_primaries = value as u64;
+            }
+            if let Some(value) = config.transfer {
+                video.transfer = value as u64;
+            }
+            if let Some(value) = config.matrix {
+                video.matrix = value as u64;
+            }
+            if let Some(value) = config.signal_range {
+                video.signal_range = value as u64;
+            }
+            if let Some(value) = config.aspect_numerator {
+                video.aspect_numerator = value as u64;
+            }
+            if let Some(value) = config.aspect_denominator {
+                video.aspect_denominator = value as u64;
+            }
+            if let Some(value) = config.maximum_access_unit_bytes {
+                video.maximum_access_unit_bytes = value as u32;
+            }
+            video.codec_string = config.codec_string.clone();
+            video.decoder_configuration = config
+                .decoder_configuration
+                .as_ref()
+                .map(|value| value.to_vec());
+        }
+        KindConfiguration::Audio(audio) => {
+            if let Some(value) = config.codec.clone() {
+                audio.codec = value;
+            }
+            if let Some(value) = config.packetization.clone() {
+                audio.packetization = value;
+            }
+            if let Some(value) = config.extradata.as_ref() {
+                audio.extradata = value.to_vec();
+            }
+            if let Some(value) = config.channel_mask {
+                audio.channel_mask = value as u64;
+            }
+            if let Some(value) = config.maximum_access_unit_bytes {
+                audio.maximum_access_unit_bytes = value as u32;
+            }
+            audio.codec_string = config.codec_string.clone();
+        }
+        KindConfiguration::Raster(raster) => {
+            if let Some(value) = config.alpha_mode {
+                raster.alpha_mode = value as u64;
+            }
+            if let Some(value) = config.delta_enabled {
+                raster.delta_enabled = value;
+            }
+            if let Some(value) = config.maximum_delta_operations {
+                raster.maximum_delta_operations = value as u8;
+            }
+            if let Some(value) = config.zstd_enabled {
+                raster.zstd_enabled = value;
+            }
+        }
+        KindConfiguration::EncodedImage(image) => {
+            if let Some(value) = config.encoded_length {
+                image.encoded_length = value as u32;
+            }
+        }
+    }
+    Ok(configuration)
 }
 
 #[napi]
