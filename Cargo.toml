@@ -16,9 +16,14 @@ exclude = [
   "python-bindings",
   "python-tests",
   "node",
+  "node-bindings",
+  "ts",
+  "package.json",
+  "npm",
   "pyproject.toml",
   "uv.lock",
   "README-python.md",
+  "README-typescript.md",
   ".pytest_cache",
 ]
 
@@ -50,5 +55,5 @@ zeroize = "1.9"
 tempfile = "3"
 
 [workspace]
-members = ["python-bindings"]
+members = ["python-bindings", "node-bindings"]
 resolver = "3"

@@ -24,3 +24,5 @@ target
 # Python build and cache artifacts. The package ships from python/, so these sit beside sources.
 __pycache__/
 *.py[cod]
+node-bindings/*.node
+node-bindings/index.d.ts

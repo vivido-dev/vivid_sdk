@@ -1,0 +1,27 @@
+[package]
+name = "vivid-sdk-node"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Private napi-rs extension for the @vivido/vivid-sdk TypeScript package"
+repository = "https://github.com/vivido-dev/vivid_sdk"
+publish = false
+
+[lib]
+name = "vivid_sdk_node"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+napi = { version = "3.12", default-features = false, features = ["napi8", "async"] }
+napi-derive = "3.6"
+# The addon carries both roles: one artifact, a producer and a presenter — the same choice the
+# Python wheel makes.
+vivid_protocol = { version = "1.5", path = "../../vivid_protocol" }
+zeroize = "1.9"
+vivid_sdk = { version = "1.5", path = "..", features = ["presenter"] }
+
+[build-dependencies]
+napi-build = "2.4"
