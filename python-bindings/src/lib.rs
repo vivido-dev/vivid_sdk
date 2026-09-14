@@ -965,6 +965,7 @@ fn build_track_config(
     // Applying them after the build keeps the arithmetic in one place while preserving every
     // field the wire carries.
     match &mut configuration.kind {
+        vivid_protocol::track::KindConfiguration::VectorScene(_) => {}
         vivid_protocol::track::KindConfiguration::Video(video) => {
             if let Some(value) = optional::<String>(config, "packetization")? {
                 video.packetization = value;
@@ -1086,6 +1087,12 @@ fn build_track_config(
     dict.set_item("maximum_latency_us", configuration.maximum_latency_us)?;
     dict.set_item("retained_pixel_charge", configuration.retained_pixel_charge)?;
     match &configuration.kind {
+        vivid_protocol::track::KindConfiguration::VectorScene(vector) => {
+            dict.set_item("kind", "vector")?;
+            dict.set_item("width", vector.width)?;
+            dict.set_item("height", vector.height)?;
+            dict.set_item("maximum_scene_bytes", vector.maximum_scene_bytes)?;
+        }
         vivid_protocol::track::KindConfiguration::Video(video) => {
             dict.set_item("kind", "video")?;
             dict.set_item("codec", &video.codec)?;
@@ -3357,6 +3364,7 @@ fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Audio => "audio",
         TrackKind::Raster => "raster",
         TrackKind::EncodedImage => "image",
+        TrackKind::VectorScene => "vector",
     }
 }
 

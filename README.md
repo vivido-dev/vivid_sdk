@@ -1,5 +1,7 @@
 # vivid_sdk
 
+See [overlay implementation status](OVERLAYS.md) for above-text composition and the pending interactive window API.
+
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `vivid_sdk` is the full-duplex Rust SDK for Vivid Protocol 1.5. It serves both roles: the crate

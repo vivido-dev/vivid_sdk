@@ -1,5 +1,7 @@
 # vivid-sdk for TypeScript
 
+See [overlay implementation status](OVERLAYS.md) for above-text composition and the pending interactive window API.
+
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `@vivido/vivid-sdk` is the TypeScript SDK for Vivid Protocol 1.5, for both roles. The current local build is tested with Node 22 and Bun 1.3.14;

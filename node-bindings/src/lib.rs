@@ -1175,6 +1175,7 @@ fn track_configuration(
 
     // The builder owns the claims; these are the codec details a caller may state explicitly.
     match &mut configuration.kind {
+        KindConfiguration::VectorScene(_) => {}
         KindConfiguration::Video(video) => {
             if let Some(value) = config.packetization.clone() {
                 video.packetization = value;
@@ -1306,6 +1307,7 @@ fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Audio => "audio",
         TrackKind::Raster => "raster",
         TrackKind::EncodedImage => "image",
+        TrackKind::VectorScene => "vector",
     }
 }
 

@@ -853,6 +853,18 @@ impl VirtualVivid {
     ) -> io::Result<Self> {
         config.supported_profiles.sort();
         config.supported_profiles.dedup();
+        if config.supported_profiles.iter().any(|profile| {
+            matches!(
+                profile.as_str(),
+                registry::TERMINAL_OVERLAY | registry::VECTOR_SCENE | registry::OVERLAY_INPUT
+            )
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this terminating presenter has no vector overlay renderer or pane input router",
+            ));
+        }
+
         if !config
             .supported_profiles
             .iter()
@@ -1502,6 +1514,7 @@ impl VirtualVivid {
                 KindConfiguration::EncodedImage(_) => ("image", true),
                 KindConfiguration::Video(_) => ("video", true),
                 KindConfiguration::Audio(_) => ("audio", false),
+                KindConfiguration::VectorScene(_) => ("vector", true),
             };
             tracks.push(PaneTrackSummary {
                 source: bridge_track_key(*key),
@@ -1550,56 +1563,57 @@ impl VirtualVivid {
                 semantic_descriptor: semantic_descriptor(&surface.state.definition.descriptor),
             })
             .collect::<Vec<_>>();
-        let sources = state
-            .tracks
-            .iter()
-            .filter(|(key, track)| {
-                sessions.contains(&key.surface.session)
-                    && track.configuration.direction != crate::TrackDirection::Uplink
-            })
-            .map(|(key, track)| SnapshotSource {
-                key: bridge_track_key(*key),
-                descriptor: source_descriptor(&state.tracks, *key, track),
-                decoder_reset_serial: track.decoder_reset_serial,
-                live: track.configuration.mode == TrackMode::Live,
-                active: state.surfaces.get(&key.surface).is_some_and(|surface| {
-                    surface
-                        .active_slots
-                        .values()
-                        .any(|track_id| *track_id == key.track)
-                }),
-                audio_gain: (matches!(track.configuration.kind, KindConfiguration::Audio(_))
-                    && state
-                        .sessions
-                        .get(&key.surface.session)
-                        .is_some_and(|session| {
-                            session.accepted_profiles.contains(registry::AUDIO_GAIN)
-                        }))
-                .then_some(track.audio_gain),
-                retained: track.retained.clone(),
-                retained_raster: track.retained_raster.clone(),
-                first_visible_presented: track.outer_presented,
-                playing: track.playing,
-                play_request: track.play_request,
-                eos_epoch: track.eos_epoch,
-                last_inner_record_sequence: track.last_record_sequence,
-                causation_id: track.causation_id,
-                capture_policy: state
-                    .surfaces
-                    .get(&key.surface)
-                    .map_or(0, |surface| surface.state.definition.policy),
-                semantic_descriptor: state
-                    .surfaces
-                    .get(&key.surface)
-                    .map(|surface| semantic_descriptor(&surface.state.definition.descriptor)),
-                raster_delta_operation_limit: match &track.configuration.kind {
-                    KindConfiguration::Raster(config) if config.delta_enabled => {
-                        Some(u32::from(config.maximum_delta_operations))
-                    }
-                    _ => None,
-                },
-            })
-            .collect::<Vec<_>>();
+        let sources =
+            state
+                .tracks
+                .iter()
+                .filter(|(key, track)| {
+                    sessions.contains(&key.surface.session)
+                        && track.configuration.direction != crate::TrackDirection::Uplink
+                })
+                .filter_map(|(key, track)| {
+                    Some(SnapshotSource {
+                        key: bridge_track_key(*key),
+                        descriptor: source_descriptor(&state.tracks, *key, track)?,
+                        decoder_reset_serial: track.decoder_reset_serial,
+                        live: track.configuration.mode == TrackMode::Live,
+                        active: state.surfaces.get(&key.surface).is_some_and(|surface| {
+                            surface
+                                .active_slots
+                                .values()
+                                .any(|track_id| *track_id == key.track)
+                        }),
+                        audio_gain: (matches!(
+                            track.configuration.kind,
+                            KindConfiguration::Audio(_)
+                        ) && state.sessions.get(&key.surface.session).is_some_and(
+                            |session| session.accepted_profiles.contains(registry::AUDIO_GAIN),
+                        ))
+                        .then_some(track.audio_gain),
+                        retained: track.retained.clone(),
+                        retained_raster: track.retained_raster.clone(),
+                        first_visible_presented: track.outer_presented,
+                        playing: track.playing,
+                        play_request: track.play_request,
+                        eos_epoch: track.eos_epoch,
+                        last_inner_record_sequence: track.last_record_sequence,
+                        causation_id: track.causation_id,
+                        capture_policy: state
+                            .surfaces
+                            .get(&key.surface)
+                            .map_or(0, |surface| surface.state.definition.policy),
+                        semantic_descriptor: state.surfaces.get(&key.surface).map(|surface| {
+                            semantic_descriptor(&surface.state.definition.descriptor)
+                        }),
+                        raster_delta_operation_limit: match &track.configuration.kind {
+                            KindConfiguration::Raster(config) if config.delta_enabled => {
+                                Some(u32::from(config.maximum_delta_operations))
+                            }
+                            _ => None,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
         let mut nodes = Vec::new();
         for (key, entry) in &state.nodes {
             if !sessions.contains(&key.session) {
@@ -5391,8 +5405,9 @@ fn source_descriptor(
     tracks: &HashMap<TrackKey, TrackEntry>,
     key: TrackKey,
     track: &TrackEntry,
-) -> SourceDescriptor {
-    match &track.configuration.kind {
+) -> Option<SourceDescriptor> {
+    Some(match &track.configuration.kind {
+        KindConfiguration::VectorScene(_) => return None,
         KindConfiguration::Raster(config) => SourceDescriptor::Raster(config.clone()),
         KindConfiguration::EncodedImage(config) => SourceDescriptor::Image(config.clone()),
         KindConfiguration::Video(config) => SourceDescriptor::Video(config.clone()),
@@ -5416,7 +5431,7 @@ fn source_descriptor(
                 codec_string: config.codec_string.clone(),
             })
         }
-    }
+    })
 }
 
 fn semantic_descriptor(descriptor: &SurfaceDescriptor) -> SemanticDescriptor {
@@ -5447,6 +5462,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             )
             .is_ok(),
             KindConfiguration::Raster(_) | KindConfiguration::EncodedImage(_) => true,
+            KindConfiguration::VectorScene(_) => false,
         }
 }
 
@@ -6182,6 +6198,7 @@ fn kind_name(kind: &KindConfiguration) -> &'static str {
     match kind {
         KindConfiguration::Video(_) => "video",
         KindConfiguration::Audio(_) => "audio",
+        KindConfiguration::VectorScene(_) => "vector",
         KindConfiguration::Raster(_) => "raster",
         KindConfiguration::EncodedImage(_) => "image",
     }
@@ -6295,6 +6312,24 @@ mod tests {
                 cancel,
                 timeout,
             ))
+        }
+    }
+
+    #[test]
+    fn terminating_presenter_cannot_advertise_unimplemented_overlay_profiles() {
+        use crate::presenter::SocketListener;
+        for profile in [
+            registry::VECTOR_SCENE,
+            registry::TERMINAL_OVERLAY,
+            registry::OVERLAY_INPUT,
+        ] {
+            let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
+            let mut config = PresenterConfig::terminal(MediaConfig::default());
+            config.supported_profiles.push(profile.to_owned());
+            let error = VirtualVivid::start_configured(listener, config, None)
+                .err()
+                .expect("must reject unsupported renderer");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         }
     }
 
