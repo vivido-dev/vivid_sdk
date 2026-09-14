@@ -59,6 +59,13 @@ impl OverlayWindow {
         retain: bool,
     ) -> io::Result<Vec<(u64, TextMeasurement)>> {
         self.with_state(|session, state| {
+            if texts.iter().any(|t| t.typography != Default::default())
+                && !session.supports(vivid_protocol::registry::OVERLAY_TYPOGRAPHY)
+            {
+                return Err(invalid_input(
+                    "presenter does not support overlay-typography-v1",
+                ));
+            }
             if !session.supports(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT) {
                 return Err(invalid_input(
                     "presenter does not support overlay-text-layout-v1",
@@ -92,6 +99,9 @@ impl OverlayWindow {
             }
             let mut ids = BTreeSet::new();
             for ((id, m), text) in measured.layouts.iter().zip(texts) {
+                if m.truncated_at.is_some() && text.typography.overflow != TextOverflow::Ellipsis {
+                    return Err(invalid_data("unexpected ellipsis geometry"));
+                }
                 if retain && (*id == 0 || !ids.insert(*id) || state.layouts.contains(id))
                     || !retain && *id != 0
                 {

@@ -14,6 +14,50 @@ pub fn measurement_text(canvas: &Canvas) -> io::Result<Text> {
     Ok(text.clone())
 }
 
+pub fn typography(
+    overflow: &str,
+    letter_spacing: f64,
+    word_spacing: f64,
+    line_height: Option<f64>,
+    ligatures: bool,
+    kerning: bool,
+) -> io::Result<vivid_sdk::overlay::Typography> {
+    use vivid_sdk::overlay::{TextOverflow, Typography};
+    let result = Typography {
+        overflow: match overflow {
+            "clip" => TextOverflow::Clip,
+            "ellipsis" => TextOverflow::Ellipsis,
+            _ => return Err(invalid("unknown text overflow")),
+        },
+        letter_spacing: Scalar::new(letter_spacing).map_err(io::Error::other)?,
+        word_spacing: Scalar::new(word_spacing).map_err(io::Error::other)?,
+        line_height: line_height
+            .map(Scalar::new)
+            .transpose()
+            .map_err(io::Error::other)?,
+        ligatures,
+        kerning,
+    };
+    result.validate().map_err(io::Error::other)?;
+    Ok(result)
+}
+
+pub fn text_offset(offset: Option<u32>, source: &str, utf16: bool) -> io::Result<Option<u32>> {
+    offset
+        .map(|offset| {
+            let prefix = source
+                .get(..offset as usize)
+                .ok_or_else(|| invalid("invalid truncation offset"))?;
+            u32::try_from(if utf16 {
+                prefix.encode_utf16().count()
+            } else {
+                prefix.chars().count()
+            })
+            .map_err(io::Error::other)
+        })
+        .transpose()
+}
+
 pub fn styled_text(
     canvas: &Canvas,
     decorations: &[u32],
@@ -52,6 +96,7 @@ pub fn styled_text(
         })
         .collect::<io::Result<_>>()?;
     let text = StyledText {
+        typography: Default::default(),
         runs,
         max_width: max_width
             .map(Scalar::new)

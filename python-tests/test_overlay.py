@@ -123,5 +123,9 @@ def test_styled_text_validates_native_runs_and_snapshots_the_sequence() -> None:
     assert len(text.runs) == 2
     for invalid in (StyledText([]), StyledText([TextRun("x" * 4097)]),
                     StyledText([TextRun("x")], max_lines=0),
+                    StyledText([TextRun("x")], overflow="ellipsis"),
+                    StyledText([TextRun("x")], letter_spacing=-1),
+                    StyledText([TextRun("x")], line_height=0),
+                    StyledText([TextRun("x")], word_spacing=float("inf")),
                     StyledText([TextRun("x", TextStyle(size=float("nan")))])):
         with pytest.raises((ValueError, OSError)): invalid._native()

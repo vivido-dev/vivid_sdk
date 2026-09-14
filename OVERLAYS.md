@@ -214,8 +214,8 @@ Connection helpers also optionally negotiate `overlay-text-layout-v1`. `StyledTe
 paragraph of `TextRun` values with `TextStyle`: size, family, weight, italic, color, underline,
 and strikethrough. Runs shape together with host font fallback. Paragraph options provide maximum
 width, start/center/end/justify alignment, wrapping, and a maximum line count. Disabling wrapping
-preserves explicit line breaks. Width overflow and extra lines are clipped; truncation does not
-insert an ellipsis. With a maximum width, the measured width is the paragraph box width; geometry
+preserves explicit line breaks. By default, width overflow and extra lines are clipped. The
+optional typography service below adds ellipsis insertion. With a maximum width, the measured width is the paragraph box width; geometry
 still reports actual cluster positions, including horizontally clipped content.
 
 | Operation | Rust / Python | TypeScript |
@@ -267,6 +267,42 @@ atomically on malformed input, overload, or oversized replies. Retention is boun
 per owner and 2,048 globally, including released layouts still used by scenes. Single and batch
 requests share the existing worker limits. Terminating SDK presenters/gateways decline this profile.
 
+### Ellipsis and typography
+
+Connection helpers optionally negotiate `overlay-typography-v1`. Rust configures
+`StyledText.typography` with `Typography` and `TextOverflow::{Clip, Ellipsis}`. Python uses
+`StyledText(overflow="ellipsis", letter_spacing=..., word_spacing=..., line_height=...,
+ligatures=..., kerning=...)`; TypeScript uses the corresponding camelCase fields. These options
+work with both measurement batches and retained layouts. Unsupported hosts fail explicitly.
+
+- `overflow="ellipsis"` requires `max_width` / `maxWidth`. It fits a prefix plus `…` within the
+  width and `max_lines` / `maxLines` (one line when omitted). It preserves grapheme sequences,
+  original RTL/LTR direction, and the last kept run's style. If even the marker cannot fit,
+  no text is drawn. The default overflow remains `"clip"`.
+- Letter/word spacing add 0–1,024 logical pixels across the paragraph; defaults are zero.
+- Absolute line height accepts positive values up to 4,096 logical pixels; omission uses host
+  font metrics. Small values may clip tall glyphs within the measured box.
+- Ligatures and kerning default to host behavior. Setting them false disables optional
+  ligatures/contextual alternates or kerning, while preserving required script shaping.
+
+```python
+paragraph = StyledText(
+    (TextRun("A long status message that may not fit", TextStyle(size=18)),),
+    max_width=220, max_lines=2, overflow="ellipsis",
+    letter_spacing=0.5, word_spacing=2, line_height=26,
+    ligatures=False, kerning=True,
+)
+layout = window.layout_text(paragraph)
+cut = layout.measurement.truncated_at  # None when the complete text fits.
+```
+
+Rust returns `TextMeasurement.truncated_at` in UTF-8 bytes; Python returns character indexes;
+TypeScript exposes optional `truncatedAt` in UTF-16 units. All cluster ranges refer to the
+original text. The inserted marker has an empty range at the cutoff and positive visible geometry;
+it is not part of the application's editable string. The retained layout paints the exact fitted
+result, including spacing and decorations, without reshaping on later frames. Prefix fitting has
+bounded work and does not guarantee the longest possible prefix with unusual contextual font metrics.
+
 `wait_event(timeout)` / `waitEvent(timeout)` use **seconds**, bounded to 0–60. Event iteration
 uses bounded waits and ends after connection loss or explicit session close. Typed events cover
 pointer, wheel, physical key, committed text, IME, focus, geometry, dismissal, cancellation,
@@ -304,7 +340,6 @@ is required; this test fails rather than silently skipping its rendering asserti
 
 ## Remaining work and acceptance
 
-- Ellipsis insertion and additional typographic controls beyond the current styled paragraphs.
 - Full live visual/input acceptance, including clipboard policy, IME placement, accessibility,
   platform-specific input behavior, and performance measurements.
 - The separate declarative UI engine, layout/editing services, accessibility bridge, and gallery.
@@ -322,6 +357,13 @@ sizes/colors, wrapping, italic, underline, and strikethrough. Moving the window 
 layouts preserved the displayed glyph scenes. The socket/GPU harness additionally verifies both
 run colors through Python blocking, Python asyncio, and TypeScript. Native Rust regressions cover
 atomic batch rejection, quota recovery, in-flight release accounting, and two-owner cleanup.
+
+Typography validation includes LTR/RTL ellipsis, combining sequences, emoji grapheme boundaries,
+mixed styles, spacing, absolute line height, and narrower-than-marker boxes. Python blocking,
+asyncio, and TypeScript socket/GPU workflows validate original-string truncation offsets and
+retained painting. A Windows live-pane check at 125% DPI confirmed styled and RTL marker placement,
+two-line fitting, spacing, and the empty result for a 1-pixel box. Other-platform visual checks
+remain unavailable in this session.
 
 Windows binding validation passes for Python blocking, Python asyncio, and native TypeScript,
 including the Vivido socket/GPU test above. The Python SDK, presenter, and overlay suites have

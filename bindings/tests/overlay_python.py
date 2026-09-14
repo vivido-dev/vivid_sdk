@@ -8,6 +8,14 @@ from vivid_sdk.overlay import Canvas, Brush, Path, Rect, Point, ImeEvent, Pointe
 OPTIONS = OverlayWindowOptions(Rect(10, 20, 100, 80))
 PIXELS = bytes([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255])
 TEXT = StyledText((TextRun("A😀", TextStyle(size=18, color=0xFF0000FF, underline=True)), TextRun("日", TextStyle(size=20, color=0x0000FFFF, strikethrough=True))), max_width=90, alignment="center")
+ELLIPSIS = StyledText((TextRun("A😀日e\u0301 long label to truncate", TextStyle(size=12, color=0x00FF00FF)),), max_width=85, max_lines=1, overflow="ellipsis", letter_spacing=0.5, word_spacing=2, line_height=16, ligatures=False, kerning=False)
+
+def check_ellipsis(measured):
+    cut = measured.truncated_at
+    assert cut is not None and 0 < cut < len(ELLIPSIS.runs[0].text)
+    assert ELLIPSIS.runs[0].text[cut] != "\u0301"
+    assert all(c.end <= cut for c in measured.clusters)
+    assert any(c.start == c.end == cut and c.bounds.width > 0 for c in measured.clusters)
 
 def canvas():
     result = Canvas()
@@ -39,12 +47,16 @@ def blocking():
             measured = window.measure_text("A😀日", 18)
             batch = window.measure_text_batch((TEXT, TEXT))
             layout = window.layout_text_batch((TEXT,))[0]
+            ellipsis = window.layout_text(ELLIPSIS)
+            check_ellipsis(ellipsis.measurement)
+            assert window.measure_text_batch((ELLIPSIS,))[0] == ellipsis.measurement
             assert batch[0] == batch[1] == layout.measurement
             assert max(c.end for c in layout.measurement.clusters) == 3
             assert measured.width > 0 and measured.height > 0 and measured.lines
             assert max(c.end for c in measured.clusters) == 3
             scene = canvas()
             window.draw_text_layout(scene, layout, Point(0, 40))
+            window.draw_text_layout(scene, ellipsis, Point(0, 22))
             image = window.upload_rgba(2, 2, PIXELS)
             window.draw_image(scene, image, Rect(50, 0, 20, 20))
             receipt = window.submit(scene)
@@ -65,6 +77,7 @@ def blocking():
             pending = window.submit(Canvas())
             replacement_scene = canvas()
             window.draw_text_layout(replacement_scene, layout, Point(0, 40))
+            window.draw_text_layout(replacement_scene, ellipsis, Point(0, 22))
             replacement = window.replace_track(replacement_scene)
             assert pending.wait(5) == "superseded" and replacement.revision == 3
             status = window.reconcile()
@@ -72,6 +85,7 @@ def blocking():
             assert replacement.wait(10) == "presented"
             assert window.reconcile().presented_revision == 3
             window.release_text_layout(layout)
+            window.release_text_layout(ellipsis)
             try: window.submit(replacement_scene)
             except (ValueError, OSError): pass
             else: raise AssertionError("released layout was accepted")
@@ -90,12 +104,16 @@ async def asynchronous():
             measured = await window.measure_text("A😀日", 18)
             batch = await window.measure_text_batch((TEXT, TEXT))
             layout = (await window.layout_text_batch((TEXT,)))[0]
+            ellipsis = await window.layout_text(ELLIPSIS)
+            check_ellipsis(ellipsis.measurement)
+            assert (await window.measure_text_batch((ELLIPSIS,)))[0] == ellipsis.measurement
             assert batch[0] == batch[1] == layout.measurement
             assert max(c.end for c in layout.measurement.clusters) == 3
             assert measured.width > 0 and measured.height > 0 and measured.lines
             assert max(c.end for c in measured.clusters) == 3
             scene = canvas()
             await window.draw_text_layout(scene, layout, Point(0, 40))
+            await window.draw_text_layout(scene, ellipsis, Point(0, 22))
             image = await window.upload_rgba(2, 2, PIXELS)
             await window.draw_image(scene, image, Rect(50, 0, 20, 20))
             receipt = await window.submit(scene)
@@ -117,6 +135,7 @@ async def asynchronous():
             pending = await window.submit(Canvas())
             replacement_scene = canvas()
             await window.draw_text_layout(replacement_scene, layout, Point(0, 40))
+            await window.draw_text_layout(replacement_scene, ellipsis, Point(0, 22))
             replacement = await window.replace_track(replacement_scene)
             assert await pending.wait(5) == "superseded" and replacement.revision == 3
             status = await window.reconcile()
@@ -124,6 +143,7 @@ async def asynchronous():
             assert await replacement.wait(10) == "presented"
             assert (await window.reconcile()).presented_revision == 3
             await window.release_text_layout(layout)
+            await window.release_text_layout(ellipsis)
             try: await window.submit(replacement_scene)
             except (ValueError, OSError): pass
             else: raise AssertionError("released layout was accepted")

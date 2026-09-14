@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -40,13 +40,16 @@ interface NativeWindow {
   uploadRgba(width: number, height: number, rgba: Buffer): Promise<object>;
   drawImage(canvas: NativeCanvas, image: object, bounds: number[], opacity: number): Promise<void>;
 }
-interface NativeTextLayout { measurement(): { width: number; height: number; lines: number[][]; clusters: number[][] } }
+interface NativeTextLayout { measurement(): { width: number; height: number; lines: number[][]; clusters: number[][]; truncatedAt?: number } }
 export interface TextStyle {
   readonly size?: number; readonly family?: string; readonly weight?: number;
   readonly italic?: boolean; readonly color?: number; readonly underline?: boolean; readonly strikethrough?: boolean;
 }
 export interface TextRun { readonly text: string; readonly style?: TextStyle }
 export interface StyledText {
+  readonly overflow?: "clip" | "ellipsis";
+  readonly letterSpacing?: number; readonly wordSpacing?: number; readonly lineHeight?: number;
+  readonly ligatures?: boolean; readonly kerning?: boolean;
   readonly runs: readonly TextRun[]; readonly maxWidth?: number;
   readonly alignment?: "start" | "center" | "end" | "justify";
   readonly wrap?: boolean;
@@ -63,8 +66,10 @@ function nativeStyledText(text: StyledText): object {
       { family: style.family ?? "", weight: style.weight ?? 400, italic: style.italic ?? false });
     decorations.push(Number(Boolean(style.underline)) | (Number(Boolean(style.strikethrough)) << 1));
   }
-  const Type = native().OverlayStyledText as { new(canvas: NativeCanvas, decorations: number[], maxWidth: number | undefined, alignment: string, wrap: boolean, maxLines: number | undefined): object };
-  return new Type(canvas.raw, decorations, text.maxWidth, text.alignment ?? "start", text.wrap ?? true, text.maxLines);
+  const Type = native().OverlayStyledText as { new(canvas: NativeCanvas, decorations: number[], maxWidth: number | undefined, alignment: string, wrap: boolean, maxLines: number | undefined): { typography(overflow: string, letterSpacing: number, wordSpacing: number, lineHeight: number | undefined, ligatures: boolean, kerning: boolean): void } };
+  const result = new Type(canvas.raw, decorations, text.maxWidth, text.alignment ?? "start", text.wrap ?? true, text.maxLines);
+  result.typography(text.overflow ?? "clip", text.letterSpacing ?? 0, text.wordSpacing ?? 0, text.lineHeight, text.ligatures ?? true, text.kerning ?? true);
+  return result;
 }
 function layoutMeasurement(raw: NativeTextLayout): TextMeasurement {
   const measured = raw.measurement();
@@ -117,7 +122,7 @@ export class Brush {
 export interface TextOptions { readonly family?: string; readonly weight?: number; readonly italic?: boolean; readonly maxWidth?: number }
 /** Ranges use JavaScript UTF-16 indexes. Geometry is layout-local logical pixels. */
 export interface TextGeometry { readonly start: number; readonly end: number; readonly bounds: Rect; readonly baseline: number; readonly rtl: boolean }
-export interface TextMeasurement { readonly width: number; readonly height: number; readonly lines: readonly TextGeometry[]; readonly clusters: readonly TextGeometry[] }
+export interface TextMeasurement { readonly width: number; readonly height: number; readonly lines: readonly TextGeometry[]; readonly clusters: readonly TextGeometry[]; readonly truncatedAt?: number }
 const textGeometry = (v: number[]): TextGeometry => ({ start: v[0]!, end: v[1]!, bounds: asRect(v.slice(2, 6)), baseline: v[6]!, rtl: Boolean(v[7]) });
 export class Canvas {
   /** @internal */ readonly raw: NativeCanvas;
@@ -207,7 +212,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT].filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));

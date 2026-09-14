@@ -471,6 +471,30 @@ struct PyStyledText {
 }
 #[pymethods]
 impl PyStyledText {
+    fn typography(
+        &mut self,
+        overflow: &str,
+        letter_spacing: f64,
+        word_spacing: f64,
+        line_height: Option<f64>,
+        ligatures: bool,
+        kerning: bool,
+    ) -> PyResult<()> {
+        let typography = model::typography(
+            overflow,
+            letter_spacing,
+            word_spacing,
+            line_height,
+            ligatures,
+            kerning,
+        )
+        .map_err(io_error)?;
+        let mut text = self.inner.clone();
+        text.typography = typography;
+        text.validate().map_err(value_error)?;
+        self.inner = text;
+        Ok(())
+    }
     #[new]
     #[pyo3(signature = (canvas, decorations, max_width, alignment, wrap, max_lines))]
     fn new(
@@ -506,6 +530,11 @@ impl PyTextLayout {
         let dict = PyDict::new(py);
         dict.set_item("width", self.measurement.width.get())?;
         dict.set_item("height", self.measurement.height.get())?;
+        dict.set_item(
+            "truncated_at",
+            model::text_offset(self.measurement.truncated_at, &self.source, false)
+                .map_err(io_error)?,
+        )?;
         dict.set_item(
             "lines",
             model::text_geometry(&self.measurement.lines, &self.source, false).map_err(io_error)?,

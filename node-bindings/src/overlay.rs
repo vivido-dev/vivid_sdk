@@ -263,6 +263,7 @@ impl OverlayWindow {
         blocking(move || {
             let m = window.measure_text(&text).map_err(io_error)?;
             Ok(OverlayTextMeasurement {
+                truncated_at: None,
                 width: m.width.get(),
                 height: m.height.get(),
                 lines: model::text_geometry(&m.lines, &text.text, true).map_err(io_error)?,
@@ -479,6 +480,7 @@ pub struct OverlayWindowStatus {
 
 #[napi(object)]
 pub struct OverlayTextMeasurement {
+    pub truncated_at: Option<u32>,
     pub width: f64,
     pub height: f64,
     pub lines: Vec<Vec<f64>>,
@@ -491,6 +493,31 @@ pub struct OverlayStyledText {
 }
 #[napi]
 impl OverlayStyledText {
+    #[napi]
+    pub fn typography(
+        &mut self,
+        overflow: String,
+        letter_spacing: f64,
+        word_spacing: f64,
+        line_height: Option<f64>,
+        ligatures: bool,
+        kerning: bool,
+    ) -> Result<()> {
+        let typography = model::typography(
+            &overflow,
+            letter_spacing,
+            word_spacing,
+            line_height,
+            ligatures,
+            kerning,
+        )
+        .map_err(io_error)?;
+        let mut text = self.inner.clone();
+        text.typography = typography;
+        text.validate().map_err(value_error)?;
+        self.inner = text;
+        Ok(())
+    }
     #[napi(constructor)]
     pub fn new(
         canvas: &OverlayCanvas,
@@ -524,6 +551,8 @@ impl OverlayTextLayout {
     #[napi]
     pub fn measurement(&self) -> Result<OverlayTextMeasurement> {
         Ok(OverlayTextMeasurement {
+            truncated_at: model::text_offset(self.measurement.truncated_at, &self.source, true)
+                .map_err(io_error)?,
             width: self.measurement.width.get(),
             height: self.measurement.height.get(),
             lines: model::text_geometry(&self.measurement.lines, &self.source, true)

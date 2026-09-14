@@ -32,7 +32,7 @@ use crate::*;
 mod layout;
 pub use layout::RetainedTextLayout;
 pub use vivid_protocol::overlay::wire::text::styled::{
-    StyledText, TextAlignment, TextRun, TextStyle,
+    StyledText, TextAlignment, TextOverflow, TextRun, TextStyle, Typography,
 };
 
 /// Initial geometry in viewport logical pixels, independent of terminal cells and scrollback.
@@ -133,6 +133,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_TYPOGRAPHY.into());
         config.optional_profiles.sort();
         config.optional_profiles.dedup();
         config

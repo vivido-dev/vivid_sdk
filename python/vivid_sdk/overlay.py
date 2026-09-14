@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -134,11 +134,12 @@ class TextMeasurement:
     height: float
     lines: Tuple[TextGeometry, ...]
     clusters: Tuple[TextGeometry, ...]
+    truncated_at: Optional[int] = None
 
 def _text_measurement(raw: Any) -> TextMeasurement:
     def geometry(values: Any) -> Tuple[TextGeometry, ...]:
         return tuple(TextGeometry(int(v[0]), int(v[1]), Rect(*v[2:6]), v[6], bool(v[7])) for v in values)
-    return TextMeasurement(raw["width"], raw["height"], geometry(raw["lines"]), geometry(raw["clusters"]))
+    return TextMeasurement(raw["width"], raw["height"], geometry(raw["lines"]), geometry(raw["clusters"]), raw.get("truncated_at"))
 
 PresentationOutcome = Literal["presented", "superseded"]
 
@@ -164,6 +165,12 @@ class StyledText:
     alignment: Literal["start", "center", "end", "justify"] = "start"
     wrap: bool = True
     max_lines: Optional[int] = None
+    overflow: Literal["clip", "ellipsis"] = "clip"
+    letter_spacing: float = 0
+    word_spacing: float = 0
+    line_height: Optional[float] = None
+    ligatures: bool = True
+    kerning: bool = True
     def __post_init__(self) -> None: object.__setattr__(self, "runs", tuple(self.runs))
     def _native(self) -> Any:
         canvas = Canvas()
@@ -172,7 +179,9 @@ class StyledText:
             style = run.style
             canvas.text(run.text, Point(0, 0), style.size, style.color, family=style.family, weight=style.weight, italic=style.italic)
             decorations.append(int(style.underline) | (int(style.strikethrough) << 1))
-        return _native.OverlayStyledText(canvas._raw, decorations, self.max_width, self.alignment, self.wrap, self.max_lines)
+        result = _native.OverlayStyledText(canvas._raw, decorations, self.max_width, self.alignment, self.wrap, self.max_lines)
+        result.typography(self.overflow, self.letter_spacing, self.word_spacing, self.line_height, self.ligatures, self.kerning)
+        return result
 
 class RetainedTextLayout:
     """Opaque, immutable host layout. Release explicitly through its owning window."""
@@ -313,7 +322,7 @@ class OverlaySession:
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
         required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT) if p not in required})
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))
