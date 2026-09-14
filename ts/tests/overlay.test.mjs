@@ -24,10 +24,17 @@ test("native overlays reuse scenes and isolate retained assets and parent handle
     await window.drawImage(canvas, image, rect);
     await assert.rejects(neighbor.drawImage(new Canvas(), image, rect));
     await window.present(canvas); await window.present(canvas.snapshot());
+    const receipt = await window.submit(canvas.snapshot());
+    assert.equal(receipt.revision,3n); assert.equal(await receipt.wait(0),undefined);
+    await assert.rejects(receipt.wait(61));
+    await window.releaseImage(image);
+    await assert.rejects(window.submit(canvas)); await assert.rejects(window.releaseImage(image));
     await assert.rejects(window.uploadRgba(2, 2, Buffer.from("bad")));
     await window.close(); await assert.rejects(window.present(canvas));
-    await neighbor.present(canvas);
+    await assert.rejects(neighbor.present(canvas));
+    await neighbor.present(drawing());
     await session.close(); await assert.rejects(neighbor.present(canvas));
+    await assert.rejects(receipt.wait(0));
   } finally { await session.close(); await other.close(); }
 });
 test("canvas validation bounds geometry, state, colors and full-width hit IDs", () => {
@@ -48,6 +55,9 @@ test("typed events preserve bigint identities and translate IME offsets to UTF-1
   const pointer = decodeOverlayEvent(raw({ kind: "pointer", values: [1, 2, 0, 1, 1] }));
   assert.equal(pointer.sceneRevision, (1n << 64n)-1n);
   assert.equal(pointer.applicationId, (1n << 63n)+17n);
+  const viewport = decodeOverlayEvent(raw({ kind:"viewport", values:[400,300,3,2] }));
+  assert.equal(viewport.revision,(1n << 64n)-1n); assert.equal(viewport.sceneRevision,0n);
+  assert.equal(viewport.viewport.scaleNumerator,3);
 });
 
 test("unsupported presenters reject the automatically required overlay profiles", async () => {

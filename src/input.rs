@@ -378,6 +378,7 @@ impl Session {
             connection.set_receive_body_limit(maximum_body)?;
         }
         let shared = Arc::new(PendingInput {
+            overlay_receipts: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_ready: Condvar::new(),
@@ -421,6 +422,7 @@ fn spawn_interactive_reader(
         .name("vivid-input-reader".into())
         .spawn(move || {
             let result = (|| -> io::Result<()> {
+                let mut viewport_revision = 0;
                 loop {
                     let record = reader.read_record()?;
                     if record.flags & !vivid_protocol::wire::RECORD_OPTIONAL != 0 {
@@ -434,7 +436,10 @@ fn spawn_interactive_reader(
                         common
                             || matches!(
                                 record.record_type,
-                                messages::OK | messages::OVERLAY_INPUT_EVENT
+                                messages::OK
+                                    | messages::OVERLAY_INPUT_EVENT
+                                    | messages::OVERLAY_SUBMISSION_OUTCOME
+                                    | messages::OVERLAY_VIEWPORT_CHANGED
                             )
                     } else {
                         matches!(
@@ -491,6 +496,39 @@ fn spawn_interactive_reader(
                         return Err(invalid_data("presenter sent a fatal interactive error"));
                     }
                     let event = match record.record_type {
+                        messages::OVERLAY_SUBMISSION_OUTCOME => {
+                            let outcome = vivid_protocol::overlay::wire::SubmissionOutcome::decode(
+                                record.object_id,
+                                &Value::Map(envelope.payload.clone()),
+                            )?;
+                            if let Some(receipt) =
+                                lock(&pending.overlay_receipts, "overlay receipts")?
+                                    .remove(&outcome.submission)
+                            {
+                                receipt.finish(Ok(outcome.outcome));
+                                continue;
+                            }
+                            InputLaneEvent::Input {
+                                record_type: record.record_type,
+                                surface_id: record.object_id,
+                                payload: envelope.payload,
+                            }
+                        }
+                        messages::OVERLAY_VIEWPORT_CHANGED => {
+                            let update = vivid_protocol::overlay::wire::ViewportChanged::decode(
+                                record.object_id,
+                                &Value::Map(envelope.payload.clone()),
+                            )?;
+                            if update.revision <= viewport_revision {
+                                return Err(invalid_data("viewport revision did not advance"));
+                            }
+                            viewport_revision = update.revision;
+                            InputLaneEvent::Input {
+                                record_type: record.record_type,
+                                surface_id: record.object_id,
+                                payload: envelope.payload,
+                            }
+                        }
                         messages::OVERLAY_INPUT_EVENT => {
                             vivid_protocol::overlay::wire::InputEvent::decode(
                                 record.object_id,
@@ -537,6 +575,23 @@ fn spawn_interactive_reader(
                         }
                     };
                     let mut events = lock(&pending.events, "input event queue")?;
+                    if matches!(
+                        event,
+                        InputLaneEvent::Input {
+                            record_type: messages::OVERLAY_VIEWPORT_CHANGED,
+                            ..
+                        }
+                    ) {
+                        events.retain(|e| {
+                            !matches!(
+                                e,
+                                InputLaneEvent::Input {
+                                    record_type: messages::OVERLAY_VIEWPORT_CHANGED,
+                                    ..
+                                }
+                            )
+                        });
+                    }
                     if events.len()
                         >= if overlay {
                             vivid_protocol::overlay::MAX_PENDING_EVENTS
@@ -571,7 +626,66 @@ fn spawn_interactive_reader(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayLaneEvent {
     Input(vivid_protocol::overlay::wire::InputEvent),
+    Outcome(vivid_protocol::overlay::wire::SubmissionOutcome),
+    Viewport(vivid_protocol::overlay::wire::ViewportChanged),
     ConnectionLost { diagnostic: String },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OverlayCompletion {
+    result: Mutex<Option<Result<vivid_protocol::overlay::wire::PresentationOutcome, String>>>,
+    ready: Condvar,
+}
+impl OverlayCompletion {
+    pub(crate) fn finish(
+        &self,
+        result: Result<vivid_protocol::overlay::wire::PresentationOutcome, String>,
+    ) {
+        if let Ok(mut slot) = self.result.lock()
+            && slot.is_none()
+        {
+            *slot = Some(result);
+            self.ready.notify_all();
+        }
+    }
+}
+/// Opaque submission receipt. Waiting does not consume pointer, key, or viewport events.
+#[derive(Debug, Clone)]
+pub struct OverlaySubmission {
+    pub(crate) identity: vivid_protocol::overlay::wire::Submission,
+    completion: Arc<OverlayCompletion>,
+}
+impl OverlaySubmission {
+    pub fn revision(&self) -> u64 {
+        self.identity.revision
+    }
+    pub fn wait(
+        &self,
+        timeout: Duration,
+    ) -> io::Result<Option<vivid_protocol::overlay::wire::PresentationOutcome>> {
+        if timeout > Duration::from_secs(60) {
+            return Err(invalid_input("submission wait exceeds 60 seconds"));
+        }
+        let deadline = Instant::now() + timeout;
+        let mut result = lock(&self.completion.result, "overlay submission")?;
+        loop {
+            if let Some(result) = result.as_ref() {
+                return result
+                    .clone()
+                    .map(Some)
+                    .map_err(|message| io::Error::new(io::ErrorKind::BrokenPipe, message));
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            result = self
+                .completion
+                .ready
+                .wait_timeout(result, remaining)
+                .map_err(|_| invalid_data("submission lock poisoned"))?
+                .0;
+        }
+    }
 }
 
 /// An overlay-only view of an authenticated interactive lane.
@@ -582,6 +696,44 @@ pub struct OverlayInputLane {
 }
 
 impl OverlayInputLane {
+    pub(crate) fn cancel_submission(
+        &self,
+        identity: vivid_protocol::overlay::wire::Submission,
+        message: &str,
+    ) {
+        if let Ok(mut receipts) = self.inner.shared.overlay_receipts.lock()
+            && let Some(receipt) = receipts.remove(&identity)
+        {
+            receipt.finish(Err(message.to_owned()));
+        }
+    }
+    pub(crate) fn register_submission(
+        &self,
+        identity: vivid_protocol::overlay::wire::Submission,
+    ) -> io::Result<OverlaySubmission> {
+        let mut receipts = lock(&self.inner.shared.overlay_receipts, "overlay receipts")?;
+        if self.inner.shared.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "overlay lane closed",
+            ));
+        }
+        if receipts.len() >= 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many pending overlay submissions",
+            ));
+        }
+        if receipts.contains_key(&identity) {
+            return Err(invalid_input("duplicate submission receipt"));
+        }
+        let completion = Arc::new(OverlayCompletion::default());
+        receipts.insert(identity, completion.clone());
+        Ok(OverlaySubmission {
+            identity,
+            completion,
+        })
+    }
     pub fn generation(&self) -> u64 {
         self.inner.generation()
     }
@@ -589,6 +741,26 @@ impl OverlayInputLane {
     pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<OverlayLaneEvent>> {
         match self.inner.wait_event(timeout)? {
             None => Ok(None),
+            Some(InputLaneEvent::Input {
+                record_type: messages::OVERLAY_SUBMISSION_OUTCOME,
+                surface_id,
+                payload,
+            }) => Ok(Some(OverlayLaneEvent::Outcome(
+                vivid_protocol::overlay::wire::SubmissionOutcome::decode(
+                    surface_id,
+                    &Value::Map(payload),
+                )?,
+            ))),
+            Some(InputLaneEvent::Input {
+                record_type: messages::OVERLAY_VIEWPORT_CHANGED,
+                surface_id,
+                payload,
+            }) => Ok(Some(OverlayLaneEvent::Viewport(
+                vivid_protocol::overlay::wire::ViewportChanged::decode(
+                    surface_id,
+                    &Value::Map(payload),
+                )?,
+            ))),
             Some(InputLaneEvent::Input {
                 record_type: messages::OVERLAY_INPUT_EVENT,
                 surface_id,
@@ -755,6 +927,11 @@ pub(crate) fn close_input_lane(pending: &PendingInput, message: &str) {
         });
     }
     pending.events_ready.notify_all();
+    if let Ok(mut receipts) = pending.overlay_receipts.lock() {
+        for (_, receipt) in receipts.drain() {
+            receipt.finish(Err(message.to_owned()));
+        }
+    }
     fail_pending_input(pending, message);
 }
 
@@ -833,6 +1010,60 @@ pub(crate) fn decode_input_termination(
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+    #[test]
+    fn overlay_receipts_are_repeatable_bounded_and_resolved_on_lane_loss() {
+        use vivid_protocol::overlay::wire::{PresentationOutcome, Submission, WindowAddress};
+        let mut config = ProducerConfig::offline();
+        config.required_profiles.extend([
+            TERMINAL_OVERLAY.into(),
+            VECTOR_SCENE.into(),
+            OVERLAY_INPUT.into(),
+        ]);
+        config.required_profiles.sort();
+        config.required_profiles.dedup();
+        let session = Session::connect(config).unwrap();
+        let lane = session.open_overlay_input_lane(1).unwrap();
+        let identity = Submission {
+            address: WindowAddress {
+                context_id: 1,
+                surface_id: 2,
+                generation: 1,
+            },
+            track_id: 3,
+            channel_generation: 1,
+            epoch: 1,
+            revision: u64::MAX,
+        };
+        let receipt = lane.register_submission(identity).unwrap();
+        assert!(lane.register_submission(identity).is_err());
+        assert_eq!(receipt.wait(Duration::ZERO).unwrap(), None);
+        assert!(receipt.wait(Duration::from_secs(61)).is_err());
+        receipt
+            .completion
+            .finish(Ok(PresentationOutcome::Presented));
+        receipt
+            .completion
+            .finish(Ok(PresentationOutcome::Superseded));
+        assert_eq!(
+            receipt.wait(Duration::ZERO).unwrap(),
+            Some(PresentationOutcome::Presented)
+        );
+        let other = lane
+            .register_submission(Submission {
+                track_id: 4,
+                ..identity
+            })
+            .unwrap();
+        lane.close().unwrap();
+        assert_eq!(
+            receipt.wait(Duration::ZERO).unwrap(),
+            Some(PresentationOutcome::Presented)
+        );
+        assert_eq!(
+            other.wait(Duration::ZERO).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
     #[test]
     fn overlay_lane_requires_its_profile_and_close_retires_the_transport() {
         let session = Session::connect(ProducerConfig::offline()).unwrap();
@@ -917,6 +1148,7 @@ mod audit_tests {
             let (reader, writer) = connection.split().unwrap();
             let (sender, receiver) = mpsc::channel();
             let pending = Arc::new(PendingInput {
+                overlay_receipts: Mutex::new(HashMap::new()),
                 requests: Mutex::new(HashMap::from([(7, sender)])),
                 events: Mutex::new(VecDeque::new()),
                 events_ready: Condvar::new(),
@@ -986,6 +1218,7 @@ mod audit_tests {
             let (reader, writer) = connection.split().unwrap();
             let (send, receive) = mpsc::channel();
             let pending = Arc::new(PendingInput {
+                overlay_receipts: Mutex::new(HashMap::new()),
                 requests: Mutex::new(HashMap::from([(7, send)])),
                 events: Mutex::new(VecDeque::new()),
                 events_ready: Condvar::new(),

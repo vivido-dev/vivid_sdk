@@ -189,6 +189,43 @@ struct PyOverlayWindow {
 }
 #[pymethods]
 impl PyOverlayWindow {
+    fn submit(&self, py: Python<'_>, canvas: &PyCanvas) -> PyResult<PyOverlaySubmission> {
+        let canvas = lock(&canvas.inner, "canvas")?.clone();
+        py.detach(|| self.inner.submit(canvas))
+            .map(|inner| PyOverlaySubmission { inner })
+            .map_err(io_error)
+    }
+    fn replace_track(&self, py: Python<'_>, canvas: &PyCanvas) -> PyResult<PyOverlaySubmission> {
+        let canvas = lock(&canvas.inner, "canvas")?.clone();
+        py.detach(|| self.inner.replace_track(canvas))
+            .map(|inner| PyOverlaySubmission { inner })
+            .map_err(io_error)
+    }
+    fn release_image(&self, py: Python<'_>, image: &PyOverlayImage) -> PyResult<()> {
+        py.detach(|| self.inner.release_image(&image.inner))
+            .map_err(io_error)
+    }
+    fn reconcile(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let state = py.detach(|| self.inner.reconcile()).map_err(io_error)?;
+        let dict = PyDict::new(py);
+        dict.set_item("bounds", model::bounds(state.bounds))?;
+        dict.set_item(
+            "viewport",
+            (
+                state.viewport.width.get(),
+                state.viewport.height.get(),
+                state.viewport.scale_numerator,
+                state.viewport.scale_denominator,
+            ),
+        )?;
+        dict.set_item("viewport_revision", state.viewport_revision)?;
+        dict.set_item("window_revision", state.window_revision)?;
+        dict.set_item("presented_revision", state.presented_revision)?;
+        dict.set_item("accepted_revision", state.accepted_revision)?;
+        dict.set_item("active_revision", state.active_revision)?;
+        dict.set_item("focused", state.focused)?;
+        Ok(dict.unbind())
+    }
     fn present(&self, py: Python<'_>, canvas: &PyCanvas) -> PyResult<()> {
         let canvas = lock(&canvas.inner, "canvas")?.clone();
         py.detach(|| self.inner.present(canvas)).map_err(io_error)
@@ -274,6 +311,23 @@ impl PyOverlayWindow {
 struct PyOverlayImage {
     inner: vivid_sdk::overlay::RetainedImage,
 }
+#[pyclass(name = "OverlaySubmission", module = "vivid_sdk._native")]
+struct PyOverlaySubmission {
+    inner: vivid_sdk::OverlaySubmission,
+}
+#[pymethods]
+impl PyOverlaySubmission {
+    #[getter]
+    fn revision(&self) -> u64 {
+        self.inner.revision()
+    }
+    fn wait(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<&'static str>> {
+        let timeout = model::timeout(timeout).map_err(io_error)?;
+        py.detach(|| self.inner.wait(timeout))
+            .map(|result| result.map(model::outcome))
+            .map_err(io_error)
+    }
+}
 #[pyclass(name = "OverlayEvent", module = "vivid_sdk._native")]
 struct PyOverlayEvent {
     owner: Weak<vivid_sdk::OverlaySession>,
@@ -306,5 +360,6 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyOverlayWindow>()?;
     module.add_class::<PyOverlayImage>()?;
     module.add_class::<PyOverlayEvent>()?;
+    module.add_class::<PyOverlaySubmission>()?;
     Ok(())
 }

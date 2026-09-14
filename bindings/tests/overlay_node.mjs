@@ -18,22 +18,34 @@ try {
     canvas.fill(Path.rectangle({ x, y, width: 10, height: 10 }), Brush.solid(color));
   }
   canvas.hit((1n << 63n) + 17n, Path.rectangle({ x: 0, y: 0, width: 100, height: 80 }));
+  const replacementCanvas = canvas.snapshot();
   const image = await window.uploadRgba(2, 2, Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255));
   await window.drawImage(canvas, image, { x: 50, y: 0, width: 20, height: 20 });
-  await window.present(canvas);
+  const receipt = await window.submit(canvas);
+  assert.equal(receipt.revision, 1n); assert.equal(await receipt.wait(10), "presented");
+  await window.releaseImage(image);
+  await assert.rejects(window.submit(canvas));
   const deadline = Date.now() + 10000, seen = new Set();
   for await (const event of session.events()) {
+    if (event.kind === "viewport" && event.viewport.width === 500) {
+      assert(event.revision >= 2n); assert.equal(event.sceneRevision, 0n); seen.add("viewport");
+    }
     if (event.kind === "pointer" || event.kind === "ime") {
       assert(event.targets(window)); assert.equal(event.sceneRevision, 1n);
     }
     if (event.kind === "pointer") { assert.equal(event.applicationId, (1n << 63n) + 17n); seen.add("pointer"); }
     if (event.kind === "ime") { assert.equal(event.preedit, "A😀日"); assert.deepEqual(event.selection, [1, 3]); seen.add("ime"); }
     assert(Date.now() < deadline);
-    if (seen.size === 2) break;
+    if (seen.size === 3) break;
   }
   await session.capturePointer(window); await session.capturePointer(window, false);
   assert.equal(await release, "release");
+  const pending = await window.submit(new Canvas());
+  const replacement = await window.replaceTrack(replacementCanvas);
+  assert.equal(await pending.wait(5), "superseded"); assert.equal(replacement.revision, 3n);
+  const state = await window.reconcile(); assert.equal(state.activeRevision, 3n); assert.equal(state.acceptedRevision, 3n);
+  assert.equal(await replacement.wait(10), "presented"); assert.equal((await window.reconcile()).presentedRevision, 3n);
   const popup = await session.createWindow({ bounds: { x: 40, y: 40, width: 20, height: 20 }, mode: "popup" }, window);
   await popup.present(new Canvas()); await popup.close();
-  await window.present(canvas); await window.close();
+  await window.present(replacementCanvas); await window.close();
 } finally { await session.close(); input.close(); }

@@ -97,7 +97,7 @@ pub use file_drop::{
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
-    OverlayInputLane, OverlayLaneEvent,
+    OverlayInputLane, OverlayLaneEvent, OverlaySubmission,
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use media_info::probe_encoded_image;
@@ -760,6 +760,7 @@ mod tests {
     #[test]
     fn input_and_track_queue_pressure_fail_closed_without_dropping_transitions() {
         let pending = PendingInput {
+            overlay_receipts: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::from([InputLaneEvent::Input {
                 record_type: messages::KEY_INPUT,

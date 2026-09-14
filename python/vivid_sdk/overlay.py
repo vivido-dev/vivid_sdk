@@ -120,6 +120,27 @@ class Canvas:
 class RetainedImage:
     def __init__(self, raw: Any) -> None: self._raw = raw
 
+PresentationOutcome = Literal["presented", "superseded"]
+
+class OverlaySubmission:
+    """A specific submission. Timeout leaves the receipt usable; lane loss raises OSError."""
+    def __init__(self, raw: Any) -> None: self._raw = raw
+    @property
+    def revision(self) -> int: return int(self._raw.revision)
+    def wait(self, timeout: float = 0.25) -> Optional[PresentationOutcome]:
+        return cast(Optional[PresentationOutcome], self._raw.wait(timeout))
+
+@dataclass(frozen=True)
+class OverlayWindowStatus:
+    bounds: Rect
+    viewport: Viewport
+    viewport_revision: int
+    window_revision: int
+    presented_revision: int
+    accepted_revision: int
+    active_revision: Optional[int]
+    focused: bool
+
 class _WindowHandle(Protocol):
     @property
     def _raw(self) -> Any: ...
@@ -193,9 +214,22 @@ class ConnectionLostEvent(OverlayEvent):
     kind: ClassVar[str] = "connection-lost"
     diagnostic: str
 
+@dataclass(frozen=True)
+class ViewportEvent(OverlayEvent):
+    kind: ClassVar[str] = "viewport"
+    revision: int
+    viewport: Viewport
+
+@dataclass(frozen=True)
+class SubmissionOutcomeEvent(OverlayEvent):
+    kind: ClassVar[str] = "submission-outcome"
+    outcome: PresentationOutcome
+
 def _event(raw: Any) -> OverlayEvent:
     data = raw.data()
     kind, revision, values, text = data["kind"], data["revision"], data["values"], data["text"]
+    if kind == "viewport": return ViewportEvent(0, raw, revision, Viewport(values[0], values[1], int(values[2]), int(values[3])))
+    if kind == "submission-outcome": return SubmissionOutcomeEvent(revision, raw, cast(PresentationOutcome, text))
     if kind == "pointer": return PointerEvent(revision, raw, Point(*values[:2]), data["region"], int(values[2]), int(values[3]) if len(values) > 3 else None, bool(values[4]) if len(values) > 3 else None)
     if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]))
     if kind == "key": return KeyEvent(revision, raw, int(values[0]), bool(values[1]), bool(values[2]), int(values[3]))
@@ -254,6 +288,15 @@ class OverlayWindow:
     def present(self, canvas: Canvas) -> None:
         """Submit an atomic snapshot; success does not acknowledge GPU presentation."""
         self._raw.present(canvas._raw)
+    def submit(self, canvas: Canvas) -> OverlaySubmission:
+        return OverlaySubmission(self._raw.submit(canvas._raw))
+    def replace_track(self, canvas: Canvas) -> OverlaySubmission:
+        """Prime and activate a fresh track; old retained images cannot appear in canvas."""
+        return OverlaySubmission(self._raw.replace_track(canvas._raw))
+    def release_image(self, image: RetainedImage) -> None: self._raw.release_image(image._raw)
+    def reconcile(self) -> OverlayWindowStatus:
+        state = self._raw.reconcile()
+        return OverlayWindowStatus(Rect(*state["bounds"]), Viewport(*state["viewport"]), state["viewport_revision"], state["window_revision"], state["presented_revision"], state["accepted_revision"], state["active_revision"], state["focused"])
     def set_bounds(self, bounds: Rect) -> None: self._raw.set_bounds(bounds._values())
     def set_visible(self, visible: bool) -> None: self._raw.set_visible(visible)
     def center(self) -> None: self._raw.action("center")

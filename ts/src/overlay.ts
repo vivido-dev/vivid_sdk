@@ -22,6 +22,10 @@ interface NativeCanvas {
 }
 interface CanvasConstructor { new(): NativeCanvas; shape(kind: string, bounds: number[], radius: number): number[][] }
 interface NativeWindow {
+  submit(canvas: NativeCanvas): Promise<NativeSubmission>;
+  replaceTrack(canvas: NativeCanvas): Promise<NativeSubmission>;
+  releaseImage(image: object): Promise<void>;
+  reconcile(): Promise<Omit<OverlayWindowStatus, "bounds" | "viewport"> & { bounds: number[]; viewport: number[] }>;
   present(canvas: NativeCanvas): Promise<void>;
   setBounds(bounds: number[]): Promise<void>;
   setVisible(visible: boolean): Promise<void>;
@@ -92,6 +96,21 @@ export class Canvas {
 }
 export class RetainedImage { /** @internal */ constructor(readonly raw: object) {} }
 
+export type PresentationOutcome = "presented" | "superseded";
+interface NativeSubmission { readonly revision: bigint; wait(timeout: number): Promise<PresentationOutcome | null> }
+export class OverlaySubmission {
+  /** @internal */ constructor(private readonly raw: NativeSubmission) {}
+  get revision(): bigint { return this.raw.revision; }
+  /** Timeout returns undefined and leaves the receipt usable. Lane loss rejects the wait. */
+  async wait(timeout = 0.25): Promise<PresentationOutcome | undefined> { return (await call(this.raw.wait(timeout))) ?? undefined; }
+}
+export interface OverlayWindowStatus {
+  readonly bounds: Rect; readonly viewport: Viewport; readonly viewportRevision: bigint;
+  readonly windowRevision: bigint; readonly presentedRevision: bigint; readonly acceptedRevision: bigint;
+  readonly activeRevision?: bigint; readonly focused: boolean;
+}
+const asViewport = (v: number[]): Viewport => ({ width: v[0]!, height: v[1]!, scaleNumerator: v[2]!, scaleDenominator: v[3]! });
+
 interface EventBase { readonly sceneRevision: bigint; targets(window: OverlayWindow): boolean }
 export type OverlayEvent = EventBase & (
   | { readonly kind: "pointer"; readonly position: Point; readonly applicationId: bigint; readonly modifiers: number; readonly button?: number; readonly down?: boolean }
@@ -104,6 +123,8 @@ export type OverlayEvent = EventBase & (
   | { readonly kind: "dismissed"; readonly reason: "escape" | "outside-press" | "closed" | "owner-lost" | "parent-closed" }
   | { readonly kind: "cancel" }
   | { readonly kind: "connection-lost"; readonly diagnostic: string }
+  | { readonly kind: "viewport"; readonly revision: bigint; readonly viewport: Viewport }
+  | { readonly kind: "submission-outcome"; readonly outcome: PresentationOutcome }
 );
 /** @internal Native conversion is exported only for binding regression tests. */
 export function decodeOverlayEvent(raw: NativeEvent): OverlayEvent {
@@ -111,6 +132,11 @@ export function decodeOverlayEvent(raw: NativeEvent): OverlayEvent {
   const base: EventBase = { sceneRevision: data.revision, targets: window => callSync(() => raw.targets(window.raw)) };
   const position = { x: v[0]!, y: v[1]! };
   switch (data.kind) {
+    case "viewport": return { ...base, sceneRevision: 0n, kind: "viewport", revision: data.revision, viewport: asViewport(v) };
+    case "submission-outcome": {
+      if (data.text !== "presented" && data.text !== "superseded") throw new Error("unknown submission outcome");
+      return { ...base, kind: "submission-outcome", outcome: data.text };
+    }
     case "pointer": return { ...base, kind: "pointer", position, applicationId: data.region, modifiers: v[2]!, button: v[3], down: v.length > 3 ? Boolean(v[4]) : undefined };
     case "wheel": return { ...base, kind: "wheel", position, dx: v[2]!, dy: v[3]!, modifiers: v[4]! };
     case "key": return { ...base, kind: "key", physical: v[0]!, down: Boolean(v[1]), repeat: Boolean(v[2]), modifiers: v[3]! };
@@ -169,6 +195,13 @@ export class OverlayWindow {
   get closed(): boolean { return this.stopped; }
   /** Success acknowledges submission and initial activation, not GPU presentation. */
   async present(canvas: Canvas): Promise<void> { await call(this.raw.present(canvas.raw)); }
+  async submit(canvas: Canvas): Promise<OverlaySubmission> { return new OverlaySubmission(await call(this.raw.submit(canvas.raw))); }
+  /** Prime and activate a fresh track. The replacement cannot reference old retained images. */
+  async replaceTrack(canvas: Canvas): Promise<OverlaySubmission> { return new OverlaySubmission(await call(this.raw.replaceTrack(canvas.raw))); }
+  async releaseImage(image: RetainedImage): Promise<void> { await call(this.raw.releaseImage(image.raw)); }
+  async reconcile(): Promise<OverlayWindowStatus> {
+    const state = await call(this.raw.reconcile()); return { ...state, bounds: asRect(state.bounds), viewport: asViewport(state.viewport) };
+  }
   async setBounds(bounds: Rect): Promise<void> { await call(this.raw.setBounds(values(bounds))); }
   async setVisible(visible: boolean): Promise<void> { await call(this.raw.setVisible(visible)); }
   async center(): Promise<void> { await call(this.raw.action("center")); }

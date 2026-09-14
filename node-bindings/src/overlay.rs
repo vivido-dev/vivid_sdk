@@ -198,6 +198,59 @@ pub struct OverlayWindow {
 #[napi]
 impl OverlayWindow {
     #[napi]
+    pub async fn submit(&self, canvas: &OverlayCanvas) -> Result<OverlaySubmission> {
+        let canvas = locked(&canvas.inner, "canvas")?.clone();
+        let window = self.inner.clone();
+        blocking(move || {
+            window
+                .submit(canvas)
+                .map(|inner| OverlaySubmission { inner })
+                .map_err(io_error)
+        })
+        .await
+    }
+    #[napi]
+    pub async fn replace_track(&self, canvas: &OverlayCanvas) -> Result<OverlaySubmission> {
+        let canvas = locked(&canvas.inner, "canvas")?.clone();
+        let window = self.inner.clone();
+        blocking(move || {
+            window
+                .replace_track(canvas)
+                .map(|inner| OverlaySubmission { inner })
+                .map_err(io_error)
+        })
+        .await
+    }
+    #[napi]
+    pub async fn release_image(&self, image: &OverlayImage) -> Result<()> {
+        let image = image.inner.clone();
+        let window = self.inner.clone();
+        blocking(move || window.release_image(&image).map_err(io_error)).await
+    }
+    #[napi]
+    pub async fn reconcile(&self) -> Result<OverlayWindowStatus> {
+        let window = self.inner.clone();
+        blocking(move || {
+            let state = window.reconcile().map_err(io_error)?;
+            Ok(OverlayWindowStatus {
+                bounds: model::bounds(state.bounds),
+                viewport: vec![
+                    state.viewport.width.get(),
+                    state.viewport.height.get(),
+                    f64::from(state.viewport.scale_numerator),
+                    f64::from(state.viewport.scale_denominator),
+                ],
+                viewport_revision: state.viewport_revision.into(),
+                window_revision: state.window_revision.into(),
+                presented_revision: state.presented_revision.into(),
+                accepted_revision: state.accepted_revision.into(),
+                active_revision: state.active_revision.map(Into::into),
+                focused: state.focused,
+            })
+        })
+        .await
+    }
+    #[napi]
     pub async fn present(&self, canvas: &OverlayCanvas) -> Result<()> {
         let canvas = locked(&canvas.inner, "canvas")?.clone();
         let window = self.inner.clone();
@@ -299,6 +352,40 @@ impl OverlayWindow {
 #[napi]
 pub struct OverlayImage {
     inner: vivid_sdk::overlay::RetainedImage,
+}
+#[napi(object)]
+pub struct OverlayWindowStatus {
+    pub bounds: Vec<f64>,
+    pub viewport: Vec<f64>,
+    pub viewport_revision: BigInt,
+    pub window_revision: BigInt,
+    pub presented_revision: BigInt,
+    pub accepted_revision: BigInt,
+    pub active_revision: Option<BigInt>,
+    pub focused: bool,
+}
+#[napi]
+pub struct OverlaySubmission {
+    inner: vivid_sdk::OverlaySubmission,
+}
+#[napi]
+impl OverlaySubmission {
+    #[napi(getter)]
+    pub fn revision(&self) -> BigInt {
+        self.inner.revision().into()
+    }
+    #[napi]
+    pub async fn wait(&self, timeout: f64) -> Result<Option<String>> {
+        let timeout = model::timeout(timeout).map_err(io_error)?;
+        let receipt = self.inner.clone();
+        blocking(move || {
+            receipt
+                .wait(timeout)
+                .map(|r| r.map(|v| model::outcome(v).into()))
+                .map_err(io_error)
+        })
+        .await
+    }
 }
 #[napi]
 pub struct OverlayEvent {

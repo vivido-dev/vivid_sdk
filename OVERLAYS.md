@@ -47,18 +47,33 @@ handles are rejected before sending anything. Coordinates are viewport logical p
 not follow terminal scrollback.
 
 `present(Canvas)` reuses the window's surface, immutable vector track, and authenticated channel.
-Initial readiness is bounded to five seconds before activation. Later calls acknowledge submission,
-not physical presentation; the producer does not claim a superseded scene reached the GPU.
+Initial readiness is bounded to five seconds before activation. Use `submit(Canvas)` to obtain
+an `OverlaySubmission` with an opaque identity and a full-width `revision()`. Its bounded
+`wait(Duration)` returns `Some(Presented)`, `Some(Superseded)`, or `None` on timeout. A timeout
+leaves the receipt usable; lane or track loss returns an error. Waiting does not consume input events.
+Presented means successful host composition, not physical scanout. `present` remains a convenience
+that submits and discards the receipt. Unresolved submissions are bounded to 256 per session.
+
+`reconcile()` returns authoritative geometry, viewport and window revisions, highest accepted
+revision, active revision, last presented revision, and focus. `replace_track(Canvas)` primes
+and activates a new immutable track on the same surface, then retires its predecessor, returning
+a submission receipt. Window revisions continue across replacement. The old complete scene stays
+visible until composition of its replacement; old-track image handles cannot be reused on the
+new track. The initial replacement Canvas must contain no old image references.
 The high-level helper currently budgets at most 256 KiB per record, reduced by the session's
 negotiated limits. The low-level vector channel APIs remain available for explicit resource claims.
 
 The `overlay` module re-exports portable Canvas commands, paths, brushes, transforms, text, and
 hit roles. Host text shaping runs off the UI loop. Upload RGBA pixels with `window.upload_rgba`;
 `window.draw_image` checks the retained handle's window ownership before adding it to a Canvas.
-Assets remain retained until window/channel cleanup; independent asset release is still pending.
+`release_image(&image)` removes an image from future lookup independently of window lifetime.
+Previously submitted scenes retain their references and decoded storage remains charged until
+those references are gone. Drawing or submitting a prebuilt Canvas with a released image fails.
 
 `wait_event(Duration)` returns typed pointer, wheel, key, text, IME, geometry, focus, dismissal,
-and connection-loss events. `capture_pointer` validates ownership and the current scene revision.
+connection-loss, and unsolicited `Viewport` events. Viewport notifications include their own
+revision, logical extent, and scale. They arrive initially and on changes, and may coalesce.
+`capture_pointer` validates ownership and the current scene revision.
 Popups dismiss on Escape or an outside press and consume the corresponding release. Modal focus
 is isolated from other producers. Host drag/resize hit regions change window geometry while the
 compiled content stays cached. Native pane focus loss cancels gestures and held input state.
@@ -135,7 +150,15 @@ brushes, strokes, opacity, affine transforms, nested clips, host-shaped text, an
 copied when added to a Canvas. Use `validate()` to check a complete list without sending it.
 An image returned by `upload_rgba` / `uploadRgba` belongs to its window; `draw_image` / `drawImage`
 validates this before appending the retained reference. Await TypeScript `drawImage` before
-modifying or presenting the Canvas. Image release currently occurs on window/channel cleanup.
+modifying or presenting the Canvas. `release_image(image)` / `releaseImage(image)` releases its
+namespace entry while protecting references in pending or displayed scenes.
+
+Python `window.submit(canvas)` and TypeScript `await window.submit(canvas)` return a receipt;
+`receipt.wait(seconds)` returns `"presented"`, `"superseded"`, or a timeout (`None` / `undefined`).
+Await both submission and receipt waits in Python's async facade. TypeScript receipt revisions
+are `bigint`. Use `reconcile()` for a typed status snapshot and `replace_track(canvas)` /
+`replaceTrack(canvas)` for an immutable track replacement. In TypeScript all status revisions
+are also `bigint`. Receipt waits remain independent of event iteration.
 
 Colors are straight-alpha sRGB `0xRRGGBBAA`; opacity and gradient offsets are in `[0, 1]`.
 Geometry uses logical pixels. Hit roles are `input`, `drag`, `resize`, and `transparent`;
@@ -145,7 +168,8 @@ and richer styled text remain separate host-service work.
 
 `wait_event(timeout)` / `waitEvent(timeout)` use **seconds**, bounded to 0–60. Event iteration
 uses bounded waits and ends after connection loss or explicit session close. Typed events cover
-pointer, wheel, physical key, committed text, IME, focus, geometry, dismissal, and cancellation.
+pointer, wheel, physical key, committed text, IME, focus, geometry, dismissal, cancellation,
+and viewport changes (`ViewportEvent` / `kind: "viewport"`, with `revision` and `viewport`).
 Python provides event dataclasses; TypeScript provides a discriminated union on `kind`.
 IME selections use Python character indexes or JavaScript UTF-16 indexes into the preedit string.
 TypeScript scene revisions and application hit IDs are `bigint` throughout. Window, session,
@@ -170,14 +194,13 @@ cargo test --lib native_overlay_python_and_typescript_bindings -- --ignored --no
 The harness starts Python blocking, Python asyncio, and TypeScript producers against isolated
 authenticated host sessions. It verifies exact four-color Vello readback, window controls,
 retained assets, typed pointer input with an ID above 2^53, IME offset conversion, capture,
-child popups, repeated presentation, and cleanup. Each subprocess has a bounded deadline.
+child popups, per-submission outcomes, track replacement/reconciliation, independent asset
+release, unsolicited viewport changes, and cleanup. Each subprocess has a bounded deadline.
 Capabilities are passed through child environments, never command arguments. A Vello adapter
 is required; this test fails rather than silently skipping its rendering assertions.
 
 ## Remaining work and acceptance
 
-- Explicit per-submission presented/superseded outcomes, richer reconciliation across replacement
-  tracks, independent retained-asset release, and unsolicited typed viewport updates.
 - Host text measurement and focused-editor geometry for platform IME positioning.
 - Full live visual/input acceptance, including clipboard policy, IME placement, accessibility,
   platform-specific input behavior, and performance measurements.

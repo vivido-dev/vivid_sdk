@@ -186,10 +186,28 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
         text: String::new(),
     };
     let vivid_sdk::OverlayLaneEvent::Input(input) = event else {
-        let vivid_sdk::OverlayLaneEvent::ConnectionLost { diagnostic } = event else {
-            unreachable!()
-        };
-        data.text = diagnostic.clone();
+        match event {
+            vivid_sdk::OverlayLaneEvent::ConnectionLost { diagnostic } => {
+                data.text = diagnostic.clone()
+            }
+            vivid_sdk::OverlayLaneEvent::Viewport(update) => {
+                data.kind = "viewport";
+                data.revision = update.revision;
+                let v = update.viewport;
+                data.values = vec![
+                    v.width.get(),
+                    v.height.get(),
+                    f64::from(v.scale_numerator),
+                    f64::from(v.scale_denominator),
+                ];
+            }
+            vivid_sdk::OverlayLaneEvent::Outcome(result) => {
+                data.kind = "submission-outcome";
+                data.revision = result.submission.revision;
+                data.text = outcome(result.outcome).into();
+            }
+            vivid_sdk::OverlayLaneEvent::Input(_) => unreachable!(),
+        }
         return data;
     };
     data.revision = input.scene_revision;
@@ -276,4 +294,11 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
         }
     }
     data
+}
+
+pub fn outcome(value: vivid_sdk::overlay::PresentationOutcome) -> &'static str {
+    match value {
+        vivid_sdk::overlay::PresentationOutcome::Presented => "presented",
+        vivid_sdk::overlay::PresentationOutcome::Superseded => "superseded",
+    }
 }

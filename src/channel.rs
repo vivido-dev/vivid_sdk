@@ -65,6 +65,7 @@ pub(crate) struct ChannelMediaState {
     pub(crate) eos: bool,
     vector_assets: BTreeMap<u64, u64>,
     vector_asset_bytes: u64,
+    last_vector_asset_id: u64,
 }
 
 pub(crate) struct ChannelRateState {
@@ -249,6 +250,7 @@ impl TrackChannel {
             eos: false,
             vector_assets: BTreeMap::new(),
             vector_asset_bytes: 0,
+            last_vector_asset_id: 0,
         }));
         {
             let mut state = lock(&track.inner, "track")?;
@@ -838,9 +840,9 @@ impl TrackChannel {
             if media.eos {
                 return Err(invalid_input("assets cannot follow CHANNEL_EOS"));
             }
-            if media.vector_assets.contains_key(&asset.id) {
+            if asset.id <= media.last_vector_asset_id {
                 return Err(invalid_input(
-                    "retained asset ID already exists in this channel generation",
+                    "retained asset IDs must increase in this channel generation",
                 ));
             }
             if asset_bytes > limits.values()[7]
@@ -869,6 +871,38 @@ impl TrackChannel {
         media.last_sequence = sequence;
         media.vector_assets.insert(asset.id, asset_bytes);
         media.vector_asset_bytes += asset_bytes;
+        media.last_vector_asset_id = asset.id;
+        Ok(sequence)
+    }
+
+    /// Remove an asset from future scene lookup. Already submitted scenes retain their images.
+    pub fn release_vector_asset(&self, id: u64) -> io::Result<u64> {
+        self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
+        let configuration = self.track.configuration()?;
+        let bytes = {
+            let media = lock(&self.media, "channel media state")?;
+            if media.eos {
+                return Err(invalid_input("asset release cannot follow CHANNEL_EOS"));
+            }
+            *media
+                .vector_assets
+                .get(&id)
+                .ok_or_else(|| invalid_input("retained asset is absent"))?
+        };
+        let body = vivid_protocol::vector::AssetRelease { id }
+            .encode()
+            .map_err(|e| invalid_input(e.0))?;
+        let sequence = self.write_charged_record(
+            messages::VECTOR_ASSET_RELEASE,
+            configuration.track_id,
+            8,
+            &body,
+        )?;
+        let mut media = lock(&self.media, "channel media state")?;
+        media.last_sequence = sequence;
+        media.vector_assets.remove(&id);
+        media.vector_asset_bytes -= bytes;
         Ok(sequence)
     }
 
@@ -943,6 +977,19 @@ impl TrackChannel {
             let media_state = lock(&self.media, "channel media state")?;
             if media_state.eos {
                 return Err(invalid_input("media cannot follow CHANNEL_EOS"));
+            }
+            if record_type == messages::VECTOR_FRAME {
+                let frame =
+                    vivid_protocol::vector::Frame::decode(body).map_err(|e| invalid_input(e.0))?;
+                for command in frame.canvas.commands() {
+                    if let vivid_protocol::vector::Command::Image { asset, .. } = command
+                        && !media_state.vector_assets.contains_key(asset)
+                    {
+                        return Err(invalid_input(
+                            "scene references an absent or released image",
+                        ));
+                    }
+                }
             }
             if media_state.needs_recovery && !recovery_unit {
                 return Err(invalid_input(
@@ -1468,7 +1515,14 @@ mod tests {
         let asset_sequence = channel.send_vector_asset(&second).unwrap();
         assert_eq!(channel.media.lock().unwrap().last_sequence, asset_sequence);
         assert_eq!(channel.track_sequence.lock().unwrap().last_id, 3);
-        assert!(channel.eos().unwrap() > asset_sequence);
+        let release_sequence = channel.release_vector_asset(7).unwrap();
+        assert!(release_sequence > asset_sequence);
+        assert_eq!(channel.media.lock().unwrap().vector_asset_bytes, 4);
+        assert!(channel.release_vector_asset(7).is_err());
+        assert!(channel.send_vector_asset(&asset).is_err());
+        assert_eq!(channel.track_sequence.lock().unwrap().last_id, 3);
+        assert!(channel.eos().unwrap() > release_sequence);
+        assert!(channel.release_vector_asset(8).is_err());
         assert!(
             channel
                 .send_vector_asset(&vivid_protocol::vector::ImageAsset { id: 9, ..asset })

@@ -59,6 +59,13 @@ class OverlaySession:
     async def __aenter__(self) -> OverlaySession: return self
     async def __aexit__(self, *args: Any) -> None: await self.close()
 
+class OverlaySubmission:
+    def __init__(self, inner: overlay.OverlaySubmission) -> None: self._inner = inner
+    @property
+    def revision(self) -> int: return self._inner.revision
+    async def wait(self, timeout: float = 0.25) -> Optional[overlay.PresentationOutcome]:
+        return await _run(self._inner.wait, timeout)
+
 class OverlayWindow:
     def __init__(self, inner: overlay.OverlayWindow) -> None: self._inner = inner
     @property
@@ -67,6 +74,13 @@ class OverlayWindow:
     def _raw(self) -> Any: return self._inner._raw
     async def present(self, canvas: overlay.Canvas) -> None:
         await _run(self._inner.present, canvas.snapshot())
+    async def submit(self, canvas: overlay.Canvas) -> OverlaySubmission:
+        return OverlaySubmission(await _run(self._inner.submit, canvas.snapshot()))
+    async def replace_track(self, canvas: overlay.Canvas) -> OverlaySubmission:
+        return OverlaySubmission(await _run(self._inner.replace_track, canvas.snapshot()))
+    async def release_image(self, image: overlay.RetainedImage) -> None:
+        await _run(self._inner.release_image, image)
+    async def reconcile(self) -> overlay.OverlayWindowStatus: return await _run(self._inner.reconcile)
     async def set_bounds(self, bounds: overlay.Rect) -> None: await _run(self._inner.set_bounds, bounds)
     async def set_visible(self, visible: bool) -> None: await _run(self._inner.set_visible, visible)
     async def center(self) -> None: await _run(self._inner.center)

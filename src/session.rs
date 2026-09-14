@@ -128,6 +128,9 @@ pub(crate) struct PendingControl {
 }
 
 pub(crate) struct PendingInput {
+    pub(crate) overlay_receipts: Mutex<
+        HashMap<vivid_protocol::overlay::wire::Submission, Arc<crate::input::OverlayCompletion>>,
+    >,
     pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
     pub(crate) events: Mutex<VecDeque<InputLaneEvent>>,
     /// Signalled whenever the lane reader queues an event or the lane ends.
@@ -1115,6 +1118,27 @@ pub(crate) fn spawn_control_reader(
                     }
                     if record.record_type == messages::TRACK_LOST {
                         apply_track_lost(record.object_id, &envelope.payload, &tracks)?;
+                        let context = required_u64(&envelope.payload, 0)?;
+                        let surface = required_u64(&envelope.payload, 1)?;
+                        let diagnostic = required_text(&envelope.payload, 6)?;
+                        for lane in lock(&lifecycle.input_lanes, "input lanes")?
+                            .iter()
+                            .filter_map(Weak::upgrade)
+                        {
+                            let mut receipts = lock(&lane.overlay_receipts, "overlay receipts")?;
+                            receipts.retain(|submission, receipt| {
+                                if submission.address.context_id == context
+                                    && submission.address.surface_id == surface
+                                    && submission.track_id == record.object_id
+                                {
+                                    receipt
+                                        .finish(Err(format!("overlay track lost: {diagnostic}")));
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                        }
                     }
                     let event =
                         session_event(record.record_type, record.object_id, envelope.payload)?;

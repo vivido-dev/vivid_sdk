@@ -8,10 +8,12 @@ use std::io;
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Duration;
 
+pub use crate::OverlaySubmission;
 use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity};
 use vivid_protocol::messages;
 use vivid_protocol::overlay::WindowOptions;
+pub use vivid_protocol::overlay::wire::PresentationOutcome;
 pub use vivid_protocol::overlay::wire::Viewport;
 use vivid_protocol::overlay::wire::{
     Action, Query, SetWindow, Status, WindowAction, WindowAddress,
@@ -56,6 +58,7 @@ pub struct OverlaySession {
 #[derive(Debug)]
 pub struct OverlayWindow {
     session: Weak<Mutex<Option<Session>>>,
+    input: Weak<OverlayInputLane>,
     address: WindowAddress,
     state: Mutex<WindowState>,
 }
@@ -78,6 +81,20 @@ pub struct RetainedImage {
     session: Weak<Mutex<Option<Session>>>,
     window: WindowAddress,
     id: u64,
+    track_id: u64,
+    channel_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayWindowStatus {
+    pub bounds: Rect,
+    pub viewport: Viewport,
+    pub viewport_revision: u64,
+    pub window_revision: u64,
+    pub presented_revision: u64,
+    pub accepted_revision: u64,
+    pub active_revision: Option<u64>,
+    pub focused: bool,
 }
 
 impl OverlaySession {
@@ -241,6 +258,7 @@ impl OverlaySession {
             let window = set_window(session, &request)?;
             Ok(OverlayWindow {
                 session: Arc::downgrade(&self.session),
+                input: Arc::downgrade(&self.input),
                 address: window.address,
                 state: Mutex::new(WindowState {
                     surface: surface.clone(),
@@ -351,6 +369,8 @@ impl OverlayWindow {
                 session: self.session.clone(),
                 window: state.window.address,
                 id,
+                track_id: state.track.id(),
+                channel_generation: state.track.channel_generation().get(),
             })
         })
     }
@@ -366,6 +386,8 @@ impl OverlayWindow {
         self.with_state(|_, state| {
             if !Weak::ptr_eq(&self.session, &image.session)
                 || image.window != state.window.address
+                || image.track_id != state.track.id()
+                || image.channel_generation != state.track.channel_generation().get()
                 || !state.assets.contains(&image.id)
             {
                 return Err(invalid_input("retained image belongs to another window"));
@@ -398,16 +420,32 @@ impl OverlayWindow {
     /// Submit a full replacement. Initial readiness is bounded to five seconds before activation.
     /// Success acknowledges sending and initial activation, not GPU presentation of later scenes.
     pub fn present(&self, canvas: Canvas) -> io::Result<()> {
+        self.submit(canvas).map(|_| ())
+    }
+
+    pub fn submit(&self, canvas: Canvas) -> io::Result<OverlaySubmission> {
         self.with_state(|session, state| {
             let next = state
                 .next_scene
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("scene revision exhausted"))?;
-            state.channel.send_vector(&Frame {
+            let input = self.input.upgrade().ok_or_else(closed)?;
+            let receipt = input.register_submission(vivid_protocol::overlay::wire::Submission {
+                address: state.window.address,
+                track_id: state.track.id(),
+                channel_generation: state.track.channel_generation().get(),
+                epoch: 1,
+                revision: state.next_scene,
+            })?;
+            let send = state.channel.send_vector(&Frame {
                 epoch: 1,
                 revision: state.next_scene,
                 canvas,
-            })?;
+            });
+            if let Err(error) = send {
+                input.cancel_submission(receipt.identity, &error.to_string());
+                return Err(error);
+            }
             state.next_scene = next;
             if !state.active {
                 session.wait_track(
@@ -428,6 +466,120 @@ impl OverlayWindow {
                 )?;
                 state.active = true;
             }
+            Ok(receipt)
+        })
+    }
+
+    /// Query authoritative placement and active/presented state; recover the next scene revision.
+    pub fn reconcile(&self) -> io::Result<OverlayWindowStatus> {
+        self.with_state(|session, state| {
+            let status = refresh(session, state)?;
+            state.next_scene = state.next_scene.max(
+                status
+                    .accepted_revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("scene revision exhausted"))?,
+            );
+            Ok(OverlayWindowStatus {
+                bounds: status.window.options.bounds,
+                viewport: status.viewport,
+                viewport_revision: status.viewport_revision,
+                window_revision: status.window.expected_revision,
+                presented_revision: status.scene_revision,
+                accepted_revision: status.accepted_revision,
+                active_revision: status.active.map(|s| s.revision),
+                focused: status.focused,
+            })
+        })
+    }
+
+    /// Prime and activate a new immutable vector track, preserving this window's identity.
+    /// Old-track images cannot be used in the replacement Canvas; upload new images afterwards.
+    pub fn replace_track(&self, canvas: Canvas) -> io::Result<OverlaySubmission> {
+        canvas.validate().map_err(io::Error::other)?;
+        if canvas
+            .commands()
+            .iter()
+            .any(|c| matches!(c, Command::Image { .. }))
+        {
+            return Err(invalid_input(
+                "replacement scene cannot reference images from the retired track",
+            ));
+        }
+        self.reconcile()?;
+        self.with_state(|session, state| {
+            let mut config = state.track.configuration()?;
+            config.track_id = session.allocate_id()?;
+            let track = session.create_track(config, &RequestMetadata::default())?;
+            let result = (|| {
+                let channel = session.open_track_channel(&track)?;
+                let input = self.input.upgrade().ok_or_else(closed)?;
+                let receipt =
+                    input.register_submission(vivid_protocol::overlay::wire::Submission {
+                        address: state.window.address,
+                        track_id: track.id(),
+                        channel_generation: track.channel_generation().get(),
+                        epoch: 1,
+                        revision: state.next_scene,
+                    })?;
+                let next = state
+                    .next_scene
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("scene revision exhausted"))?;
+                if let Err(error) = channel.send_vector(&Frame {
+                    epoch: 1,
+                    revision: state.next_scene,
+                    canvas,
+                }) {
+                    input.cancel_submission(receipt.identity, &error.to_string());
+                    return Err(error);
+                }
+                state.next_scene = next;
+                session.wait_track(
+                    &track,
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_OUTPUT_READY),
+                    5_000_000,
+                )?;
+                session.activate_tracks(
+                    &state.surface,
+                    &[SlotBinding {
+                        slot: SLOT_VECTOR,
+                        track_id: track.id(),
+                        expected_channel_generation: track.channel_generation(),
+                        required_milestone: MILESTONE_OUTPUT_READY,
+                    }],
+                    &RequestMetadata::default(),
+                )?;
+                let old = std::mem::replace(&mut state.track, track.clone());
+                let old_channel = std::mem::replace(&mut state.channel, channel);
+                state.active = true;
+                state.assets.clear();
+                let _ = old_channel.eos();
+                session.destroy_track(&old, &RequestMetadata::default())?;
+                Ok(receipt)
+            })();
+            if result.is_err() && state.track.id() != track.id() {
+                let _ = session.destroy_track(&track, &RequestMetadata::default());
+            }
+            result
+        })
+    }
+
+    pub fn release_image(&self, image: &RetainedImage) -> io::Result<()> {
+        self.with_state(|_, state| {
+            if !Weak::ptr_eq(&self.session, &image.session)
+                || image.window != state.window.address
+                || image.track_id != state.track.id()
+                || image.channel_generation != state.track.channel_generation().get()
+                || !state.assets.contains(&image.id)
+            {
+                return Err(invalid_input(
+                    "retained image is released or belongs to another track",
+                ));
+            }
+            state.channel.release_vector_asset(image.id)?;
+            state.assets.remove(&image.id);
             Ok(())
         })
     }

@@ -3,7 +3,7 @@ import asyncio
 import sys
 import time
 from vivid_sdk import OverlaySession, OverlayWindowOptions, aio
-from vivid_sdk.overlay import Canvas, Brush, Path, Rect, ImeEvent, PointerEvent
+from vivid_sdk.overlay import Canvas, Brush, Path, Rect, ImeEvent, PointerEvent, ViewportEvent
 
 OPTIONS = OverlayWindowOptions(Rect(10, 20, 100, 80))
 PIXELS = bytes([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255])
@@ -15,6 +15,9 @@ def canvas():
     return result.hit((1 << 63) + 17, Path.rectangle(Rect(0, 0, 100, 80)))
 
 def accept(event, window, seen):
+    if isinstance(event, ViewportEvent) and event.viewport.width == 500:
+        assert event.revision >= 2 and event.scene_revision == 0
+        seen.add("viewport")
     if isinstance(event, (PointerEvent, ImeEvent)):
         assert event.targets(window) and event.scene_revision == 1
     if isinstance(event, PointerEvent):
@@ -35,17 +38,29 @@ def blocking():
             scene = canvas()
             image = window.upload_rgba(2, 2, PIXELS)
             window.draw_image(scene, image, Rect(50, 0, 20, 20))
-            window.present(scene)
+            receipt = window.submit(scene)
+            assert receipt.revision == 1 and receipt.wait(10) == "presented"
+            window.release_image(image)
+            try: window.submit(scene)
+            except (ValueError, OSError): pass
+            else: raise AssertionError("released image was accepted")
             seen = set(); deadline = time.monotonic() + 10
             for event in session.events():
                 accept(event, window, seen)
                 assert time.monotonic() < deadline
-                if len(seen) == 2: break
+                if len(seen) == 3: break
             session.capture_pointer(window); session.capture_pointer(window, False)
             assert sys.stdin.readline().strip() == "release"
+            pending = window.submit(Canvas())
+            replacement = window.replace_track(canvas())
+            assert pending.wait(5) == "superseded" and replacement.revision == 3
+            status = window.reconcile()
+            assert status.active_revision == status.accepted_revision == 3
+            assert replacement.wait(10) == "presented"
+            assert window.reconcile().presented_revision == 3
             popup = session.create_window(OverlayWindowOptions(Rect(40, 40, 20, 20), "popup"), parent=window)
             popup.present(Canvas()); popup.close()
-            window.present(scene)
+            window.present(canvas())
 
 async def asynchronous():
     async with await aio.OverlaySession.from_env() as session:
@@ -58,18 +73,30 @@ async def asynchronous():
             scene = canvas()
             image = await window.upload_rgba(2, 2, PIXELS)
             await window.draw_image(scene, image, Rect(50, 0, 20, 20))
-            await window.present(scene)
+            receipt = await window.submit(scene)
+            assert receipt.revision == 1 and await receipt.wait(10) == "presented"
+            await window.release_image(image)
+            try: await window.submit(scene)
+            except (ValueError, OSError): pass
+            else: raise AssertionError("released image was accepted")
             seen = set()
             async def receive():
                 async for event in session.events():
                     accept(event, window, seen)
-                    if len(seen) == 2: return
+                    if len(seen) == 3: return
             await asyncio.wait_for(receive(), 10)
             await session.capture_pointer(window); await session.capture_pointer(window, False)
             assert sys.stdin.readline().strip() == "release"
+            pending = await window.submit(Canvas())
+            replacement = await window.replace_track(canvas())
+            assert await pending.wait(5) == "superseded" and replacement.revision == 3
+            status = await window.reconcile()
+            assert status.active_revision == status.accepted_revision == 3
+            assert await replacement.wait(10) == "presented"
+            assert (await window.reconcile()).presented_revision == 3
             popup = await session.create_window(OverlayWindowOptions(Rect(40, 40, 20, 20), "popup"), parent=window)
             await popup.present(Canvas()); await popup.close()
-            await window.present(scene)
+            await window.present(canvas())
 
 if sys.argv[-1] == "async": asyncio.run(asynchronous())
 else: blocking()

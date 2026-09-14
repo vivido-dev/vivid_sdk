@@ -4,7 +4,7 @@ import threading
 from typing import Any
 import pytest
 from vivid_sdk import OverlaySession, OverlayWindowOptions, aio
-from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, ImeEvent, PointerEvent, _event
+from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, ImeEvent, PointerEvent, ViewportEvent, _event
 
 def drawing() -> Canvas:
     path = Path().move_to(0, 0).line_to(50, 0).quad_to(60, 20, 50, 40).cubic_to(30, 60, 10, 60, 0, 40).close()
@@ -31,12 +31,20 @@ def test_native_canvas_ownership_and_session_cleanup() -> None:
             neighbor.draw_image(Canvas(), image, Rect(0, 0, 10, 10))
         window.present(canvas)
         window.present(canvas.snapshot())
+        receipt = window.submit(canvas.snapshot())
+        assert receipt.revision == 3 and receipt.wait(0) is None
+        with pytest.raises((ValueError,OSError)): receipt.wait(61)
+        window.release_image(image)
+        with pytest.raises((ValueError,OSError)): window.submit(canvas)
+        with pytest.raises((ValueError,OSError)): window.release_image(image)
         with pytest.raises((ValueError, OSError)):
             window.upload_rgba(2, 2, b"bad")
         window.close()
         with pytest.raises(OSError): window.present(canvas)
-        neighbor.present(canvas)
+        with pytest.raises((ValueError, OSError)): neighbor.present(canvas)
+        neighbor.present(drawing())
         session.close()
+        with pytest.raises(OSError): receipt.wait(0)
         with pytest.raises(OSError): neighbor.present(canvas)
 
 def test_invalid_scenes_and_numeric_boundaries() -> None:
@@ -64,6 +72,9 @@ def test_event_offsets_and_full_width_values() -> None:
     assert isinstance(pointer, PointerEvent)
     assert pointer.scene_revision == (1 << 64)-1
     assert pointer.application_id == (1 << 63)+17
+    viewport = _event(RawEvent("viewport",[400,300,3,2]))
+    assert isinstance(viewport,ViewportEvent) and viewport.revision == (1 << 64)-1
+    assert viewport.scene_revision == 0 and viewport.viewport.scale_numerator == 3
 
 def test_async_workflow_and_creation_cancellation() -> None:
     async def run() -> None:

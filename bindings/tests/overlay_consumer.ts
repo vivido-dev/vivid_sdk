@@ -11,6 +11,14 @@ async function producer(): Promise<void> {
   await window.present(canvas);
   const image = await window.uploadRgba(1, 1, Uint8Array.of(255, 0, 0, 255));
   await window.drawImage(canvas, image, { x: 0, y: 0, width: 1, height: 1 });
+  const receipt = await window.submit(canvas);
+  const submittedRevision: bigint = receipt.revision;
+  const outcome: overlay.PresentationOutcome | undefined = await receipt.wait(0);
+  await window.releaseImage(image);
+  const replacement = await window.replaceTrack(new Canvas());
+  const status: overlay.OverlayWindowStatus = await window.reconcile();
+  const acceptedRevision: bigint = status.acceptedRevision;
+  void [submittedRevision, outcome, replacement, acceptedRevision];
   for await (const event of session.events()) {
     const revision: bigint = event.sceneRevision;
     if (event.kind === "pointer" && event.targets(window)) {
@@ -20,6 +28,11 @@ async function producer(): Promise<void> {
     if (event.kind === "ime") {
       const selection: readonly [number, number] | undefined = event.selection;
       void selection;
+    }
+    if (event.kind === "viewport") {
+      const viewportRevision: bigint = event.revision;
+      const viewport: overlay.Viewport = event.viewport;
+      void [viewportRevision, viewport];
     }
     if (event.kind === "connection-lost") break;
     void revision;
