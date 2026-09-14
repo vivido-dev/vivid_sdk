@@ -257,6 +257,44 @@ impl OverlayWindow {
         blocking(move || window.present(canvas).map_err(io_error)).await
     }
     #[napi]
+    pub async fn measure_text(&self, canvas: &OverlayCanvas) -> Result<OverlayTextMeasurement> {
+        let text = model::measurement_text(&*locked(&canvas.inner, "canvas")?).map_err(io_error)?;
+        let window = self.inner.clone();
+        blocking(move || {
+            let m = window.measure_text(&text).map_err(io_error)?;
+            Ok(OverlayTextMeasurement {
+                width: m.width.get(),
+                height: m.height.get(),
+                lines: model::text_geometry(&m.lines, &text.text, true).map_err(io_error)?,
+                clusters: model::text_geometry(&m.clusters, &text.text, true).map_err(io_error)?,
+            })
+        })
+        .await
+    }
+    #[napi]
+    pub async fn set_editor_geometry(
+        &self,
+        scene_revision: BigInt,
+        caret: Option<Vec<f64>>,
+    ) -> Result<()> {
+        let (negative, revision, lossless) = scene_revision.get_u64();
+        if negative || !lossless || revision == 0 {
+            return Err(value_error("scene revision must be a nonzero u64 bigint"));
+        }
+        let caret = caret
+            .as_deref()
+            .map(model::rect)
+            .transpose()
+            .map_err(io_error)?;
+        let window = self.inner.clone();
+        blocking(move || {
+            window
+                .set_editor_geometry(revision, caret)
+                .map_err(io_error)
+        })
+        .await
+    }
+    #[napi]
     pub async fn set_bounds(&self, bounds: Vec<f64>) -> Result<()> {
         let bounds = model::rect(&bounds).map_err(io_error)?;
         let window = self.inner.clone();
@@ -363,6 +401,14 @@ pub struct OverlayWindowStatus {
     pub accepted_revision: BigInt,
     pub active_revision: Option<BigInt>,
     pub focused: bool,
+}
+
+#[napi(object)]
+pub struct OverlayTextMeasurement {
+    pub width: f64,
+    pub height: f64,
+    pub lines: Vec<Vec<f64>>,
+    pub clusters: Vec<Vec<f64>>,
 }
 #[napi]
 pub struct OverlaySubmission {

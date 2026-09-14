@@ -1255,6 +1255,7 @@ fn supported_control_record(kind: u16) -> bool {
             | TRACK_READY
             | OVERLAY_WINDOW_READY
             | OVERLAY_STATUS
+            | OVERLAY_TEXT_MEASURED
             | DESTROY_TRACK
             | TRACK_LOST
             | ACTIVATE_TRACK

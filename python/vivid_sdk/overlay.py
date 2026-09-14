@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -119,6 +119,26 @@ class Canvas:
 
 class RetainedImage:
     def __init__(self, raw: Any) -> None: self._raw = raw
+
+@dataclass(frozen=True)
+class TextGeometry:
+    start: int
+    end: int
+    bounds: Rect
+    baseline: float
+    rtl: bool
+
+@dataclass(frozen=True)
+class TextMeasurement:
+    width: float
+    height: float
+    lines: Tuple[TextGeometry, ...]
+    clusters: Tuple[TextGeometry, ...]
+
+def _text_measurement(raw: Any) -> TextMeasurement:
+    def geometry(values: Any) -> Tuple[TextGeometry, ...]:
+        return tuple(TextGeometry(int(v[0]), int(v[1]), Rect(*v[2:6]), v[6], bool(v[7])) for v in values)
+    return TextMeasurement(raw["width"], raw["height"], geometry(raw["lines"]), geometry(raw["clusters"]))
 
 PresentationOutcome = Literal["presented", "superseded"]
 
@@ -252,8 +272,8 @@ class OverlaySession:
     @classmethod
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
-        required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in options.get("optional_profiles", ()) or () if p not in required})
+        required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT))
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))
@@ -282,6 +302,11 @@ class OverlaySession:
     def __exit__(self, *args: Any) -> None: self.close()
 
 class OverlayWindow:
+    def measure_text(self, text: str, size: float, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> TextMeasurement:
+        canvas = Canvas().text(text, Point(0, 0), size, 0xFFFFFFFF, family=family, weight=weight, italic=italic, max_width=max_width)
+        return _text_measurement(self._raw.measure_text(canvas._raw))
+    def set_editor_geometry(self, scene_revision: int, caret: Optional[Rect]) -> None:
+        self._raw.set_editor_geometry(scene_revision, None if caret is None else [caret.x, caret.y, caret.width, caret.height])
     def __init__(self, raw: Any) -> None:
         self._raw = raw
         self.closed = False

@@ -163,8 +163,50 @@ are also `bigint`. Receipt waits remain independent of event iteration.
 Colors are straight-alpha sRGB `0xRRGGBBAA`; opacity and gradient offsets are in `[0, 1]`.
 Geometry uses logical pixels. Hit roles are `input`, `drag`, `resize`, and `transparent`;
 resize edge bits are left=1, right=2, top=4, bottom=8. Save/restore delimit transforms and clips.
-Text supports host font family, weight, italic, color, and optional maximum width; measurement
-and richer styled text remain separate host-service work.
+Text supports host font family, weight, italic, color, and optional maximum width.
+
+## Host text measurement and editor geometry
+
+Connection helpers optionally negotiate `overlay-text-v1`. Measurement and editor operations
+fail explicitly if the host did not negotiate it. Vivido shapes measurements off the UI loop
+with the same Parley/font-fallback implementation used to paint Canvas text.
+
+- Rust: `window.measure_text(&Text)` returns `TextMeasurement`.
+- Python: `window.measure_text(text, size, family="", weight=400, italic=False, max_width=None)`.
+  Await the same method in the asyncio facade.
+- TypeScript: `await window.measureText(text, size, { family, weight, italic, maxWidth })`.
+
+Results contain logical-pixel width, height, line geometry, and visual-order cluster geometry.
+Geometry includes text ranges, bounds, baselines, and cluster direction. Rust ranges use UTF-8
+byte offsets; Python uses character indexes; TypeScript uses UTF-16 indexes. Measurement starts
+at `(0, 0)` independently of Canvas text origin and color. These are measurement snapshots,
+not retained layout handles: use matching text/style when painting. Batched measurements,
+retained layouts, and richer styled text are future host-service work.
+
+After a submission is presented and its window has focus, publish the editor's window-local
+caret rectangle with `set_editor_geometry(revision, Some(rect))` in Rust,
+`set_editor_geometry(revision, rect)` in Python, or
+`await setEditorGeometry(revision, rect)` in TypeScript. TypeScript revisions remain `bigint`.
+For example, with an existing Python window and Canvas:
+
+```python
+measurement = window.measure_text("Hello", 20)
+receipt = window.submit(canvas)
+if receipt.wait(5) == "presented":
+    window.request_focus()
+    window.set_editor_geometry(receipt.revision, Rect(20, 20, 1, measurement.height))
+```
+
+Include any producer transforms and scrolling in that rectangle. Vivido clips it to the window
+and pane, applies current DPI scale, and updates the native IME cursor area when the window moves.
+Publish geometry again after changing the scene revision. Clear it with `None` in Rust/Python
+or an omitted rectangle in TypeScript. Focus loss, hiding, closing, lane loss, and stale scene
+revisions also clear it. Terminal draws cannot overwrite an active overlay editor rectangle;
+clearing it restores the latest available terminal IME area.
+
+Requests are bounded to 4,096 UTF-8 text bytes and replies to 1,024 lines and 1,024 clusters,
+subject to negotiated control-record limits. Vivido permits one outstanding shaping job per
+owner and at most 16 globally; overload fails explicitly without blocking input or rendering.
 
 `wait_event(timeout)` / `waitEvent(timeout)` use **seconds**, bounded to 0–60. Event iteration
 uses bounded waits and ends after connection loss or explicit session close. Typed events cover
@@ -195,13 +237,14 @@ The harness starts Python blocking, Python asyncio, and TypeScript producers aga
 authenticated host sessions. It verifies exact four-color Vello readback, window controls,
 retained assets, typed pointer input with an ID above 2^53, IME offset conversion, capture,
 child popups, per-submission outcomes, track replacement/reconciliation, independent asset
-release, unsolicited viewport changes, and cleanup. Each subprocess has a bounded deadline.
+release, unsolicited viewport changes, host text measurement, focused-editor geometry, and cleanup.
+Each subprocess has a bounded deadline.
 Capabilities are passed through child environments, never command arguments. A Vello adapter
 is required; this test fails rather than silently skipping its rendering assertions.
 
 ## Remaining work and acceptance
 
-- Host text measurement and focused-editor geometry for platform IME positioning.
+- Batched text measurement, retained measured layouts, and richer styled text services.
 - Full live visual/input acceptance, including clipboard policy, IME placement, accessibility,
   platform-specific input behavior, and performance measurements.
 - The separate declarative UI engine, layout/editing services, accessibility bridge, and gallery.
@@ -210,7 +253,9 @@ The new socket integration regression exercises two producers reusing local IDs,
 modal focus protection, popup dismissal, IME event delivery, capture, and independent cleanup.
 It also performs actual Vello GPU readback, verifies DPI placement and clipping, and checks that
 idle frames and window movement preserve cached texture identity. This is not a substitute for
-live native pane interaction acceptance. No new live pane acceptance or benchmark has completed.
+live native pane interaction acceptance. A Windows live-pane probe verified editor geometry
+reaching the window backend, following window movement at 125% DPI, and clearing on request.
+Native IME candidate-popup placement and performance benchmarks remain unverified.
 
 Windows binding validation passes for Python blocking, Python asyncio, and native TypeScript,
 including the Vivido socket/GPU test above. The Python SDK, presenter, and overlay suites have

@@ -13,6 +13,9 @@ try {
   await window.raise(); await window.lower(); await window.requestFocus();
   assert.deepEqual(await window.bounds(), bounds);
   assert.equal((await window.viewport()).width, 400);
+  const measured = await window.measureText("A😀日", 18);
+  assert(measured.width > 0 && measured.height > 0 && measured.lines.length > 0);
+  assert.equal(Math.max(...measured.clusters.map(c => c.end)), 4);
   const canvas = new Canvas();
   for (const [x, y, color] of [[0, 0, 0xff0000ff], [10, 0, 0x00ff00ff], [0, 10, 0x0000ffff], [10, 10, 0xffff00ff]]) {
     canvas.fill(Path.rectangle({ x, y, width: 10, height: 10 }), Brush.solid(color));
@@ -39,6 +42,8 @@ try {
     if (seen.size === 3) break;
   }
   await session.capturePointer(window); await session.capturePointer(window, false);
+  await window.setEditorGeometry(receipt.revision, { x: 5, y: 6, width: 1, height: 18 });
+  await window.setEditorGeometry(receipt.revision);
   assert.equal(await release, "release");
   const pending = await window.submit(new Canvas());
   const replacement = await window.replaceTrack(replacementCanvas);

@@ -35,6 +35,9 @@ def blocking():
             window.raise_window(); window.lower(); window.request_focus()
             assert window.bounds() == OPTIONS.bounds
             assert window.viewport().width == 400
+            measured = window.measure_text("A😀日", 18)
+            assert measured.width > 0 and measured.height > 0 and measured.lines
+            assert max(c.end for c in measured.clusters) == 3
             scene = canvas()
             image = window.upload_rgba(2, 2, PIXELS)
             window.draw_image(scene, image, Rect(50, 0, 20, 20))
@@ -50,6 +53,8 @@ def blocking():
                 assert time.monotonic() < deadline
                 if len(seen) == 3: break
             session.capture_pointer(window); session.capture_pointer(window, False)
+            window.set_editor_geometry(receipt.revision, Rect(5, 6, 1, 18))
+            window.set_editor_geometry(receipt.revision, None)
             assert sys.stdin.readline().strip() == "release"
             pending = window.submit(Canvas())
             replacement = window.replace_track(canvas())
@@ -70,6 +75,9 @@ async def asynchronous():
             await window.raise_window(); await window.lower(); await window.request_focus()
             assert await window.bounds() == OPTIONS.bounds
             assert (await window.viewport()).width == 400
+            measured = await window.measure_text("A😀日", 18)
+            assert measured.width > 0 and measured.height > 0 and measured.lines
+            assert max(c.end for c in measured.clusters) == 3
             scene = canvas()
             image = await window.upload_rgba(2, 2, PIXELS)
             await window.draw_image(scene, image, Rect(50, 0, 20, 20))
@@ -86,6 +94,8 @@ async def asynchronous():
                     if len(seen) == 3: return
             await asyncio.wait_for(receive(), 10)
             await session.capture_pointer(window); await session.capture_pointer(window, False)
+            await window.set_editor_geometry(receipt.revision, Rect(5, 6, 1, 18))
+            await window.set_editor_geometry(receipt.revision, None)
             assert sys.stdin.readline().strip() == "release"
             pending = await window.submit(Canvas())
             replacement = await window.replace_track(canvas())

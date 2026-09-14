@@ -230,6 +230,38 @@ impl PyOverlayWindow {
         let canvas = lock(&canvas.inner, "canvas")?.clone();
         py.detach(|| self.inner.present(canvas)).map_err(io_error)
     }
+    fn measure_text(&self, py: Python<'_>, canvas: &PyCanvas) -> PyResult<Py<PyDict>> {
+        let text = model::measurement_text(&*lock(&canvas.inner, "canvas")?).map_err(io_error)?;
+        let measured = py
+            .detach(|| self.inner.measure_text(&text))
+            .map_err(io_error)?;
+        let dict = PyDict::new(py);
+        dict.set_item("width", measured.width.get())?;
+        dict.set_item("height", measured.height.get())?;
+        dict.set_item(
+            "lines",
+            model::text_geometry(&measured.lines, &text.text, false).map_err(io_error)?,
+        )?;
+        dict.set_item(
+            "clusters",
+            model::text_geometry(&measured.clusters, &text.text, false).map_err(io_error)?,
+        )?;
+        Ok(dict.unbind())
+    }
+    fn set_editor_geometry(
+        &self,
+        py: Python<'_>,
+        scene_revision: u64,
+        caret: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let caret = caret
+            .as_deref()
+            .map(model::rect)
+            .transpose()
+            .map_err(io_error)?;
+        py.detach(|| self.inner.set_editor_geometry(scene_revision, caret))
+            .map_err(io_error)
+    }
     fn set_bounds(&self, py: Python<'_>, bounds: Vec<f64>) -> PyResult<()> {
         let bounds = model::rect(&bounds).map_err(io_error)?;
         py.detach(|| self.inner.set_bounds(bounds))

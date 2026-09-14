@@ -13,6 +13,10 @@ async function producer(): Promise<void> {
   await window.drawImage(canvas, image, { x: 0, y: 0, width: 1, height: 1 });
   const receipt = await window.submit(canvas);
   const submittedRevision: bigint = receipt.revision;
+  const measured: overlay.TextMeasurement = await window.measureText("A😀日", 18, { maxWidth: 100 });
+  await window.setEditorGeometry(submittedRevision, { x: measured.width, y: 0, width: 1, height: measured.height });
+  // @ts-expect-error Scene revisions must retain their full u64 precision.
+  await window.setEditorGeometry(123);
   const outcome: overlay.PresentationOutcome | undefined = await receipt.wait(0);
   await window.releaseImage(image);
   const replacement = await window.replaceTrack(new Canvas());

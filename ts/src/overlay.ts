@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -22,6 +22,8 @@ interface NativeCanvas {
 }
 interface CanvasConstructor { new(): NativeCanvas; shape(kind: string, bounds: number[], radius: number): number[][] }
 interface NativeWindow {
+  measureText(canvas: NativeCanvas): Promise<{ width: number; height: number; lines: number[][]; clusters: number[][] }>;
+  setEditorGeometry(sceneRevision: bigint, caret?: number[]): Promise<void>;
   submit(canvas: NativeCanvas): Promise<NativeSubmission>;
   replaceTrack(canvas: NativeCanvas): Promise<NativeSubmission>;
   releaseImage(image: object): Promise<void>;
@@ -76,6 +78,10 @@ export class Brush {
   static radial(center: Point, radius: number, stops: readonly GradientStop[]): Brush { return new Brush("radial", [center.x, center.y, radius], stops.map(s => s.color), stops.map(s => s.offset)); }
 }
 export interface TextOptions { readonly family?: string; readonly weight?: number; readonly italic?: boolean; readonly maxWidth?: number }
+/** Ranges use JavaScript UTF-16 indexes. Geometry is layout-local logical pixels. */
+export interface TextGeometry { readonly start: number; readonly end: number; readonly bounds: Rect; readonly baseline: number; readonly rtl: boolean }
+export interface TextMeasurement { readonly width: number; readonly height: number; readonly lines: readonly TextGeometry[]; readonly clusters: readonly TextGeometry[] }
+const textGeometry = (v: number[]): TextGeometry => ({ start: v[0]!, end: v[1]!, bounds: asRect(v.slice(2, 6)), baseline: v[6]!, rtl: Boolean(v[7]) });
 export class Canvas {
   /** @internal */ readonly raw: NativeCanvas;
   constructor(raw?: NativeCanvas) { this.raw = raw ?? callSync(() => new (canvasType())()); }
@@ -164,7 +170,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set((options.optionalProfiles ?? []).filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));
@@ -190,6 +196,14 @@ export class OverlaySession {
   async [Symbol.asyncDispose](): Promise<void> { await this.close(); }
 }
 export class OverlayWindow {
+  async measureText(text: string, size: number, options: TextOptions = {}): Promise<TextMeasurement> {
+    const canvas = new Canvas().text(text, { x: 0, y: 0 }, size, 0xffffffff, options);
+    const measured = await call(this.raw.measureText(canvas.raw));
+    return { ...measured, lines: measured.lines.map(textGeometry), clusters: measured.clusters.map(textGeometry) };
+  }
+  async setEditorGeometry(sceneRevision: bigint, caret?: Rect): Promise<void> {
+    await call(this.raw.setEditorGeometry(sceneRevision, caret ? values(caret) : undefined));
+  }
   private stopped = false;
   /** @internal */ constructor(readonly raw: NativeWindow) {}
   get closed(): boolean { return this.stopped; }

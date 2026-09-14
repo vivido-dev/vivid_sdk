@@ -67,6 +67,10 @@ class OverlaySubmission:
         return await _run(self._inner.wait, timeout)
 
 class OverlayWindow:
+    async def measure_text(self, text: str, size: float, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> overlay.TextMeasurement:
+        return await _run(self._inner.measure_text, text, size, family=family, weight=weight, italic=italic, max_width=max_width)
+    async def set_editor_geometry(self, scene_revision: int, caret: Optional[overlay.Rect]) -> None:
+        await _run(self._inner.set_editor_geometry, scene_revision, caret)
     def __init__(self, inner: overlay.OverlayWindow) -> None: self._inner = inner
     @property
     def closed(self) -> bool: return self._inner.closed

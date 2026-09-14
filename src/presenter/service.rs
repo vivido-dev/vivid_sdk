@@ -856,7 +856,10 @@ impl VirtualVivid {
         if config.supported_profiles.iter().any(|profile| {
             matches!(
                 profile.as_str(),
-                registry::TERMINAL_OVERLAY | registry::VECTOR_SCENE | registry::OVERLAY_INPUT
+                registry::TERMINAL_OVERLAY
+                    | registry::VECTOR_SCENE
+                    | registry::OVERLAY_INPUT
+                    | registry::OVERLAY_TEXT
             )
         }) {
             return Err(io::Error::new(
@@ -6322,6 +6325,7 @@ mod tests {
             registry::VECTOR_SCENE,
             registry::TERMINAL_OVERLAY,
             registry::OVERLAY_INPUT,
+            registry::OVERLAY_TEXT,
         ] {
             let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
             let mut config = PresenterConfig::terminal(MediaConfig::default());

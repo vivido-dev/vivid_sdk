@@ -15,6 +15,8 @@ use vivid_protocol::messages;
 use vivid_protocol::overlay::WindowOptions;
 pub use vivid_protocol::overlay::wire::PresentationOutcome;
 pub use vivid_protocol::overlay::wire::Viewport;
+use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText};
+pub use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
     Action, Query, SetWindow, Status, WindowAction, WindowAddress,
 };
@@ -117,6 +119,11 @@ impl OverlaySession {
         }
         config.required_profiles.sort();
         config.required_profiles.dedup();
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_TEXT.into());
+        config.optional_profiles.sort();
+        config.optional_profiles.dedup();
         config
             .optional_profiles
             .retain(|p| !config.required_profiles.contains(p));
@@ -330,6 +337,64 @@ impl Drop for OverlaySession {
 }
 
 impl OverlayWindow {
+    /// Measure host-shaped text in logical pixels, independent of its drawing origin and color.
+    pub fn measure_text(&self, text: &Text) -> io::Result<TextMeasurement> {
+        self.with_state(|session, _| {
+            if !session.supports(vivid_protocol::registry::OVERLAY_TEXT) {
+                return Err(invalid_input("presenter does not support overlay-text-v1"));
+            }
+            let request = MeasureText {
+                address: self.address,
+                text: text.clone(),
+            };
+            let reply = session
+                .request(
+                    messages::MEASURE_OVERLAY_TEXT,
+                    self.address.surface_id,
+                    request.payload().map_err(io::Error::other)?,
+                    &RequestMetadata::default(),
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| invalid_input("offline presenter has no text service"))?;
+            expect_record(
+                &reply,
+                messages::OVERLAY_TEXT_MEASURED,
+                self.address.surface_id,
+            )?;
+            let result =
+                TextMeasurement::decode(self.address, &Value::Map(decoded_payload(&reply)?))
+                    .map_err(io::Error::other)?;
+            result.validate_text(&text.text).map_err(io::Error::other)?;
+            Ok(result)
+        })
+    }
+
+    /// Set a window-local logical IME exclusion/caret rectangle for the focused presented scene.
+    pub fn set_editor_geometry(&self, scene_revision: u64, caret: Option<Rect>) -> io::Result<()> {
+        self.with_state(|session, _| {
+            if !session.supports(vivid_protocol::registry::OVERLAY_TEXT) {
+                return Err(invalid_input("presenter does not support overlay-text-v1"));
+            }
+            let request = EditorGeometry {
+                address: self.address,
+                scene_revision,
+                caret,
+            };
+            let reply = session
+                .request(
+                    messages::SET_OVERLAY_EDITOR,
+                    self.address.surface_id,
+                    request.payload().map_err(io::Error::other)?,
+                    &RequestMetadata::default(),
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| invalid_input("offline presenter has no text service"))?;
+            expect_record(&reply, messages::OK, self.address.surface_id)?;
+            Ok(())
+        })
+    }
     pub fn upload_rgba(&self, width: u32, height: u32, rgba: &[u8]) -> io::Result<RetainedImage> {
         self.with_state(|session, state| {
             let bytes = u64::from(width)

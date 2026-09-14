@@ -6,6 +6,45 @@ use vivid_sdk::overlay::{OverlayWindowOptions, WindowMode};
 pub fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+
+pub fn measurement_text(canvas: &Canvas) -> io::Result<Text> {
+    let [Command::Text(text)] = canvas.commands() else {
+        return Err(invalid("measurement requires one text specification"));
+    };
+    Ok(text.clone())
+}
+
+pub fn text_geometry(
+    values: &[vivid_sdk::overlay::TextGeometry],
+    text: &str,
+    utf16: bool,
+) -> io::Result<Vec<Vec<f64>>> {
+    values
+        .iter()
+        .map(|g| {
+            let index = |offset: u32| -> io::Result<f64> {
+                let prefix = text
+                    .get(..offset as usize)
+                    .ok_or_else(|| invalid("invalid text geometry offset"))?;
+                Ok(if utf16 {
+                    prefix.encode_utf16().count()
+                } else {
+                    prefix.chars().count()
+                } as f64)
+            };
+            Ok(vec![
+                index(g.start)?,
+                index(g.end)?,
+                g.x.get(),
+                g.y.get(),
+                g.width.get(),
+                g.height.get(),
+                g.baseline.get(),
+                f64::from(g.rtl),
+            ])
+        })
+        .collect()
+}
 pub fn number(value: f64, maximum: u64) -> io::Result<u64> {
     if !value.is_finite() || value < 0. || value.fract() != 0. || value > maximum as f64 {
         return Err(invalid("integer is outside its supported range"));
