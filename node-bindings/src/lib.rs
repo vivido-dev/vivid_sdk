@@ -7,6 +7,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod overlay;
+
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;

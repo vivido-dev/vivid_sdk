@@ -2,6 +2,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod overlay;
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -3908,6 +3910,7 @@ fn presenter_release_media_resource(presenter: PyRef<'_, PyPresenter>, id: &str)
 
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    overlay::register(module)?;
     module.add("VividError", py.get_type::<VividError>())?;
     module.add("ClosedHandleError", py.get_type::<ClosedHandleError>())?;
     module.add_class::<PyPresenter>()?;

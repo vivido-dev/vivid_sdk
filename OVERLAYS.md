@@ -1,6 +1,6 @@
 # Pane overlays
 
-The Rust SDK now exports `OverlaySession`, `OverlayWindow`, and `OverlayWindowOptions`.
+Rust, Python, and TypeScript expose `OverlaySession`, `OverlayWindow`, and window options.
 Direct Vivido connections have window-control, vector-channel, cached Vello rendering, and
 interactive-lane integration. This is a development preview: the complete cross-language overlay
 and GPUI-inspired UI plan has not passed live pane acceptance.
@@ -80,9 +80,102 @@ compiled content stays cached. Native pane focus loss cancels gestures and held 
   share bulk compilation. Lane loss, overflow, session loss, context revocation, and surface
   destruction remove the affected owner's windows and resources. Overlays never become posters.
 
+## Python and TypeScript
+
+Python exports blocking handles at `vivid_sdk.OverlaySession` and async handles at
+`vivid_sdk.aio.OverlaySession`. Drawing and event types live in `vivid_sdk.overlay`.
+
+```python
+from vivid_sdk import OverlaySession, OverlayWindowOptions
+from vivid_sdk.overlay import Brush, Canvas, Path, Rect
+
+with OverlaySession.from_env() as session:
+    with session.create_window(OverlayWindowOptions(Rect(40, 40, 320, 180))) as window:
+        canvas = Canvas().fill(
+            Path.rounded_rectangle(Rect(0, 0, 320, 180), 12),
+            Brush.solid(0x203050FF),
+        )
+        window.present(canvas)
+        window.center()
+        input("Press Enter to close")
+```
+
+For asyncio use `async with await aio.OverlaySession.from_env()` and
+`async with await session.create_window(options)`. Await window operations and iterate
+`async for event in session.events()`. Canvas building remains synchronous. Native calls release
+the GIL; no native worker invokes application callbacks. Cancellation of resource creation waits
+for completion and closes the newly created resource. `event.targets(window)` accepts either
+blocking or async window handles without acquiring a transport lock.
+
+```typescript
+import { OverlaySession, overlay } from "@vivido/vivid-sdk";
+const { Canvas, Path, Brush } = overlay;
+
+await using session = await OverlaySession.fromEnv();
+await using window = await session.createWindow({
+  bounds: { x: 40, y: 40, width: 320, height: 180 }, mode: "floating",
+});
+const path = Path.roundedRectangle({ x: 0, y: 0, width: 320, height: 180 }, 12);
+await window.present(new Canvas().fill(path, Brush.solid(0x203050ff)).hit(1n, path));
+await window.center();
+for await (const event of session.events()) {
+  if (event.kind === "dismissed" || event.kind === "connection-lost") break;
+  if (event.kind === "pointer" && event.targets(window) && event.down) break;
+}
+```
+
+Both connection helpers negotiate the profile bundle automatically and accept the language's
+normal connection options. Pass `parent=window` in Python or the parent as `createWindow`'s
+second argument in TypeScript to create child windows. Python uses `raise_window()` because
+`raise` is a keyword; TypeScript uses `raise()`.
+
+Canvas supports rectangles, rounded rectangles, ellipses, Bézier paths, solid/linear/radial
+brushes, strokes, opacity, affine transforms, nested clips, host-shaped text, and hit regions.
+`snapshot()` copies the current display list; `present` also snapshots before sending. Paths are
+copied when added to a Canvas. Use `validate()` to check a complete list without sending it.
+An image returned by `upload_rgba` / `uploadRgba` belongs to its window; `draw_image` / `drawImage`
+validates this before appending the retained reference. Await TypeScript `drawImage` before
+modifying or presenting the Canvas. Image release currently occurs on window/channel cleanup.
+
+Colors are straight-alpha sRGB `0xRRGGBBAA`; opacity and gradient offsets are in `[0, 1]`.
+Geometry uses logical pixels. Hit roles are `input`, `drag`, `resize`, and `transparent`;
+resize edge bits are left=1, right=2, top=4, bottom=8. Save/restore delimit transforms and clips.
+Text supports host font family, weight, italic, color, and optional maximum width; measurement
+and richer styled text remain separate host-service work.
+
+`wait_event(timeout)` / `waitEvent(timeout)` use **seconds**, bounded to 0–60. Event iteration
+uses bounded waits and ends after connection loss or explicit session close. Typed events cover
+pointer, wheel, physical key, committed text, IME, focus, geometry, dismissal, and cancellation.
+Python provides event dataclasses; TypeScript provides a discriminated union on `kind`.
+IME selections use Python character indexes or JavaScript UTF-16 indexes into the preedit string.
+TypeScript scene revisions and application hit IDs are `bigint` throughout. Window, session,
+and asset wire identities stay opaque. Closing sessions invalidates their remaining windows.
+
+### Binding validation
+
+Build from the SDK directory with `python -m maturin develop` in the configured virtual
+environment and `npm run build:debug`. Run `python -m pytest python-tests/test_overlay.py`,
+`python -m mypy --platform linux`, `npm test`, `npm run typecheck`, and
+`npm run typecheck:overlay-consumer`. The mypy platform override includes the package's Unix
+automation annotations; it does not run Unix-only automation tests on Windows.
+
+For the native Vivido socket/GPU integration test, build both bindings first, set
+`VIVID_OVERLAY_TEST_PYTHON` to that environment's Python executable and
+`VIVID_OVERLAY_TEST_NODE` to the Node executable, then run from `vivido/`:
+
+```sh
+cargo test --lib native_overlay_python_and_typescript_bindings -- --ignored --nocapture
+```
+
+The harness starts Python blocking, Python asyncio, and TypeScript producers against isolated
+authenticated host sessions. It verifies exact four-color Vello readback, window controls,
+retained assets, typed pointer input with an ID above 2^53, IME offset conversion, capture,
+child popups, repeated presentation, and cleanup. Each subprocess has a bounded deadline.
+Capabilities are passed through child environments, never command arguments. A Vello adapter
+is required; this test fails rather than silently skipping its rendering assertions.
+
 ## Remaining work and acceptance
 
-- Python blocking/async and TypeScript native async high-level window/Canvas wrappers.
 - Explicit per-submission presented/superseded outcomes, richer reconciliation across replacement
   tracks, independent retained-asset release, and unsolicited typed viewport updates.
 - Host text measurement and focused-editor geometry for platform IME positioning.
@@ -96,13 +189,10 @@ It also performs actual Vello GPU readback, verifies DPI placement and clipping,
 idle frames and window movement preserve cached texture identity. This is not a substitute for
 live native pane interaction acceptance. No new live pane acceptance or benchmark has completed.
 
-Validation on Windows includes Rust default and presenter-enabled SDK tests, the protocol and
-gateway suites, and Vivido's workspace suite (708 library tests passed; 4 ignored, plus passing
-workspace targets). Vivido's suite passed with one test thread after an IPC global-state race
-in the concurrent run. A protocol socket-shutdown timeout also passed on serial rerun. Existing
-Python and TypeScript bindings build successfully; 27 Python and 18 TypeScript tests pass, along
-with mypy and TypeScript typechecking. Python's Unix-socket automation suite and live native
-interaction checks were not run on this Windows host. These binding checks cover existing APIs,
-not high-level overlay wrappers.
+Windows binding validation passes for Python blocking, Python asyncio, and native TypeScript,
+including the Vivido socket/GPU test above. The Python SDK, presenter, and overlay suites have
+32 passing tests; TypeScript has 22. Python's Unix-socket automation suite and live native pane
+interaction checks were not run on this Windows host. Socket-delivered IME events do not prove
+platform IME positioning or native input acceptance.
 
 See the [normative overlay specification](../vivid_protocol/vivid-protocol-1.5-overlays.md).

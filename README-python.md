@@ -190,6 +190,11 @@ See [conformance/README.md](conformance/README.md).
 
 ## Parity status
 
+Pane overlays have blocking `OverlaySession` / `OverlayWindow` handles and asyncio counterparts
+in `vivid_sdk.aio`. Use `vivid_sdk.overlay` for Canvas builders and typed events. See the
+[overlay API and validation guide](OVERLAYS.md#python-and-typescript). Direct Vivido connections
+are supported; the SDK's terminating presenter explicitly rejects the overlay profiles.
+
 The bindings cover both roles, but method coverage is not yet proof of full Rust parity.
 In particular, lease/resume identity queries do not yet provide an activation/resume connection
 workflow. Cross-language tests cover public constants, raster capture, and invalid dimensions;

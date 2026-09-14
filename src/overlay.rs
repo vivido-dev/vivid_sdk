@@ -56,6 +56,7 @@ pub struct OverlaySession {
 #[derive(Debug)]
 pub struct OverlayWindow {
     session: Weak<Mutex<Option<Session>>>,
+    address: WindowAddress,
     state: Mutex<WindowState>,
 }
 
@@ -240,6 +241,7 @@ impl OverlaySession {
             let window = set_window(session, &request)?;
             Ok(OverlayWindow {
                 session: Arc::downgrade(&self.session),
+                address: window.address,
                 state: Mutex::new(WindowState {
                     surface: surface.clone(),
                     track,
@@ -272,7 +274,7 @@ impl OverlaySession {
         if !Weak::ptr_eq(&window.session, &Arc::downgrade(&self.session)) {
             return Ok(false);
         }
-        Ok(lock(&window.state, "overlay window")?.window.address == event.address)
+        Ok(window.address == event.address)
     }
 
     pub fn capture_pointer(&self, window: &OverlayWindow, capture: bool) -> io::Result<()> {

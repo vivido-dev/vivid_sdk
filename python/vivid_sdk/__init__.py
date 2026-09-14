@@ -1378,3 +1378,7 @@ __all__ = [
     "supports",
     "update_surface",
 ]
+
+from . import overlay as overlay
+from .overlay import OverlaySession as OverlaySession, OverlayWindow as OverlayWindow, OverlayWindowOptions as OverlayWindowOptions
+__all__ += ["overlay", "OverlaySession", "OverlayWindow", "OverlayWindowOptions"]

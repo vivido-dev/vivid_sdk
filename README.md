@@ -1,6 +1,6 @@
 # vivid_sdk
 
-See [pane overlays](OVERLAYS.md) for the Rust window API, Vello drawing, and current acceptance status.
+See [pane overlays](OVERLAYS.md) for Rust, Python, and TypeScript window APIs, Vello drawing, and current acceptance status.
 
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 

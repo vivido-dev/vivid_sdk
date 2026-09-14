@@ -24,6 +24,9 @@ export * as fileDrop from "./file-drop.js";
 export * as pipeline from "./pipeline.js";
 export * as lease from "./lease.js";
 export { PaneSession } from "./pane.js";
+export * as overlay from "./overlay.js";
+export { OverlaySession, OverlayWindow } from "./overlay.js";
+export type { OverlayWindowOptions } from "./overlay.js";
 export { DesktopSession, establishDesktop } from "./desktop.js";
 export * as presenter from "./presenter.js";
 

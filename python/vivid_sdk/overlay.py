@@ -1,0 +1,274 @@
+"""Typed pane overlays backed by the shared Rust window and Canvas implementation."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
+
+from . import _native, connect as _connect
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT
+
+WindowMode = Literal["floating", "popup", "modal"]
+HitRole = Literal["input", "drag", "resize", "transparent"]
+DismissReason = Literal["escape", "outside-press", "closed", "owner-lost", "parent-closed"]
+
+@dataclass(frozen=True)
+class Point:
+    x: float
+    y: float
+
+@dataclass(frozen=True)
+class Rect:
+    x: float
+    y: float
+    width: float
+    height: float
+    def _values(self) -> Tuple[float, float, float, float]:
+        return self.x, self.y, self.width, self.height
+
+@dataclass(frozen=True)
+class Viewport:
+    width: float
+    height: float
+    scale_numerator: int
+    scale_denominator: int
+
+@dataclass(frozen=True)
+class OverlayWindowOptions:
+    bounds: Rect
+    mode: WindowMode = "floating"
+    title: str = ""
+    visible: bool = True
+
+class Path:
+    """Mutable Bézier builder. Canvas commands snapshot paths when added."""
+    def __init__(self, *, even_odd: bool = False) -> None:
+        self.even_odd = even_odd
+        self._segments: list[list[float]] = []
+    def _add(self, *values: float) -> Path:
+        if len(self._segments) >= 4096:
+            raise ValueError("path segment limit exceeded")
+        self._segments.append(list(values))
+        return self
+    def move_to(self, x: float, y: float) -> Path: return self._add(0, x, y)
+    def line_to(self, x: float, y: float) -> Path: return self._add(1, x, y)
+    def quad_to(self, cx: float, cy: float, x: float, y: float) -> Path: return self._add(2, cx, cy, x, y)
+    def cubic_to(self, ax: float, ay: float, bx: float, by: float, x: float, y: float) -> Path: return self._add(3, ax, ay, bx, by, x, y)
+    def close(self) -> Path: return self._add(4)
+    @staticmethod
+    def _shape(kind: str, bounds: Rect, radius: float = 0) -> Path:
+        path = Path()
+        path._segments = _native.OverlayCanvas.shape(kind, bounds._values(), radius)
+        return path
+    @staticmethod
+    def rectangle(bounds: Rect) -> Path: return Path._shape("rectangle", bounds)
+    @staticmethod
+    def rounded_rectangle(bounds: Rect, radius: float) -> Path: return Path._shape("rounded", bounds, radius)
+    @staticmethod
+    def ellipse(bounds: Rect) -> Path: return Path._shape("ellipse", bounds)
+
+@dataclass(frozen=True)
+class GradientStop:
+    offset: float
+    color: int
+
+@dataclass(frozen=True)
+class Brush:
+    """Colors are straight-alpha sRGB 0xRRGGBBAA; gradient offsets are in [0, 1]."""
+    _kind: str
+    _geometry: Tuple[float, ...]
+    _colors: Tuple[int, ...]
+    _offsets: Tuple[float, ...]
+    @staticmethod
+    def solid(color: int) -> Brush: return Brush("solid", (), (color,), ())
+    @staticmethod
+    def linear(start: Point, end: Point, stops: Sequence[GradientStop]) -> Brush:
+        return Brush("linear", (start.x, start.y, end.x, end.y), tuple(s.color for s in stops), tuple(s.offset for s in stops))
+    @staticmethod
+    def radial(center: Point, radius: float, stops: Sequence[GradientStop]) -> Brush:
+        return Brush("radial", (center.x, center.y, radius), tuple(s.color for s in stops), tuple(s.offset for s in stops))
+
+class Canvas:
+    def __init__(self) -> None: self._raw = _native.OverlayCanvas()
+    def snapshot(self) -> Canvas:
+        result = Canvas()
+        result._raw = self._raw.snapshot()
+        return result
+    def fill(self, path: Path, brush: Brush) -> Canvas:
+        self._raw.draw(path._segments, path.even_odd, brush._kind, brush._geometry, brush._colors, brush._offsets, None)
+        return self
+    def stroke(self, path: Path, brush: Brush, width: float) -> Canvas:
+        self._raw.draw(path._segments, path.even_odd, brush._kind, brush._geometry, brush._colors, brush._offsets, width)
+        return self
+    def save(self) -> Canvas:
+        self._raw.state("save", []); return self
+    def restore(self) -> Canvas:
+        self._raw.state("restore", []); return self
+    def opacity(self, value: float) -> Canvas:
+        self._raw.state("opacity", [value]); return self
+    def transform(self, a: float, b: float, c: float, d: float, e: float, f: float) -> Canvas:
+        self._raw.state("transform", [a, b, c, d, e, f]); return self
+    def clip(self, path: Path) -> Canvas:
+        self._raw.clip(path._segments, path.even_odd); return self
+    def text(self, text: str, origin: Point, size: float, color: int, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> Canvas:
+        self._raw.text(text, origin.x, origin.y, size, color, family, weight, italic, max_width)
+        return self
+    def hit(self, application_id: int, path: Path, role: HitRole = "input", *, edges: int = 0) -> Canvas:
+        """Resize edges: left=1, right=2, top=4, bottom=8. IDs are unsigned 64-bit."""
+        self._raw.hit(path._segments, path.even_odd, application_id, role, edges); return self
+    def validate(self) -> None: self._raw.validate()
+
+class RetainedImage:
+    def __init__(self, raw: Any) -> None: self._raw = raw
+
+class _WindowHandle(Protocol):
+    @property
+    def _raw(self) -> Any: ...
+
+@dataclass(frozen=True)
+class OverlayEvent:
+    scene_revision: int
+    _raw: Any = field(repr=False, compare=False)
+    kind: ClassVar[str]
+    def targets(self, window: _WindowHandle) -> bool:
+        return bool(self._raw.targets(window._raw))
+
+@dataclass(frozen=True)
+class PointerEvent(OverlayEvent):
+    kind: ClassVar[str] = "pointer"
+    position: Point
+    application_id: int
+    modifiers: int
+    button: Optional[int]
+    down: Optional[bool]
+
+@dataclass(frozen=True)
+class WheelEvent(OverlayEvent):
+    kind: ClassVar[str] = "wheel"
+    position: Point
+    dx: float
+    dy: float
+    modifiers: int
+
+@dataclass(frozen=True)
+class KeyEvent(OverlayEvent):
+    kind: ClassVar[str] = "key"
+    physical: int
+    down: bool
+    repeat: bool
+    modifiers: int
+
+@dataclass(frozen=True)
+class TextEvent(OverlayEvent):
+    kind: ClassVar[str] = "text"
+    text: str
+
+@dataclass(frozen=True)
+class ImeEvent(OverlayEvent):
+    kind: ClassVar[str] = "ime"
+    preedit: str
+    selection: Optional[Tuple[int, int]]  # Python character offsets, not UTF-8 byte offsets.
+
+@dataclass(frozen=True)
+class FocusEvent(OverlayEvent):
+    kind: ClassVar[str] = "focus"
+    focused: bool
+
+@dataclass(frozen=True)
+class GeometryEvent(OverlayEvent):
+    kind: ClassVar[str] = "geometry"
+    bounds: Rect
+    settled: bool
+
+@dataclass(frozen=True)
+class DismissedEvent(OverlayEvent):
+    kind: ClassVar[str] = "dismissed"
+    reason: DismissReason
+
+@dataclass(frozen=True)
+class CancelEvent(OverlayEvent):
+    kind: ClassVar[str] = "cancel"
+
+@dataclass(frozen=True)
+class ConnectionLostEvent(OverlayEvent):
+    kind: ClassVar[str] = "connection-lost"
+    diagnostic: str
+
+def _event(raw: Any) -> OverlayEvent:
+    data = raw.data()
+    kind, revision, values, text = data["kind"], data["revision"], data["values"], data["text"]
+    if kind == "pointer": return PointerEvent(revision, raw, Point(*values[:2]), data["region"], int(values[2]), int(values[3]) if len(values) > 3 else None, bool(values[4]) if len(values) > 3 else None)
+    if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]))
+    if kind == "key": return KeyEvent(revision, raw, int(values[0]), bool(values[1]), bool(values[2]), int(values[3]))
+    if kind == "text": return TextEvent(revision, raw, text)
+    if kind == "ime":
+        encoded = text.encode("utf-8")
+        selection = (len(encoded[:int(values[0])].decode("utf-8")), len(encoded[:int(values[1])].decode("utf-8"))) if values else None
+        return ImeEvent(revision, raw, text, selection)
+    if kind == "geometry": return GeometryEvent(revision, raw, Rect(*values[:4]), bool(values[4]))
+    if kind == "focus": return FocusEvent(revision, raw, bool(values[0]))
+    if kind == "dismissed": return DismissedEvent(revision, raw, cast(DismissReason, text))
+    if kind == "cancel": return CancelEvent(revision, raw)
+    if kind == "connection-lost": return ConnectionLostEvent(revision, raw, text)
+    raise ValueError("unknown native overlay event")
+
+class OverlaySession:
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self.closed = False
+    @classmethod
+    def connect(cls, **options: Any) -> OverlaySession:
+        required = set(options.pop("required_profiles", ()) or ())
+        required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
+        options["optional_profiles"] = sorted({p for p in options.get("optional_profiles", ()) or () if p not in required})
+        options["target_profile"] = PROFILE_TERMINAL_SURFACE
+        session = _connect(required_profiles=sorted(required), **options)
+        return cls(_native.OverlaySession.adopt(session))
+    @classmethod
+    def from_env(cls) -> OverlaySession: return cls.connect()
+    def create_window(self, options: OverlayWindowOptions, *, parent: Optional[OverlayWindow] = None) -> OverlayWindow:
+        return OverlayWindow(self._raw.create_window(options.bounds._values(), options.mode, options.title, options.visible, parent._raw if parent else None))
+    def capture_pointer(self, window: OverlayWindow, capture: bool = True) -> None:
+        self._raw.capture_pointer(window._raw, capture)
+    def wait_event(self, timeout: float = 0.25) -> Optional[OverlayEvent]:
+        """Wait at most timeout seconds (0–60), independently of bulk traffic."""
+        if self.closed: return None
+        raw = self._raw.wait_event(timeout)
+        return _event(raw) if raw is not None else None
+    def events(self, timeout: float = 0.25) -> Iterator[OverlayEvent]:
+        while not self.closed:
+            event = self.wait_event(timeout)
+            if event is not None:
+                yield event
+                if isinstance(event, ConnectionLostEvent): return
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._raw.close()
+    def __enter__(self) -> OverlaySession: return self
+    def __exit__(self, *args: Any) -> None: self.close()
+
+class OverlayWindow:
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self.closed = False
+    def present(self, canvas: Canvas) -> None:
+        """Submit an atomic snapshot; success does not acknowledge GPU presentation."""
+        self._raw.present(canvas._raw)
+    def set_bounds(self, bounds: Rect) -> None: self._raw.set_bounds(bounds._values())
+    def set_visible(self, visible: bool) -> None: self._raw.set_visible(visible)
+    def center(self) -> None: self._raw.action("center")
+    def request_focus(self) -> None: self._raw.action("focus")
+    def raise_window(self) -> None: self._raw.action("raise")
+    def lower(self) -> None: self._raw.action("lower")
+    def bounds(self) -> Rect: return Rect(*self._raw.bounds())
+    def viewport(self) -> Viewport: return Viewport(*self._raw.viewport())
+    def upload_rgba(self, width: int, height: int, rgba: bytes) -> RetainedImage:
+        return RetainedImage(self._raw.upload_rgba(width, height, rgba))
+    def draw_image(self, canvas: Canvas, image: RetainedImage, bounds: Rect, opacity: float = 1) -> None:
+        self._raw.draw_image(canvas._raw, image._raw, bounds._values(), opacity)
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.action("close")
+            self.closed = True
+    def __enter__(self) -> OverlayWindow: return self
+    def __exit__(self, *args: Any) -> None: self.close()
