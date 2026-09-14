@@ -338,11 +338,41 @@ Each subprocess has a bounded deadline.
 Capabilities are passed through child environments, never command arguments. A Vello adapter
 is required; this test fails rather than silently skipping its rendering assertions.
 
-## Remaining work and acceptance
+## Live acceptance status
 
-- Full live visual/input acceptance, including clipboard policy, IME placement, accessibility,
-  platform-specific input behavior, and performance measurements.
-- The separate declarative UI engine, layout/editing services, accessibility bridge, and gallery.
+Vivido's `inspect` reply exposes the active overlay window/resource counts, compilation and
+presentation totals, Vello overlay render/skip passes, target allocations, native IME cursor area,
+and accessibility focus state. This makes cache, cleanup, queue, and focused-editor checks
+repeatable without exposing producer content or capabilities.
+
+The bounded live probe is `bindings/tests/overlay_live_acceptance.py`. It presents retained text,
+requests focus, publishes editor geometry, reports typed key/text/IME/focus events, and exits on
+Escape. Its hit region also reports pointer and wheel events for native interaction checks.
+UI-routed automation keys now traverse the same overlay path as native keys and synthesize a
+complete HID press/text/release sequence. UI-routed paste traverses Vivido's normal paste policy:
+it reaches the focused overlay as committed Unicode text and falls through to the terminal only
+when no overlay or Vivido UI mode consumes it.
+
+On the Windows test host at 125% DPI, live visual acceptance confirmed pane clipping, retained text,
+overlay focus, Unicode typing, and a physical IME cursor area derived from the focused editor. The
+reported logical editor rectangle `(112,186,2,24)` became physical `(140,232.5,2.5,30)`. The native
+accessibility adapter now remains installed on Windows and Linux with a bounded window tree even
+though retained terminal scrollback is disabled there; while an overlay owns focus, the terminal
+is no longer exposed as the focused accessibility element. Low-level Canvas windows do not yet
+publish application semantic nodes.
+
+The release-mode movement benchmark
+`cargo test --release -p vivido vivid::tests::overlay_window_movement_performance_measurement -- --ignored --exact --nocapture`
+rendered 240 changing window transforms with one target allocation and no display-list
+recompilation. This host measured 537 microseconds p50, 686 microseconds p95, and 3,876 microseconds
+maximum for the control update plus Vello overlay preparation, below a 16.667 ms 60 Hz frame at
+p95. The benchmark fails if p95 exceeds that budget or if movement reallocates the target or
+recompiles content.
+
+Remaining platform acceptance is native IME candidate UI and assistive-technology interaction on
+Windows, macOS VoiceOver and IME, Linux Wayland IME/accessibility, and pressure-capable pointer
+hardware. The declarative UI engine will supply bounded application semantic trees and editable
+selection/copy actions; those are not inferred from low-level drawing commands.
 
 The new socket integration regression exercises two producers reusing local IDs, window movement,
 modal focus protection, popup dismissal, IME event delivery, capture, and independent cleanup.
@@ -350,7 +380,8 @@ It also performs actual Vello GPU readback, verifies DPI placement and clipping,
 idle frames and window movement preserve cached texture identity. This is not a substitute for
 live native pane interaction acceptance. A Windows live-pane probe verified editor geometry
 reaching the window backend, following window movement at 125% DPI, and clearing on request.
-Native IME candidate-popup placement and performance benchmarks remain unverified.
+Native IME candidate-popup UI remains unverified; the locally cached platform rectangle and its
+DPI/window-placement updates are verified.
 
 A separate Windows live-pane check verified retained styled layouts at 125% DPI: centered mixed
 sizes/colors, wrapping, italic, underline, and strikethrough. Moving the window and releasing its
@@ -369,6 +400,6 @@ Windows binding validation passes for Python blocking, Python asyncio, and nativ
 including the Vivido socket/GPU test above. The Python SDK, presenter, and overlay suites have
 33 passing tests; TypeScript has 22. Python's Unix-socket automation suite and live native pane
 interaction checks were not run on this Windows host. Socket-delivered IME events do not prove
-platform IME positioning or native input acceptance.
+platform IME candidate UI on hardware outside the Windows test host.
 
 See the [normative overlay specification](../vivid_protocol/vivid-protocol-1.5-overlays.md).
