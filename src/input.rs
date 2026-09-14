@@ -263,7 +263,7 @@ impl InputLane {
 
     pub fn close(&self) -> io::Result<()> {
         close_input_lane(&self.shared, "interactive lane closed");
-        Ok(())
+        self.writer.shutdown()
     }
 }
 
@@ -280,11 +280,27 @@ impl Session {
     /// `desktop-input-v1` must have been accepted. Lane loss never recreates an old grant; callers
     /// reconcile state and use a greater producer input epoch before enabling input again.
     pub fn open_input_lane(&self, lane_generation: u64) -> io::Result<InputLane> {
+        self.open_interactive_lane(lane_generation, false)
+    }
+
+    /// Open a separately authenticated lane carrying typed pane-overlay input.
+    pub fn open_overlay_input_lane(&self, lane_generation: u64) -> io::Result<OverlayInputLane> {
+        Ok(OverlayInputLane {
+            inner: self.open_interactive_lane(lane_generation, true)?,
+        })
+    }
+
+    fn open_interactive_lane(&self, lane_generation: u64, overlay: bool) -> io::Result<InputLane> {
         self.lifecycle.ensure_active()?;
-        if !self.supports(DESKTOP_INPUT) {
+        let profile = if overlay {
+            OVERLAY_INPUT
+        } else {
+            DESKTOP_INPUT
+        };
+        if !self.supports(profile) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "desktop-input-v1 was not accepted",
+                format!("{profile} was not accepted"),
             ));
         }
         if lane_generation == 0 {
@@ -372,7 +388,7 @@ impl Session {
             connection.writer()
         } else {
             let (reader, writer) = connection.split()?;
-            spawn_input_reader(reader, writer.clone(), shared.clone())?;
+            spawn_interactive_reader(reader, writer.clone(), shared.clone(), overlay)?;
             writer
         };
         Ok(InputLane {
@@ -386,10 +402,20 @@ impl Session {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_input_reader(
+    reader: ConnectionReader,
+    writer: ConnectionWriter,
+    pending: Arc<PendingInput>,
+) -> io::Result<()> {
+    spawn_interactive_reader(reader, writer, pending, false)
+}
+
+fn spawn_interactive_reader(
     mut reader: ConnectionReader,
     writer: ConnectionWriter,
     pending: Arc<PendingInput>,
+    overlay: bool,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("vivid-input-reader".into())
@@ -397,20 +423,36 @@ pub(crate) fn spawn_input_reader(
             let result = (|| -> io::Result<()> {
                 loop {
                     let record = reader.read_record()?;
-                    if !matches!(
+                    if record.flags & !vivid_protocol::wire::RECORD_OPTIONAL != 0 {
+                        return Err(invalid_data("unknown interactive record flags"));
+                    }
+                    let common = matches!(
                         record.record_type,
-                        messages::PING
-                            | messages::PONG
-                            | messages::ERROR
-                            | messages::INPUT_BOUND
-                            | messages::INPUT_REVOKED
-                            | messages::INPUT_RESET
-                            | messages::INPUT_LEASE_RENEW
-                            | messages::KEY_INPUT
-                            | messages::POINTER_MOTION
-                            | messages::POINTER_BUTTON
-                            | messages::POINTER_AXIS
-                    ) {
+                        messages::PING | messages::PONG | messages::ERROR
+                    );
+                    let allowed = if overlay {
+                        common
+                            || matches!(
+                                record.record_type,
+                                messages::OK | messages::OVERLAY_INPUT_EVENT
+                            )
+                    } else {
+                        matches!(
+                            record.record_type,
+                            messages::PING
+                                | messages::PONG
+                                | messages::ERROR
+                                | messages::INPUT_BOUND
+                                | messages::INPUT_REVOKED
+                                | messages::INPUT_RESET
+                                | messages::INPUT_LEASE_RENEW
+                                | messages::KEY_INPUT
+                                | messages::POINTER_MOTION
+                                | messages::POINTER_BUTTON
+                                | messages::POINTER_AXIS
+                        )
+                    };
+                    if !allowed {
                         if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 {
                             continue;
                         }
@@ -449,6 +491,17 @@ pub(crate) fn spawn_input_reader(
                         return Err(invalid_data("presenter sent a fatal interactive error"));
                     }
                     let event = match record.record_type {
+                        messages::OVERLAY_INPUT_EVENT => {
+                            vivid_protocol::overlay::wire::InputEvent::decode(
+                                record.object_id,
+                                &Value::Map(envelope.payload.clone()),
+                            )?;
+                            InputLaneEvent::Input {
+                                record_type: record.record_type,
+                                surface_id: record.object_id,
+                                payload: envelope.payload,
+                            }
+                        }
                         messages::KEY_INPUT
                         | messages::POINTER_MOTION
                         | messages::POINTER_BUTTON
@@ -484,7 +537,17 @@ pub(crate) fn spawn_input_reader(
                         }
                     };
                     let mut events = lock(&pending.events, "input event queue")?;
-                    if events.len() == MAX_INPUT_EVENTS {
+                    if events.len()
+                        >= if overlay {
+                            vivid_protocol::overlay::MAX_PENDING_EVENTS
+                        } else {
+                            MAX_INPUT_EVENTS
+                        }
+                        || (overlay
+                            && events.iter().map(overlay_event_bytes).sum::<usize>()
+                                + overlay_event_bytes(&event)
+                                > vivid_protocol::overlay::MAX_EVENT_QUEUE_BYTES)
+                    {
                         return Err(invalid_data(
                             "interactive input queue exceeded its safety bound",
                         ));
@@ -504,8 +567,187 @@ pub(crate) fn spawn_input_reader(
         .map(|_| ())
 }
 
+/// Actionable overlay input, with identities and revisions preserved at full width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayLaneEvent {
+    Input(vivid_protocol::overlay::wire::InputEvent),
+    ConnectionLost { diagnostic: String },
+}
+
+/// An overlay-only view of an authenticated interactive lane.
+/// Capture and renewal never share a writer with scene or asset traffic.
+#[derive(Debug)]
+pub struct OverlayInputLane {
+    inner: InputLane,
+}
+
+impl OverlayInputLane {
+    pub fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+
+    pub fn wait_event(&self, timeout: Duration) -> io::Result<Option<OverlayLaneEvent>> {
+        match self.inner.wait_event(timeout)? {
+            None => Ok(None),
+            Some(InputLaneEvent::Input {
+                record_type: messages::OVERLAY_INPUT_EVENT,
+                surface_id,
+                payload,
+            }) => Ok(Some(OverlayLaneEvent::Input(
+                vivid_protocol::overlay::wire::InputEvent::decode(
+                    surface_id,
+                    &Value::Map(payload),
+                )?,
+            ))),
+            Some(InputLaneEvent::LaneClosed { diagnostic }) => {
+                Ok(Some(OverlayLaneEvent::ConnectionLost { diagnostic }))
+            }
+            Some(InputLaneEvent::Error(error)) => Err(io::Error::other(error)),
+            Some(_) => Err(invalid_data("unexpected desktop event on overlay lane")),
+        }
+    }
+
+    pub fn capture(
+        &self,
+        capture: vivid_protocol::overlay::wire::Capture,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.request(
+            messages::OVERLAY_INPUT_CAPTURE,
+            capture.address.surface_id,
+            capture.payload()?,
+            timeout,
+        )
+    }
+
+    pub fn renew(&self, watchdog_us: u64, timeout: Duration) -> io::Result<()> {
+        let renewal = vivid_protocol::overlay::wire::Renew {
+            lane_generation: self.generation(),
+            watchdog_us,
+        };
+        self.request(
+            messages::OVERLAY_INPUT_RENEW,
+            0,
+            renewal.payload()?,
+            timeout,
+        )
+    }
+
+    pub fn close(&self) -> io::Result<()> {
+        self.inner.close()
+    }
+
+    fn request(
+        &self,
+        record_type: u16,
+        object: u64,
+        payload: PayloadMap,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(5) {
+            return Err(invalid_input(
+                "overlay input request timeout must be in (0, 5s]",
+            ));
+        }
+        self.inner.lifecycle.ensure_active()?;
+        let id = self
+            .inner
+            .next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| invalid_data("interactive request ID space exhausted"))?;
+        let body = Envelope::correlated(id, payload)?.encode()?;
+        if self.inner.offline {
+            if self.inner.shared.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "overlay lane is closed",
+                ));
+            }
+            self.inner
+                .writer
+                .write_record(record_type, 0, object, &body)?;
+            return Ok(());
+        }
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut requests = lock(&self.inner.shared.requests, "overlay request table")?;
+            if self.inner.shared.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "overlay lane is closed",
+                ));
+            }
+            if requests.len() >= 64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "overlay input request limit reached",
+                ));
+            }
+            requests.insert(id, sender);
+        }
+        if let Err(error) = self
+            .inner
+            .writer
+            .write_record(record_type, 0, object, &body)
+        {
+            let _ = self.close();
+            return Err(error);
+        }
+        let record = match receiver.recv_timeout(timeout) {
+            Ok(Ok(record)) => record,
+            outcome => {
+                // A timed-out mutation has an unknown outcome. Retire the whole lane so a late
+                // capture reply cannot revive a gesture that the application already cancelled.
+                let _ = self.close();
+                return Err(match outcome {
+                    Err(mpsc::RecvTimeoutError::Timeout) => io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "overlay input request timed out; lane retired",
+                    ),
+                    _ => io::Error::new(io::ErrorKind::BrokenPipe, "overlay input lane closed"),
+                });
+            }
+        };
+        if record.record_type == messages::ERROR {
+            return Err(presenter_error(&record.body)?);
+        }
+        let result = (|| {
+            expect_record(&record, messages::OK, object)?;
+            if !decoded_payload(&record)?.is_empty() {
+                return Err(invalid_data("overlay input OK reply must be empty"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.close();
+        }
+        result
+    }
+}
+
+fn overlay_event_bytes(event: &InputLaneEvent) -> usize {
+    // The strict codec bounds the fixed fields. Only committed/preedit text is variable-sized.
+    let text_bytes = match event {
+        InputLaneEvent::Input { payload, .. } => payload
+            .iter()
+            .find(|(key, _)| *key == 5)
+            .and_then(|(_, value)| {
+                value
+                    .as_text()
+                    .or_else(|| value.as_array()?.first()?.as_text())
+            })
+            .map_or(0, str::len),
+        InputLaneEvent::Error(error) => error.diagnostic.len(),
+        InputLaneEvent::LaneClosed { diagnostic } => diagnostic.len(),
+        _ => 0,
+    };
+    128 + text_bytes
+}
+
 pub(crate) fn close_input_lane(pending: &PendingInput, message: &str) {
-    pending.closed.store(true, Ordering::Release);
+    if pending.closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
     if let Ok(mut events) = pending.events.lock() {
         events.clear();
         events.push_back(InputLaneEvent::LaneClosed {
@@ -591,6 +833,106 @@ pub(crate) fn decode_input_termination(
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+    #[test]
+    fn overlay_lane_requires_its_profile_and_close_retires_the_transport() {
+        let session = Session::connect(ProducerConfig::offline()).unwrap();
+        assert_eq!(
+            session.open_overlay_input_lane(1).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        let mut config = ProducerConfig::offline();
+        config.required_profiles.extend([
+            TERMINAL_OVERLAY.into(),
+            VECTOR_SCENE.into(),
+            OVERLAY_INPUT.into(),
+        ]);
+        config.required_profiles.sort();
+        config.required_profiles.dedup();
+        let session = Session::connect(config).unwrap();
+        let lane = session.open_overlay_input_lane(u64::MAX).unwrap();
+        lane.renew(1_000_000, Duration::from_millis(100)).unwrap();
+        assert!(lane.renew(1_000_000, Duration::ZERO).is_err());
+        lane.close().unwrap();
+        assert!(lane.renew(1_000_000, Duration::from_millis(100)).is_err());
+        assert!(matches!(
+            lane.wait_event(Duration::ZERO).unwrap(),
+            Some(OverlayLaneEvent::ConnectionLost { .. })
+        ));
+        assert!(lane.wait_event(Duration::ZERO).unwrap().is_none());
+        lane.close().unwrap();
+        assert!(lane.wait_event(Duration::ZERO).unwrap().is_none());
+    }
+
+    #[test]
+    fn overlay_reader_validates_before_dispatch_and_revokes_on_byte_overflow() {
+        use std::io::Cursor;
+        use vivid_protocol::wire::RecordHeader;
+        let event = vivid_protocol::overlay::wire::InputEvent {
+            address: vivid_protocol::overlay::wire::WindowAddress {
+                context_id: 1,
+                surface_id: 2,
+                generation: u64::MAX,
+            },
+            scene_revision: u64::MAX,
+            event: vivid_protocol::overlay::Event::Text("x".repeat(4096)),
+        };
+        let body = Envelope::new(0, event.payload().unwrap()).encode().unwrap();
+        for (overlay, count, kind, body, accepted) in [
+            (true, 1, messages::OVERLAY_INPUT_EVENT, body.clone(), true),
+            (false, 1, messages::OVERLAY_INPUT_EVENT, body.clone(), false),
+            (true, 32, messages::OVERLAY_INPUT_EVENT, body, false),
+            (
+                true,
+                1,
+                messages::OVERLAY_INPUT_EVENT,
+                messages::empty(0),
+                false,
+            ),
+            (true, 1, messages::KEY_INPUT, messages::empty(0), false),
+        ] {
+            let mut records = vec![(messages::LANE_ACCEPTED, 0, vec![])];
+            records.extend((0..count).map(|_| (kind, 2, body.clone())));
+            records.push((messages::PONG, 0, messages::empty(7)));
+            let mut bytes = Vec::new();
+            for (index, (record_type, object_id, body)) in records.into_iter().enumerate() {
+                bytes.extend_from_slice(
+                    &RecordHeader {
+                        body_length: body.len() as u32,
+                        record_type,
+                        flags: 0,
+                        object_id,
+                        sequence: index as u64 + 1,
+                    }
+                    .encode(),
+                );
+                bytes.extend_from_slice(&body);
+            }
+            let mut connection = Connection::from_streams(
+                Box::new(Cursor::new(bytes)),
+                Box::new(io::sink()),
+                ConnectionKind::Lane,
+            )
+            .unwrap();
+            connection.read_record().unwrap();
+            let (reader, writer) = connection.split().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let pending = Arc::new(PendingInput {
+                requests: Mutex::new(HashMap::from([(7, sender)])),
+                events: Mutex::new(VecDeque::new()),
+                events_ready: Condvar::new(),
+                closed: AtomicBool::new(false),
+            });
+            spawn_interactive_reader(reader, writer, pending, overlay).unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_ok(),
+                accepted
+            );
+        }
+    }
+
     #[test]
     fn interactive_optional_and_fatal_records_are_handled_before_dispatch() {
         use std::{io::Cursor, time::Duration};

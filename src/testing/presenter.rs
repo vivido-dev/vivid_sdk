@@ -346,14 +346,26 @@ impl Drop for TestPresenter {
         // Wake an accepted connection even when it has not completed the handshake yet. The
         // serving thread installs this clone while holding the same mutex and checks `stop` before
         // doing so, which closes the race between this take and its handoff.
-        if let Ok(mut guard) = self.control_shutdown.lock()
-            && let Some(stream) = guard.take()
-        {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        let waiting_for_accept = match self.control_shutdown.lock() {
+            Ok(mut guard) => match guard.take() {
+                Some(stream) => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    false
+                }
+                None => true,
+            },
+            Err(_) => true,
+        };
         // The accept loop wakes on its own connection, so a probe connect unblocks it.
-        if let Some(address) = self.endpoint.strip_prefix("tcp:") {
-            let _ = TcpStream::connect(address);
+        // Do not reconnect to a listener already being torn down after an accepted handshake.
+        // On Windows that connect can wait longer than the entire shutdown budget.
+        if waiting_for_accept
+            && let Some(address) = self
+                .endpoint
+                .strip_prefix("tcp:")
+                .and_then(|s| s.parse().ok())
+        {
+            let _ = TcpStream::connect_timeout(&address, Duration::from_millis(100));
         }
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -381,7 +393,7 @@ fn write_record(
     stream.flush()
 }
 
-fn read_record(stream: &mut TcpStream) -> io::Result<Record> {
+fn read_record(stream: &mut impl Read) -> io::Result<Record> {
     let mut header = [0_u8; HEADER_SIZE];
     stream.read_exact(&mut header)?;
     let header = RecordHeader::decode(header);
@@ -394,6 +406,35 @@ fn read_record(stream: &mut TcpStream) -> io::Result<Record> {
         sequence: header.sequence,
         body,
     })
+}
+
+/// Poll cancellation only during establishment. Some Windows socket providers do not wake an
+/// already-blocked read reliably when another cloned handle calls shutdown.
+struct HandshakeReader<'a> {
+    stream: &'a mut TcpStream,
+    stop: &'a AtomicBool,
+}
+impl Read for HandshakeReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "test presenter stopped during handshake",
+                ));
+            }
+            match self.stream.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 fn read_preface(stream: &mut TcpStream) -> io::Result<Preface> {
@@ -449,15 +490,19 @@ fn serve(serving: Serving) -> io::Result<()> {
         *guard = Some(control.try_clone()?);
     }
     let _control_shutdown_guard = ControlShutdownGuard(control_shutdown);
-    // No read or write timeout here. A presenter serves until its peer closes the connection or
-    // the harness drops it: a mid-session timeout would abandon a still-open session, and every
-    // request the producer sends afterwards would wait forever for a reply nobody will read.
-    // Drop shuts the stream down, which is the wake-up this loop needs.
+    // A short read timeout makes incomplete establishment cancellable on every platform. Remove
+    // it after HELLO: an ordinary idle established session must not be abandoned on a timeout.
+    control.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let mut handshake = HandshakeReader {
+        stream: &mut control,
+        stop: &stop,
+    };
     let mut preface_bytes = [0_u8; PREFACE_SIZE];
-    control.read_exact(&mut preface_bytes)?;
+    handshake.read_exact(&mut preface_bytes)?;
     let _ = Preface::decode(preface_bytes)?;
 
-    let hello_record = read_record(&mut control)?;
+    let hello_record = read_record(&mut handshake)?;
+    control.set_read_timeout(None)?;
     if hello_record.record_type != messages::HELLO {
         return Err(io::Error::other("first control record was not HELLO"));
     }

@@ -1,6 +1,6 @@
 # Overlay implementation status
 
-The interactive overlay facility is in development and is **not yet available as an SDK API**.
+The interactive overlay facility is in development and is **not yet usable end to end**.
 `OverlaySession` and `OverlayWindow` are not exported. Direct Vivido and the terminating SDK
 presenter do not currently negotiate the new overlay profiles. Configuring the terminating
 presenter to advertise them fails explicitly.
@@ -18,10 +18,21 @@ Implemented foundations:
   drag/resize, and bounded input queues.
 - Vello scene compilation with matching transformed/clipped hit regions and host text shaping.
 - Explicit rejection of unsupported overlay profiles by the terminating presenter/gateway.
+- Typed window control, viewport/status, capture/renewal, and input-event codecs shared with the
+  presenter. Input carries the published scene revision independently of window geometry; motion
+  coalescing cannot cross scene revisions. Window actions preserve popup stacking and check owners,
+  generations, and revisions. Wheel routing respects modal eligibility and input transparency.
+- Rust `TrackChannel::send_vector` and `send_vector_asset`, with authenticated negotiated limits,
+  retained-image budgeting, increasing scene revisions, and ordered EOS. Oversized records fail
+  before spending channel credit. Asset release and publication outcomes are still outstanding.
+- Rust `Session::open_overlay_input_lane`, returning typed `OverlayLaneEvent` values with bounded
+  capture/renewal requests. Overflow or request timeout retires the lane; close shuts down the
+  transport and reports connection loss once. The host does not yet accept this lane profile.
+- Overlay profile, vector-kind, and vector-slot constants in all three language packages.
 
 Still required before enabling the profiles:
 
-- Complete control and interactive-lane codecs/dispatch, authoritative viewport/DPI notifications,
+- Live control and interactive-lane dispatch, authoritative viewport/DPI notifications,
   input-lane liveness, host input/IME routing, and live window lifecycle integration.
 - Bounded worker scheduling, retained-asset accounting, atomic scene publication and explicit
   superseded/presented outcomes integrated with track credit and readiness.
@@ -29,6 +40,11 @@ Still required before enabling the profiles:
   TypeScript APIs with full-width identities represented as bigint.
 - Text measurement, resource/multi-owner stress tests, full language workflows, benchmarks, and
   live pane visual/input acceptance checks.
+- The GPUI-inspired declarative UI engine, Taffy layout, rich text/editing/IME services, semantic
+  accessibility bridge, image/SVG/GIF loading, and the separate three-language demo gallery.
+
+The GPUI-inspired implementation is not complete. No declarative UI module, high-level overlay
+window API, or gallery is exported by this increment. Existing examples and Zed remain unchanged.
 
 The protocol extension is specified in
 [the overlay specification](../vivid_protocol/vivid-protocol-1.5-overlays.md).
@@ -38,15 +54,16 @@ Existing examples are intentionally unchanged.
 
 - Protocol: all-target tests and Clippy pass; the added input-state tests also pass.
 - Gateway: all 21 tests and Clippy pass.
-- SDK: default workspace tests pass. All-feature tests pass when excluding the existing Windows
-  `drop_wakes_an_incomplete_control_handshake` timeout; that test still fails. Clippy passes.
-- Vivido: both new GPU regressions pass. The workspace suite reports 703 passed, 4 ignored, and
-  one IPC capability-classification failure that passes when rerun alone. Clippy passes.
+- SDK: default all-target tests and all-feature workspace tests pass without exclusions, including
+  109 default and 155 all-feature library tests. The incomplete-handshake shutdown regression now
+  passes on Windows with cancellable establishment reads. Workspace Clippy passes.
+- Vivido: workspace all-target tests and Clippy pass, including the GPU regressions. The main
+  library reports 704 passed and 4 ignored; the IPC classification test passes in this run.
 - Python: native build and 27 SDK/presenter tests pass with a workspace-local temporary directory.
   Mypy passes with the Unix automation platform selected. The full Windows suite cannot run
-  Unix-only automation tests (`AF_UNIX`, `geteuid`, and `uname`).
-- TypeScript: native build and typecheck pass; 17 tests pass. The existing security test fails
-  because it turns a Windows file URL into an invalid `F:\F:\...` path.
+  Unix-only automation tests; the full-suite attempt stopped after three missing-`AF_UNIX` failures.
+- TypeScript: native build, typecheck, and all 18 tests pass. The security test now converts its
+  source-directory file URL with `fileURLToPath`, which works on Windows as well as Unix.
 - No live overlay window/input acceptance run or overlay performance benchmark has been completed.
 
 These checks validate the foundations, not the unfinished interactive overlay facility.

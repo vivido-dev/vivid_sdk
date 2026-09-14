@@ -75,6 +75,17 @@ pub(crate) fn session_info(welcome: &messages::Welcome) -> SessionInfo {
         establishment_state: welcome.establishment_state,
         resume_generation: welcome.resume_generation,
         resource_contract: welcome.resource_contract.clone(),
+        vector_limits: welcome
+            .extensions
+            .iter()
+            .find(|(key, _)| {
+                *key == 15
+                    && welcome
+                        .accepted_profiles
+                        .iter()
+                        .any(|profile| profile == crate::VECTOR_SCENE)
+            })
+            .and_then(|(_, value)| vivid_protocol::vector::Limits::from_value(value).ok()),
     }
 }
 

@@ -79,8 +79,8 @@ pub use config::{
 };
 pub use constants::{
     ConstantValue, IMAGE_ENCODING_JPEG, IMAGE_ENCODING_PNG, SLOT_AUDIO, SLOT_NONE, SLOT_POSTER,
-    SLOT_PRIMARY_VIDEO, SLOT_RASTER, TRACK_KIND_AUDIO, TRACK_KIND_IMAGE, TRACK_KIND_RASTER,
-    TRACK_KIND_VIDEO, constant_table,
+    SLOT_PRIMARY_VIDEO, SLOT_RASTER, SLOT_VECTOR, TRACK_KIND_AUDIO, TRACK_KIND_IMAGE,
+    TRACK_KIND_RASTER, TRACK_KIND_VECTOR, TRACK_KIND_VIDEO, constant_table,
 };
 pub use controller::{
     ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
@@ -96,6 +96,7 @@ pub use file_drop::{
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
+    OverlayInputLane, OverlayLaneEvent,
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use media_info::probe_encoded_image;
@@ -143,7 +144,7 @@ pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
     AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
     DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY,
-    TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA,
+    OVERLAY_INPUT, TERMINAL_CONTENT, TERMINAL_OVERLAY, TERMINAL_SURFACE, TIMED_MEDIA, VECTOR_SCENE,
 };
 pub use vivid_protocol::revision::FileTransferGeneration;
 pub use vivid_protocol::scene::{Fit, SceneNode};
@@ -159,7 +160,7 @@ pub use vivid_protocol::track::{
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA,
     MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS,
     MILESTONE_TRACK_LOST, RasterConfiguration, TrackConfiguration, TrackDirection, TrackMode,
-    VideoConfiguration,
+    VectorConfiguration, VideoConfiguration,
 };
 
 const MAX_CONTROL_EVENTS: usize = 1024;

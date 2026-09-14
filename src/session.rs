@@ -35,6 +35,8 @@ pub struct SessionInfo {
     pub establishment_state: u64,
     pub resume_generation: u64,
     pub resource_contract: ResourceContract,
+    /// Authenticated vector ceilings, present only when vector-scene-v1 was accepted.
+    pub vector_limits: Option<vivid_protocol::vector::Limits>,
 }
 
 impl SessionInfo {
@@ -798,6 +800,10 @@ impl Session {
             target_generation: TargetGeneration::ONE,
             target_descriptor: offline_target_descriptor(&config.target_profile),
             target_profile: config.target_profile,
+            vector_limits: accepted_profiles
+                .iter()
+                .any(|p| p == vivid_protocol::registry::VECTOR_SCENE)
+                .then(vivid_protocol::vector::Limits::default),
             accepted_profiles,
             session_revision: 1,
             scene_revision: SceneRevision::ZERO,

@@ -26,6 +26,7 @@ pub struct Track {
 #[derive(Clone)]
 pub(crate) struct TrackLocal {
     pub(crate) configuration: TrackConfiguration,
+    pub(crate) vector_limits: Option<vivid_protocol::vector::Limits>,
     pub(crate) revision: TrackRevision,
     pub(crate) channel_generation: ChannelGeneration,
     pub(crate) open_deadline_us: u64,
@@ -329,6 +330,19 @@ impl Session {
     ) -> io::Result<Track> {
         configuration.validate(false)?;
         self.require_audio_input_profile(&configuration)?;
+        if let KindConfiguration::VectorScene(vector) = &configuration.kind {
+            let limits = self.info.vector_limits.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "vector-scene-v1 was not accepted",
+                )
+            })?;
+            if u64::from(vector.maximum_scene_bytes) > limits.values()[0] {
+                return Err(invalid_input(
+                    "vector configuration exceeds negotiated scene limit",
+                ));
+            }
+        }
         if !self
             .surfaces
             .contains_key(&(configuration.context_id, configuration.surface_id))
@@ -408,6 +422,7 @@ impl Session {
         }
         let inner = Arc::new(Mutex::new(TrackLocal {
             configuration,
+            vector_limits: self.info.vector_limits.clone(),
             revision: ready.revision,
             channel_generation: ready.generation,
             open_deadline_us: ready.open_deadline_us,
