@@ -33,6 +33,7 @@ mod lease;
 mod media_info;
 mod offline;
 mod orch;
+pub mod overlay;
 mod pane;
 mod pipeline;
 mod resume;
@@ -101,6 +102,7 @@ pub use input::{
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use media_info::probe_encoded_image;
 pub use orch::{DeskMutation, DesktopSurface, SurfaceBuilder, SurfaceSlots, TrackBuilder};
+pub use overlay::{OverlaySession, OverlayWindow, OverlayWindowOptions};
 pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
     AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, MINIMUM_TARGET_BITS_PER_SECOND,

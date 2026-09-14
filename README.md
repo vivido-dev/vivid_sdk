@@ -1,6 +1,6 @@
 # vivid_sdk
 
-See [overlay implementation status](OVERLAYS.md) for above-text composition and the pending interactive window API.
+See [pane overlays](OVERLAYS.md) for the Rust window API, Vello drawing, and current acceptance status.
 
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
