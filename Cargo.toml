@@ -60,8 +60,34 @@ serde_json = "1"
 
 [[example]]
 name = "conformance"
+path = "examples/rust/conformance.rs"
 required-features = ["presenter"]
 
 [workspace]
 members = ["python-bindings", "node-bindings"]
 resolver = "3"
+
+[[example]]
+name = "sdk_01_show_image"
+path = "examples/rust/01_show_image.rs"
+
+[[example]]
+name = "sdk_02_generated_raster"
+path = "examples/rust/02_generated_raster.rs"
+
+[[example]]
+name = "sdk_03_surface_and_track"
+path = "examples/rust/03_surface_and_track.rs"
+
+[[example]]
+name = "sdk_04_raster_animation"
+path = "examples/rust/04_raster_animation.rs"
+
+[[example]]
+name = "sdk_05_replace_track"
+path = "examples/rust/05_replace_track.rs"
+
+[[example]]
+name = "sdk_06_presenter_roundtrip"
+path = "examples/rust/06_presenter_roundtrip.rs"
+required-features = ["presenter"]

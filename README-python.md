@@ -1,5 +1,7 @@
 # vivid-sdk for Python
 
+See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
+
 `vivid-sdk` is the typed Python SDK for Vivid Protocol 1.5, for both roles. Python 3.9+ and Rust
 1.88+ are required.
 

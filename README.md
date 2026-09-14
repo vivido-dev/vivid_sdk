@@ -1,5 +1,7 @@
 # vivid_sdk
 
+See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
+
 `vivid_sdk` is the full-duplex Rust SDK for Vivid Protocol 1.5. It serves both roles: the crate
 root is the producer, and [`presenter`](src/presenter/) — behind the off-by-default `presenter`
 feature — is the terminating presenter that accepts one.

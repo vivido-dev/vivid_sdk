@@ -28,7 +28,9 @@
     "typecheck": "tsc -p ts --noEmit",
     "test": "node --test ts/tests/*.test.mjs",
     "test:bun": "bun test ts/tests",
-    "test:conformance": "node --test conformance/compare.test.mjs && node conformance/compare.mjs"
+    "test:conformance": "node --test conformance/compare.test.mjs && node conformance/compare.mjs",
+    "build:examples": "tsc -p examples/typescript",
+    "typecheck:examples": "tsc -p examples/typescript --noEmit"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0",

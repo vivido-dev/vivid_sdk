@@ -1,0 +1,12 @@
+{
+  "extends": "../../ts/tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../../target/examples-typescript",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": [
+    "*.ts"
+  ]
+}
