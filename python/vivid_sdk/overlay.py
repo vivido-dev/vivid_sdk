@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -142,6 +142,46 @@ def _text_measurement(raw: Any) -> TextMeasurement:
 
 PresentationOutcome = Literal["presented", "superseded"]
 
+@dataclass(frozen=True)
+class TextStyle:
+    size: float = 16
+    family: str = ""
+    weight: int = 400
+    italic: bool = False
+    color: int = 0xFFFFFFFF
+    underline: bool = False
+    strikethrough: bool = False
+
+@dataclass(frozen=True)
+class TextRun:
+    text: str
+    style: TextStyle = field(default_factory=TextStyle)
+
+@dataclass(frozen=True)
+class StyledText:
+    runs: Sequence[TextRun]
+    max_width: Optional[float] = None
+    alignment: Literal["start", "center", "end", "justify"] = "start"
+    wrap: bool = True
+    max_lines: Optional[int] = None
+    def __post_init__(self) -> None: object.__setattr__(self, "runs", tuple(self.runs))
+    def _native(self) -> Any:
+        canvas = Canvas()
+        decorations = []
+        for run in self.runs:
+            style = run.style
+            canvas.text(run.text, Point(0, 0), style.size, style.color, family=style.family, weight=style.weight, italic=style.italic)
+            decorations.append(int(style.underline) | (int(style.strikethrough) << 1))
+        return _native.OverlayStyledText(canvas._raw, decorations, self.max_width, self.alignment, self.wrap, self.max_lines)
+
+class RetainedTextLayout:
+    """Opaque, immutable host layout. Release explicitly through its owning window."""
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._measurement = _text_measurement(raw.measurement())
+    @property
+    def measurement(self) -> TextMeasurement: return self._measurement
+
 class OverlaySubmission:
     """A specific submission. Timeout leaves the receipt usable; lane loss raises OSError."""
     def __init__(self, raw: Any) -> None: self._raw = raw
@@ -272,8 +312,8 @@ class OverlaySession:
     @classmethod
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
-        required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT) if p not in required})
+        required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))
@@ -302,6 +342,14 @@ class OverlaySession:
     def __exit__(self, *args: Any) -> None: self.close()
 
 class OverlayWindow:
+    def measure_text_batch(self, texts: Sequence[StyledText]) -> Tuple[TextMeasurement, ...]:
+        return tuple(_text_measurement(raw.measurement()) for raw in self._raw.text_batch([text._native() for text in texts], False))
+    def layout_text_batch(self, texts: Sequence[StyledText]) -> Tuple[RetainedTextLayout, ...]:
+        return tuple(RetainedTextLayout(raw) for raw in self._raw.text_batch([text._native() for text in texts], True))
+    def layout_text(self, text: StyledText) -> RetainedTextLayout: return self.layout_text_batch((text,))[0]
+    def draw_text_layout(self, canvas: Canvas, layout: RetainedTextLayout, origin: Point) -> None:
+        self._raw.draw_text_layout(canvas._raw, layout._raw, origin.x, origin.y)
+    def release_text_layout(self, layout: RetainedTextLayout) -> None: self._raw.release_text_layout(layout._raw)
     def measure_text(self, text: str, size: float, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> TextMeasurement:
         canvas = Canvas().text(text, Point(0, 0), size, 0xFFFFFFFF, family=family, weight=weight, italic=italic, max_width=max_width)
         return _text_measurement(self._raw.measure_text(canvas._raw))

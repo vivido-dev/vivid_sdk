@@ -2,7 +2,7 @@
 from __future__ import annotations
 import asyncio
 import functools
-from typing import Any, AsyncIterator, Callable, Optional, TypeVar
+from typing import Any, AsyncIterator, Callable, Optional, TypeVar, Sequence, Tuple
 from . import overlay
 
 _Owned = TypeVar("_Owned", overlay.OverlaySession, overlay.OverlayWindow)
@@ -67,6 +67,31 @@ class OverlaySubmission:
         return await _run(self._inner.wait, timeout)
 
 class OverlayWindow:
+    async def measure_text_batch(self, texts: Sequence[overlay.StyledText]) -> Tuple[overlay.TextMeasurement, ...]:
+        return await _run(self._inner.measure_text_batch, tuple(texts))
+    async def layout_text_batch(self, texts: Sequence[overlay.StyledText]) -> Tuple[overlay.RetainedTextLayout, ...]:
+        future = asyncio.get_running_loop().run_in_executor(None, self._inner.layout_text_batch, tuple(texts))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            while not future.done():
+                try: await asyncio.shield(future)
+                except asyncio.CancelledError: pass
+            layouts = future.result()
+            def release() -> None:
+                for layout in layouts: self._inner.release_text_layout(layout)
+            cleanup = asyncio.get_running_loop().run_in_executor(None, release)
+            while not cleanup.done():
+                try: await asyncio.shield(cleanup)
+                except asyncio.CancelledError: pass
+            cleanup.result()
+            raise
+    async def layout_text(self, text: overlay.StyledText) -> overlay.RetainedTextLayout:
+        return (await self.layout_text_batch((text,)))[0]
+    async def draw_text_layout(self, canvas: overlay.Canvas, layout: overlay.RetainedTextLayout, origin: overlay.Point) -> None:
+        await _run(self._inner.draw_text_layout, canvas, layout, origin)
+    async def release_text_layout(self, layout: overlay.RetainedTextLayout) -> None:
+        await _run(self._inner.release_text_layout, layout)
     async def measure_text(self, text: str, size: float, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> overlay.TextMeasurement:
         return await _run(self._inner.measure_text, text, size, family=family, weight=weight, italic=italic, max_width=max_width)
     async def set_editor_geometry(self, scene_revision: int, caret: Optional[overlay.Rect]) -> None:

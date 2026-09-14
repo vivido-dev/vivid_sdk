@@ -248,6 +248,73 @@ impl PyOverlayWindow {
         )?;
         Ok(dict.unbind())
     }
+    fn text_batch(
+        &self,
+        py: Python<'_>,
+        texts: Vec<Py<PyStyledText>>,
+        retain: bool,
+    ) -> PyResult<Vec<PyTextLayout>> {
+        let texts: Vec<_> = texts.iter().map(|t| t.borrow(py).inner.clone()).collect();
+        let sources: Vec<_> = texts.iter().map(|t| t.text()).collect();
+        let values = py
+            .detach(|| -> io::Result<Vec<_>> {
+                if retain {
+                    Ok(self
+                        .inner
+                        .layout_text_batch(&texts)?
+                        .into_iter()
+                        .map(|layout| (layout.measurement().clone(), Some(layout)))
+                        .collect())
+                } else {
+                    Ok(self
+                        .inner
+                        .measure_text_batch(&texts)?
+                        .into_iter()
+                        .map(|m| (m, None))
+                        .collect())
+                }
+            })
+            .map_err(io_error)?;
+        Ok(values
+            .into_iter()
+            .zip(sources)
+            .map(|((measurement, inner), source)| PyTextLayout {
+                measurement,
+                inner,
+                source,
+            })
+            .collect())
+    }
+    fn draw_text_layout(
+        &self,
+        py: Python<'_>,
+        canvas: &PyCanvas,
+        layout: &PyTextLayout,
+        x: f64,
+        y: f64,
+    ) -> PyResult<()> {
+        let layout = layout
+            .inner
+            .as_ref()
+            .ok_or_else(|| value_error("measurement is not retained"))?;
+        let origin = Point::new(x, y).map_err(value_error)?;
+        let mut command = Canvas::new();
+        py.detach(|| self.inner.draw_text_layout(&mut command, layout, origin))
+            .map_err(io_error)?;
+        let mut target = lock(&canvas.inner, "canvas")?;
+        for command in command.commands() {
+            target.push(command.clone()).map_err(value_error)?;
+        }
+        Ok(())
+    }
+    fn release_text_layout(&self, py: Python<'_>, layout: &PyTextLayout) -> PyResult<()> {
+        let layout = layout
+            .inner
+            .as_ref()
+            .ok_or_else(|| value_error("measurement is not retained"))?;
+        py.detach(|| self.inner.release_text_layout(layout))
+            .map_err(io_error)
+    }
     fn set_editor_geometry(
         &self,
         py: Python<'_>,
@@ -387,6 +454,8 @@ impl PyOverlayEvent {
     }
 }
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyStyledText>()?;
+    module.add_class::<PyTextLayout>()?;
     module.add_class::<PyCanvas>()?;
     module.add_class::<PyOverlaySession>()?;
     module.add_class::<PyOverlayWindow>()?;
@@ -394,4 +463,58 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyOverlayEvent>()?;
     module.add_class::<PyOverlaySubmission>()?;
     Ok(())
+}
+
+#[pyclass(name = "OverlayStyledText", module = "vivid_sdk._native")]
+struct PyStyledText {
+    inner: vivid_sdk::overlay::StyledText,
+}
+#[pymethods]
+impl PyStyledText {
+    #[new]
+    #[pyo3(signature = (canvas, decorations, max_width, alignment, wrap, max_lines))]
+    fn new(
+        canvas: &PyCanvas,
+        decorations: Vec<u32>,
+        max_width: Option<f64>,
+        alignment: &str,
+        wrap: bool,
+        max_lines: Option<u16>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: model::styled_text(
+                &*lock(&canvas.inner, "canvas")?,
+                &decorations,
+                max_width,
+                alignment,
+                wrap,
+                max_lines,
+            )
+            .map_err(io_error)?,
+        })
+    }
+}
+#[pyclass(name = "OverlayTextLayout", module = "vivid_sdk._native")]
+struct PyTextLayout {
+    inner: Option<vivid_sdk::overlay::RetainedTextLayout>,
+    measurement: vivid_sdk::overlay::TextMeasurement,
+    source: String,
+}
+#[pymethods]
+impl PyTextLayout {
+    fn measurement(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("width", self.measurement.width.get())?;
+        dict.set_item("height", self.measurement.height.get())?;
+        dict.set_item(
+            "lines",
+            model::text_geometry(&self.measurement.lines, &self.source, false).map_err(io_error)?,
+        )?;
+        dict.set_item(
+            "clusters",
+            model::text_geometry(&self.measurement.clusters, &self.source, false)
+                .map_err(io_error)?,
+        )?;
+        Ok(dict.unbind())
+    }
 }

@@ -272,6 +272,80 @@ impl OverlayWindow {
         .await
     }
     #[napi]
+    pub fn text_batch<'env>(
+        &self,
+        env: &'env Env,
+        texts: Vec<ClassInstance<'_, OverlayStyledText>>,
+        retain: bool,
+    ) -> Result<PromiseRaw<'env, Vec<OverlayTextLayout>>> {
+        let texts: Vec<_> = texts.iter().map(|t| t.inner.clone()).collect();
+        let window = self.inner.clone();
+        env.spawn_future(blocking(move || {
+            let sources: Vec<_> = texts.iter().map(|t| t.text()).collect();
+            let values: Vec<_> = if retain {
+                window
+                    .layout_text_batch(&texts)
+                    .map_err(io_error)?
+                    .into_iter()
+                    .map(|layout| (layout.measurement().clone(), Some(layout)))
+                    .collect()
+            } else {
+                window
+                    .measure_text_batch(&texts)
+                    .map_err(io_error)?
+                    .into_iter()
+                    .map(|m| (m, None))
+                    .collect()
+            };
+            Ok(values
+                .into_iter()
+                .zip(sources)
+                .map(|((measurement, inner), source)| OverlayTextLayout {
+                    measurement,
+                    inner,
+                    source,
+                })
+                .collect())
+        }))
+    }
+    #[napi]
+    pub async fn draw_text_layout(
+        &self,
+        canvas: &OverlayCanvas,
+        layout: &OverlayTextLayout,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        let layout = layout
+            .inner
+            .clone()
+            .ok_or_else(|| value_error("measurement is not retained"))?;
+        let origin = Point::new(x, y).map_err(value_error)?;
+        let target = canvas.inner.clone();
+        let window = self.inner.clone();
+        blocking(move || {
+            let mut command = Canvas::new();
+            window
+                .draw_text_layout(&mut command, &layout, origin)
+                .map_err(io_error)?;
+            let mut target = locked(&target, "canvas")?;
+            for command in command.commands() {
+                target.push(command.clone()).map_err(value_error)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+    #[napi]
+    pub async fn release_text_layout(&self, layout: &OverlayTextLayout) -> Result<()> {
+        let layout = layout
+            .inner
+            .clone()
+            .ok_or_else(|| value_error("measurement is not retained"))?;
+        let window = self.inner.clone();
+        blocking(move || window.release_text_layout(&layout).map_err(io_error)).await
+    }
+    #[napi]
     pub async fn set_editor_geometry(
         &self,
         scene_revision: BigInt,
@@ -409,6 +483,55 @@ pub struct OverlayTextMeasurement {
     pub height: f64,
     pub lines: Vec<Vec<f64>>,
     pub clusters: Vec<Vec<f64>>,
+}
+
+#[napi]
+pub struct OverlayStyledText {
+    inner: vivid_sdk::overlay::StyledText,
+}
+#[napi]
+impl OverlayStyledText {
+    #[napi(constructor)]
+    pub fn new(
+        canvas: &OverlayCanvas,
+        decorations: Vec<u32>,
+        max_width: Option<f64>,
+        alignment: String,
+        wrap: bool,
+        max_lines: Option<u16>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: model::styled_text(
+                &*locked(&canvas.inner, "canvas")?,
+                &decorations,
+                max_width,
+                &alignment,
+                wrap,
+                max_lines,
+            )
+            .map_err(io_error)?,
+        })
+    }
+}
+#[napi]
+pub struct OverlayTextLayout {
+    inner: Option<vivid_sdk::overlay::RetainedTextLayout>,
+    measurement: vivid_sdk::overlay::TextMeasurement,
+    source: String,
+}
+#[napi]
+impl OverlayTextLayout {
+    #[napi]
+    pub fn measurement(&self) -> Result<OverlayTextMeasurement> {
+        Ok(OverlayTextMeasurement {
+            width: self.measurement.width.get(),
+            height: self.measurement.height.get(),
+            lines: model::text_geometry(&self.measurement.lines, &self.source, true)
+                .map_err(io_error)?,
+            clusters: model::text_geometry(&self.measurement.clusters, &self.source, true)
+                .map_err(io_error)?,
+        })
+    }
 }
 #[napi]
 pub struct OverlaySubmission {

@@ -180,8 +180,8 @@ Results contain logical-pixel width, height, line geometry, and visual-order clu
 Geometry includes text ranges, bounds, baselines, and cluster direction. Rust ranges use UTF-8
 byte offsets; Python uses character indexes; TypeScript uses UTF-16 indexes. Measurement starts
 at `(0, 0)` independently of Canvas text origin and color. These are measurement snapshots,
-not retained layout handles: use matching text/style when painting. Batched measurements,
-retained layouts, and richer styled text are future host-service work.
+not retained layout handles: use matching text/style when painting. For guaranteed
+measurement/painting consistency, use the retained layout service below.
 
 After a submission is presented and its window has focus, publish the editor's window-local
 caret rectangle with `set_editor_geometry(revision, Some(rect))` in Rust,
@@ -207,6 +207,65 @@ clearing it restores the latest available terminal IME area.
 Requests are bounded to 4,096 UTF-8 text bytes and replies to 1,024 lines and 1,024 clusters,
 subject to negotiated control-record limits. Vivido permits one outstanding shaping job per
 owner and at most 16 globally; overload fails explicitly without blocking input or rendering.
+
+### Batched measurements and retained styled layouts
+
+Connection helpers also optionally negotiate `overlay-text-layout-v1`. `StyledText` describes a
+paragraph of `TextRun` values with `TextStyle`: size, family, weight, italic, color, underline,
+and strikethrough. Runs shape together with host font fallback. Paragraph options provide maximum
+width, start/center/end/justify alignment, wrapping, and a maximum line count. Disabling wrapping
+preserves explicit line breaks. Width overflow and extra lines are clipped; truncation does not
+insert an ellipsis. With a maximum width, the measured width is the paragraph box width; geometry
+still reports actual cluster positions, including horizontally clipped content.
+
+| Operation | Rust / Python | TypeScript |
+|---|---|---|
+| Measure one batch without retention | `measure_text_batch` | `measureTextBatch` |
+| Measure and retain one paragraph | `layout_text` | `layoutText` |
+| Measure and retain a batch | `layout_text_batch` | `layoutTextBatch` |
+| Add a retained layout to a Canvas | `draw_text_layout` | `drawTextLayout` |
+| Release future use of a layout | `release_text_layout` | `releaseTextLayout` |
+
+Python's asyncio facade awaits each operation; TypeScript operations are asynchronous. A retained
+layout exposes `measurement()` in Rust and `.measurement` in Python/TypeScript. Wire IDs stay
+opaque. Line/cluster ranges use the same language-specific offsets as single measurements.
+Example with an existing Python window:
+
+```python
+from vivid_sdk.overlay import Canvas, Point, StyledText, TextRun, TextStyle
+
+paragraph = StyledText(
+    (TextRun("Hello ", TextStyle(size=20)),
+     TextRun("world", TextStyle(size=20, weight=700, color=0x66CCFFFF, underline=True))),
+    max_width=260, alignment="center", max_lines=2,
+)
+layout = window.layout_text(paragraph)
+scene = Canvas()
+window.draw_text_layout(scene, layout, Point(20, 20))
+receipt = window.submit(scene)
+if receipt.wait(5) == "presented":
+    window.release_text_layout(layout)
+```
+
+The host compiles a retained glyph scene from the exact measured layout. Repainting, movement,
+and replacement tracks reuse it without shaping again. Existing layouts keep their fonts and
+glyph positions if host font settings change; create a new layout to adopt those changes.
+Canvas transforms, clipping, and opacity apply normally. Handles belong to one window and remain
+valid across its track replacements. Other windows, including another producer's reused local
+IDs, cannot use them.
+
+Release removes future lookup, preserving scenes that already resolved the layout. Wait for a
+presented receipt before releasing when the submitted scene must keep it: control release and
+bulk submission use separate lanes. The SDK rejects new submissions of prebuilt Canvases referring
+to released layouts. Closing/dismissing the window or losing its owner/input lane removes its
+namespace. Released resources stay charged while pending or displayed scenes reference them.
+Python cancellation during retained batch creation waits for completion and releases the results.
+
+A batch has 1–32 paragraphs, at most 64 runs and 4,096 UTF-8 text bytes in total, and at most
+1,024 returned line-plus-cluster entries. Each family is at most 256 bytes. Whole batches fail
+atomically on malformed input, overload, or oversized replies. Retention is bounded to 128 layouts
+per owner and 2,048 globally, including released layouts still used by scenes. Single and batch
+requests share the existing worker limits. Terminating SDK presenters/gateways decline this profile.
 
 `wait_event(timeout)` / `waitEvent(timeout)` use **seconds**, bounded to 0–60. Event iteration
 uses bounded waits and ends after connection loss or explicit session close. Typed events cover
@@ -237,14 +296,15 @@ The harness starts Python blocking, Python asyncio, and TypeScript producers aga
 authenticated host sessions. It verifies exact four-color Vello readback, window controls,
 retained assets, typed pointer input with an ID above 2^53, IME offset conversion, capture,
 child popups, per-submission outcomes, track replacement/reconciliation, independent asset
-release, unsolicited viewport changes, host text measurement, focused-editor geometry, and cleanup.
+release, unsolicited viewport changes, host text measurement, focused-editor geometry, styled
+measurement batches, retained layout colors, replacement-track reuse, release, and cleanup.
 Each subprocess has a bounded deadline.
 Capabilities are passed through child environments, never command arguments. A Vello adapter
 is required; this test fails rather than silently skipping its rendering assertions.
 
 ## Remaining work and acceptance
 
-- Batched text measurement, retained measured layouts, and richer styled text services.
+- Ellipsis insertion and additional typographic controls beyond the current styled paragraphs.
 - Full live visual/input acceptance, including clipboard policy, IME placement, accessibility,
   platform-specific input behavior, and performance measurements.
 - The separate declarative UI engine, layout/editing services, accessibility bridge, and gallery.
@@ -257,9 +317,15 @@ live native pane interaction acceptance. A Windows live-pane probe verified edit
 reaching the window backend, following window movement at 125% DPI, and clearing on request.
 Native IME candidate-popup placement and performance benchmarks remain unverified.
 
+A separate Windows live-pane check verified retained styled layouts at 125% DPI: centered mixed
+sizes/colors, wrapping, italic, underline, and strikethrough. Moving the window and releasing its
+layouts preserved the displayed glyph scenes. The socket/GPU harness additionally verifies both
+run colors through Python blocking, Python asyncio, and TypeScript. Native Rust regressions cover
+atomic batch rejection, quota recovery, in-flight release accounting, and two-owner cleanup.
+
 Windows binding validation passes for Python blocking, Python asyncio, and native TypeScript,
 including the Vivido socket/GPU test above. The Python SDK, presenter, and overlay suites have
-32 passing tests; TypeScript has 22. Python's Unix-socket automation suite and live native pane
+33 passing tests; TypeScript has 22. Python's Unix-socket automation suite and live native pane
 interaction checks were not run on this Windows host. Socket-delivered IME events do not prove
 platform IME positioning or native input acceptance.
 

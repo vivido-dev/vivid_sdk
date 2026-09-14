@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -22,6 +22,9 @@ interface NativeCanvas {
 }
 interface CanvasConstructor { new(): NativeCanvas; shape(kind: string, bounds: number[], radius: number): number[][] }
 interface NativeWindow {
+  textBatch(texts: object[], retain: boolean): Promise<NativeTextLayout[]>;
+  drawTextLayout(canvas: NativeCanvas, layout: NativeTextLayout, x: number, y: number): Promise<void>;
+  releaseTextLayout(layout: NativeTextLayout): Promise<void>;
   measureText(canvas: NativeCanvas): Promise<{ width: number; height: number; lines: number[][]; clusters: number[][] }>;
   setEditorGeometry(sceneRevision: bigint, caret?: number[]): Promise<void>;
   submit(canvas: NativeCanvas): Promise<NativeSubmission>;
@@ -36,6 +39,40 @@ interface NativeWindow {
   viewport(): Promise<number[]>;
   uploadRgba(width: number, height: number, rgba: Buffer): Promise<object>;
   drawImage(canvas: NativeCanvas, image: object, bounds: number[], opacity: number): Promise<void>;
+}
+interface NativeTextLayout { measurement(): { width: number; height: number; lines: number[][]; clusters: number[][] } }
+export interface TextStyle {
+  readonly size?: number; readonly family?: string; readonly weight?: number;
+  readonly italic?: boolean; readonly color?: number; readonly underline?: boolean; readonly strikethrough?: boolean;
+}
+export interface TextRun { readonly text: string; readonly style?: TextStyle }
+export interface StyledText {
+  readonly runs: readonly TextRun[]; readonly maxWidth?: number;
+  readonly alignment?: "start" | "center" | "end" | "justify";
+  readonly wrap?: boolean;
+  /** Clip after this many complete lines. */
+  readonly maxLines?: number;
+}
+function nativeStyledText(text: StyledText): object {
+  if (text.maxLines !== undefined && (!Number.isInteger(text.maxLines) || text.maxLines < 1 || text.maxLines > 1024)) throw new RangeError("maxLines must be an integer in [1, 1024]");
+  const canvas = new Canvas();
+  const decorations: number[] = [];
+  for (const run of text.runs) {
+    const style = run.style ?? {};
+    canvas.text(run.text, { x: 0, y: 0 }, style.size ?? 16, style.color ?? 0xffffffff,
+      { family: style.family ?? "", weight: style.weight ?? 400, italic: style.italic ?? false });
+    decorations.push(Number(Boolean(style.underline)) | (Number(Boolean(style.strikethrough)) << 1));
+  }
+  const Type = native().OverlayStyledText as { new(canvas: NativeCanvas, decorations: number[], maxWidth: number | undefined, alignment: string, wrap: boolean, maxLines: number | undefined): object };
+  return new Type(canvas.raw, decorations, text.maxWidth, text.alignment ?? "start", text.wrap ?? true, text.maxLines);
+}
+function layoutMeasurement(raw: NativeTextLayout): TextMeasurement {
+  const measured = raw.measurement();
+  return { ...measured, lines: measured.lines.map(textGeometry), clusters: measured.clusters.map(textGeometry) };
+}
+export class RetainedTextLayout {
+  readonly measurement: TextMeasurement;
+  /** @internal */ constructor(readonly raw: NativeTextLayout) { this.measurement = layoutMeasurement(raw); }
 }
 interface NativeSession {
   createWindow(bounds: number[], mode: string, title: string, visible: boolean, parent?: NativeWindow): Promise<NativeWindow>;
@@ -170,7 +207,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT].filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));
@@ -196,6 +233,18 @@ export class OverlaySession {
   async [Symbol.asyncDispose](): Promise<void> { await this.close(); }
 }
 export class OverlayWindow {
+  async measureTextBatch(texts: readonly StyledText[]): Promise<readonly TextMeasurement[]> {
+    return (await call(this.raw.textBatch(texts.map(nativeStyledText), false))).map(layoutMeasurement);
+  }
+  async layoutTextBatch(texts: readonly StyledText[]): Promise<readonly RetainedTextLayout[]> {
+    return (await call(this.raw.textBatch(texts.map(nativeStyledText), true))).map(raw => new RetainedTextLayout(raw));
+  }
+  async layoutText(text: StyledText): Promise<RetainedTextLayout> { return (await this.layoutTextBatch([text]))[0]!; }
+  /** Await before modifying or submitting the Canvas. */
+  async drawTextLayout(canvas: Canvas, layout: RetainedTextLayout, origin: Point): Promise<void> {
+    await call(this.raw.drawTextLayout(canvas.raw, layout.raw, origin.x, origin.y));
+  }
+  async releaseTextLayout(layout: RetainedTextLayout): Promise<void> { await call(this.raw.releaseTextLayout(layout.raw)); }
   async measureText(text: string, size: number, options: TextOptions = {}): Promise<TextMeasurement> {
     const canvas = new Canvas().text(text, { x: 0, y: 0 }, size, 0xffffffff, options);
     const measured = await call(this.raw.measureText(canvas.raw));

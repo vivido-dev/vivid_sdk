@@ -43,3 +43,13 @@ async function producer(): Promise<void> {
   }
 }
 void producer;
+async function textServices(window: import("../../dist/overlay.js").OverlayWindow): Promise<void> {
+  const text: overlay.StyledText = { runs: [{ text: "Hello", style: { size: 20, underline: true } }], maxWidth: 120, maxLines: 2 };
+  const measured: readonly overlay.TextMeasurement[] = await window.measureTextBatch([text]);
+  const layouts: readonly overlay.RetainedTextLayout[] = await window.layoutTextBatch([text]);
+  const scene = new overlay.Canvas();
+  await window.drawTextLayout(scene, layouts[0]!, { x: 4, y: 8 });
+  await window.releaseTextLayout(layouts[0]!);
+  void measured;
+}
+void textServices;

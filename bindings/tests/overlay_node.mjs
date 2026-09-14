@@ -14,6 +14,11 @@ try {
   assert.deepEqual(await window.bounds(), bounds);
   assert.equal((await window.viewport()).width, 400);
   const measured = await window.measureText("A😀日", 18);
+  const text = { runs: [{ text: "A😀", style: { size: 18, color: 0xff0000ff, underline: true } }, { text: "日", style: { size: 20, color: 0x0000ffff, strikethrough: true } }], maxWidth: 90, alignment: "center" };
+  const batch = await window.measureTextBatch([text, text]);
+  const [layout] = await window.layoutTextBatch([text]);
+  assert.deepEqual(batch[0], batch[1]); assert.deepEqual(batch[0], layout.measurement);
+  assert.equal(Math.max(...layout.measurement.clusters.map(c => c.end)), 4);
   assert(measured.width > 0 && measured.height > 0 && measured.lines.length > 0);
   assert.equal(Math.max(...measured.clusters.map(c => c.end)), 4);
   const canvas = new Canvas();
@@ -21,6 +26,7 @@ try {
     canvas.fill(Path.rectangle({ x, y, width: 10, height: 10 }), Brush.solid(color));
   }
   canvas.hit((1n << 63n) + 17n, Path.rectangle({ x: 0, y: 0, width: 100, height: 80 }));
+  await window.drawTextLayout(canvas, layout, { x: 0, y: 40 });
   const replacementCanvas = canvas.snapshot();
   const image = await window.uploadRgba(2, 2, Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255));
   await window.drawImage(canvas, image, { x: 50, y: 0, width: 20, height: 20 });
@@ -50,7 +56,9 @@ try {
   assert.equal(await pending.wait(5), "superseded"); assert.equal(replacement.revision, 3n);
   const state = await window.reconcile(); assert.equal(state.activeRevision, 3n); assert.equal(state.acceptedRevision, 3n);
   assert.equal(await replacement.wait(10), "presented"); assert.equal((await window.reconcile()).presentedRevision, 3n);
+  await window.releaseTextLayout(layout);
+  await assert.rejects(window.submit(replacementCanvas));
   const popup = await session.createWindow({ bounds: { x: 40, y: 40, width: 20, height: 20 }, mode: "popup" }, window);
   await popup.present(new Canvas()); await popup.close();
-  await window.present(replacementCanvas); await window.close();
+  await window.present(new Canvas()); await window.close();
 } finally { await session.close(); input.close(); }

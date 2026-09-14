@@ -14,6 +14,63 @@ pub fn measurement_text(canvas: &Canvas) -> io::Result<Text> {
     Ok(text.clone())
 }
 
+pub fn styled_text(
+    canvas: &Canvas,
+    decorations: &[u32],
+    max_width: Option<f64>,
+    alignment: &str,
+    wrap: bool,
+    max_lines: Option<u16>,
+) -> io::Result<vivid_sdk::overlay::StyledText> {
+    use vivid_sdk::overlay::{StyledText, TextAlignment, TextRun, TextStyle};
+    if canvas.commands().len() != decorations.len() {
+        return Err(invalid("text run decorations count mismatch"));
+    }
+    let runs = canvas
+        .commands()
+        .iter()
+        .zip(decorations)
+        .map(|(command, flags)| {
+            let Command::Text(t) = command else {
+                return Err(invalid("styled text requires text runs"));
+            };
+            if *flags > 3 {
+                return Err(invalid("invalid text decorations"));
+            }
+            Ok(TextRun {
+                text: t.text.clone(),
+                style: TextStyle {
+                    size: t.size,
+                    family: t.family.clone(),
+                    weight: t.weight,
+                    italic: t.italic,
+                    color: t.color,
+                    underline: flags & 1 != 0,
+                    strikethrough: flags & 2 != 0,
+                },
+            })
+        })
+        .collect::<io::Result<_>>()?;
+    let text = StyledText {
+        runs,
+        max_width: max_width
+            .map(Scalar::new)
+            .transpose()
+            .map_err(io::Error::other)?,
+        alignment: match alignment {
+            "start" => TextAlignment::Start,
+            "center" => TextAlignment::Center,
+            "end" => TextAlignment::End,
+            "justify" => TextAlignment::Justify,
+            _ => return Err(invalid("unknown text alignment")),
+        },
+        wrap,
+        max_lines,
+    };
+    text.validate().map_err(io::Error::other)?;
+    Ok(text)
+}
+
 pub fn text_geometry(
     values: &[vivid_sdk::overlay::TextGeometry],
     text: &str,

@@ -113,3 +113,15 @@ def test_unsupported_presenter_rejects_overlay_negotiation() -> None:
             OverlaySession.connect(endpoint_control=presenter.endpoint(running), root_secret=secret)
     finally:
         presenter.close(running)
+
+def test_styled_text_validates_native_runs_and_snapshots_the_sequence() -> None:
+    from vivid_sdk.overlay import StyledText, TextRun, TextStyle
+    runs = [TextRun("A😀", TextStyle(size=18, underline=True)), TextRun("日", TextStyle(size=24, strikethrough=True))]
+    text = StyledText(runs, max_width=100, alignment="center", max_lines=2)
+    runs.clear()
+    text._native()
+    assert len(text.runs) == 2
+    for invalid in (StyledText([]), StyledText([TextRun("x" * 4097)]),
+                    StyledText([TextRun("x")], max_lines=0),
+                    StyledText([TextRun("x", TextStyle(size=float("nan")))])):
+        with pytest.raises((ValueError, OSError)): invalid._native()

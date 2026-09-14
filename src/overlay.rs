@@ -28,6 +28,13 @@ pub use vivid_protocol::vector::{
 
 use crate::*;
 
+#[path = "overlay_layout.rs"]
+mod layout;
+pub use layout::RetainedTextLayout;
+pub use vivid_protocol::overlay::wire::text::styled::{
+    StyledText, TextAlignment, TextRun, TextStyle,
+};
+
 /// Initial geometry in viewport logical pixels, independent of terminal cells and scrollback.
 #[derive(Debug, Clone)]
 pub struct OverlayWindowOptions {
@@ -75,6 +82,7 @@ struct WindowState {
     active: bool,
     closed: bool,
     assets: BTreeSet<u64>,
+    layouts: BTreeSet<u64>,
 }
 
 /// An immutable RGBA image uploaded once to one window's channel. Released when the window closes.
@@ -122,6 +130,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
         config.optional_profiles.sort();
         config.optional_profiles.dedup();
         config
@@ -276,6 +287,7 @@ impl OverlaySession {
                     active: false,
                     closed: false,
                     assets: BTreeSet::new(),
+                    layouts: BTreeSet::new(),
                 }),
             })
         })();
@@ -490,6 +502,7 @@ impl OverlayWindow {
 
     pub fn submit(&self, canvas: Canvas) -> io::Result<OverlaySubmission> {
         self.with_state(|session, state| {
+            layout::validate_references(&canvas, &state.layouts)?;
             let next = state
                 .next_scene
                 .checked_add(1)
@@ -573,6 +586,7 @@ impl OverlayWindow {
         }
         self.reconcile()?;
         self.with_state(|session, state| {
+            layout::validate_references(&canvas, &state.layouts)?;
             let mut config = state.track.configuration()?;
             config.track_id = session.allocate_id()?;
             let track = session.create_track(config, &RequestMetadata::default())?;
