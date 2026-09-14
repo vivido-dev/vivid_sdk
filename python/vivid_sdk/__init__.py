@@ -7,7 +7,11 @@ tracks, and each track is fed through an authenticated channel generation.
 from __future__ import annotations
 
 import hashlib
+import os
+import secrets
 import struct
+import sys
+import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -215,7 +219,7 @@ class SceneNode:
     linear_sampling: bool = True
     z_index: int = 0
     visible: bool = True
-    opacity: int = 255
+    opacity: int = 0xFFFF  # `0..=65535`, so the byte-sized 255 is nearly transparent.
 
     def native(self, session: Session, surface: object) -> Dict[str, object]:
         del session, surface  # Identity defaults come from the Rust scene builder.
@@ -929,6 +933,90 @@ def anchor_marker(
     )
 
 
+_ANCHOR_STATE_READY = 1
+
+
+def _anchor_at_cursor(session: Session, *, timeout_us: int = 2_000_000) -> Optional[int]:
+    """Create an authenticated anchor at the terminal's current cursor cell.
+
+    The zero-width marker is the one thing a producer may write to the PTY, and the anchor it
+    creates is what lets the presenter keep a node with the text it belongs to: anchored nodes
+    follow scroll and reflow, and only they can become a retained poster after a clean
+    `GOODBYE`. Returns `None` when this session has no text plane to anchor to, leaving the
+    caller to position against the terminal grid instead.
+    """
+
+    if session_info(session).target_profile != PROFILE_TERMINAL_SURFACE:
+        return None
+    if os.environ.get("TMUX") or os.environ.get("STY"):
+        return None  # A foreign multiplexer owns the text stream and drops the marker.
+    try:
+        if not sys.stdout.isatty():
+            return None
+    except ValueError:
+        return None  # A closed stream is not a text plane either.
+    context_id = session_info(session).root_context_id
+    # The anchor ID authenticates the marker, so it comes from the CSPRNG rather than from the
+    # session's sequential object IDs, and is never reused in this context.
+    anchor_id = 0
+    while anchor_id == 0:
+        anchor_id = secrets.randbits(64)
+    try:
+        marker = (
+            conpty_anchor_marker(session, context_id, anchor_id)
+            if os.environ.get("VIVID_ANCHOR_TRANSPORT") == "conpty"
+            else anchor_marker(session, context_id=context_id, anchor_id=anchor_id)
+        )
+        sys.stdout.write(marker)
+        sys.stdout.flush()
+        # A node may only name an anchor the presenter has already created, so wait for the
+        # marker to be recognized. Polling leaves the session's event queue to its owner.
+        deadline = time.monotonic() + timeout_us / 1_000_000
+        while True:
+            if query_anchor(session, context_id, anchor_id).get("state") == _ANCHOR_STATE_READY:
+                return anchor_id
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.005)
+    except OSError:
+        # `VividError` is an `OSError`: a target that refuses the anchor, and a stream that
+        # refuses the write, both leave the caller with the grid rather than with a failure.
+        return None
+
+
+def _place_image_node(
+    session: Session, surface: Surface, *, columns: int, rows: int
+) -> None:
+    """Place `surface` at the cursor, or against the grid when there is no anchor to use."""
+
+    anchor_id = _anchor_at_cursor(session)
+    if anchor_id is None:
+        place_terminal_surface(session, surface, width=columns << 32, height=rows << 32)
+        return
+    create_node(
+        session,
+        surface,
+        SceneNode(
+            node_id=allocate_id(session),
+            geometry={
+                0: 2,  # Anchor-cell space: (0,0) is the anchor's own cell.
+                1: 0,
+                2: 0,
+                3: columns << 32,
+                4: rows << 32,
+                5: 1,
+                6: session_info(session).root_context_id,
+                7: anchor_id,
+            },
+        ),
+    )
+    # Move the text cursor past the rectangle the image now occupies, so the shell prompt and
+    # anything printed next land below it rather than behind it. Only this ordinary whitespace
+    # crosses the PTY, and the anchor carries the image along when these lines scroll.
+    sys.stdout.write("\n" * rows)
+    sys.stdout.flush()
+
+
 def display_image(
     path: Union[str, Path],
     *,
@@ -936,16 +1024,26 @@ def display_image(
     rows: Optional[int] = None,
     **connect_options: Any,
 ) -> ImagePresentation:
-    """Create and retain one PNG/JPEG presentation.
+    """Create, activate, and retain one PNG/JPEG presentation.
 
-    The returned object owns the live session. Call ``close()`` when the image
-    should disappear.
+    Returns once the presenter has accepted the image into the surface's active slot. The
+    returned object owns the live session: call ``close()`` when the image should disappear,
+    or ``close(session)`` for a clean GOODBYE that leaves the retained image with the
+    presenter after this process exits.
+
+    The image is anchored to the cursor cell where it is written, and the text cursor is then
+    advanced past it so ordinary output continues underneath. A target with no text plane to
+    anchor to — a redirected stdout, a foreign multiplexer, a non-terminal profile — falls back
+    to the terminal grid, where the presenter shows the image but retains nothing once this
+    session ends.
     """
 
     encoded = Path(path).read_bytes()
     # The container is read once, in Rust, so the surface geometry, the track's declared
     # dimensions, and the bytes that are sent all come from the same parse.
     _, width, height, _ = probe_encoded_image(encoded)
+    cell_columns = columns if columns is not None else min(width, 80)
+    cell_rows = rows if rows is not None else min(height, 24)
     session = connect(**connect_options)
     try:
         surface = create_surface(
@@ -957,12 +1055,7 @@ def display_image(
                 title=Path(path).name,
             ),
         )
-        place_terminal_surface(
-            session,
-            surface,
-            width=(columns if columns is not None else min(width, 80)) << 32,
-            height=(rows if rows is not None else min(height, 24)) << 32,
-        )
+        _place_image_node(session, surface, columns=cell_columns, rows=cell_rows)
         track = create_track(
             session,
             surface,
@@ -973,6 +1066,13 @@ def display_image(
         )
         channel = open_track_channel(session, track)
         send_image(channel, encoded)
+        # Media and control use independent connections: submitting the bytes does not
+        # establish the presenter's readiness for slot activation, so the track must reach
+        # OUTPUT_READY before it can take the surface's slot. This is the same handshake the
+        # pane state machine performs; whether the presented milestone follows depends on the
+        # presenter's own downstream, so it is not part of this helper's contract.
+        wait_track(session, track, condition=WAIT_MILESTONE_SET, value=MILESTONE_OUTPUT_READY)
+        activate_track(session, surface, track, required_milestone=MILESTONE_OUTPUT_READY)
         return ImagePresentation(session, surface, track, channel)
     except BaseException:
         close(session)

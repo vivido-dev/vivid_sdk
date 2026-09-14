@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import zlib
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,35 @@ def test_encoded_image_track_is_immutable_and_one_shot() -> None:
             vivid.send_image(channel, encoded)
     finally:
         vivid.close(session)
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return len(data).to_bytes(4, "big") + kind + data + zlib.crc32(kind + data).to_bytes(4, "big")
+
+
+def one_pixel_png() -> bytes:
+    header = (1).to_bytes(4, "big") + (1).to_bytes(4, "big") + bytes([8, 6, 0, 0, 0])
+    compressed = zlib.compress(b"\x00\xff\x00\x00\xff")
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", compressed)
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def test_display_image_activates_and_returns_live_handles(tmp_path: Path) -> None:
+    path = tmp_path / "pixel.png"
+    path.write_bytes(one_pixel_png())
+    presentation = vivid.display_image(path, dry_run=True)
+    try:
+        assert not presentation.session.closed
+        assert not presentation.channel.closed
+        assert presentation.track.surface_id == presentation.surface.id
+        assert presentation.track.context_id == presentation.surface.context_id
+    finally:
+        presentation.close()
+    assert presentation.session.closed
 
 
 def test_trace_contains_metadata_without_record_bodies(tmp_path: Path) -> None:
