@@ -332,9 +332,18 @@ belonged to.
 Vivido maps the tree into its existing AccessKit adapter: overlay nodes become children of the
 window root, and a user action routes back to the producer as the event above. That path is Linux
 and Windows only. On macOS the native adapter builds its own tree from the terminal snapshot and
-never reads the overlay nodes, so a tree set there is accepted, validated and reported in
-`inspect`, but reaches no assistive technology and returns no actions. Publishing one is not an
-error there; it is simply not yet visible.
+never reads the overlay nodes, so a tree set there is accepted, validated, retired with its scene
+and reported in `inspect`, but reaches no assistive technology and returns no actions. Publishing
+one is not an error there; it is simply not yet visible.
+
+Vivido offers the profile on macOS regardless, and deliberately. A profile says what this wire
+carries, not what one platform's adapter happens to read today, and everything the profile claims
+does happen there — only the last hop into AppKit is missing. Withdrawing it would put every
+producer on a permanent fallback on that platform and make them all change back the day the hop
+lands, in exchange for knowledge none of them could act on: there is no other channel a producer
+could describe itself through. The gap is observable in `inspect` rather than silent, and
+`the_overlay_bundle_is_offered_wherever_the_wire_carries_it` pins the decision so it is not
+quietly reversed.
 
 ## Host text measurement and editor geometry
 
