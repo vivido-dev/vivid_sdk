@@ -51,6 +51,54 @@ impl PyCanvas {
             .map_err(value_error)?;
         Ok(())
     }
+    #[pyo3(signature = (segments, even_odd, kind, geometry, colors, offsets, space, image_asset, image_transform, extend, width, cap, join, miter, dashes, dash_offset))]
+    fn draw_paint(
+        &self,
+        segments: Vec<Vec<f64>>,
+        even_odd: bool,
+        kind: &str,
+        geometry: Vec<f64>,
+        colors: Vec<f64>,
+        offsets: Vec<f64>,
+        space: &str,
+        image_asset: Option<u64>,
+        image_transform: Option<Vec<f64>>,
+        extend: &str,
+        width: Option<f64>,
+        cap: &str,
+        join: &str,
+        miter: f64,
+        dashes: Vec<f64>,
+        dash_offset: f64,
+    ) -> PyResult<()> {
+        let path = model::path(&segments, even_odd).map_err(io_error)?;
+        let brush = if let Some(asset) = image_asset {
+            model::brush_image(asset, image_transform, extend).map_err(io_error)?
+        } else if space != "srgb" {
+            model::gradient_brush(kind, &geometry, &colors, &offsets, space).map_err(io_error)?
+        } else {
+            model::brush(kind, &geometry, &colors, &offsets).map_err(io_error)?
+        };
+        let command = match width {
+            Some(width) => Command::StyledStroke(
+                path,
+                brush,
+                model::stroke_style(width, cap, join, miter, &dashes, dash_offset)
+                    .map_err(io_error)?,
+            ),
+            None => Command::Fill(path, brush),
+        };
+        lock(&self.inner, "canvas")?
+            .push(command)
+            .map_err(value_error)?;
+        Ok(())
+    }
+    fn shadow(&self, values: Vec<f64>, color: u32) -> PyResult<()> {
+        lock(&self.inner, "canvas")?
+            .push(model::shadow(&values, color).map_err(io_error)?)
+            .map_err(value_error)?;
+        Ok(())
+    }
     fn state(&self, kind: &str, values: Vec<f64>) -> PyResult<()> {
         lock(&self.inner, "canvas")?
             .push(model::state(kind, &values).map_err(io_error)?)
@@ -412,6 +460,14 @@ impl PyOverlayWindow {
 #[pyclass(name = "OverlayImage", module = "vivid_sdk._native")]
 struct PyOverlayImage {
     inner: vivid_sdk::overlay::RetainedImage,
+}
+#[pymethods]
+impl PyOverlayImage {
+    /// The channel-qualified asset identity, at full unsigned width.
+    #[getter]
+    fn id(&self) -> u64 {
+        self.inner.id()
+    }
 }
 #[pyclass(name = "OverlaySubmission", module = "vivid_sdk._native")]
 struct PyOverlaySubmission {

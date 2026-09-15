@@ -862,6 +862,7 @@ impl VirtualVivid {
                     | registry::OVERLAY_TEXT
                     | registry::OVERLAY_TEXT_LAYOUT
                     | registry::OVERLAY_TYPOGRAPHY
+                    | registry::OVERLAY_PAINT
             )
         }) {
             return Err(io::Error::new(
@@ -6330,6 +6331,7 @@ mod tests {
             registry::OVERLAY_TEXT,
             registry::OVERLAY_TEXT_LAYOUT,
             registry::OVERLAY_TYPOGRAPHY,
+            registry::OVERLAY_PAINT,
         ] {
             let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
             let mut config = PresenterConfig::terminal(MediaConfig::default());

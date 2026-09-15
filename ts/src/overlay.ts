@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -26,6 +26,8 @@ export interface GradientStop { readonly offset: number; readonly color: number 
 interface NativeCanvas {
   snapshot(): NativeCanvas;
   draw(path: readonly (readonly number[])[], evenOdd: boolean, kind: string, geometry: readonly number[], colors: readonly number[], offsets: readonly number[], width?: number): void;
+  drawPaint(path: readonly (readonly number[])[], evenOdd: boolean, kind: string, geometry: readonly number[], colors: readonly number[], offsets: readonly number[], space: string, imageAsset: bigint | undefined, imageTransform: readonly number[] | undefined, extend: string, width: number | undefined, cap: string, join: string, miter: number, dashes: readonly number[], dashOffset: number): void;
+  shadow(values: readonly number[], color: number): void;
   state(kind: string, values: number[]): void;
   clip(path: readonly (readonly number[])[], evenOdd: boolean): void;
   text(text: string, x: number, y: number, size: number, color: number, family: string, weight: number, italic: boolean, maxWidth?: number): void;
@@ -33,6 +35,8 @@ interface NativeCanvas {
   validate(): void;
 }
 interface CanvasConstructor { new(): NativeCanvas; shape(kind: string, bounds: number[], radius: number): number[][] }
+/** A retained image handle. The asset identity stays a bigint all the way to the wire. */
+interface NativeImage { readonly id: bigint }
 interface NativeWindow {
   textBatch(texts: object[], retain: boolean): Promise<NativeTextLayout[]>;
   drawTextLayout(canvas: NativeCanvas, layout: NativeTextLayout, x: number, y: number): Promise<void>;
@@ -49,7 +53,7 @@ interface NativeWindow {
   action(action: string): Promise<void>;
   bounds(): Promise<number[]>;
   viewport(): Promise<number[]>;
-  uploadRgba(width: number, height: number, rgba: Buffer): Promise<object>;
+  uploadRgba(width: number, height: number, rgba: Buffer): Promise<NativeImage>;
   drawImage(canvas: NativeCanvas, image: object, bounds: number[], opacity: number): Promise<void>;
 }
 interface NativeTextLayout { measurement(): { width: number; height: number; lines: number[][]; clusters: number[][]; truncatedAt?: number } }
@@ -121,15 +125,54 @@ export class Path {
   }
   static rectangle(bounds: Rect): Path { return Path.shape("rectangle", bounds); }
   static roundedRectangle(bounds: Rect, radius: number): Path { return Path.shape("rounded", bounds, radius); }
+  /** Radii are clockwise from the top left and scale down together when they overrun their sides. */
+  static roundedRectangleCorners(bounds: Rect, radii: readonly [number, number, number, number]): Path {
+    const path = new Path();
+    path.segments.push(...callSync(() => canvasType().shape("rounded-corners", [...values(bounds), ...radii], 0)));
+    return path;
+  }
   static ellipse(bounds: Rect): Path { return Path.shape("ellipse", bounds); }
 }
 
 /** Colors are straight-alpha sRGB 0xRRGGBBAA; offsets are in [0, 1]. */
+export type GradientSpace = "srgb" | "oklab";
+export type ImageExtend = "pad" | "repeat" | "reflect";
 export class Brush {
-  private constructor(readonly kind: string, readonly geometry: readonly number[], readonly colors: readonly number[], readonly offsets: readonly number[]) {}
+  private constructor(
+    readonly kind: string,
+    readonly geometry: readonly number[],
+    readonly colors: readonly number[],
+    readonly offsets: readonly number[],
+    readonly space: GradientSpace = "srgb",
+    readonly image?: { readonly asset: bigint; readonly transform?: readonly number[]; readonly extend: ImageExtend },
+  ) {}
   static solid(color: number): Brush { return new Brush("solid", [], [color], []); }
-  static linear(start: Point, end: Point, stops: readonly GradientStop[]): Brush { return new Brush("linear", [start.x, start.y, end.x, end.y], stops.map(s => s.color), stops.map(s => s.offset)); }
-  static radial(center: Point, radius: number, stops: readonly GradientStop[]): Brush { return new Brush("radial", [center.x, center.y, radius], stops.map(s => s.color), stops.map(s => s.offset)); }
+  static linear(start: Point, end: Point, stops: readonly GradientStop[], space: GradientSpace = "srgb"): Brush { return new Brush("linear", [start.x, start.y, end.x, end.y], stops.map(s => s.color), stops.map(s => s.offset), space); }
+  static radial(center: Point, radius: number, stops: readonly GradientStop[], space: GradientSpace = "srgb"): Brush { return new Brush("radial", [center.x, center.y, radius], stops.map(s => s.color), stops.map(s => s.offset), space); }
+  /** Fill any path with an uploaded image. `transform` is six affine terms. */
+  static image(image: RetainedImage, transform?: readonly number[], extend: ImageExtend = "pad"): Brush {
+    return new Brush("image", [], [], [], "srgb", { asset: image.id, transform, extend });
+  }
+}
+/** One blurred rounded rectangle, as CSS box-shadow defines it. */
+export interface Shadow {
+  readonly rect: Rect;
+  /** Clockwise from the top left. */
+  readonly radii?: readonly [number, number, number, number];
+  readonly color?: number;
+  readonly offset?: Point;
+  readonly blur?: number;
+  readonly spread?: number;
+  readonly inset?: boolean;
+}
+/** Caps are butt/round/square; joins are miter/bevel/round; dashes alternate on/off lengths. */
+export interface StrokeStyle {
+  readonly width: number;
+  readonly cap?: "butt" | "round" | "square";
+  readonly join?: "miter" | "bevel" | "round";
+  readonly miterLimit?: number;
+  readonly dashes?: readonly number[];
+  readonly dashOffset?: number;
 }
 export interface TextOptions { readonly family?: string; readonly weight?: number; readonly italic?: boolean; readonly maxWidth?: number }
 /** Ranges use JavaScript UTF-16 indexes. Geometry is layout-local logical pixels. */
@@ -140,8 +183,27 @@ export class Canvas {
   /** @internal */ readonly raw: NativeCanvas;
   constructor(raw?: NativeCanvas) { this.raw = raw ?? callSync(() => new (canvasType())()); }
   snapshot(): Canvas { return new Canvas(callSync(() => this.raw.snapshot())); }
-  fill(path: Path, brush: Brush): this { callSync(() => this.raw.draw(path.segments, path.evenOdd, brush.kind, brush.geometry, brush.colors, brush.offsets)); return this; }
-  stroke(path: Path, brush: Brush, width: number): this { callSync(() => this.raw.draw(path.segments, path.evenOdd, brush.kind, brush.geometry, brush.colors, brush.offsets, width)); return this; }
+  private paint(path: Path, brush: Brush, width: number | undefined, style: Partial<StrokeStyle> = {}): void {
+    callSync(() => this.raw.drawPaint(
+      path.segments, path.evenOdd, brush.kind, brush.geometry, brush.colors, brush.offsets, brush.space,
+      brush.image?.asset, brush.image?.transform, brush.image?.extend ?? "pad",
+      width, style.cap ?? "butt", style.join ?? "miter", style.miterLimit ?? 4, style.dashes ?? [], style.dashOffset ?? 0,
+    ));
+  }
+  fill(path: Path, brush: Brush): this { this.paint(path, brush, undefined); return this; }
+  stroke(path: Path, brush: Brush, width: number): this { this.paint(path, brush, width); return this; }
+  /** Cast a blurred rounded rectangle. Draw the element over its own shadow separately. */
+  shadow(value: Shadow): this {
+    const r = value.radii ?? [0, 0, 0, 0];
+    const offset = value.offset ?? { x: 0, y: 0 };
+    callSync(() => this.raw.shadow(
+      [...values(value.rect), ...r, offset.x, offset.y, value.blur ?? 0, value.spread ?? 0, value.inset ? 1 : 0],
+      value.color ?? 0x000000ff,
+    ));
+    return this;
+  }
+  /** Stroke with caps, joins, and dashes. */
+  strokeStyled(path: Path, brush: Brush, style: StrokeStyle): this { this.paint(path, brush, style.width, style); return this; }
   save(): this { callSync(() => this.raw.state("save", [])); return this; }
   restore(): this { callSync(() => this.raw.state("restore", [])); return this; }
   opacity(value: number): this { callSync(() => this.raw.state("opacity", [value])); return this; }
@@ -154,7 +216,11 @@ export class Canvas {
   hit(applicationId: bigint, path: Path, role: HitRole = "input", edges = 0): this { callSync(() => this.raw.hit(path.segments, path.evenOdd, applicationId, role, edges)); return this; }
   validate(): void { callSync(() => this.raw.validate()); }
 }
-export class RetainedImage { /** @internal */ constructor(readonly raw: object) {} }
+export class RetainedImage {
+  /** @internal */ constructor(readonly raw: NativeImage) {}
+  /** The channel-qualified asset identity, at full unsigned width. */
+  get id(): bigint { return this.raw.id; }
+}
 
 export type PresentationOutcome = "presented" | "superseded";
 interface NativeSubmission { readonly revision: bigint; wait(timeout: number): Promise<PresentationOutcome | null> }
@@ -224,7 +290,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY].filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));

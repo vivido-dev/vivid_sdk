@@ -15,6 +15,20 @@ impl RetainedTextLayout {
     }
 }
 
+/// Paint commands exist only under `overlay-paint-v1`. Failing here, before anything is sent,
+/// gives the producer a local diagnosis instead of a channel failure on the host.
+pub(super) fn validate_paint(canvas: &Canvas, session: &Session) -> io::Result<()> {
+    if canvas
+        .commands()
+        .iter()
+        .any(|command| command.requires_paint())
+        && !session.supports(vivid_protocol::registry::OVERLAY_PAINT)
+    {
+        return Err(invalid_input("presenter does not support overlay-paint-v1"));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_references(canvas: &Canvas, layouts: &BTreeSet<u64>) -> io::Result<()> {
     for command in canvas.commands() {
         if let Command::TextLayout { layout, .. } = command

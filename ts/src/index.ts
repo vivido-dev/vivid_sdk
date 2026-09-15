@@ -27,6 +27,7 @@ export { PaneSession } from "./pane.js";
 export * as overlay from "./overlay.js";
 export { OverlaySession, OverlayWindow } from "./overlay.js";
 export type { OverlayWindowOptions } from "./overlay.js";
+export type { ImageExtend, GradientSpace, Shadow, StrokeStyle } from "./overlay.js";
 export { DesktopSession, establishDesktop } from "./desktop.js";
 export * as presenter from "./presenter.js";
 

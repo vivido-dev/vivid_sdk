@@ -213,6 +213,19 @@ pub fn path(segments: &[Vec<f64>], even_odd: bool) -> io::Result<Path> {
     Ok(path)
 }
 pub fn shape(kind: &str, values: &[f64], radius: f64) -> io::Result<Vec<Vec<f64>>> {
+    if kind == "rounded-corners" {
+        let (bounds, radii) = values.split_at(4);
+        let radii: Vec<f64> = radii.to_vec();
+        let [tl, tr, br, bl]: [f64; 4] = radii
+            .try_into()
+            .map_err(|_| invalid("rounded corners require four radii"))?;
+        let path = Path::rounded_rectangle_corners(
+            rect(bounds)?,
+            Corners::new([tl, tr, br, bl]).map_err(io::Error::other)?,
+        )
+        .map_err(io::Error::other)?;
+        return flatten(&path);
+    }
     let rect = rect(values)?;
     let path = match kind {
         "rectangle" => Path::rectangle(rect),
@@ -221,6 +234,10 @@ pub fn shape(kind: &str, values: &[f64], radius: f64) -> io::Result<Vec<Vec<f64>
         _ => return Err(invalid("unknown shape")),
     }
     .map_err(io::Error::other)?;
+    flatten(&path)
+}
+
+fn flatten(path: &Path) -> io::Result<Vec<Vec<f64>>> {
     Ok(path
         .segments
         .iter()
@@ -241,6 +258,40 @@ pub fn shape(kind: &str, values: &[f64], radius: f64) -> io::Result<Vec<Vec<f64>
         })
         .collect())
 }
+pub fn color_space(space: &str) -> io::Result<ColorSpace> {
+    match space {
+        "srgb" => Ok(ColorSpace::Srgb),
+        "oklab" => Ok(ColorSpace::Oklab),
+        _ => Err(invalid("gradient space is srgb or oklab")),
+    }
+}
+
+/// An image brush by the asset identity a retained image handle owns. The identity crosses the
+/// language boundary at full width because the caller reads it from the handle, not from a
+/// floating-point array.
+pub fn brush_image(asset: u64, transform: Option<Vec<f64>>, extend: &str) -> io::Result<Brush> {
+    let transform = transform
+        .map(|values| {
+            let values: Result<Vec<_>, _> = values.iter().map(|v| Scalar::new(*v)).collect();
+            let values = values.map_err(|_| invalid("image transform terms are out of range"))?;
+            <[Scalar; 6]>::try_from(values)
+                .map(Transform)
+                .map_err(|_| invalid("image transform requires six terms"))
+        })
+        .transpose()?;
+    let extend = match extend {
+        "pad" => Extend::Pad,
+        "repeat" => Extend::Repeat,
+        "reflect" => Extend::Reflect,
+        _ => return Err(invalid("image extend is pad, repeat, or reflect")),
+    };
+    Ok(Brush::Image {
+        asset,
+        transform,
+        extend,
+    })
+}
+
 pub fn brush(kind: &str, geometry: &[f64], colors: &[f64], offsets: &[f64]) -> io::Result<Brush> {
     if colors.len() > MAX_GRADIENT_STOPS {
         return Err(invalid("gradient stop limit exceeded"));
@@ -276,14 +327,120 @@ pub fn brush(kind: &str, geometry: &[f64], colors: &[f64], offsets: &[f64]) -> i
             start: Point::new(*x, *y).map_err(io::Error::other)?,
             end: Point::new(*a, *b).map_err(io::Error::other)?,
             stops,
+            color_space: ColorSpace::Srgb,
         }),
         ("radial", [x, y, r]) => Ok(Brush::Radial {
             center: Point::new(*x, *y).map_err(io::Error::other)?,
             radius: Scalar::new(*r).map_err(io::Error::other)?,
             stops,
+            color_space: ColorSpace::Srgb,
         }),
         _ => Err(invalid("invalid gradient geometry")),
     }
+}
+
+/// A gradient brush with an explicit interpolation space.
+pub fn gradient_brush(
+    kind: &str,
+    geometry: &[f64],
+    colors: &[f64],
+    offsets: &[f64],
+    space: &str,
+) -> io::Result<Brush> {
+    let space = color_space(space)?;
+    match brush(kind, geometry, colors, offsets)? {
+        Brush::Linear {
+            start, end, stops, ..
+        } => Ok(Brush::Linear {
+            start,
+            end,
+            stops,
+            color_space: space,
+        }),
+        Brush::Radial {
+            center,
+            radius,
+            stops,
+            ..
+        } => Ok(Brush::Radial {
+            center,
+            radius,
+            stops,
+            color_space: space,
+        }),
+        _ => Err(invalid("gradient brush requires gradient geometry")),
+    }
+}
+
+/// One blurred rounded rectangle, from the flattened language-side values:
+/// `[x, y, width, height, tl, tr, br, bl, offset_x, offset_y, blur, spread, inset]`.
+pub fn shadow(values: &[f64], color: u32) -> io::Result<Command> {
+    let [
+        x,
+        y,
+        width,
+        height,
+        tl,
+        tr,
+        br,
+        bl,
+        ox,
+        oy,
+        blur,
+        spread,
+        inset,
+    ] = values
+    else {
+        return Err(invalid("shadow requires thirteen values"));
+    };
+    let command = Command::Shadow(Shadow {
+        rect: rect(&[*x, *y, *width, *height])?,
+        radii: Corners::new([*tl, *tr, *br, *bl]).map_err(io::Error::other)?,
+        color: Color(color),
+        offset: Point::new(*ox, *oy).map_err(io::Error::other)?,
+        blur: Scalar::new(*blur).map_err(io::Error::other)?,
+        spread: Scalar::new(*spread).map_err(io::Error::other)?,
+        inset: *inset != 0.,
+    });
+    Ok(command)
+}
+
+/// A stroke with caps, joins, and dashes. `dashes` empty means a solid line.
+pub fn stroke_style(
+    width: f64,
+    cap: &str,
+    join: &str,
+    miter_limit: f64,
+    dashes: &[f64],
+    dash_offset: f64,
+) -> io::Result<StrokeStyle> {
+    let cap = match cap {
+        "butt" => Cap::Butt,
+        "round" => Cap::Round,
+        "square" => Cap::Square,
+        _ => return Err(invalid("stroke cap is butt, round, or square")),
+    };
+    let join = match join {
+        "miter" => Join::Miter,
+        "bevel" => Join::Bevel,
+        "round" => Join::Round,
+        _ => return Err(invalid("stroke join is miter, bevel, or round")),
+    };
+    let dashes = dashes
+        .iter()
+        .map(|d| Scalar::new(*d))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid("dash lengths are out of range"))?;
+    Ok(StrokeStyle {
+        width: Scalar::new(width).map_err(|_| invalid("stroke width is out of range"))?,
+        cap,
+        join,
+        miter_limit: Scalar::new(miter_limit)
+            .map_err(|_| invalid("miter limit is out of range"))?,
+        dashes,
+        dash_offset: Scalar::new(dash_offset)
+            .map_err(|_| invalid("dash offset is out of range"))?,
+    })
 }
 pub fn state(kind: &str, values: &[f64]) -> io::Result<Command> {
     match (kind, values) {

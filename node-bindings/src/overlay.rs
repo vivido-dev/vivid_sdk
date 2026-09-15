@@ -50,6 +50,60 @@ impl OverlayCanvas {
         Ok(())
     }
     #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_paint(
+        &self,
+        segments: Vec<Vec<f64>>,
+        even_odd: bool,
+        kind: String,
+        geometry: Vec<f64>,
+        colors: Vec<f64>,
+        offsets: Vec<f64>,
+        space: String,
+        image_asset: Option<BigInt>,
+        image_transform: Option<Vec<f64>>,
+        extend: String,
+        width: Option<f64>,
+        cap: String,
+        join: String,
+        miter: f64,
+        dashes: Vec<f64>,
+        dash_offset: f64,
+    ) -> Result<()> {
+        let path = model::path(&segments, even_odd).map_err(io_error)?;
+        let brush = if let Some(asset) = image_asset
+            && let (_, value, lossless) = asset.get_u64()
+            && lossless
+            && let asset = value
+        {
+            model::brush_image(asset, image_transform, &extend).map_err(io_error)?
+        } else if space != "srgb" {
+            model::gradient_brush(&kind, &geometry, &colors, &offsets, &space).map_err(io_error)?
+        } else {
+            model::brush(&kind, &geometry, &colors, &offsets).map_err(io_error)?
+        };
+        let command = match width {
+            Some(width) => Command::StyledStroke(
+                path,
+                brush,
+                model::stroke_style(width, &cap, &join, miter, &dashes, dash_offset)
+                    .map_err(io_error)?,
+            ),
+            None => Command::Fill(path, brush),
+        };
+        locked(&self.inner, "canvas")?
+            .push(command)
+            .map_err(value_error)?;
+        Ok(())
+    }
+    #[napi]
+    pub fn shadow(&self, values: Vec<f64>, color: u32) -> Result<()> {
+        locked(&self.inner, "canvas")?
+            .push(model::shadow(&values, color).map_err(io_error)?)
+            .map_err(value_error)?;
+        Ok(())
+    }
+    #[napi]
     pub fn state(&self, kind: String, values: Vec<f64>) -> Result<()> {
         locked(&self.inner, "canvas")?
             .push(model::state(&kind, &values).map_err(io_error)?)
@@ -468,6 +522,14 @@ impl OverlayWindow {
 #[napi]
 pub struct OverlayImage {
     inner: vivid_sdk::overlay::RetainedImage,
+}
+#[napi]
+impl OverlayImage {
+    /// The channel-qualified asset identity, at full unsigned width.
+    #[napi(getter)]
+    pub fn id(&self) -> BigInt {
+        BigInt::from(self.inner.id())
+    }
 }
 #[napi(object)]
 pub struct OverlayWindowStatus {

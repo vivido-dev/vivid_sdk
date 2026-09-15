@@ -66,3 +66,41 @@ test("unsupported presenters reject the automatically required overlay profiles"
     await assert.rejects(OverlaySession.connect({ endpointControl: running.endpoint(), rootSecret: running.issuePaneCapability(1) }), /profile/);
   } finally { await running.close(); }
 });
+
+test("paint commands validate locally and reach a presenter", async () => {
+  const session = await OverlaySession.connect({ offline: true });
+  try {
+    const window = await session.createWindow({ bounds: rect });
+    const image = await window.uploadRgba(2, 2, new Uint8Array(16));
+    assert.ok(image.id > 0n, "the asset identity survives as a bigint");
+    const path = Path.rectangle(rect);
+    const stops = [{ offset: 0, color: 0xff0000ff }, { offset: 1, color: 0x0000ffff }];
+    const canvas = new Canvas()
+      .shadow({ rect: { x: 10, y: 10, width: 60, height: 40 }, radii: [4, 8, 12, 16], color: 0x00000055, offset: { x: 0, y: 6 }, blur: 18, spread: -2 })
+      .fill(path, Brush.image(image, [2, 0, 0, 2, 5, -5], "reflect"))
+      .fill(path, Brush.linear({ x: 0, y: 0 }, { x: 100, y: 0 }, stops, "oklab"))
+      .strokeStyled(path, Brush.solid(0xffffffff), { width: 2.5, cap: "round", join: "bevel", miterLimit: 6, dashes: [4, 2], dashOffset: 1.5 })
+      .fill(Path.roundedRectangleCorners({ x: 0, y: 0, width: 80, height: 40 }, [2, 6, 10, 14]), Brush.solid(0x00ff00ff));
+    canvas.validate();
+    assert.ok((await window.submit(canvas)).revision > 0n);
+
+    for (const bad of [
+      { rect, radii: [-1, 0, 0, 0] },
+      { rect, blur: 4097 },
+      { rect, blur: -1 },
+    ]) {
+      assert.throws(() => new Canvas().shadow(bad).validate(), "shadow values are bounded");
+    }
+    for (const bad of [
+      { width: 0 },
+      { width: 1, miterLimit: 0.5 },
+      { width: 1, dashes: [0] },
+      { width: 1, dashes: Array.from({ length: 33 }, () => 1) },
+      { width: 1, dashOffset: -1 },
+    ]) {
+      assert.throws(() => new Canvas().strokeStyled(path, Brush.solid(0xffffffff), bad).validate());
+    }
+  } finally {
+    await session.close();
+  }
+});

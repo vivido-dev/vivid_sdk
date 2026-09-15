@@ -152,8 +152,9 @@ normal connection options. Pass `parent=window` in Python or the parent as `crea
 second argument in TypeScript to create child windows. Python uses `raise_window()` because
 `raise` is a keyword; TypeScript uses `raise()`.
 
-Canvas supports rectangles, rounded rectangles, ellipses, Bézier paths, solid/linear/radial
-brushes, strokes, opacity, affine transforms, nested clips, host-shaped text, and hit regions.
+Canvas supports rectangles, rounded rectangles (uniform or per-corner), ellipses, Bézier paths,
+solid/linear/radial/image brushes, plain and styled strokes, box shadows, opacity, affine
+transforms, nested clips, host-shaped text, and hit regions.
 `snapshot()` copies the current display list; `present` also snapshots before sending. Paths are
 copied when added to a Canvas. Use `validate()` to check a complete list without sending it.
 An image returned by `upload_rgba` / `uploadRgba` belongs to its window; `draw_image` / `drawImage`
@@ -172,6 +173,35 @@ Colors are straight-alpha sRGB `0xRRGGBBAA`; opacity and gradient offsets are in
 Geometry uses logical pixels. Hit roles are `input`, `drag`, `resize`, and `transparent`;
 resize edge bits are left=1, right=2, top=4, bottom=8. Save/restore delimit transforms and clips.
 Text supports host font family, weight, italic, color, and optional maximum width.
+
+## Paint commands
+
+Connection helpers optionally negotiate `overlay-paint-v1`. Without it, a paint command is
+refused locally at submission with that profile named, rather than failing the channel on the
+host. Rust adds `Canvas::shadow`, `Canvas::stroke_styled`, `Path::rounded_rectangle_corners`,
+`Brush::Image`, and a `color_space` on gradient brushes. Python adds `Canvas.shadow`,
+`Canvas.stroke_styled`, `Path.rounded_rectangle_corners`, `Brush.image`, `Shadow`, and
+`StrokeStyle`; TypeScript adds `shadow`, `strokeStyled`, `roundedRectangleCorners`,
+`Brush.image`, `Shadow`, and `StrokeStyle`, with `image.id` as a `bigint`.
+
+- **Shadows** are CSS `box-shadow`: a rectangle, four corner radii clockwise from the top left,
+  a color, an offset, a blur diameter, a spread, and an inset flag. Radii that overrun their
+  sides scale down together, as CSS does. A spread adjusts the radii with the rectangle. Blur
+  is 0–4096 logical pixels and spread −4096–4096. The command paints only the shadow; an inset
+  shadow is clipped to its own rectangle, and drawing the element over an outer one is the
+  application's business.
+- **Styled strokes** add caps (`butt`, `round`, `square`), joins (`miter`, `bevel`, `round`), a
+  miter limit of at least one, and an optional dash pattern: 1–32 alternating on/off lengths,
+  each positive and at most 4096, with a dash offset. Plain `stroke` is unchanged.
+- **Image brushes** fill any path with an uploaded image at its natural pixel size, optionally
+  repositioned by a six-term affine transform, with `pad`, `repeat`, or `reflect` sampling
+  outside its extent. The image belongs to the same window, and a scene naming an asset the
+  channel never carried fails whole rather than rendering a placeholder.
+- **Gradient color space** selects sRGB (the default) or Oklab interpolation. sRGB scenes encode
+  exactly as before, so a host that has not adopted the profile sees no change.
+
+Shadows and dashed strokes cost more host work than a fill: a host may approximate a blur, and
+the wire value stays exact so a better renderer improves it without a protocol change.
 
 ## Host text measurement and editor geometry
 

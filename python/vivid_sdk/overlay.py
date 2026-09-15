@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -85,13 +85,19 @@ class Path:
     def close(self) -> Path: return self._add(4)
     @staticmethod
     def _shape(kind: str, bounds: Rect, radius: float = 0) -> Path:
+        return Path._shape_values(kind, (*bounds._values(),), radius)
+    @staticmethod
+    def _shape_values(kind: str, values: Sequence[float], radius: float = 0) -> Path:
         path = Path()
-        path._segments = _native.OverlayCanvas.shape(kind, bounds._values(), radius)
+        path._segments = _native.OverlayCanvas.shape(kind, list(values), radius)
         return path
     @staticmethod
     def rectangle(bounds: Rect) -> Path: return Path._shape("rectangle", bounds)
     @staticmethod
     def rounded_rectangle(bounds: Rect, radius: float) -> Path: return Path._shape("rounded", bounds, radius)
+    @staticmethod
+    def rounded_rectangle_corners(bounds: Rect, radii: Sequence[float]) -> Path:
+        return Path._shape_values("rounded-corners", (*bounds._values(), *radii))
     @staticmethod
     def ellipse(bounds: Rect) -> Path: return Path._shape("ellipse", bounds)
 
@@ -107,14 +113,47 @@ class Brush:
     _geometry: Tuple[float, ...]
     _colors: Tuple[int, ...]
     _offsets: Tuple[float, ...]
+    _image: Optional[Tuple[int, Tuple[float, ...], str]] = None
+    _space: str = "srgb"
     @staticmethod
     def solid(color: int) -> Brush: return Brush("solid", (), (color,), ())
     @staticmethod
-    def linear(start: Point, end: Point, stops: Sequence[GradientStop]) -> Brush:
-        return Brush("linear", (start.x, start.y, end.x, end.y), tuple(s.color for s in stops), tuple(s.offset for s in stops))
+    def linear(start: Point, end: Point, stops: Sequence[GradientStop], space: str = "srgb") -> Brush:
+        return Brush("linear", (start.x, start.y, end.x, end.y), tuple(s.color for s in stops), tuple(s.offset for s in stops), None, space)
     @staticmethod
-    def radial(center: Point, radius: float, stops: Sequence[GradientStop]) -> Brush:
-        return Brush("radial", (center.x, center.y, radius), tuple(s.color for s in stops), tuple(s.offset for s in stops))
+    def radial(center: Point, radius: float, stops: Sequence[GradientStop], space: str = "srgb") -> Brush:
+        return Brush("radial", (center.x, center.y, radius), tuple(s.color for s in stops), tuple(s.offset for s in stops), None, space)
+    @staticmethod
+    def image(image: RetainedImage, transform: Optional[Sequence[float]] = None, extend: str = "pad") -> Brush:
+        """Fill with an uploaded image. `transform` is six affine terms; `extend` is pad, repeat, or reflect."""
+        return Brush("image", (), (), (), (image.id, tuple(transform or ()), extend))
+
+@dataclass(frozen=True)
+class Shadow:
+    """One blurred rounded rectangle, as CSS box-shadow defines it. Radii are clockwise from the top left."""
+    rect: Rect
+    radii: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    color: int = 0x000000FF
+    offset: Point = field(default_factory=lambda: Point(0.0, 0.0))
+    blur: float = 0.0
+    spread: float = 0.0
+    inset: bool = False
+    def _values(self) -> Sequence[float]:
+        return (
+            self.rect.x, self.rect.y, self.rect.width, self.rect.height,
+            *self.radii, self.offset.x, self.offset.y, self.blur, self.spread,
+            1.0 if self.inset else 0.0,
+        )
+
+@dataclass(frozen=True)
+class StrokeStyle:
+    """Caps are butt/round/square; joins are miter/bevel/round; dashes alternate on/off lengths."""
+    width: float
+    cap: str = "butt"
+    join: str = "miter"
+    miter_limit: float = 4.0
+    dashes: Tuple[float, ...] = ()
+    dash_offset: float = 0.0
 
 class Canvas:
     def __init__(self) -> None: self._raw = _native.OverlayCanvas()
@@ -122,11 +161,26 @@ class Canvas:
         result = Canvas()
         result._raw = self._raw.snapshot()
         return result
+    def _paint(self, path: Path, brush: Brush, width: Optional[float], cap: str, join: str, miter: float, dashes: Sequence[float], dash_offset: float) -> None:
+        image = brush._image
+        self._raw.draw_paint(
+            path._segments, path.even_odd, brush._kind, brush._geometry, brush._colors, brush._offsets, brush._space,
+            image[0] if image else None,
+            list(image[1]) if image and image[1] else None,
+            image[2] if image else "pad",
+            width, cap, join, miter, list(dashes), dash_offset,
+        )
     def fill(self, path: Path, brush: Brush) -> Canvas:
-        self._raw.draw(path._segments, path.even_odd, brush._kind, brush._geometry, brush._colors, brush._offsets, None)
+        self._paint(path, brush, None, "butt", "miter", 4.0, (), 0.0)
         return self
     def stroke(self, path: Path, brush: Brush, width: float) -> Canvas:
-        self._raw.draw(path._segments, path.even_odd, brush._kind, brush._geometry, brush._colors, brush._offsets, width)
+        self._paint(path, brush, width, "butt", "miter", 4.0, (), 0.0)
+        return self
+    def shadow(self, value: Shadow) -> Canvas:
+        self._raw.shadow(value._values(), value.color)
+        return self
+    def stroke_styled(self, path: Path, brush: Brush, style: StrokeStyle) -> Canvas:
+        self._paint(path, brush, style.width, style.cap, style.join, style.miter_limit, style.dashes, style.dash_offset)
         return self
     def save(self) -> Canvas:
         self._raw.state("save", []); return self
@@ -148,6 +202,10 @@ class Canvas:
 
 class RetainedImage:
     def __init__(self, raw: Any) -> None: self._raw = raw
+    @property
+    def id(self) -> int:
+        """The channel-qualified asset identity, at full unsigned width."""
+        return int(self._raw.id)
 
 @dataclass(frozen=True)
 class TextGeometry:
@@ -353,7 +411,7 @@ class OverlaySession:
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
         required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY) if p not in required})
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))

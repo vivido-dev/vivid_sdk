@@ -4,7 +4,7 @@ import threading
 from typing import Any
 import pytest
 from vivid_sdk import OverlaySession, OverlayWindowOptions, aio
-from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, ImeEvent, PointerEvent, ViewportEvent, _event
+from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, Shadow, StrokeStyle, ImeEvent, PointerEvent, ViewportEvent, _event
 
 def drawing() -> Canvas:
     path = Path().move_to(0, 0).line_to(50, 0).quad_to(60, 20, 50, 40).cubic_to(30, 60, 10, 60, 0, 40).close()
@@ -129,3 +129,44 @@ def test_styled_text_validates_native_runs_and_snapshots_the_sequence() -> None:
                     StyledText([TextRun("x")], word_spacing=float("inf")),
                     StyledText([TextRun("x", TextStyle(size=float("nan")))])):
         with pytest.raises((ValueError, OSError)): invalid._native()
+
+def test_paint_commands_validate_and_round_trip_through_a_scene() -> None:
+    # Every paint form is bounded locally, before anything reaches a presenter, and the
+    # negotiated profile is what gates them at submit time.
+    with OverlaySession.connect(dry_run=True) as session:
+        window = session.create_window(OverlayWindowOptions(Rect(0, 0, 200, 120)))
+        path = Path.rectangle(Rect(0, 0, 200, 120))
+        image = window.upload_rgba(2, 2, bytes(16))
+        canvas = (
+            Canvas()
+            .shadow(Shadow(Rect(10, 10, 100, 60), (4, 8, 12, 16), 0x00000055, Point(0, 6), 18, -2))
+            .fill(path, Brush.image(image, extend="repeat"))
+            .fill(path, Brush.linear(Point(0, 0), Point(200, 0),
+                                     [GradientStop(0, 0xFF0000FF), GradientStop(1, 0x0000FFFF)],
+                                     space="oklab"))
+            .stroke_styled(path, Brush.solid(0xFFFFFFFF),
+                           StrokeStyle(2.5, cap="round", join="bevel", miter_limit=6,
+                                       dashes=(4.0, 2.0), dash_offset=1.5))
+            .fill(Path.rounded_rectangle_corners(Rect(0, 0, 80, 40), (2, 6, 10, 14)), Brush.solid(0x00FF00FF))
+        )
+        canvas.validate()
+        assert image.id > 0
+        # A dry-run session accepts the paint profile, so submission is the only gate left.
+        assert window.submit(canvas).revision > 0
+
+        for bad_shadow in (
+            Shadow(Rect(0, 0, 10, 10), (-1, 0, 0, 0)),
+            Shadow(Rect(0, 0, 10, 10), blur=4097),
+            Shadow(Rect(0, 0, 10, 10), blur=-1),
+        ):
+            with pytest.raises((ValueError, OSError)):
+                Canvas().shadow(bad_shadow).validate()
+        for bad_style in (
+            StrokeStyle(0),
+            StrokeStyle(1, miter_limit=0.5),
+            StrokeStyle(1, dashes=(0.0,)),
+            StrokeStyle(1, dashes=tuple([1.0] * 33)),
+            StrokeStyle(1, dash_offset=-1.0),
+        ):
+            with pytest.raises((ValueError, OSError)):
+                Canvas().stroke_styled(path, Brush.solid(0xFFFFFFFF), bad_style).validate()

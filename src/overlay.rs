@@ -25,7 +25,8 @@ pub use vivid_protocol::overlay::{
 };
 use vivid_protocol::vector::Frame;
 pub use vivid_protocol::vector::{
-    Brush, Canvas, Color, Command, HitRole, Path, Point, Rect, Scalar, Text, Transform,
+    Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, Extend, GradientStop, HitRole, Join,
+    Path, Point, Rect, Scalar, Shadow, StrokeStyle, Text, Transform,
 };
 
 use crate::*;
@@ -102,7 +103,14 @@ pub struct RetainedImage {
     channel_generation: u64,
 }
 
-#[derive(Debug, Clone)]
+impl RetainedImage {
+    /// The channel-qualified asset identity. Language bindings expose it so an image can be
+    /// referenced by value, as an image brush does.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 pub struct OverlayWindowStatus {
     pub bounds: Rect,
     pub viewport: Viewport,
@@ -137,6 +145,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_PAINT.into());
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
@@ -516,6 +527,7 @@ impl OverlayWindow {
     pub fn submit(&self, canvas: Canvas) -> io::Result<OverlaySubmission> {
         self.with_state(|session, state| {
             layout::validate_references(&canvas, &state.layouts)?;
+            layout::validate_paint(&canvas, session)?;
             let next = state
                 .next_scene
                 .checked_add(1)
@@ -588,6 +600,10 @@ impl OverlayWindow {
     /// Old-track images cannot be used in the replacement Canvas; upload new images afterwards.
     pub fn replace_track(&self, canvas: Canvas) -> io::Result<OverlaySubmission> {
         canvas.validate().map_err(io::Error::other)?;
+        let session = self.session.upgrade().ok_or_else(closed)?;
+        if let Some(session) = lock(&session, "overlay session")?.as_ref() {
+            layout::validate_paint(&canvas, session)?;
+        }
         if canvas
             .commands()
             .iter()
