@@ -7,7 +7,6 @@
     "declarationMap": false
   },
   "include": [
-    "*.ts",
-    "ui/*.ts"
+    "*.ts"
   ]
 }

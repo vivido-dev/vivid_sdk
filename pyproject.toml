@@ -37,9 +37,6 @@ testpaths = ["python-tests"]
 python_version = "3.9"
 strict = true
 files = ["python/vivid_sdk", "python-tests"]
-# So python-tests/test_ui_examples.py can `import _ui`, the shared helper behind
-# examples/python/ui/ — which also strict-checks the helper itself, transitively.
-mypy_path = "examples/python/ui"
 
 [[tool.mypy.overrides]]
 module = ["pytest", "pytest.*", "vivid_sdk._native"]
