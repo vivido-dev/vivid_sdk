@@ -20,7 +20,9 @@ pub use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
     Action, Query, SetWindow, Status, WindowAction, WindowAddress,
 };
-pub use vivid_protocol::overlay::{DismissReason, Event, WindowMode};
+pub use vivid_protocol::overlay::{
+    DismissReason, Event, Scroll, ScrollPhase, WindowMode, buttons, keys, modifiers,
+};
 use vivid_protocol::vector::Frame;
 pub use vivid_protocol::vector::{
     Brush, Canvas, Color, Command, HitRole, Path, Point, Rect, Scalar, Text, Transform,
@@ -42,6 +44,9 @@ pub struct OverlayWindowOptions {
     pub mode: WindowMode,
     pub title: String,
     pub visible: bool,
+    /// Floor for host-driven `HitRole::Resize` gestures. Bounds may not start below it.
+    pub min_width: Scalar,
+    pub min_height: Scalar,
 }
 impl OverlayWindowOptions {
     pub fn new(bounds: Rect, mode: WindowMode) -> Self {
@@ -50,6 +55,8 @@ impl OverlayWindowOptions {
             mode,
             title: String::new(),
             visible: true,
+            min_width: Scalar::ONE,
+            min_height: Scalar::ONE,
         }
     }
 }
@@ -213,6 +220,9 @@ impl OverlaySession {
         let session = guard.as_mut().ok_or_else(closed)?;
         let mut window_options = WindowOptions::new(options.bounds, options.mode);
         window_options.visible = options.visible;
+        window_options.min_width = options.min_width;
+        window_options.min_height = options.min_height;
+        window_options.validate().map_err(io::Error::other)?;
         if let Some(parent) = parent {
             let state = lock(&parent.state, "overlay parent")?;
             if state.closed {

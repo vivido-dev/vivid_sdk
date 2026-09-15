@@ -153,9 +153,12 @@ impl OverlaySession {
         mode: String,
         title: String,
         visible: bool,
+        min_width: f64,
+        min_height: f64,
         parent: Option<&OverlayWindow>,
     ) -> Result<OverlayWindow> {
-        let options = model::options(&bounds, &mode, title, visible).map_err(io_error)?;
+        let options = model::options(&bounds, &mode, title, visible, min_width, min_height)
+            .map_err(io_error)?;
         let owner = self.inner.clone();
         let parent = parent.map(|p| p.inner.clone());
         blocking(move || {

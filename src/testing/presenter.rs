@@ -48,6 +48,22 @@ impl TargetKind {
             Self::Desktop { .. } => registry::DESKTOP_SURFACE,
         }
     }
+
+    /// The overlay viewport this target implies, in logical pixels. Terminal cells are given a
+    /// fixed 8x16 size so a test's geometry is arithmetic rather than font-dependent.
+    fn overlay_width(self) -> u32 {
+        match self {
+            Self::Terminal { columns, .. } => (columns as u32).saturating_mul(8).max(1),
+            Self::Desktop { width, .. } => width.max(1),
+        }
+    }
+
+    fn overlay_height(self) -> u32 {
+        match self {
+            Self::Terminal { rows, .. } => (rows as u32).saturating_mul(16).max(1),
+            Self::Desktop { height, .. } => height.max(1),
+        }
+    }
 }
 
 /// One control-connection request the presenter observed, in arrival order.
@@ -89,6 +105,8 @@ struct Shared {
     lanes: Vec<u64>,
     /// Input bindings observed on the interactive lane, in arrival order.
     input_bindings: Vec<ObservedBinding>,
+    /// Headless overlay windows, scenes and assets. Empty unless a producer negotiates them.
+    overlays: crate::testing::overlay::Overlays,
 }
 
 /// One `SET_INPUT_BINDING` the presenter answered, with the grant it returned.
@@ -317,6 +335,133 @@ impl TestPresenter {
         .encode()
         .map_err(io::Error::other)?;
         self.push(messages::TRACK_LOST, track_id, &body)
+    }
+
+    // ---- headless overlays -----------------------------------------------------------------
+
+    /// Every display list this presenter accepted, keyed by the window that published it.
+    pub fn overlay_scenes(&self) -> Vec<crate::testing::overlay::PresentedScene> {
+        self.shared.lock().expect("shared").overlays.scenes()
+    }
+
+    /// Retained images still reachable by a future scene.
+    pub fn overlay_assets(&self) -> Vec<crate::testing::overlay::RetainedAsset> {
+        self.shared.lock().expect("shared").overlays.assets()
+    }
+
+    /// Whether any overlay window currently holds focus.
+    pub fn overlay_focused(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .focused()
+            .is_some()
+    }
+
+    /// Replace the overlay viewport, as a pane resize or DPI change would.
+    pub fn set_overlay_viewport(&self, width: f64, height: f64, scale: u32) -> io::Result<()> {
+        {
+            let mut guard = self.shared.lock().expect("shared");
+            let viewport = vivid_protocol::overlay::wire::Viewport {
+                width: vivid_protocol::vector::Scalar::new(width).map_err(io::Error::other)?,
+                height: vivid_protocol::vector::Scalar::new(height).map_err(io::Error::other)?,
+                scale_numerator: scale.max(1),
+                scale_denominator: 1,
+            };
+            guard.overlays.set_viewport(viewport);
+        }
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(())
+    }
+
+    /// Deliver a pointer event in viewport logical pixels. `button` is `(button, pressed)`.
+    pub fn overlay_pointer(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let consumed = self
+            .shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .pointer(1, position, button, modifiers);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Deliver a wheel delta in viewport logical pixels.
+    pub fn overlay_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let scroll = vivid_protocol::overlay::Scroll {
+            dx: vivid_protocol::vector::Scalar::new(dx).map_err(io::Error::other)?,
+            dy: vivid_protocol::vector::Scalar::new(dy).map_err(io::Error::other)?,
+            precise: true,
+            phase: vivid_protocol::overlay::ScrollPhase::Changed,
+        };
+        let consumed = self
+            .shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .wheel(1, position, scroll, modifiers);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Deliver a physical key transition. `usage` is a USB HID keyboard-page usage.
+    pub fn overlay_key(&self, usage: u32, down: bool, modifiers: u32) -> io::Result<bool> {
+        let event = vivid_protocol::overlay::Event::Key {
+            physical: usage,
+            down,
+            repeat: false,
+            modifiers,
+        };
+        // Escape dismissal is the host's policy, and it keys off the usage rather than the text.
+        let escape = usage == 0x29;
+        let consumed = self
+            .shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .keyboard(1, event, escape);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Deliver committed text, as a platform text-input path would after a key or an IME commit.
+    pub fn overlay_text(&self, text: &str) -> io::Result<bool> {
+        let event = vivid_protocol::overlay::Event::Text(text.to_owned());
+        let consumed = self
+            .shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .keyboard(1, event, false);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Gain or lose native pane focus, which cancels gestures and held input state.
+    pub fn set_overlay_pane_focus(&self, focused: bool) -> io::Result<()> {
+        self.shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .set_pane_focus(1, focused);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(())
     }
 
     /// Write an unsolicited record on the interactive lane.
@@ -555,6 +700,20 @@ fn serve(serving: Serving) -> io::Result<()> {
         resume_generation: 0,
         extensions: Vec::new(),
     };
+    if welcome
+        .accepted_profiles
+        .iter()
+        .any(|profile| profile == registry::VECTOR_SCENE)
+    {
+        let mut guard = shared.lock().expect("shared");
+        guard.overlays.install_viewport(
+            f64::from(initial_target.kind.overlay_width()),
+            f64::from(initial_target.kind.overlay_height()),
+        );
+        welcome
+            .extensions
+            .push((15, guard.overlays.limits().to_value()));
+    }
     welcome.confirm(&prk).map_err(io::Error::other)?;
     let welcome_body = welcome.encode(hello_request).map_err(io::Error::other)?;
     {
@@ -654,10 +813,19 @@ fn serve(serving: Serving) -> io::Result<()> {
             messages::CREATE_TRACK => {
                 track_revisions.insert(record.object_id, 1);
                 let maximum_body = unsigned(7).unwrap_or(1);
-                shared.lock().expect("shared").track_bodies.insert(
-                    record.object_id,
-                    u32::try_from(maximum_body).unwrap_or(u32::MAX),
-                );
+                {
+                    let mut guard = shared.lock().expect("shared");
+                    guard.track_bodies.insert(
+                        record.object_id,
+                        u32::try_from(maximum_body).unwrap_or(u32::MAX),
+                    );
+                    guard.overlays.note_track(
+                        welcome.session_id,
+                        record.object_id,
+                        unsigned(0).unwrap_or(0),
+                        unsigned(1).unwrap_or(0),
+                    );
+                }
                 let delta_operations = payload
                     .iter()
                     .find(|(key, _)| *key == 12)
@@ -687,6 +855,22 @@ fn serve(serving: Serving) -> io::Result<()> {
                         ],
                     )?,
                 )
+            }
+            messages::SET_OVERLAY_WINDOW | messages::OVERLAY_ACTION | messages::QUERY_OVERLAY => {
+                let mut guard = shared.lock().expect("shared");
+                let overlays = &mut guard.overlays;
+                let (reply, fields) = match record.record_type {
+                    messages::SET_OVERLAY_WINDOW => {
+                        overlays.set_window(welcome.session_id, record.object_id, &payload)
+                    }
+                    messages::OVERLAY_ACTION => {
+                        overlays.action(welcome.session_id, record.object_id, &payload)
+                    }
+                    _ => overlays.status(welcome.session_id, record.object_id, &payload),
+                };
+                drop(guard);
+                flush_overlay_lane(&shared, &lane_writer);
+                (reply, ok_payload(request_id, fields)?)
             }
             messages::WAIT_TRACK => {
                 let revision = *track_revisions.get(&record.object_id).unwrap_or(&1);
@@ -920,8 +1104,11 @@ fn accept_secondary_connections(
                 ));
             }
             vivid_protocol::wire::ConnectionKind::Track => {
+                let lane_writer = lane_writer.clone();
                 workers.push((
-                    thread::spawn(move || serve_track_channel(stream, shared, key, script)),
+                    thread::spawn(move || {
+                        serve_track_channel(stream, shared, key, script, lane_writer)
+                    }),
                     shutdown,
                 ));
             }
@@ -945,6 +1132,7 @@ fn serve_track_channel(
     shared: Arc<Mutex<Shared>>,
     channel_key: Secret32,
     script: Script,
+    lane_writer: Arc<Mutex<Option<(TcpStream, u64)>>>,
 ) -> io::Result<()> {
     let open_record = read_record(&mut stream)?;
     if open_record.record_type != messages::CHANNEL_OPEN {
@@ -1037,7 +1225,7 @@ fn serve_track_channel(
     loop {
         match read_record(&mut stream) {
             Ok(record) if record.record_type == messages::CHANNEL_EOS => break,
-            Ok(_) => {
+            Ok(record) => {
                 accepted_records += 1;
                 let mut guard = shared.lock().expect("shared");
                 if let Some(entry) = guard.channels.iter_mut().find(|entry| {
@@ -1046,7 +1234,20 @@ fn serve_track_channel(
                 }) {
                     entry.media_records += 1;
                 }
+                let accepted = guard.overlays.media_record(
+                    open.session_id,
+                    record.record_type,
+                    open.track_id,
+                    &record.body,
+                );
                 drop(guard);
+                flush_overlay_lane(&shared, &lane_writer);
+                if !accepted {
+                    // A real presenter fails the channel rather than the request when a producer
+                    // breaks its contract; the producer must recover this track on its own.
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
                 if close_after.is_some_and(|limit| accepted_records >= limit) {
                     // Drop the transport mid-stream: the producer must recover this track alone.
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -1076,6 +1277,7 @@ fn serve_interactive_lane(
     lane_writer: Arc<Mutex<Option<(TcpStream, u64)>>>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let session_id = 1;
     let open_record = read_record(&mut stream)?;
     if open_record.record_type != messages::LANE_OPEN {
         return Err(io::Error::other("lane connection did not open a lane"));
@@ -1128,6 +1330,30 @@ fn serve_interactive_lane(
             Ok(record) => record,
             Err(_) => break,
         };
+        if matches!(
+            record.record_type,
+            messages::OVERLAY_INPUT_RENEW | messages::OVERLAY_INPUT_CAPTURE
+        ) {
+            let envelope = messages::decode_control(&record.body).map_err(io::Error::other)?;
+            let mut guard = shared.lock().expect("shared");
+            let (reply, fields) = if record.record_type == messages::OVERLAY_INPUT_RENEW {
+                guard.overlays.renew(record.object_id, &envelope.payload)
+            } else {
+                guard
+                    .overlays
+                    .capture(session_id, record.object_id, &envelope.payload)
+            };
+            drop(guard);
+            let body = ok_payload(envelope.request_id, fields)?;
+            let mut writer = lane_writer.lock().expect("lane writer");
+            if let Some((stream, sequence)) = writer.as_mut() {
+                *sequence += 1;
+                write_record(stream, *sequence, reply, 0, record.object_id, &body)?;
+            }
+            drop(writer);
+            flush_overlay_lane(&shared, &lane_writer);
+            continue;
+        }
         if record.record_type != messages::SET_INPUT_BINDING {
             // Ordinary input events travel producer-to-presenter on a real desktop presenter;
             // here they are simply counted by arriving, and nothing is echoed.
@@ -1222,6 +1448,40 @@ fn serve_interactive_lane(
     }
     *lane_writer.lock().expect("lane writer") = None;
     Ok(())
+}
+
+/// Write every lane record the overlay state owes a producer.
+///
+/// Bulk and control records arrive on their own connections, but submission outcomes, viewport
+/// snapshots and input events are all owed on the interactive lane, so every producer of one
+/// queues it and drains here. A lane that is not open yet simply keeps the queue.
+fn flush_overlay_lane(
+    shared: &Arc<Mutex<Shared>>,
+    lane_writer: &Arc<Mutex<Option<(TcpStream, u64)>>>,
+) {
+    let mut guard = lane_writer.lock().expect("lane writer");
+    let Some((stream, sequence)) = guard.as_mut() else {
+        return;
+    };
+    let pending = shared.lock().expect("shared").overlays.take_pending();
+    for record in pending {
+        let Ok(body) = Envelope::new(0, record.payload).encode() else {
+            continue;
+        };
+        *sequence += 1;
+        if write_record(
+            stream,
+            *sequence,
+            record.record_type,
+            0,
+            record.object_id,
+            &body,
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
 }
 
 fn envelope_body(request_id: u64, payload: PayloadMap) -> io::Result<Vec<u8>> {

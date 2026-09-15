@@ -6,8 +6,14 @@ interactive-lane integration. This is a development preview: the complete cross-
 and GPUI-inspired UI plan has not passed live pane acceptance.
 
 The terminating SDK presenter and terminating gateways still reject these profiles explicitly.
-Vivido offers them only for terminal targets with native viewport geometry installed. Existing
-SDK examples are unchanged.
+Vivido offers them only for terminal targets with native viewport geometry installed. Example 07
+in each language draws an interactive overlay panel and pumps its input lane.
+
+For tests, `vivid_sdk::testing::TestPresenter` serves the profile bundle headlessly: it keeps
+window, focus and revision state in the protocol's own state machine, validates every display
+list against the negotiated limits, and exposes the accepted lists plus pointer, wheel, key,
+text, focus and viewport injection. It composes nothing, so it needs neither a GPU nor a
+terminal. The production terminating presenter still refuses these profiles outright.
 
 ## Rust window API
 
@@ -44,7 +50,9 @@ Windows support `set_bounds`, `set_visible`, `center`, `request_focus`, `raise`,
 explicit `close`. `bounds()` and `viewport()` query host truth, including DPI scale. Use
 `create_child(&parent, options)` for parent-scoped popup or modal windows. Foreign-session parent
 handles are rejected before sending anything. Coordinates are viewport logical pixels and do
-not follow terminal scrollback.
+not follow terminal scrollback. `min_width` / `min_height` (Python `min_width`/`min_height`,
+TypeScript `minWidth`/`minHeight`) default to one logical pixel and bound host-driven
+`HitRole::Resize` gestures; initial bounds smaller than the minimum are rejected locally.
 
 `present(Canvas)` reuses the window's surface, immutable vector track, and authenticated channel.
 Initial readiness is bounded to five seconds before activation. Use `submit(Canvas)` to obtain
@@ -311,6 +319,19 @@ Python provides event dataclasses; TypeScript provides a discriminated union on 
 IME selections use Python character indexes or JavaScript UTF-16 indexes into the preedit string.
 TypeScript scene revisions and application hit IDs are `bigint` throughout. Window, session,
 and asset wire identities stay opaque. Closing sessions invalidates their remaining windows.
+
+Physical keys, pointer buttons, and modifier masks are protocol values, never a host's platform
+encoding, and they match `desktop-surface-v1`'s assignments. Rust re-exports
+`overlay::{keys, buttons, modifiers}`; Python exposes `overlay.Key`, `overlay.MouseButton`, and
+`overlay.Modifiers`; TypeScript exports `overlay.Key`, `overlay.MouseButton`, and
+`overlay.Modifiers`. A physical key is a USB HID keyboard-page usage in `0x04..=0xe7`, with zero
+for a key the page does not name. Buttons are primary, auxiliary, secondary, back, forward, then
+`5..=31`. Modifiers are shift, control, alt, super, caps lock, and num lock; every other bit is
+reserved and an event that sets one is rejected rather than dispatched.
+
+Wheel events add `precise` (true for trackpads, false for detented wheels whose detents the host
+has already converted to logical pixels) and `phase` (`"none"`, `"began"`, `"changed"`, `"ended"`,
+`"cancelled"`). Deltas stay in logical pixels, so ignoring both fields still scrolls correctly.
 
 ### Binding validation
 

@@ -172,6 +172,8 @@ pub fn options(
     mode: &str,
     title: String,
     visible: bool,
+    min_width: f64,
+    min_height: f64,
 ) -> io::Result<OverlayWindowOptions> {
     let mode = match mode {
         "floating" => WindowMode::Floating,
@@ -184,6 +186,8 @@ pub fn options(
         mode,
         title,
         visible,
+        min_width: Scalar::new(min_width).map_err(io::Error::other)?,
+        min_height: Scalar::new(min_height).map_err(io::Error::other)?,
     })
 }
 pub fn path(segments: &[Vec<f64>], even_odd: bool) -> io::Result<Path> {
@@ -310,6 +314,18 @@ pub fn timeout(seconds: f64) -> io::Result<std::time::Duration> {
     std::time::Duration::try_from_secs_f64(seconds).map_err(io::Error::other)
 }
 
+/// The language-facing scroll phase index, matching the protocol's wire order.
+fn scroll_phase(phase: vivid_sdk::overlay::ScrollPhase) -> u8 {
+    use vivid_sdk::overlay::ScrollPhase;
+    match phase {
+        ScrollPhase::None => 0,
+        ScrollPhase::Began => 1,
+        ScrollPhase::Changed => 2,
+        ScrollPhase::Ended => 3,
+        ScrollPhase::Cancelled => 4,
+    }
+}
+
 pub struct EventData {
     pub kind: &'static str,
     pub revision: u64,
@@ -376,6 +392,8 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
             dx,
             dy,
             modifiers,
+            precise,
+            phase,
         } => {
             data.kind = "wheel";
             data.values = vec![
@@ -384,6 +402,8 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
                 dx.get(),
                 dy.get(),
                 f64::from(*modifiers),
+                u8::from(*precise).into(),
+                f64::from(scroll_phase(*phase)),
             ];
         }
         Event::Key {

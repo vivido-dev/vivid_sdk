@@ -91,3 +91,7 @@ path = "examples/rust/05_replace_track.rs"
 name = "sdk_06_presenter_roundtrip"
 path = "examples/rust/06_presenter_roundtrip.rs"
 required-features = ["presenter"]
+
+[[example]]
+name = "sdk_07_overlay_window"
+path = "examples/rust/07_overlay_window.rs"

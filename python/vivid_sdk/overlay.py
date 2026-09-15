@@ -10,6 +10,33 @@ from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFIL
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
 DismissReason = Literal["escape", "outside-press", "closed", "owner-lost", "parent-closed"]
+ScrollPhase = Literal["none", "began", "changed", "ended", "cancelled"]
+_SCROLL_PHASES: Tuple[ScrollPhase, ...] = ("none", "began", "changed", "ended", "cancelled")
+
+class Modifiers:
+    """Normative overlay modifier bits. A host never forwards its platform bitmask."""
+    SHIFT = 1
+    CONTROL = 2
+    ALT = 4
+    SUPER = 8
+    CAPS_LOCK = 16
+    NUM_LOCK = 32
+    KNOWN_MASK = SHIFT | CONTROL | ALT | SUPER | CAPS_LOCK | NUM_LOCK
+
+class MouseButton:
+    """Normative overlay pointer buttons, shared with desktop-surface-v1."""
+    PRIMARY = 0
+    AUXILIARY = 1
+    SECONDARY = 2
+    BACK = 3
+    FORWARD = 4
+    MAXIMUM = 31
+
+class Key:
+    """Physical keys are USB HID keyboard-page usages; zero is a key the page does not name."""
+    UNMAPPED = 0
+    FIRST_USAGE = 0x04
+    LAST_USAGE = 0xE7
 
 @dataclass(frozen=True)
 class Point:
@@ -38,6 +65,8 @@ class OverlayWindowOptions:
     mode: WindowMode = "floating"
     title: str = ""
     visible: bool = True
+    min_width: float = 1.0
+    min_height: float = 1.0
 
 class Path:
     """Mutable Bézier builder. Canvas commands snapshot paths when added."""
@@ -238,6 +267,8 @@ class WheelEvent(OverlayEvent):
     dx: float
     dy: float
     modifiers: int
+    precise: bool
+    phase: ScrollPhase
 
 @dataclass(frozen=True)
 class KeyEvent(OverlayEvent):
@@ -300,7 +331,7 @@ def _event(raw: Any) -> OverlayEvent:
     if kind == "viewport": return ViewportEvent(0, raw, revision, Viewport(values[0], values[1], int(values[2]), int(values[3])))
     if kind == "submission-outcome": return SubmissionOutcomeEvent(revision, raw, cast(PresentationOutcome, text))
     if kind == "pointer": return PointerEvent(revision, raw, Point(*values[:2]), data["region"], int(values[2]), int(values[3]) if len(values) > 3 else None, bool(values[4]) if len(values) > 3 else None)
-    if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]))
+    if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]), bool(values[5]), _SCROLL_PHASES[int(values[6])])
     if kind == "key": return KeyEvent(revision, raw, int(values[0]), bool(values[1]), bool(values[2]), int(values[3]))
     if kind == "text": return TextEvent(revision, raw, text)
     if kind == "ime":
@@ -329,7 +360,7 @@ class OverlaySession:
     @classmethod
     def from_env(cls) -> OverlaySession: return cls.connect()
     def create_window(self, options: OverlayWindowOptions, *, parent: Optional[OverlayWindow] = None) -> OverlayWindow:
-        return OverlayWindow(self._raw.create_window(options.bounds._values(), options.mode, options.title, options.visible, parent._raw if parent else None))
+        return OverlayWindow(self._raw.create_window(options.bounds._values(), options.mode, options.title, options.visible, options.min_width, options.min_height, parent._raw if parent else None))
     def capture_pointer(self, window: OverlayWindow, capture: bool = True) -> None:
         self._raw.capture_pointer(window._raw, capture)
     def wait_event(self, timeout: float = 0.25) -> Optional[OverlayEvent]:

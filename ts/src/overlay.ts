@@ -9,7 +9,19 @@ export interface Rect extends Point { readonly width: number; readonly height: n
 export interface Viewport { readonly width: number; readonly height: number; readonly scaleNumerator: number; readonly scaleDenominator: number }
 export type WindowMode = "floating" | "popup" | "modal";
 export type HitRole = "input" | "drag" | "resize" | "transparent";
-export interface OverlayWindowOptions { readonly bounds: Rect; readonly mode?: WindowMode; readonly title?: string; readonly visible?: boolean }
+export type ScrollPhase = "none" | "began" | "changed" | "ended" | "cancelled";
+const SCROLL_PHASES: readonly ScrollPhase[] = ["none", "began", "changed", "ended", "cancelled"];
+
+/** Normative overlay modifier bits. A host never forwards its platform bitmask. */
+export const Modifiers = { shift: 1, control: 2, alt: 4, super: 8, capsLock: 16, numLock: 32, knownMask: 63 } as const;
+
+/** Normative overlay pointer buttons, shared with desktop-surface-v1. */
+export const MouseButton = { primary: 0, auxiliary: 1, secondary: 2, back: 3, forward: 4, maximum: 31 } as const;
+
+/** Physical keys are USB HID keyboard-page usages; zero is a key the page does not name. */
+export const Key = { unmapped: 0, firstUsage: 0x04, lastUsage: 0xe7 } as const;
+
+export interface OverlayWindowOptions { readonly bounds: Rect; readonly mode?: WindowMode; readonly title?: string; readonly visible?: boolean; readonly minWidth?: number; readonly minHeight?: number }
 export interface GradientStop { readonly offset: number; readonly color: number }
 interface NativeCanvas {
   snapshot(): NativeCanvas;
@@ -80,7 +92,7 @@ export class RetainedTextLayout {
   /** @internal */ constructor(readonly raw: NativeTextLayout) { this.measurement = layoutMeasurement(raw); }
 }
 interface NativeSession {
-  createWindow(bounds: number[], mode: string, title: string, visible: boolean, parent?: NativeWindow): Promise<NativeWindow>;
+  createWindow(bounds: number[], mode: string, title: string, visible: boolean, minWidth: number, minHeight: number, parent?: NativeWindow): Promise<NativeWindow>;
   capturePointer(window: NativeWindow, capture: boolean): Promise<void>;
   waitEvent(timeout: number): Promise<NativeEvent | null>;
   close(): Promise<void>;
@@ -162,7 +174,7 @@ const asViewport = (v: number[]): Viewport => ({ width: v[0]!, height: v[1]!, sc
 interface EventBase { readonly sceneRevision: bigint; targets(window: OverlayWindow): boolean }
 export type OverlayEvent = EventBase & (
   | { readonly kind: "pointer"; readonly position: Point; readonly applicationId: bigint; readonly modifiers: number; readonly button?: number; readonly down?: boolean }
-  | { readonly kind: "wheel"; readonly position: Point; readonly dx: number; readonly dy: number; readonly modifiers: number }
+  | { readonly kind: "wheel"; readonly position: Point; readonly dx: number; readonly dy: number; readonly modifiers: number; readonly precise: boolean; readonly phase: ScrollPhase }
   | { readonly kind: "key"; readonly physical: number; readonly down: boolean; readonly repeat: boolean; readonly modifiers: number }
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "ime"; readonly preedit: string; /** UTF-16 offsets into preedit. */ readonly selection?: readonly [number, number] }
@@ -186,7 +198,7 @@ export function decodeOverlayEvent(raw: NativeEvent): OverlayEvent {
       return { ...base, kind: "submission-outcome", outcome: data.text };
     }
     case "pointer": return { ...base, kind: "pointer", position, applicationId: data.region, modifiers: v[2]!, button: v[3], down: v.length > 3 ? Boolean(v[4]) : undefined };
-    case "wheel": return { ...base, kind: "wheel", position, dx: v[2]!, dy: v[3]!, modifiers: v[4]! };
+    case "wheel": return { ...base, kind: "wheel", position, dx: v[2]!, dy: v[3]!, modifiers: v[4]!, precise: v[5] !== 0, phase: SCROLL_PHASES[v[6]!]! };
     case "key": return { ...base, kind: "key", physical: v[0]!, down: Boolean(v[1]), repeat: Boolean(v[2]), modifiers: v[3]! };
     case "text": return { ...base, kind: "text", text: data.text };
     case "ime": {
@@ -219,7 +231,7 @@ export class OverlaySession {
   }
   static async fromEnv(): Promise<OverlaySession> { return OverlaySession.connect(); }
   async createWindow(options: OverlayWindowOptions, parent?: OverlayWindow): Promise<OverlayWindow> {
-    return new OverlayWindow(await call(this.raw.createWindow(values(options.bounds), options.mode ?? "floating", options.title ?? "", options.visible ?? true, parent?.raw)));
+    return new OverlayWindow(await call(this.raw.createWindow(values(options.bounds), options.mode ?? "floating", options.title ?? "", options.visible ?? true, options.minWidth ?? 1, options.minHeight ?? 1, parent?.raw)));
   }
   async capturePointer(window: OverlayWindow, capture = true): Promise<void> { await call(this.raw.capturePointer(window.raw, capture)); }
   /** timeout is seconds, bounded to [0, 60]. */

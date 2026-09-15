@@ -147,9 +147,12 @@ impl PyOverlaySession {
         mode: &str,
         title: String,
         visible: bool,
+        min_width: f64,
+        min_height: f64,
         parent: Option<&PyOverlayWindow>,
     ) -> PyResult<PyOverlayWindow> {
-        let options = model::options(&bounds, mode, title, visible).map_err(io_error)?;
+        let options = model::options(&bounds, mode, title, visible, min_width, min_height)
+            .map_err(io_error)?;
         py.detach(|| match parent {
             Some(parent) => self.inner.create_child(&parent.inner, options),
             None => self.inner.create_window(options),
