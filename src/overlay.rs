@@ -29,7 +29,8 @@ pub use vivid_protocol::overlay::{
 use vivid_protocol::vector::Frame;
 pub use vivid_protocol::vector::{
     Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, CursorShape, Extend, GradientStop,
-    HitRegion, HitRole, Join, Path, Point, Rect, Scalar, Shadow, StrokeStyle, Text, Transform,
+    HitRegion, HitRole, Join, Path, PathBuilder, Point, Rect, Scalar, Shadow, StrokeStyle, Text,
+    Transform,
 };
 
 use crate::*;

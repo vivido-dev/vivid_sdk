@@ -254,7 +254,7 @@ class Canvas:
         self._raw.text(text, origin.x, origin.y, size, color, family, weight, italic, max_width)
         return self
     def hit(self, application_id: int, path: Path, role: HitRole = "input", *, edges: int = 0, cursor: CursorShape = "") -> Canvas:
-        """Resize edges: left=1, right=2, top=4, bottom=8. IDs are unsigned 64-bit.
+        """Resize edges: left=1, top=2, right=4, bottom=8. IDs are unsigned 64-bit.
 
         `cursor` is the shape shown while this region is hovered; empty leaves the host's own.
         """

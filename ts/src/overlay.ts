@@ -273,7 +273,7 @@ export class Canvas {
     callSync(() => this.raw.text(text, origin.x, origin.y, size, color, options.family ?? "", options.weight ?? 400, options.italic ?? false, options.maxWidth)); return this;
   }
   /**
-   * Resize edge mask: left=1, right=2, top=4, bottom=8. IDs never pass through Number.
+   * Resize edge mask: left=1, top=2, right=4, bottom=8. IDs never pass through Number.
    *
    * `cursor` is the shape shown while this region is hovered; omitting it leaves the host's own.
    */

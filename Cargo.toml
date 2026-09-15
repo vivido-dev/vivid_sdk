@@ -95,3 +95,7 @@ required-features = ["presenter"]
 [[example]]
 name = "sdk_07_overlay_window"
 path = "examples/rust/07_overlay_window.rs"
+
+[[example]]
+name = "sdk_08_overlay_paths"
+path = "examples/rust/08_overlay_paths.rs"

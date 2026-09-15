@@ -1,6 +1,6 @@
 # Progressive Vivid SDK examples
 
-Seven runnable examples in each language use the current `dev` SDK and Vivid Protocol 1.5.
+Eight runnable examples in each language use the current `dev` SDK and Vivid Protocol 1.5.
 They use the public Rust, Python, and native TypeScript APIs. Start with the pane helpers,
 then learn the explicit surface/track lifecycle and the terminating presenter.
 
@@ -13,6 +13,7 @@ then learn the explicit surface/track lifecycle and the terminating presenter.
 | Advanced | Replace a track on the same surface | [05](rust/05_replace_track.rs) | [05](python/05_replace_track.py) | [05](typescript/05_replace_track.ts) |
 | Advanced | Producer/presenter round trip | [06](rust/06_presenter_roundtrip.rs) | [06](python/06_presenter_roundtrip.py) | [06](typescript/06_presenter_roundtrip.ts) |
 | Advanced | Interactive vector overlay window | [07](rust/07_overlay_window.rs) | [07](python/07_overlay_window.py) | [07](typescript/07_overlay_window.ts) |
+| Advanced | Freeform paths: curves, even-odd holes, dashes | [08](rust/08_overlay_paths.rs) | [08](python/08_overlay_paths.py) | [08](typescript/08_overlay_paths.ts) |
 
 ## Setup
 
@@ -21,7 +22,7 @@ Run every command below from the SDK directory, `vivid_sdk/`. This repository us
 Rust requires 1.88 or newer. Python requires 3.9 or newer. Use Node 22.20+ for the native
 TypeScript build tools; these examples do not require Bun or browser support.
 
-Examples 01â€“05 and 07 run **inside a Vivid-enabled Vivido pane**, inheriting `VIVID_ENDPOINT_CONTROL`,
+Examples 01â€“05, 07 and 08 run **inside a Vivid-enabled Vivido pane**, inheriting `VIVID_ENDPOINT_CONTROL`,
 the optional lane endpoints, and `VIVID_ROOT_SECRET`. Do not copy credentials into command
 arguments or print them. Media uses authenticated SDK connections, never the terminal PTY.
 Example 06 starts its own loopback presenter and needs no terminal or external credentials.
@@ -60,6 +61,7 @@ cargo run --example sdk_04_raster_animation
 cargo run --example sdk_05_replace_track
 cargo run --example sdk_06_presenter_roundtrip --features presenter
 cargo run --example sdk_07_overlay_window
+cargo run --example sdk_08_overlay_paths
 ```
 
 ```sh
@@ -70,6 +72,7 @@ python examples/python/04_raster_animation.py
 python examples/python/05_replace_track.py
 python examples/python/06_presenter_roundtrip.py
 python examples/python/07_overlay_window.py
+python examples/python/08_overlay_paths.py
 ```
 
 ```sh
@@ -80,10 +83,12 @@ node target/examples-typescript/04_raster_animation.js
 node target/examples-typescript/05_replace_track.js
 node target/examples-typescript/06_presenter_roundtrip.js
 node target/examples-typescript/07_overlay_window.js
+node target/examples-typescript/08_overlay_paths.js
 ```
 
-Examples 01, 02, 03, and 05 wait for Enter and then remove the presentation. Example 07 instead
-runs its own event loop, so its `--duration` bounds that loop rather than a blocking wait. Add
+Examples 01, 02, 03, and 05 wait for Enter and then remove the presentation. Examples 07 and 08
+instead run their own event loop, so their `--duration` bounds that loop rather than a blocking
+wait. Add
 `--duration 2` to remove it automatically after two seconds (0â€“3600 accepted).
 For Cargo, application arguments follow `--`:
 
@@ -119,6 +124,12 @@ green, blue, white pixel bytes. A timeout or mismatch fails the process.
   why `targets` exists: one session may own many windows, and outcomes and viewport snapshots
   share the same lane as input. Exiting requires a click inside the declared region, Escape, or
   `--duration`.
+- **08:** freeform paths, which 07 does not reach: the four segment kinds, caps and joins, a dash
+  pattern, and the even-odd rule. A path is built rather than described, so the same geometry is
+  written the same way in all three languages - and the builder reports the first coordinate the
+  wire cannot carry rather than panicking part way through an expression. The ring is the one to
+  watch: its hole is a hole to the host's hit testing too, because the host hit tests the fill
+  rule it draws by.
 
 Rust and Python placement take signed **32.32 fixed-point cells** (`16 << 32`); TypeScript takes
 ordinary cell numbers (`16`). Producer track waits take **microseconds** in Rust/Python and

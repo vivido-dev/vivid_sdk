@@ -158,6 +158,17 @@ second argument in TypeScript to create child windows. Python uses `raise_window
 Canvas supports rectangles, rounded rectangles (uniform or per-corner), ellipses, Bézier paths,
 solid/linear/radial/image brushes, plain and styled strokes, box shadows, opacity, affine
 transforms, nested clips, host-shaped text, and hit regions.
+
+Beyond the shape constructors, a path is built from `move_to` / `moveTo`, `line_to` / `lineTo`,
+`quad_to` / `quadTo`, `cubic_to` / `cubicTo` and `close`, chained, in all three languages. A
+builder is the only way to write a shape the constructors do not cover, and the only way to put
+two subpaths in one path — which with the even-odd rule (`Path(even_odd=True)`, `new Path(true)`,
+`Path::builder().even_odd()`) is what makes a hole rather than a second layer. A hole is a hole
+to the host's hit testing as well, since it hit tests the rule the shape is filled by. All three
+builders stop growing at the segment ceiling — Python raises `ValueError`, TypeScript `RangeError`
+— and Rust additionally reports a coordinate the wire cannot carry from `build()`, naming the
+first thing that went wrong rather than the last.
+
 `snapshot()` copies the current display list; `present` also snapshots before sending. Paths are
 copied when added to a Canvas. Use `validate()` to check a complete list without sending it.
 An image returned by `upload_rgba` / `uploadRgba` belongs to its window; `draw_image` / `drawImage`
