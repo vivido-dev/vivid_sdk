@@ -395,6 +395,11 @@ impl TestPresenter {
             .map(|(_, s)| s.clone())
     }
 
+    /// Where the focused editor last said its caret was, with the revision it said it at.
+    pub fn overlay_editor_caret(&self) -> Option<(u64, Option<vivid_protocol::vector::Rect>)> {
+        self.shared.lock().expect("shared").overlays.editor_caret()
+    }
+
     /// Deliver an assistive-technology action for a node, exactly as the adapter would.
     pub fn overlay_accessibility_action(
         &self,
@@ -488,6 +493,22 @@ impl TestPresenter {
             .expect("shared")
             .overlays
             .wheel(1, position, scroll, modifiers);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Deliver a composition from an input method.
+    pub fn overlay_ime(&self, preedit: &str, selection: Option<(u32, u32)>) -> io::Result<bool> {
+        let event = vivid_protocol::overlay::Event::Ime {
+            preedit: preedit.to_owned(),
+            selection,
+        };
+        let consumed = self
+            .shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .keyboard(1, event, false);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -929,7 +950,8 @@ fn serve(serving: Serving) -> io::Result<()> {
                     )?,
                 )
             }
-            messages::SET_OVERLAY_WINDOW
+            messages::SET_OVERLAY_EDITOR
+            | messages::SET_OVERLAY_WINDOW
             | messages::OVERLAY_ACTION
             | messages::QUERY_OVERLAY
             | messages::SET_OVERLAY_CLIPBOARD
@@ -950,6 +972,9 @@ fn serve(serving: Serving) -> io::Result<()> {
                     }
                     messages::SET_OVERLAY_SEMANTICS => {
                         overlays.set_semantics(welcome.session_id, record.object_id, &payload)
+                    }
+                    messages::SET_OVERLAY_EDITOR => {
+                        overlays.set_editor_geometry(welcome.session_id, record.object_id, &payload)
                     }
                     messages::MEASURE_OVERLAY_TEXT_BATCH => {
                         overlays.measure_text_batch(welcome.session_id, record.object_id, &payload)

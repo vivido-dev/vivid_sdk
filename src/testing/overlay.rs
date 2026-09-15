@@ -15,6 +15,7 @@ use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIdentity};
 use vivid_protocol::messages::{self, PayloadMap};
 use vivid_protocol::overlay::wire::Environment;
+use vivid_protocol::overlay::wire::text::EditorGeometry;
 use vivid_protocol::overlay::wire::text::styled::{
     BatchMeasured, MeasureBatch, ReleaseLayouts, StyledText,
 };
@@ -84,6 +85,8 @@ pub(crate) struct Overlays {
     semantics: HashMap<SurfaceIdentity, Semantics>,
     /// Retained text layouts, by the identity the producer was given.
     retained_layouts: HashMap<u64, TextMeasurement>,
+    /// Where a focused editor last said its caret was, with the revision it said it at.
+    editor_caret: Option<(u64, Option<vivid_protocol::vector::Rect>)>,
     next_layout: u64,
 }
 
@@ -545,6 +548,44 @@ impl Overlays {
             self.retained_layouts.remove(layout);
         }
         Ok((messages::OK, Vec::new()))
+    }
+
+    /// Record where a focused editor says its caret is.
+    ///
+    /// The geometry names the revision it describes, so a host knows which scene it belongs to:
+    /// an editor that moved between frames must say so again rather than leaving a stale caret.
+    pub(crate) fn set_editor_geometry(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> OverlayReply {
+        let owner = owner(session_id);
+        let Ok(request) = EditorGeometry::decode(object_id, &Value::Map(payload.clone())) else {
+            return Err("invalid overlay editor geometry");
+        };
+        let Ok(id) = request.address.identity(owner) else {
+            return Err("invalid overlay identity");
+        };
+        let Some(window) = self.windows.get(id) else {
+            return Err("overlay window is absent");
+        };
+        if window.generation != request.address.generation {
+            return Err("stale overlay window generation");
+        }
+        let Some(presented) = self.displayed.get(&id) else {
+            return Err("no scene is displayed to describe a caret in");
+        };
+        if request.scene_revision != presented.revision {
+            return Err("editor geometry must describe the displayed scene");
+        }
+        self.editor_caret = Some((request.scene_revision, request.caret));
+        Ok((messages::OK, Vec::new()))
+    }
+
+    /// Where the focused editor last placed its caret.
+    pub(crate) fn editor_caret(&self) -> Option<(u64, Option<vivid_protocol::vector::Rect>)> {
+        self.editor_caret
     }
 
     /// Queue an action for the producer, as the accessibility adapter does.
