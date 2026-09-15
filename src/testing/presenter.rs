@@ -933,7 +933,9 @@ fn serve(serving: Serving) -> io::Result<()> {
             | messages::OVERLAY_ACTION
             | messages::QUERY_OVERLAY
             | messages::SET_OVERLAY_CLIPBOARD
-            | messages::SET_OVERLAY_SEMANTICS => {
+            | messages::SET_OVERLAY_SEMANTICS
+            | messages::MEASURE_OVERLAY_TEXT_BATCH
+            | messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
                 let mut guard = shared.lock().expect("shared");
                 let overlays = &mut guard.overlays;
                 let outcome = match record.record_type {
@@ -949,6 +951,14 @@ fn serve(serving: Serving) -> io::Result<()> {
                     messages::SET_OVERLAY_SEMANTICS => {
                         overlays.set_semantics(welcome.session_id, record.object_id, &payload)
                     }
+                    messages::MEASURE_OVERLAY_TEXT_BATCH => {
+                        overlays.measure_text_batch(welcome.session_id, record.object_id, &payload)
+                    }
+                    messages::RELEASE_OVERLAY_TEXT_LAYOUTS => overlays.release_text_layouts(
+                        welcome.session_id,
+                        record.object_id,
+                        &payload,
+                    ),
                     _ => overlays.status(welcome.session_id, record.object_id, &payload),
                 };
                 drop(guard);

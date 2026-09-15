@@ -882,3 +882,55 @@ fn a_semantic_tree_is_refused_when_the_profile_was_not_negotiated() {
 
     overlays.close().unwrap();
 }
+
+#[test]
+fn a_retained_text_layout_round_trips_and_releases() {
+    use vivid_protocol::overlay::wire::text::styled::{StyledText, TextStyle};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    let mut styled = StyledText::new("Retained", TextStyle::default());
+    styled.wrap = false;
+    let layout = window.layout_text(&styled).unwrap();
+
+    // The host measured it, and keeps it as long as the handle is held.
+    assert!(layout.measurement().width.get() > 0.);
+    assert!(layout.measurement().height.get() > 0.);
+
+    // A retained layout is what a scene draws through, so painting it must be accepted.
+    let mut canvas = Canvas::new();
+    window
+        .draw_text_layout(
+            &mut canvas,
+            &layout,
+            vivid_sdk::overlay::Point::new(4., 4.).unwrap(),
+        )
+        .unwrap();
+
+    // Releasing it is what makes a later use an error rather than a stale scene.
+    window.release_text_layout(&layout).unwrap();
+    assert!(window.release_text_layout(&layout).is_err());
+    assert!(
+        window
+            .draw_text_layout(
+                &mut canvas,
+                &layout,
+                vivid_sdk::overlay::Point::new(4., 4.).unwrap()
+            )
+            .is_err()
+    );
+
+    overlays.close().unwrap();
+}

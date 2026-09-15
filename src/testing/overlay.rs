@@ -15,6 +15,10 @@ use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIdentity};
 use vivid_protocol::messages::{self, PayloadMap};
 use vivid_protocol::overlay::wire::Environment;
+use vivid_protocol::overlay::wire::text::styled::{
+    BatchMeasured, MeasureBatch, ReleaseLayouts, StyledText,
+};
+use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
     Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetSemantics, SetWindow, Status,
     Submission, SubmissionOutcome, Viewport, WindowAddress,
@@ -78,6 +82,38 @@ pub(crate) struct Overlays {
     clipboard: Vec<String>,
     /// Each window's semantic tree, retired when the scene it described is replaced.
     semantics: HashMap<SurfaceIdentity, Semantics>,
+    /// Retained text layouts, by the identity the producer was given.
+    retained_layouts: HashMap<u64, TextMeasurement>,
+    next_layout: u64,
+}
+
+/// The synthetic metric one run is measured with.
+fn measurement_of(text: &StyledText) -> TextMeasurement {
+    let style = text
+        .runs
+        .first()
+        .map(|run| run.style.clone())
+        .unwrap_or_default();
+    let size = style.size.get() as f32;
+    let characters = text.text().chars().count() as f32;
+    let width = Scalar::new((characters * size * 0.6) as f64).unwrap_or(Scalar::ZERO);
+    let height = Scalar::new((size * 1.2) as f64).unwrap_or(Scalar::ZERO);
+    TextMeasurement {
+        truncated_at: None,
+        width,
+        height,
+        lines: vec![TextGeometry {
+            start: 0,
+            end: text.text().len() as u32,
+            x: Scalar::ZERO,
+            y: Scalar::ZERO,
+            width,
+            height,
+            baseline: Scalar::new((size * 0.8) as f64).unwrap_or(Scalar::ZERO),
+            rtl: false,
+        }],
+        clusters: Vec::new(),
+    }
 }
 
 /// The producer names its own session with a placeholder presenter instance, so the presenter
@@ -416,6 +452,79 @@ impl Overlays {
             return Err("a clipboard write requires a focused window and a recent gesture in it");
         }
         self.clipboard.push(request.text);
+        Ok((messages::OK, Vec::new()))
+    }
+
+    /// Shape a batch of text, or retain it, as a host with a font system would.
+    ///
+    /// The metrics here are synthetic: with no font to shape with, a run is `0.6 * size` per
+    /// character wide and `1.2 * size` tall. That is enough for layout, hit testing, and geometry
+    /// to be exercised deterministically. A test that depends on real glyph widths belongs
+    /// against a live host, not here.
+    pub(crate) fn measure_text_batch(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> OverlayReply {
+        let owner = owner(session_id);
+        let Ok(request) = MeasureBatch::decode(object_id, &Value::Map(payload.clone())) else {
+            return Err("invalid overlay text measurement request");
+        };
+        let Ok(id) = request.address.identity(owner) else {
+            return Err("invalid overlay identity");
+        };
+        let Some(window) = self.windows.get(id) else {
+            return Err("overlay window is absent");
+        };
+        if window.generation != request.address.generation {
+            return Err("stale overlay window generation");
+        }
+        let mut layouts = Vec::with_capacity(request.texts.len());
+        for text in &request.texts {
+            let measurement = measurement_of(text);
+            if request.retain {
+                let layout = self.next_layout.max(1);
+                self.next_layout = layout + 1;
+                self.retained_layouts.insert(layout, measurement.clone());
+                layouts.push((layout, measurement));
+            } else {
+                layouts.push((0, measurement));
+            }
+        }
+        let measured = BatchMeasured {
+            address: request.address,
+            layouts,
+        };
+        Ok((
+            messages::OVERLAY_TEXT_BATCH_MEASURED,
+            measured.payload().map_err(|_| "batch too large")?,
+        ))
+    }
+
+    /// Drop retained layouts, so a producer that releases one cannot paint it again.
+    pub(crate) fn release_text_layouts(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> OverlayReply {
+        let owner = owner(session_id);
+        let Ok(request) = ReleaseLayouts::decode(object_id, &Value::Map(payload.clone())) else {
+            return Err("invalid overlay layout release");
+        };
+        let Ok(id) = request.address.identity(owner) else {
+            return Err("invalid overlay identity");
+        };
+        let Some(window) = self.windows.get(id) else {
+            return Err("overlay window is absent");
+        };
+        if window.generation != request.address.generation {
+            return Err("stale overlay window generation");
+        }
+        for layout in &request.ids {
+            self.retained_layouts.remove(layout);
+        }
         Ok((messages::OK, Vec::new()))
     }
 
