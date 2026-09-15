@@ -52,6 +52,7 @@ export const PROFILE_OVERLAY_TEXT_LAYOUT: string = textOf("PROFILE_OVERLAY_TEXT_
 export const PROFILE_OVERLAY_TYPOGRAPHY: string = textOf("PROFILE_OVERLAY_TYPOGRAPHY");
 export const PROFILE_OVERLAY_PAINT: string = textOf("PROFILE_OVERLAY_PAINT");
 export const PROFILE_OVERLAY_POINTER: string = textOf("PROFILE_OVERLAY_POINTER");
+export const PROFILE_OVERLAY_CLIPBOARD: string = textOf("PROFILE_OVERLAY_CLIPBOARD");
 
 // -- Surface semantic profiles ---------------------------------------------
 export const SURFACE_GENERIC: string = textOf("SURFACE_GENERIC");

@@ -127,3 +127,14 @@ test("cursor shapes ride hit regions and stay off the wire when unasked", async 
     await session.close();
   }
 });
+
+test("a clipboard write is offered and refused without a gesture", async () => {
+  const session = await OverlaySession.connect({ offline: true });
+  try {
+    const window = await session.createWindow({ bounds: rect });
+    // A dry-run session has no clipboard to write to, so nothing reports success.
+    await assert.rejects(window.setClipboard("text"));
+  } finally {
+    await session.close();
+  }
+});

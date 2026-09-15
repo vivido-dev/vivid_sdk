@@ -369,6 +369,12 @@ impl PyOverlayWindow {
         py.detach(|| self.inner.release_text_layout(layout))
             .map_err(io_error)
     }
+    /// Place text on the user's clipboard. Requires overlay-clipboard-v1, and the host honors
+    /// it only for a focused window just after a key or pointer press it delivered there.
+    fn set_clipboard(&self, py: Python<'_>, text: String) -> PyResult<()> {
+        py.detach(|| self.inner.set_clipboard(&text))
+            .map_err(io_error)
+    }
     fn set_editor_geometry(
         &self,
         py: Python<'_>,

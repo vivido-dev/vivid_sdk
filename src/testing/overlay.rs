@@ -15,7 +15,7 @@ use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIdentity};
 use vivid_protocol::messages::{self, PayloadMap};
 use vivid_protocol::overlay::wire::{
-    Action, Capture, PresentationOutcome, Query, Renew, SetWindow, Status, Submission,
+    Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetWindow, Status, Submission,
     SubmissionOutcome, Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::{Event, PointerReport, Scroll, Windows};
@@ -35,6 +35,9 @@ pub struct RetainedAsset {
     pub width: u32,
     pub height: u32,
 }
+
+/// One overlay answer: the record to reply with and its payload, or why it was refused.
+pub(crate) type OverlayReply = Result<(u16, PayloadMap), &'static str>;
 
 /// A lane record the presenter owes a producer, queued because bulk records arrive on a different
 /// connection than the interactive lane they are acknowledged on.
@@ -64,6 +67,11 @@ pub(crate) struct Overlays {
     pending: Vec<LaneRecord>,
     /// The last press of the current click sequence, as the real host tracks it.
     last_click: Option<(std::time::Instant, u16, Point, u8)>,
+    /// The window a key or pointer press last reached, as the real host tracks it.
+    last_gesture: Option<(SurfaceIdentity, std::time::Instant)>,
+    /// Clipboard text this presenter accepted, in acceptance order. A refused write leaves no
+    /// trace here, so asserting on this is asserting the guard allowed it.
+    clipboard: Vec<String>,
 }
 
 /// The producer names its own session with a placeholder presenter instance, so the presenter
@@ -73,17 +81,6 @@ pub(crate) fn owner(session_id: u64) -> SessionIdentity {
         presenter: PresenterInstanceId([0; 16]),
         session_id,
     }
-}
-
-fn refuse(message: &'static str) -> (u16, PayloadMap) {
-    (
-        messages::ERROR,
-        vec![
-            (0, Value::Unsigned(messages::ERROR_BAD_STATE)),
-            (1, Value::Bool(false)),
-            (2, Value::Text(message.to_owned())),
-        ],
-    )
 }
 
 impl Overlays {
@@ -203,13 +200,13 @@ impl Overlays {
         session_id: u64,
         object_id: u64,
         payload: &PayloadMap,
-    ) -> (u16, PayloadMap) {
+    ) -> OverlayReply {
         let owner = owner(session_id);
         let Ok(request) = SetWindow::decode(owner, object_id, &Value::Map(payload.clone())) else {
-            return refuse("invalid overlay window request");
+            return Err("invalid overlay window request");
         };
         let Ok(id) = request.address.identity(owner) else {
-            return refuse("invalid overlay window identity");
+            return Err("invalid overlay window identity");
         };
         let revision = if request.expected_revision == 0 {
             if self
@@ -217,7 +214,7 @@ impl Overlays {
                 .create(id, request.address.generation, request.options.clone())
                 .is_err()
             {
-                return refuse("overlay window could not be created");
+                return Err("overlay window could not be created");
             }
             1
         } else {
@@ -228,16 +225,16 @@ impl Overlays {
                 request.options.clone(),
             ) {
                 Ok(revision) => revision,
-                Err(_) => return refuse("stale or invalid overlay window update"),
+                Err(_) => return Err("stale or invalid overlay window update"),
             }
         };
         self.drain_events(owner);
         let mut reply = request;
         reply.expected_revision = revision;
-        match reply.payload(owner) {
-            Ok(payload) => (messages::OVERLAY_WINDOW_READY, payload),
-            Err(_) => refuse("overlay window reply could not be encoded"),
-        }
+        reply
+            .payload(owner)
+            .map(|payload| (messages::OVERLAY_WINDOW_READY, payload))
+            .map_err(|_| "overlay window reply could not be encoded")
     }
 
     pub(crate) fn action(
@@ -245,19 +242,19 @@ impl Overlays {
         session_id: u64,
         object_id: u64,
         payload: &PayloadMap,
-    ) -> (u16, PayloadMap) {
+    ) -> OverlayReply {
         let owner = owner(session_id);
         let Ok(action) = Action::decode(object_id, &Value::Map(payload.clone())) else {
-            return refuse("invalid overlay action");
+            return Err("invalid overlay action");
         };
         let Some(viewport) = self.viewport else {
-            return refuse("overlay viewport is absent");
+            return Err("overlay viewport is absent");
         };
         if self.windows.apply_action(owner, action, viewport).is_err() {
-            return refuse("overlay action was refused");
+            return Err("overlay action was refused");
         }
         self.drain_events(owner);
-        (messages::OK, Vec::new())
+        Ok((messages::OK, Vec::new()))
     }
 
     pub(crate) fn status(
@@ -265,22 +262,22 @@ impl Overlays {
         session_id: u64,
         object_id: u64,
         payload: &PayloadMap,
-    ) -> (u16, PayloadMap) {
+    ) -> OverlayReply {
         let owner = owner(session_id);
         let Ok(query) = Query::decode(object_id, &Value::Map(payload.clone())) else {
-            return refuse("invalid overlay query");
+            return Err("invalid overlay query");
         };
         let Some(viewport) = self.viewport else {
-            return refuse("overlay viewport is absent");
+            return Err("overlay viewport is absent");
         };
         let Ok(context) = owner.context(query.context_id) else {
-            return refuse("invalid overlay context");
+            return Err("invalid overlay context");
         };
         let Ok(id) = context.surface(query.surface_id) else {
-            return refuse("invalid overlay surface");
+            return Err("invalid overlay surface");
         };
         let Some(window) = self.windows.get(id) else {
-            return refuse("overlay window does not exist");
+            return Err("overlay window does not exist");
         };
         let presented = self.displayed.get(&id);
         let status = Status {
@@ -316,24 +313,65 @@ impl Overlays {
             viewport_revision: self.viewport_revision,
             accepted_revision: self.accepted.get(&id).copied().unwrap_or(0),
         };
-        match status.payload(owner) {
-            Ok(payload) => (messages::OVERLAY_STATUS, payload),
-            Err(_) => refuse("overlay status could not be encoded"),
+        status
+            .payload(owner)
+            .map(|payload| (messages::OVERLAY_STATUS, payload))
+            .map_err(|_| "overlay status could not be encoded")
+    }
+
+    /// A clipboard write, refused with the reason a real host would give.
+    pub(crate) fn set_clipboard(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> OverlayReply {
+        let owner = owner(session_id);
+        let Ok(request) = Clipboard::decode(object_id, &Value::Map(payload.clone())) else {
+            return Err("invalid overlay clipboard request");
+        };
+        let Ok(id) = request.address.identity(owner) else {
+            return Err("invalid overlay identity");
+        };
+        let Some(window) = self.windows.get(id) else {
+            return Err("overlay window is absent");
+        };
+        if window.generation != request.address.generation {
+            return Err("stale overlay window generation");
+        }
+        if !self.authorize_clipboard(session_id, id) {
+            return Err("a clipboard write requires a focused window and a recent gesture in it");
+        }
+        self.clipboard.push(request.text);
+        Ok((messages::OK, Vec::new()))
+    }
+
+    /// Whether a clipboard write from this window would be honored. This presenter applies the
+    /// same rules the real host does, so a producer meets the same refusals here as live.
+    pub(crate) fn authorize_clipboard(&self, _session_id: u64, id: SurfaceIdentity) -> bool {
+        if self.windows.get(id).is_none() || self.windows.focus() != Some(id) {
+            return false;
+        }
+        match self.last_gesture {
+            Some((window, at)) => {
+                window == id && at.elapsed() <= vivid_protocol::overlay::MAX_CLIPBOARD_GESTURE_AGE
+            }
+            None => false,
         }
     }
 
     // ---- interactive lane ------------------------------------------------------------------
 
-    pub(crate) fn renew(&mut self, object_id: u64, payload: &PayloadMap) -> (u16, PayloadMap) {
+    pub(crate) fn renew(&mut self, object_id: u64, payload: &PayloadMap) -> OverlayReply {
         let Ok(renew) = Renew::decode(object_id, &Value::Map(payload.clone())) else {
-            return refuse("invalid overlay renewal");
+            return Err("invalid overlay renewal");
         };
         match self.lane_generation {
             None => self.lane_generation = Some(renew.lane_generation),
             Some(generation) if generation == renew.lane_generation => {}
-            Some(_) => return refuse("stale overlay lane generation"),
+            Some(_) => return Err("stale overlay lane generation"),
         }
-        (messages::OK, Vec::new())
+        Ok((messages::OK, Vec::new()))
     }
 
     pub(crate) fn capture(
@@ -341,31 +379,31 @@ impl Overlays {
         session_id: u64,
         object_id: u64,
         payload: &PayloadMap,
-    ) -> (u16, PayloadMap) {
+    ) -> OverlayReply {
         let owner = owner(session_id);
         let Ok(capture) = Capture::decode(object_id, &Value::Map(payload.clone())) else {
-            return refuse("invalid overlay capture");
+            return Err("invalid overlay capture");
         };
         let Ok(id) = capture.address.identity(owner) else {
-            return refuse("invalid overlay identity");
+            return Err("invalid overlay identity");
         };
         let Some(window) = self.windows.get(id) else {
-            return refuse("overlay window is absent");
+            return Err("overlay window is absent");
         };
         if window.generation != capture.address.generation
             || window.scene_revision != capture.scene_revision
         {
-            return refuse("stale overlay capture scene");
+            return Err("stale overlay capture scene");
         }
         if capture.capture {
             // A real presenter uses its own last observed pointer position, never the producer's.
             if self.windows.capture_pointer(id, Point::default()).is_err() {
-                return refuse("overlay capture was refused");
+                return Err("overlay capture was refused");
             }
         } else {
             self.windows.release_pointer(id);
         }
-        (messages::OK, Vec::new())
+        Ok((messages::OK, Vec::new()))
     }
 
     // ---- bulk channel ----------------------------------------------------------------------
@@ -526,6 +564,11 @@ impl Overlays {
         self.assets.values().copied().collect()
     }
 
+    /// Clipboard text this presenter accepted, in acceptance order.
+    pub(crate) fn clipboard(&self) -> &[String] {
+        &self.clipboard
+    }
+
     pub(crate) fn focused(&self) -> Option<SurfaceIdentity> {
         self.windows.focus()
     }
@@ -556,6 +599,14 @@ impl Overlays {
                     .and_then(|scene| hit(&scene.canvas, point))
             },
         );
+        if consumed && button.is_some_and(|(_, down)| down) {
+            // Read after the dispatch: that is what settles which window the press reached. A
+            // press that reached no window clears any gesture a producer might otherwise bank.
+            self.last_gesture = self
+                .windows
+                .hovered_window()
+                .map(|id| (id, std::time::Instant::now()));
+        }
         self.drain_events(owner(session_id));
         consumed
     }
@@ -582,6 +633,12 @@ impl Overlays {
     }
 
     pub(crate) fn keyboard(&mut self, session_id: u64, event: Event, escape: bool) -> bool {
+        if matches!(event, Event::Key { down: true, .. }) {
+            self.last_gesture = self
+                .windows
+                .focus()
+                .map(|id| (id, std::time::Instant::now()));
+        }
         let consumed = self.windows.keyboard(event, escape);
         self.drain_events(owner(session_id));
         consumed

@@ -7,7 +7,8 @@ and GPUI-inspired UI plan has not passed live pane acceptance.
 
 The terminating SDK presenter and terminating gateways still reject these profiles explicitly.
 Vivido offers them only for terminal targets with native viewport geometry installed: the window,
-vector, input, and paint bundles, plus cursor and hover behaviour where the platform reports it.
+vector, input, paint, pointer, and clipboard bundles, with cursor and hover behaviour applied
+where the platform reports it.
 Example 07 in each language draws an interactive overlay panel and pumps its input lane.
 
 For tests, `vivid_sdk::testing::TestPresenter` serves the profile bundle headlessly: it keeps
@@ -230,6 +231,36 @@ leaving the window, crossing between windows, and when a newly published scene r
 replaces the region under a stationary pointer. A producer can drive hover styling without
 diffing pointer events and without missing a transition that happened while it was not looking.
 Python exposes `HoverEvent`; TypeScript adds `kind: "hover"`.
+
+## Clipboard writes
+
+Connection helpers optionally negotiate `overlay-clipboard-v1`. Rust adds
+`window.set_clipboard(&str)`, Python `window.set_clipboard(text)`, TypeScript
+`await window.set_clipboard(text)`.
+
+It is deliberately narrow, because a clipboard is shared with every other application on the
+machine and is frequently where a password or a command line briefly lives. The API is
+**write-only**: no method reads a clipboard back, so an overlay can never observe what the user
+copied elsewhere. Paste already reaches a focused overlay as ordinary committed text through
+Vivido's normal paste policy, so nothing here is needed to receive one.
+
+Vivido honors a write only when all of these hold, and reports a refusal as an error rather than
+dropping it silently:
+
+- the window exists and holds the pane's eligible focus;
+- a key press or pointer press was delivered to *that* window no more than two seconds earlier;
+and
+- the text is non-empty and at most 65536 UTF-8 bytes. Empty text is refused rather than treated
+  as a clear.
+
+The gesture requirement is what ties a write to something the user did. Without it an overlay
+could replace the clipboard at an arbitrary moment, which is the setup for a paste-hijack: the
+user copies a command, an overlay replaces it, and the user pastes something they did not copy.
+A gesture delivered to another window is not spendable, and neither is one older than the
+ceiling, so a producer cannot bank a gesture and use it later.
+
+A successful reply means the host accepted the text, not that nothing else observed it: on a
+shared display server the clipboard may be published to other applications immediately.
 
 ## Host text measurement and editor geometry
 

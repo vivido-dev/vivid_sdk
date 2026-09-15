@@ -185,3 +185,11 @@ def test_region_cursors_hover_and_click_counts() -> None:
         # loosely typed Python caller can bypass it, so the native boundary refuses it too.
         with pytest.raises((ValueError, OSError)):
             Canvas().hit(5, path, cursor=cast(Any, "wand")).validate()
+
+def test_a_clipboard_write_is_offered_and_refused_without_a_gesture() -> None:
+    # OverlaySession.connect offers the profile, so a dry-run session accepts it; what remains
+    # is the host's own guard, which a dry-run session has no gesture to satisfy.
+    with OverlaySession.connect(dry_run=True) as session:
+        window = session.create_window(OverlayWindowOptions(Rect(0, 0, 100, 80)))
+        with pytest.raises((ValueError, OSError)):
+            window.set_clipboard("text")

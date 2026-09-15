@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -48,6 +48,7 @@ interface NativeWindow {
   drawTextLayout(canvas: NativeCanvas, layout: NativeTextLayout, x: number, y: number): Promise<void>;
   releaseTextLayout(layout: NativeTextLayout): Promise<void>;
   measureText(canvas: NativeCanvas): Promise<{ width: number; height: number; lines: number[][]; clusters: number[][] }>;
+  setClipboard(text: string): Promise<void>;
   setEditorGeometry(sceneRevision: bigint, caret?: number[]): Promise<void>;
   submit(canvas: NativeCanvas): Promise<NativeSubmission>;
   replaceTrack(canvas: NativeCanvas): Promise<NativeSubmission>;
@@ -314,7 +315,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER].filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));
@@ -357,7 +358,17 @@ export class OverlayWindow {
     const measured = await call(this.raw.measureText(canvas.raw));
     return { ...measured, lines: measured.lines.map(textGeometry), clusters: measured.clusters.map(textGeometry) };
   }
-  async setEditorGeometry(sceneRevision: bigint, caret?: Rect): Promise<void> {
+  /** Place text on the user's clipboard.
+   *
+   * The host honors this only for a focused window and only just after a key or pointer press
+   * it delivered there, because a clipboard is shared with every other application. There is no
+   * way to read a clipboard back; paste arrives as committed text.
+   */
+  async setClipboard(text: string): Promise<void> {
+    await call(this.raw.setClipboard(text));
+  }
+
+    async setEditorGeometry(sceneRevision: bigint, caret?: Rect): Promise<void> {
     await call(this.raw.setEditorGeometry(sceneRevision, caret ? values(caret) : undefined));
   }
   private stopped = false;

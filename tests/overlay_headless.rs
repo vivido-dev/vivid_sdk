@@ -520,3 +520,70 @@ fn a_region_cursor_is_refused_locally_when_the_profile_was_not_negotiated() {
 
     overlays.close().unwrap();
 }
+
+#[test]
+fn a_clipboard_write_round_trips_and_is_refused_without_a_gesture() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // No gesture has happened in this window, so the host refuses and nothing is written.
+    let error = window.set_clipboard("hijacked").unwrap_err();
+    assert!(
+        error.to_string().contains("clipboard"),
+        "unexpected diagnosis: {error}"
+    );
+    assert!(presenter.overlay_clipboard().is_empty());
+
+    // A user action in the window is what authorizes the write.
+    window.request_focus().unwrap();
+    presenter
+        .overlay_pointer(50., 50., Some((buttons::PRIMARY, true)), 0)
+        .unwrap();
+    window.set_clipboard("copied from the panel").unwrap();
+    assert_eq!(presenter.overlay_clipboard(), vec!["copied from the panel"]);
+
+    // The same text over the ceiling is refused before anything is sent, so the producer gets a
+    // local diagnosis rather than a failed request.
+    let oversized = "x".repeat(64 * 1024 + 1);
+    assert!(window.set_clipboard(&oversized).is_err());
+    assert_eq!(presenter.overlay_clipboard().len(), 1);
+
+    // And an empty write is refused too, because clearing a clipboard the user did not ask to
+    // clear is the interference this profile exists to prevent.
+    assert!(window.set_clipboard("").is_err());
+    assert_eq!(presenter.overlay_clipboard().len(), 1);
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_clipboard_write_is_refused_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    presenter
+        .overlay_pointer(10., 10., Some((buttons::PRIMARY, true)), 0)
+        .unwrap();
+    let error = window.set_clipboard("text").unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-clipboard-v1"),
+        "unexpected diagnosis: {error}"
+    );
+    overlays.close().unwrap();
+}

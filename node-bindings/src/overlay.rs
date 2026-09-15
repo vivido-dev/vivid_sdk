@@ -405,6 +405,13 @@ impl OverlayWindow {
         let window = self.inner.clone();
         blocking(move || window.release_text_layout(&layout).map_err(io_error)).await
     }
+    /// Place text on the user's clipboard. Requires overlay-clipboard-v1, and the host honors
+    /// it only for a focused window just after a key or pointer press it delivered there.
+    #[napi]
+    pub async fn set_clipboard(&self, text: String) -> Result<()> {
+        let window = self.inner.clone();
+        blocking(move || window.set_clipboard(&text).map_err(io_error)).await
+    }
     #[napi]
     pub async fn set_editor_geometry(
         &self,

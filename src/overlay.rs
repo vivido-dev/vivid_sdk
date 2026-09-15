@@ -18,7 +18,7 @@ pub use vivid_protocol::overlay::wire::Viewport;
 use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText};
 pub use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
-    Action, Query, SetWindow, Status, WindowAction, WindowAddress,
+    Action, Clipboard, Query, SetWindow, Status, WindowAction, WindowAddress,
 };
 pub use vivid_protocol::overlay::{
     DismissReason, Event, Scroll, ScrollPhase, WindowMode, buttons, keys, modifiers,
@@ -151,6 +151,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_POINTER.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_CLIPBOARD.into());
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
@@ -406,6 +409,41 @@ impl OverlayWindow {
                     .map_err(io::Error::other)?;
             result.validate_text(&text.text).map_err(io::Error::other)?;
             Ok(result)
+        })
+    }
+
+    /// Place text on the user's clipboard.
+    ///
+    /// The host honors this only for a focused window and only just after a key or pointer press
+    /// it delivered there, because a clipboard is shared with every other application on the
+    /// machine. There is no way to read a clipboard back; paste arrives as ordinary committed
+    /// text. Requires `overlay-clipboard-v1`.
+    pub fn set_clipboard(&self, text: &str) -> io::Result<()> {
+        self.with_state(|session, _| {
+            if !session.supports(vivid_protocol::registry::OVERLAY_CLIPBOARD) {
+                return Err(invalid_input(
+                    "presenter does not support overlay-clipboard-v1",
+                ));
+            }
+            let request = Clipboard {
+                address: self.address,
+                text: text.to_owned(),
+            };
+            let reply = session.request(
+                messages::SET_OVERLAY_CLIPBOARD,
+                self.address.surface_id,
+                request.payload().map_err(io::Error::other)?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?;
+            let Some(reply) = reply else {
+                // An offline presenter has no clipboard to write to, and refusing is clearer
+                // than reporting a success nothing performed.
+                return Err(invalid_input("offline presenter has no clipboard"));
+            };
+            expect_record(&reply, messages::OK, self.address.surface_id)?;
+            Ok(())
         })
     }
 

@@ -20,7 +20,8 @@ use std::time::Duration;
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::messages::{
-    self, Envelope, Hello, HelloAuthentication, PayloadMap, Welcome, WelcomeAuthentication,
+    self, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, PayloadMap, Welcome,
+    WelcomeAuthentication,
 };
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract};
@@ -347,6 +348,17 @@ impl TestPresenter {
     /// Retained images still reachable by a future scene.
     pub fn overlay_assets(&self) -> Vec<crate::testing::overlay::RetainedAsset> {
         self.shared.lock().expect("shared").overlays.assets()
+    }
+
+    /// Clipboard text this presenter accepted, in acceptance order. A refused write leaves no
+    /// trace here, so an assertion on this is an assertion that the guard allowed it.
+    pub fn overlay_clipboard(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .clipboard()
+            .to_vec()
     }
 
     /// The cursor the currently hovered overlay region asks for, as the display layer sees it.
@@ -861,21 +873,27 @@ fn serve(serving: Serving) -> io::Result<()> {
                     )?,
                 )
             }
-            messages::SET_OVERLAY_WINDOW | messages::OVERLAY_ACTION | messages::QUERY_OVERLAY => {
+            messages::SET_OVERLAY_WINDOW
+            | messages::OVERLAY_ACTION
+            | messages::QUERY_OVERLAY
+            | messages::SET_OVERLAY_CLIPBOARD => {
                 let mut guard = shared.lock().expect("shared");
                 let overlays = &mut guard.overlays;
-                let (reply, fields) = match record.record_type {
+                let outcome = match record.record_type {
                     messages::SET_OVERLAY_WINDOW => {
                         overlays.set_window(welcome.session_id, record.object_id, &payload)
                     }
                     messages::OVERLAY_ACTION => {
                         overlays.action(welcome.session_id, record.object_id, &payload)
                     }
+                    messages::SET_OVERLAY_CLIPBOARD => {
+                        overlays.set_clipboard(welcome.session_id, record.object_id, &payload)
+                    }
                     _ => overlays.status(welcome.session_id, record.object_id, &payload),
                 };
                 drop(guard);
                 flush_overlay_lane(&shared, &lane_writer);
-                (reply, ok_payload(request_id, fields)?)
+                overlay_reply(request_id, outcome)?
             }
             messages::WAIT_TRACK => {
                 let revision = *track_revisions.get(&record.object_id).unwrap_or(&1);
@@ -1341,7 +1359,7 @@ fn serve_interactive_lane(
         ) {
             let envelope = messages::decode_control(&record.body).map_err(io::Error::other)?;
             let mut guard = shared.lock().expect("shared");
-            let (reply, fields) = if record.record_type == messages::OVERLAY_INPUT_RENEW {
+            let outcome = if record.record_type == messages::OVERLAY_INPUT_RENEW {
                 guard.overlays.renew(record.object_id, &envelope.payload)
             } else {
                 guard
@@ -1349,7 +1367,7 @@ fn serve_interactive_lane(
                     .capture(session_id, record.object_id, &envelope.payload)
             };
             drop(guard);
-            let body = ok_payload(envelope.request_id, fields)?;
+            let (reply, body) = overlay_reply(envelope.request_id, outcome)?;
             let mut writer = lane_writer.lock().expect("lane writer");
             if let Some((stream, sequence)) = writer.as_mut() {
                 *sequence += 1;
@@ -1453,6 +1471,31 @@ fn serve_interactive_lane(
     }
     *lane_writer.lock().expect("lane writer") = None;
     Ok(())
+}
+
+/// The record to write and its encoded body for one overlay answer.
+///
+/// A refusal has to be a well-formed ERROR carrying the request it failed: a producer cannot act
+/// on a diagnostic it cannot associate with anything, and a payload of the wrong shape reads as a
+/// protocol fault rather than a refusal.
+fn overlay_reply(
+    request_id: u64,
+    outcome: crate::testing::overlay::OverlayReply,
+) -> io::Result<(u16, Vec<u8>)> {
+    match outcome {
+        Ok((reply, fields)) => Ok((reply, ok_payload(request_id, fields)?)),
+        Err(reason) => Ok((
+            messages::ERROR,
+            ErrorReply {
+                code: messages::ERROR_BAD_STATE,
+                request_id,
+                detail: ErrorDetail::new(Vec::new())?,
+                fatal: false,
+                diagnostic: reason.to_owned(),
+            }
+            .encode()?,
+        )),
+    }
 }
 
 /// Write every lane record the overlay state owes a producer.
