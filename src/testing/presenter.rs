@@ -824,12 +824,15 @@ fn serve(serving: Serving) -> io::Result<()> {
     }
     welcome.confirm(&prk).map_err(io::Error::other)?;
     let welcome_body = welcome.encode(hello_request).map_err(io::Error::other)?;
+    // Install the control writer before WELCOME can reach the client: a producer returns from
+    // connect the moment it processes WELCOME, so anything it pushes afterwards must find the
+    // writer already in place even when this thread is preempted between the two steps.
+    *control_writer.lock().expect("control writer") = Some(control.try_clone()?);
     {
         let mut guard = sequence.lock().expect("sequence");
         *guard += 1;
         write_record(&mut control, *guard, messages::WELCOME, 0, 0, &welcome_body)?;
     }
-    *control_writer.lock().expect("control writer") = Some(control.try_clone()?);
 
     let channel_key = {
         let (keys, _) = auth::derive_session_keys(
