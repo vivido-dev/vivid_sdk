@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import threading
+from typing import cast
 from typing import Any
 import pytest
 from vivid_sdk import OverlaySession, OverlayWindowOptions, aio
@@ -170,3 +171,17 @@ def test_paint_commands_validate_and_round_trip_through_a_scene() -> None:
         ):
             with pytest.raises((ValueError, OSError)):
                 Canvas().stroke_styled(path, Brush.solid(0xFFFFFFFF), bad_style).validate()
+
+def test_region_cursors_hover_and_click_counts() -> None:
+    # An unasked cursor must not require the pointer profile, so an existing scene still submits.
+    with OverlaySession.connect(dry_run=True) as session:
+        window = session.create_window(OverlayWindowOptions(Rect(0, 0, 100, 80)))
+        path = Path.rectangle(Rect(0, 0, 100, 80))
+        Canvas().hit(1, path).validate()
+        Canvas().hit(2, path, "input", cursor="text").validate()
+        Canvas().hit(3, path, "drag", cursor="grabbing").validate()
+        Canvas().hit(4, path, "resize", edges=8, cursor="resize-up-left").validate()
+        # The annotation already forbids this, but a JavaScript caller has no typechecker and a
+        # loosely typed Python caller can bypass it, so the native boundary refuses it too.
+        with pytest.raises((ValueError, OSError)):
+            Canvas().hit(5, path, cursor=cast(Any, "wand")).validate()

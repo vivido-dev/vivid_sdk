@@ -6,8 +6,9 @@ interactive-lane integration. This is a development preview: the complete cross-
 and GPUI-inspired UI plan has not passed live pane acceptance.
 
 The terminating SDK presenter and terminating gateways still reject these profiles explicitly.
-Vivido offers them only for terminal targets with native viewport geometry installed. Example 07
-in each language draws an interactive overlay panel and pumps its input lane.
+Vivido offers them only for terminal targets with native viewport geometry installed: the window,
+vector, input, and paint bundles, plus cursor and hover behaviour where the platform reports it.
+Example 07 in each language draws an interactive overlay panel and pumps its input lane.
 
 For tests, `vivid_sdk::testing::TestPresenter` serves the profile bundle headlessly: it keeps
 window, focus and revision state in the protocol's own state machine, validates every display
@@ -202,6 +203,33 @@ host. Rust adds `Canvas::shadow`, `Canvas::stroke_styled`, `Path::rounded_rectan
 
 Shadows and dashed strokes cost more host work than a fill: a host may approximate a blur, and
 the wire value stays exact so a better renderer improves it without a protocol change.
+
+## Pointer behaviour
+
+Connection helpers optionally negotiate `overlay-pointer-v1`. A hit region may name the cursor the
+host shows while the pointer is inside it; omitting it asks for nothing and keeps the region
+encoder-identical to before, so a scene that never wanted a cursor does not require the profile.
+Rust passes `cursor: Some(CursorShape::Pointer)` on `Command::Hit`; Python adds
+`Canvas.hit(..., cursor="text")`; TypeScript adds `hit(id, path, role, edges, "text")`. The set is
+closed — `default`, `pointer`, `text`, `move`, `crosshair`, `not-allowed`, `grab`, `grabbing`,
+`wait`, `progress`, `resize-left`, `resize-right`, `resize-up`, `resize-down`, `resize-up-left`,
+`resize-up-right`, `resize-down-left`, `resize-down-right`, `resize-left-right`, `resize-up-down` —
+and an unknown name is refused rather than quietly becoming an arrow. Vivido ranks a region's
+cursor below its own chrome and above the terminal's, and keeps it for the whole of a drag or
+resize even once the pointer leaves the region.
+
+`Event::Pointer` gains `clicks` and `pressure`. `clicks` is 1–3 for a press and 0 otherwise,
+counted by the host from the same 400 ms threshold the terminal uses, so a producer never
+reproduces platform timing; a fourth press restarts at one. `pressure` is `Option`-valued because
+no sensor and a sensor reading zero are different claims — Vivido reports `None` on hardware it
+cannot read. The wire carries these in two trailing elements that a plain motion or release omits,
+so both sides agree on the common case.
+
+`Event::Hover { region, entered }` is emitted whenever the hovered region changes: entering,
+leaving the window, crossing between windows, and when a newly published scene removes or
+replaces the region under a stationary pointer. A producer can drive hover styling without
+diffing pointer events and without missing a transition that happened while it was not looking.
+Python exposes `HoverEvent`; TypeScript adds `kind: "hover"`.
 
 ## Host text measurement and editor geometry
 

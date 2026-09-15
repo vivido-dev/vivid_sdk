@@ -349,6 +349,11 @@ impl TestPresenter {
         self.shared.lock().expect("shared").overlays.assets()
     }
 
+    /// The cursor the currently hovered overlay region asks for, as the display layer sees it.
+    pub fn overlay_cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
+        self.shared.lock().expect("shared").overlays.cursor()
+    }
+
     /// Whether any overlay window currently holds focus.
     pub fn overlay_focused(&self) -> bool {
         self.shared

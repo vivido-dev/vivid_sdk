@@ -25,8 +25,8 @@ pub use vivid_protocol::overlay::{
 };
 use vivid_protocol::vector::Frame;
 pub use vivid_protocol::vector::{
-    Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, Extend, GradientStop, HitRole, Join,
-    Path, Point, Rect, Scalar, Shadow, StrokeStyle, Text, Transform,
+    Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, CursorShape, Extend, GradientStop,
+    HitRegion, HitRole, Join, Path, Point, Rect, Scalar, Shadow, StrokeStyle, Text, Transform,
 };
 
 use crate::*;
@@ -148,6 +148,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_PAINT.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_POINTER.into());
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
@@ -528,6 +531,7 @@ impl OverlayWindow {
         self.with_state(|session, state| {
             layout::validate_references(&canvas, &state.layouts)?;
             layout::validate_paint(&canvas, session)?;
+            layout::validate_pointer(&canvas, session)?;
             let next = state
                 .next_scene
                 .checked_add(1)
@@ -603,6 +607,7 @@ impl OverlayWindow {
         let session = self.session.upgrade().ok_or_else(closed)?;
         if let Some(session) = lock(&session, "overlay session")?.as_ref() {
             layout::validate_paint(&canvas, session)?;
+            layout::validate_pointer(&canvas, session)?;
         }
         if canvas
             .commands()

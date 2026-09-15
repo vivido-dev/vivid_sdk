@@ -146,6 +146,7 @@ impl PyCanvas {
             .map_err(value_error)?;
         Ok(())
     }
+    #[pyo3(signature = (segments, even_odd, id, role, edges, cursor))]
     fn hit(
         &self,
         segments: Vec<Vec<f64>>,
@@ -153,12 +154,14 @@ impl PyCanvas {
         id: u64,
         role: &str,
         edges: f64,
+        cursor: &str,
     ) -> PyResult<()> {
         lock(&self.inner, "canvas")?
             .push(Command::Hit {
                 id,
                 path: model::path(&segments, even_odd).map_err(io_error)?,
                 role: model::hit_role(role, edges).map_err(io_error)?,
+                cursor: model::cursor(cursor).map_err(io_error)?,
             })
             .map_err(value_error)?;
         Ok(())

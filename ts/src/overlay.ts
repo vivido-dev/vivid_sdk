@@ -2,7 +2,7 @@
 import { call, callSync, native } from "./native.js";
 import { Session } from "./index.js";
 import type { ConnectOptions } from "./index.js";
-import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT } from "./constants.js";
+import { PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER } from "./constants.js";
 
 export interface Point { readonly x: number; readonly y: number }
 export interface Rect extends Point { readonly width: number; readonly height: number }
@@ -10,6 +10,12 @@ export interface Viewport { readonly width: number; readonly height: number; rea
 export type WindowMode = "floating" | "popup" | "modal";
 export type HitRole = "input" | "drag" | "resize" | "transparent";
 export type ScrollPhase = "none" | "began" | "changed" | "ended" | "cancelled";
+export type CursorShape =
+  | "default" | "pointer" | "text" | "move" | "crosshair" | "not-allowed"
+  | "grab" | "grabbing" | "wait" | "progress"
+  | "resize-left" | "resize-right" | "resize-up" | "resize-down"
+  | "resize-up-left" | "resize-up-right" | "resize-down-left" | "resize-down-right"
+  | "resize-left-right" | "resize-up-down";
 const SCROLL_PHASES: readonly ScrollPhase[] = ["none", "began", "changed", "ended", "cancelled"];
 
 /** Normative overlay modifier bits. A host never forwards its platform bitmask. */
@@ -31,7 +37,7 @@ interface NativeCanvas {
   state(kind: string, values: number[]): void;
   clip(path: readonly (readonly number[])[], evenOdd: boolean): void;
   text(text: string, x: number, y: number, size: number, color: number, family: string, weight: number, italic: boolean, maxWidth?: number): void;
-  hit(path: readonly (readonly number[])[], evenOdd: boolean, id: bigint, role: string, edges: number): void;
+  hit(path: readonly (readonly number[])[], evenOdd: boolean, id: bigint, role: string, edges: number, cursor: string): void;
   validate(): void;
 }
 interface CanvasConstructor { new(): NativeCanvas; shape(kind: string, bounds: number[], radius: number): number[][] }
@@ -212,8 +218,17 @@ export class Canvas {
   text(text: string, origin: Point, size: number, color: number, options: TextOptions = {}): this {
     callSync(() => this.raw.text(text, origin.x, origin.y, size, color, options.family ?? "", options.weight ?? 400, options.italic ?? false, options.maxWidth)); return this;
   }
-  /** Resize edge mask: left=1, right=2, top=4, bottom=8. IDs never pass through Number. */
-  hit(applicationId: bigint, path: Path, role: HitRole = "input", edges = 0): this { callSync(() => this.raw.hit(path.segments, path.evenOdd, applicationId, role, edges)); return this; }
+  /**
+   * Resize edge mask: left=1, right=2, top=4, bottom=8. IDs never pass through Number.
+   *
+   * `cursor` is the shape shown while this region is hovered; omitting it leaves the host's own.
+   */
+  hit(applicationId: bigint, path: Path, role: HitRole = "input", edges = 0, cursor?: CursorShape): this {
+    // An omitted cursor is no cursor, not a default one: declaring a shape is what makes the
+    // region require the pointer profile.
+    callSync(() => this.raw.hit(path.segments, path.evenOdd, applicationId, role, edges, cursor ?? ""));
+    return this;
+  }
   validate(): void { callSync(() => this.raw.validate()); }
 }
 export class RetainedImage {
@@ -239,7 +254,8 @@ const asViewport = (v: number[]): Viewport => ({ width: v[0]!, height: v[1]!, sc
 
 interface EventBase { readonly sceneRevision: bigint; targets(window: OverlayWindow): boolean }
 export type OverlayEvent = EventBase & (
-  | { readonly kind: "pointer"; readonly position: Point; readonly applicationId: bigint; readonly modifiers: number; readonly button?: number; readonly down?: boolean }
+  | { readonly kind: "pointer"; readonly position: Point; readonly applicationId: bigint; readonly modifiers: number; readonly button?: number; readonly down?: boolean; readonly clicks: number; readonly pressure?: number }
+  | { readonly kind: "hover"; readonly applicationId: bigint; readonly entered: boolean }
   | { readonly kind: "wheel"; readonly position: Point; readonly dx: number; readonly dy: number; readonly modifiers: number; readonly precise: boolean; readonly phase: ScrollPhase }
   | { readonly kind: "key"; readonly physical: number; readonly down: boolean; readonly repeat: boolean; readonly modifiers: number }
   | { readonly kind: "text"; readonly text: string }
@@ -263,7 +279,15 @@ export function decodeOverlayEvent(raw: NativeEvent): OverlayEvent {
       if (data.text !== "presented" && data.text !== "superseded") throw new Error("unknown submission outcome");
       return { ...base, kind: "submission-outcome", outcome: data.text };
     }
-    case "pointer": return { ...base, kind: "pointer", position, applicationId: data.region, modifiers: v[2]!, button: v[3], down: v.length > 3 ? Boolean(v[4]) : undefined };
+    // Values are [x, y, modifiers, clicks] with an optional [button, down] pair, then the
+    // pressure, which is negative when the device reported none.
+    case "pointer": return {
+      ...base, kind: "pointer", position, applicationId: data.region, modifiers: v[2]!,
+      clicks: v[3]!, button: v[4],
+      down: v.length > 5 ? Boolean(v[5]) : undefined,
+      pressure: v[v.length - 1]! >= 0 ? v[v.length - 1] : undefined,
+    };
+    case "hover": return { ...base, kind: "hover", applicationId: data.region, entered: Boolean(v[0]) };
     case "wheel": return { ...base, kind: "wheel", position, dx: v[2]!, dy: v[3]!, modifiers: v[4]!, precise: v[5] !== 0, phase: SCROLL_PHASES[v[6]!]! };
     case "key": return { ...base, kind: "key", physical: v[0]!, down: Boolean(v[1]), repeat: Boolean(v[2]), modifiers: v[3]! };
     case "text": return { ...base, kind: "text", text: data.text };
@@ -290,7 +314,7 @@ export class OverlaySession {
   get closed(): boolean { return this.stopped; }
   static async connect(options: ConnectOptions = {}): Promise<OverlaySession> {
     const required = [...new Set([...(options.requiredProfiles ?? []), PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT])].sort();
-    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT].filter(p => !required.includes(p)))].sort();
+    const optional = [...new Set([...(options.optionalProfiles ?? []), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER].filter(p => !required.includes(p)))].sort();
     const session = await Session.connect({ ...options, targetProfile: PROFILE_TERMINAL_SURFACE, requiredProfiles: required, optionalProfiles: optional });
     const type = native().OverlaySession as { adopt(session: unknown): Promise<NativeSession> };
     return new OverlaySession(await call(type.adopt(session.raw)));

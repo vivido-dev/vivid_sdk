@@ -5,7 +5,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use vivid_sdk::overlay::{Brush, Canvas, Color, Command, HitRole, Path, Point, Rect, Text};
+use vivid_sdk::overlay::{
+    Brush, Canvas, Color, Command, CursorShape, HitRole, Path, Point, Rect, Text,
+};
 use vivid_sdk::overlay::{DismissReason, Event, WindowMode};
 use vivid_sdk::{OverlayLaneEvent, OverlaySession, OverlayWindowOptions};
 
@@ -49,6 +51,8 @@ fn panel(label: &str) -> io::Result<Canvas> {
             id: PANEL,
             path: face,
             role: HitRole::Input,
+            // The panel is clickable, so the host shows a pointer while the pointer is on it.
+            cursor: Some(CursorShape::Pointer),
         })
         .map_err(io::Error::other)?;
     Ok(canvas)

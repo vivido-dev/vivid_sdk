@@ -161,6 +161,7 @@ impl OverlayCanvas {
         id: BigInt,
         role: String,
         edges: f64,
+        cursor: String,
     ) -> Result<()> {
         let (negative, id, lossless) = id.get_u64();
         if negative || !lossless {
@@ -171,6 +172,7 @@ impl OverlayCanvas {
                 id,
                 path: model::path(&segments, even_odd).map_err(io_error)?,
                 role: model::hit_role(&role, edges).map_err(io_error)?,
+                cursor: model::cursor(&cursor).map_err(io_error)?,
             })
             .map_err(value_error)?;
         Ok(())

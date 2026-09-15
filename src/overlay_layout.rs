@@ -29,6 +29,21 @@ pub(super) fn validate_paint(canvas: &Canvas, session: &Session) -> io::Result<(
     Ok(())
 }
 
+/// Cursors exist only under `overlay-pointer-v1`.
+pub(super) fn validate_pointer(canvas: &Canvas, session: &Session) -> io::Result<()> {
+    if canvas
+        .commands()
+        .iter()
+        .any(|command| command.requires_pointer())
+        && !session.supports(vivid_protocol::registry::OVERLAY_POINTER)
+    {
+        return Err(invalid_input(
+            "presenter does not support overlay-pointer-v1",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_references(canvas: &Canvas, layouts: &BTreeSet<u64>) -> io::Result<()> {
     for command in canvas.commands() {
         if let Command::TextLayout { layout, .. } = command

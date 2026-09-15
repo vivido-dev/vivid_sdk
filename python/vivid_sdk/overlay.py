@@ -5,12 +5,35 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
 DismissReason = Literal["escape", "outside-press", "closed", "owner-lost", "parent-closed"]
 ScrollPhase = Literal["none", "began", "changed", "ended", "cancelled"]
+CursorShape = Literal[
+    "",
+    "default",
+    "pointer",
+    "text",
+    "move",
+    "crosshair",
+    "not-allowed",
+    "grab",
+    "grabbing",
+    "wait",
+    "progress",
+    "resize-left",
+    "resize-right",
+    "resize-up",
+    "resize-down",
+    "resize-up-left",
+    "resize-up-right",
+    "resize-down-left",
+    "resize-down-right",
+    "resize-left-right",
+    "resize-up-down",
+]
 _SCROLL_PHASES: Tuple[ScrollPhase, ...] = ("none", "began", "changed", "ended", "cancelled")
 
 class Modifiers:
@@ -195,9 +218,12 @@ class Canvas:
     def text(self, text: str, origin: Point, size: float, color: int, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> Canvas:
         self._raw.text(text, origin.x, origin.y, size, color, family, weight, italic, max_width)
         return self
-    def hit(self, application_id: int, path: Path, role: HitRole = "input", *, edges: int = 0) -> Canvas:
-        """Resize edges: left=1, right=2, top=4, bottom=8. IDs are unsigned 64-bit."""
-        self._raw.hit(path._segments, path.even_odd, application_id, role, edges); return self
+    def hit(self, application_id: int, path: Path, role: HitRole = "input", *, edges: int = 0, cursor: CursorShape = "") -> Canvas:
+        """Resize edges: left=1, right=2, top=4, bottom=8. IDs are unsigned 64-bit.
+
+        `cursor` is the shape shown while this region is hovered; empty leaves the host's own.
+        """
+        self._raw.hit(path._segments, path.even_odd, application_id, role, edges, cursor); return self
     def validate(self) -> None: self._raw.validate()
 
 class RetainedImage:
@@ -317,6 +343,14 @@ class PointerEvent(OverlayEvent):
     modifiers: int
     button: Optional[int]
     down: Optional[bool]
+    clicks: int
+    pressure: Optional[float]
+
+@dataclass(frozen=True)
+class HoverEvent(OverlayEvent):
+    kind: ClassVar[str] = "hover"
+    application_id: int
+    entered: bool
 
 @dataclass(frozen=True)
 class WheelEvent(OverlayEvent):
@@ -388,7 +422,17 @@ def _event(raw: Any) -> OverlayEvent:
     kind, revision, values, text = data["kind"], data["revision"], data["values"], data["text"]
     if kind == "viewport": return ViewportEvent(0, raw, revision, Viewport(values[0], values[1], int(values[2]), int(values[3])))
     if kind == "submission-outcome": return SubmissionOutcomeEvent(revision, raw, cast(PresentationOutcome, text))
-    if kind == "pointer": return PointerEvent(revision, raw, Point(*values[:2]), data["region"], int(values[2]), int(values[3]) if len(values) > 3 else None, bool(values[4]) if len(values) > 3 else None)
+    if kind == "pointer":
+        # Values are [x, y, modifiers, clicks] with an optional [button, down] pair, then the
+        # pressure, which is negative when the device reported none.
+        button = int(values[4]) if len(values) > 5 else None
+        pressure = values[-1] if values[-1] >= 0 else None
+        return PointerEvent(
+            revision, raw, Point(*values[:2]), data["region"], int(values[2]),
+            button, bool(values[5]) if len(values) > 5 else None,
+            int(values[3]), pressure,
+        )
+    if kind == "hover": return HoverEvent(revision, raw, data["region"], bool(values[0]))
     if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]), bool(values[5]), _SCROLL_PHASES[int(values[6])])
     if kind == "key": return KeyEvent(revision, raw, int(values[0]), bool(values[1]), bool(values[2]), int(values[3]))
     if kind == "text": return TextEvent(revision, raw, text)
@@ -411,7 +455,7 @@ class OverlaySession:
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
         required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT) if p not in required})
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))

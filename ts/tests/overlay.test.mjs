@@ -104,3 +104,26 @@ test("paint commands validate locally and reach a presenter", async () => {
     await session.close();
   }
 });
+
+test("cursor shapes ride hit regions and stay off the wire when unasked", async () => {
+  const session = await OverlaySession.connect({ offline: true });
+  try {
+    const window = await session.createWindow({ bounds: rect });
+    const path = Path.rectangle(rect);
+    // An unasked cursor must not require the pointer profile, so a plain scene still submits.
+    const plain = new Canvas().hit(1n, path);
+    plain.validate();
+    assert.ok((await window.submit(plain)).revision > 0n);
+
+    const shaped = new Canvas()
+      .hit(2n, path, "input", 0, "text")
+      .hit(3n, path, "drag", 0, "grabbing")
+      .hit(4n, path, "resize", 8, "resize-up-left");
+    shaped.validate();
+    assert.ok((await window.submit(shaped)).revision > 0n);
+
+    assert.throws(() => new Canvas().hit(5n, path, "input", 0, "wand").validate());
+  } finally {
+    await session.close();
+  }
+});

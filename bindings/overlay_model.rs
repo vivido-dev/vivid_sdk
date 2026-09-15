@@ -455,6 +455,35 @@ pub fn state(kind: &str, values: &[f64]) -> io::Result<Command> {
         _ => Err(invalid("invalid canvas state command")),
     }
 }
+/// The protocol's cursor set by name, so a language binding cannot invent a shape.
+pub fn cursor(shape: &str) -> io::Result<Option<CursorShape>> {
+    let shape = match shape {
+        "" => return Ok(None),
+        "default" => CursorShape::Default,
+        "pointer" => CursorShape::Pointer,
+        "text" => CursorShape::Text,
+        "move" => CursorShape::Move,
+        "crosshair" => CursorShape::Crosshair,
+        "not-allowed" => CursorShape::NotAllowed,
+        "grab" => CursorShape::Grab,
+        "grabbing" => CursorShape::Grabbing,
+        "wait" => CursorShape::Wait,
+        "progress" => CursorShape::Progress,
+        "resize-left" => CursorShape::ResizeLeft,
+        "resize-right" => CursorShape::ResizeRight,
+        "resize-up" => CursorShape::ResizeUp,
+        "resize-down" => CursorShape::ResizeDown,
+        "resize-up-left" => CursorShape::ResizeUpLeft,
+        "resize-up-right" => CursorShape::ResizeUpRight,
+        "resize-down-left" => CursorShape::ResizeDownLeft,
+        "resize-down-right" => CursorShape::ResizeDownRight,
+        "resize-left-right" => CursorShape::ResizeLeftRight,
+        "resize-up-down" => CursorShape::ResizeUpDown,
+        _ => return Err(invalid("unknown cursor shape")),
+    };
+    Ok(Some(shape))
+}
+
 pub fn hit_role(role: &str, edges: f64) -> io::Result<HitRole> {
     match role {
         "input" => Ok(HitRole::Input),
@@ -535,14 +564,28 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
             region,
             button,
             modifiers,
+            clicks,
+            pressure,
         } => {
             data.kind = "pointer";
             data.region = *region;
-            data.values = vec![position.x.get(), position.y.get(), f64::from(*modifiers)];
+            data.values = vec![
+                position.x.get(),
+                position.y.get(),
+                f64::from(*modifiers),
+                f64::from(*clicks),
+            ];
             if let Some((button, down)) = button {
                 data.values
                     .extend([f64::from(*button), u8::from(*down).into()]);
             }
+            // Absent pressure is reported as a negative sentinel, which no real value can be.
+            data.values.push(pressure.map_or(-1., |p| p.get()));
+        }
+        Event::Hover { region, entered } => {
+            data.kind = "hover";
+            data.region = *region;
+            data.values = vec![u8::from(*entered).into()];
         }
         Event::Wheel {
             position,

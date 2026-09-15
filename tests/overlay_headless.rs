@@ -9,8 +9,9 @@
 use std::time::Duration;
 
 use vivid_sdk::overlay::{
-    Brush, Canvas, Cap, Color, ColorSpace, Corners, Extend, GradientStop, HitRole, Join, Path,
-    Point, PresentationOutcome, Rect, Scalar, Shadow, StrokeStyle, WindowMode, buttons,
+    Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, CursorShape, Extend, GradientStop,
+    HitRole, Join, Path, Point, PresentationOutcome, Rect, Scalar, Shadow, StrokeStyle, WindowMode,
+    buttons,
 };
 use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
 use vivid_sdk::{OverlayLaneEvent, OverlaySession, OverlayWindowOptions, ProducerConfig};
@@ -33,10 +34,11 @@ fn panel() -> (Canvas, Path) {
         .fill(path.clone(), Brush::Solid(Color(0x203050ff)))
         .unwrap();
     canvas
-        .push(vivid_sdk::overlay::Command::Hit {
+        .push(Command::Hit {
             id: 7,
             path: path.clone(),
             role: HitRole::Input,
+            cursor: Some(CursorShape::Pointer),
         })
         .unwrap();
     (canvas, path)
@@ -419,6 +421,102 @@ fn paint_commands_are_refused_locally_when_the_profile_was_not_negotiated() {
     )
     .unwrap();
     window.submit(srgb).unwrap();
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_region_cursor_and_hover_transitions_reach_the_producer() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // The presenter resolves the same cursor the region declared, through the same hit test.
+    assert_eq!(presenter.overlay_cursor(), None);
+    presenter.overlay_pointer(50., 50., None, 0).unwrap();
+    assert_eq!(presenter.overlay_cursor(), Some(CursorShape::Pointer));
+    // Leaving the region drops it again.
+    presenter.overlay_pointer(500., 500., None, 0).unwrap();
+    assert_eq!(presenter.overlay_cursor(), None);
+
+    // Three presses in the same place are one sequence, exactly as a host counts them.
+    for _ in 0..3 {
+        presenter
+            .overlay_pointer(50., 50., Some((buttons::PRIMARY, true)), 0)
+            .unwrap();
+        presenter
+            .overlay_pointer(50., 50., Some((buttons::PRIMARY, false)), 0)
+            .unwrap();
+    }
+
+    let mut hover = Vec::new();
+    let mut clicks = Vec::new();
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Input(input) = event {
+            match input.event {
+                vivid_sdk::overlay::Event::Hover { region, entered } => {
+                    hover.push((region, entered));
+                }
+                vivid_sdk::overlay::Event::Pointer { clicks: n, .. } if n > 0 => clicks.push(n),
+                _ => {}
+            }
+        }
+        if clicks.len() == 3 {
+            break;
+        }
+    }
+    // Enter, leave when the pointer went to empty space, then enter again on the press back in.
+    assert_eq!(hover, vec![(7, true), (7, false), (7, true)]);
+    assert_eq!(clicks, vec![1, 2, 3]);
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_region_cursor_is_refused_locally_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let mut canvas = Canvas::new();
+    canvas
+        .push(Command::Hit {
+            id: 1,
+            path: Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            role: HitRole::Input,
+            cursor: Some(CursorShape::Text),
+        })
+        .unwrap();
+    let error = window.submit(canvas).unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-pointer-v1"),
+        "unexpected diagnosis: {error}"
+    );
+
+    // A region with no cursor is not a pointer form, so it still submits on the same session.
+    let mut plain = Canvas::new();
+    plain
+        .push(Command::Hit {
+            id: 1,
+            path: Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            role: HitRole::Input,
+            cursor: None,
+        })
+        .unwrap();
+    window.submit(plain).unwrap();
 
     overlays.close().unwrap();
 }

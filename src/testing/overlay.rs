@@ -18,7 +18,7 @@ use vivid_protocol::overlay::wire::{
     Action, Capture, PresentationOutcome, Query, Renew, SetWindow, Status, Submission,
     SubmissionOutcome, Viewport, WindowAddress,
 };
-use vivid_protocol::overlay::{Event, Scroll, Windows};
+use vivid_protocol::overlay::{Event, PointerReport, Scroll, Windows};
 use vivid_protocol::vector::{Canvas, Frame, Limits, Point, Scalar};
 
 /// A display list the presenter accepted, with the identity a real host would key it by.
@@ -62,6 +62,8 @@ pub(crate) struct Overlays {
     highest_asset: HashMap<(u64, u64), u64>,
     lane_generation: Option<u64>,
     pending: Vec<LaneRecord>,
+    /// The last press of the current click sequence, as the real host tracks it.
+    last_click: Option<(std::time::Instant, u16, Point, u8)>,
 }
 
 /// The producer names its own session with a placeholder presenter instance, so the presenter
@@ -147,6 +149,33 @@ impl Overlays {
     }
 
     // ---- control records -------------------------------------------------------------------
+
+    /// Count a press in the current sequence, matching the real host's policy so a producer
+    /// testing against this presenter sees the same counts it will see live.
+    fn count_clicks(&mut self, position: Point, button: Option<(u16, bool)>) -> u8 {
+        let Some((button_id, true)) = button else {
+            return 0;
+        };
+        let now = std::time::Instant::now();
+        let clicks = match self.last_click {
+            Some((at, id, point, count))
+                if id == button_id
+                    && now.saturating_duration_since(at)
+                        < std::time::Duration::from_millis(400)
+                    && (point.x.get() - position.x.get()).abs() <= 4.
+                    && (point.y.get() - position.y.get()).abs() <= 4. =>
+            {
+                if count >= vivid_protocol::overlay::MAX_CLICKS {
+                    1
+                } else {
+                    count + 1
+                }
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, button_id, position, clicks));
+        clicks
+    }
 
     /// Note a track's surface so a later vector record can be attributed to a window.
     pub(crate) fn note_track(
@@ -483,6 +512,12 @@ impl Overlays {
 
     // ---- test-facing observation and injection ---------------------------------------------
 
+    /// The cursor the pointer currently calls for, through the same state machine a real host
+    /// drives.
+    pub(crate) fn cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
+        self.windows.cursor()
+    }
+
     pub(crate) fn scenes(&self) -> Vec<PresentedScene> {
         self.displayed.values().cloned().collect()
     }
@@ -504,15 +539,23 @@ impl Overlays {
         button: Option<(u16, bool)>,
         modifiers: u32,
     ) -> bool {
+        let clicks = self.count_clicks(position, button);
         let scenes: Vec<PresentedScene> = self.displayed.values().cloned().collect();
-        let consumed = self
-            .windows
-            .pointer(position, button, modifiers, |id, point| {
+        let consumed = self.windows.pointer(
+            PointerReport {
+                position,
+                button,
+                modifiers,
+                clicks,
+                pressure: None,
+            },
+            |id, point| {
                 scenes
                     .iter()
                     .find(|scene| scene.window == id)
                     .and_then(|scene| hit(&scene.canvas, point))
-            });
+            },
+        );
         self.drain_events(owner(session_id));
         consumed
     }
@@ -532,6 +575,7 @@ impl Overlays {
                     .iter()
                     .find(|scene| scene.window == id)
                     .and_then(|scene| hit(&scene.canvas, point))
+                    .map(|target| (target.id, target.role))
             });
         self.drain_events(owner(session_id));
         consumed
@@ -554,11 +598,17 @@ impl Overlays {
 /// This walks the display list rather than a compiled scene: a headless presenter has no
 /// rasterizer, and an axis-aligned bounding test is enough for the region identity a producer's
 /// event routing depends on.
-fn hit(canvas: &Canvas, point: Point) -> Option<(u64, vivid_protocol::vector::HitRole)> {
+fn hit(canvas: &Canvas, point: Point) -> Option<vivid_protocol::vector::HitRegion> {
     use vivid_protocol::vector::{Command, Segment};
     let mut found = None;
     for command in canvas.commands() {
-        let Command::Hit { id, path, role } = command else {
+        let Command::Hit {
+            id,
+            path,
+            role,
+            cursor,
+        } = command
+        else {
             continue;
         };
         let (mut left, mut top) = (f64::MAX, f64::MAX);
@@ -579,7 +629,11 @@ fn hit(canvas: &Canvas, point: Point) -> Option<(u64, vivid_protocol::vector::Hi
         }
         let (x, y) = (point.x.get(), point.y.get());
         if x >= left && x < right && y >= top && y < bottom {
-            found = Some((*id, *role));
+            found = Some(vivid_protocol::vector::HitRegion {
+                id: *id,
+                role: *role,
+                cursor: *cursor,
+            });
         }
     }
     found
