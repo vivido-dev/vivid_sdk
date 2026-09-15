@@ -13,12 +13,14 @@ use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity};
 use vivid_protocol::messages;
 use vivid_protocol::overlay::WindowOptions;
-pub use vivid_protocol::overlay::wire::PresentationOutcome;
 pub use vivid_protocol::overlay::wire::Viewport;
 use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText};
 pub use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
     Action, Clipboard, Query, SetWindow, Status, WindowAction, WindowAddress,
+};
+pub use vivid_protocol::overlay::wire::{
+    Appearance, Environment, EnvironmentChanged, PresentationOutcome,
 };
 pub use vivid_protocol::overlay::{
     DismissReason, Event, Scroll, ScrollPhase, WindowMode, buttons, keys, modifiers,
@@ -154,6 +156,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_CLIPBOARD.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_ENV.into());
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());

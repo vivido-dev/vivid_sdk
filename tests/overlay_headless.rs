@@ -587,3 +587,100 @@ fn a_clipboard_write_is_refused_when_the_profile_was_not_negotiated() {
     );
     overlays.close().unwrap();
 }
+
+#[test]
+fn the_host_environment_reaches_the_producer() {
+    use vivid_sdk::overlay::Scalar;
+    use vivid_sdk::overlay::{Appearance, Environment};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let _window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    // The presenter names the defaults a producer should adopt.
+    presenter.set_overlay_environment(Environment {
+        font_family: "Iosevka Term".to_owned(),
+        font_size: Scalar::new(13.5).unwrap(),
+        appearance: Appearance::Dark,
+        // A host that cannot read the preference reports absence rather than asserting one.
+        reduced_motion: None,
+        refresh_interval_us: Some(16_667),
+    });
+
+    let mut seen = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Environment(update) = event {
+            seen = Some(update);
+            if seen
+                .as_ref()
+                .is_some_and(|u| !u.environment.font_family.is_empty())
+            {
+                break;
+            }
+        }
+    }
+    let update = seen.expect("environment snapshot");
+    assert_eq!(update.environment.font_family, "Iosevka Term");
+    assert_eq!(update.environment.font_size.get(), 13.5);
+    assert_eq!(update.environment.appearance, Appearance::Dark);
+    assert_eq!(update.environment.reduced_motion, None);
+    assert_eq!(update.environment.refresh_interval_us, Some(16_667));
+    assert!(update.revision > 0);
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn an_environment_snapshot_precedes_the_first_viewport_and_carries_a_revision() {
+    // A producer that adopts the host's font must be able to do it before it draws anything, so
+    // the environment arrives on the lane a producer already has open.
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let mut environment_revision = 0;
+    let mut viewport_revision = 0;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        match event {
+            OverlayLaneEvent::Environment(update) => environment_revision = update.revision,
+            OverlayLaneEvent::Viewport(update) => viewport_revision = update.revision,
+            OverlayLaneEvent::ConnectionLost { diagnostic } => {
+                panic!("lane lost before an initial snapshot: {diagnostic}")
+            }
+            _ => {}
+        }
+        if environment_revision > 0 && viewport_revision > 0 {
+            break;
+        }
+    }
+    assert!(environment_revision > 0, "no environment snapshot arrived");
+    assert!(viewport_revision > 0, "no viewport snapshot arrived");
+
+    // A change bumps the environment revision without touching the viewport's.
+    presenter.set_overlay_environment(vivid_sdk::overlay::Environment {
+        appearance: vivid_sdk::overlay::Appearance::Dark,
+        ..presenter.overlay_environment()
+    });
+    let mut bumped = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Environment(update) = event {
+            bumped = Some(update);
+            break;
+        }
+    }
+    let bumped = bumped.expect("revised environment snapshot");
+    assert!(bumped.revision > environment_revision);
+    assert_eq!(
+        bumped.environment.appearance,
+        vivid_sdk::overlay::Appearance::Dark
+    );
+    assert_eq!(
+        presenter.overlay_environment().appearance,
+        vivid_sdk::overlay::Appearance::Dark
+    );
+
+    overlays.close().unwrap();
+}

@@ -108,6 +108,9 @@ struct Shared {
     input_bindings: Vec<ObservedBinding>,
     /// Headless overlay windows, scenes and assets. Empty unless a producer negotiates them.
     overlays: crate::testing::overlay::Overlays,
+    /// Sessions that negotiated the overlay bundle. An overlay record on any other lane would
+    /// be a record that lane never agreed to carry.
+    overlay_sessions: std::collections::HashSet<u64>,
 }
 
 /// One `SET_INPUT_BINDING` the presenter answered, with the grant it returned.
@@ -348,6 +351,25 @@ impl TestPresenter {
     /// Retained images still reachable by a future scene.
     pub fn overlay_assets(&self) -> Vec<crate::testing::overlay::RetainedAsset> {
         self.shared.lock().expect("shared").overlays.assets()
+    }
+
+    /// The environment this presenter reports to a producer.
+    pub fn overlay_environment(&self) -> vivid_protocol::overlay::wire::Environment {
+        self.shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .environment()
+            .clone()
+    }
+
+    /// Change the environment, as a font or theme change would.
+    pub fn set_overlay_environment(&self, environment: vivid_protocol::overlay::wire::Environment) {
+        {
+            let mut guard = self.shared.lock().expect("shared");
+            guard.overlays.set_environment(environment);
+        }
+        flush_overlay_lane(&self.shared, &self.lane_writer);
     }
 
     /// Clipboard text this presenter accepted, in acceptance order. A refused write leaves no
@@ -723,6 +745,7 @@ fn serve(serving: Serving) -> io::Result<()> {
         .any(|profile| profile == registry::VECTOR_SCENE)
     {
         let mut guard = shared.lock().expect("shared");
+        guard.overlay_sessions.insert(welcome.session_id);
         guard.overlays.install_viewport(
             f64::from(initial_target.kind.overlay_width()),
             f64::from(initial_target.kind.overlay_height()),
@@ -1343,6 +1366,20 @@ fn serve_interactive_lane(
         .lanes
         .push(open.lane_generation);
     *lane_writer.lock().expect("lane writer") = Some((stream.try_clone()?, sequence));
+
+    if shared
+        .lock()
+        .expect("shared")
+        .overlay_sessions
+        .contains(&session_id)
+    {
+        shared
+            .lock()
+            .expect("shared")
+            .overlays
+            .queue_initial_environment();
+        flush_overlay_lane(&shared, &lane_writer);
+    }
 
     let mut grant_generation = 0_u64;
     loop {

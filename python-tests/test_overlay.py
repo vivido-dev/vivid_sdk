@@ -5,7 +5,7 @@ from typing import cast
 from typing import Any
 import pytest
 from vivid_sdk import OverlaySession, OverlayWindowOptions, aio
-from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, Shadow, StrokeStyle, ImeEvent, PointerEvent, ViewportEvent, _event
+from vivid_sdk.overlay import Brush, Canvas, GradientStop, Path, Point, Rect, Shadow, StrokeStyle, EnvironmentEvent, ImeEvent, PointerEvent, ViewportEvent, _event
 
 def drawing() -> Canvas:
     path = Path().move_to(0, 0).line_to(50, 0).quad_to(60, 20, 50, 40).cubic_to(30, 60, 10, 60, 0, 40).close()
@@ -193,3 +193,21 @@ def test_a_clipboard_write_is_offered_and_refused_without_a_gesture() -> None:
         window = session.create_window(OverlayWindowOptions(Rect(0, 0, 100, 80)))
         with pytest.raises((ValueError, OSError)):
             window.set_clipboard("text")
+
+def test_environment_events_decode_with_honest_absence() -> None:
+    # Values are [font size, dark flag, reduced motion, refresh interval, revision]; a negative
+    # optional field is the host saying it cannot tell, which is not the same as "false".
+    known = _event(RawEvent("environment", [13.5, 1, 1, 16667, 3], "Iosevka Term"))
+    assert isinstance(known, EnvironmentEvent)
+    assert known.environment.font_family == "Iosevka Term"
+    assert known.environment.font_size == 13.5
+    assert known.environment.appearance == "dark"
+    assert known.environment.reduced_motion is True
+    assert known.environment.refresh_interval_us == 16667
+    assert known.revision == 3
+
+    unknown = _event(RawEvent("environment", [16.0, 0, -1, -1, 1], ""))
+    assert isinstance(unknown, EnvironmentEvent)
+    assert unknown.environment.appearance == "light"
+    assert unknown.environment.reduced_motion is None
+    assert unknown.environment.refresh_interval_us is None

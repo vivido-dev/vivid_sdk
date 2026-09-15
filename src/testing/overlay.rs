@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIdentity};
 use vivid_protocol::messages::{self, PayloadMap};
+use vivid_protocol::overlay::wire::Environment;
 use vivid_protocol::overlay::wire::{
     Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetWindow, Status, Submission,
     SubmissionOutcome, Viewport, WindowAddress,
@@ -65,6 +66,9 @@ pub(crate) struct Overlays {
     highest_asset: HashMap<(u64, u64), u64>,
     lane_generation: Option<u64>,
     pending: Vec<LaneRecord>,
+    /// The environment a producer sees, and the revision it last changed at.
+    environment: Environment,
+    environment_revision: u64,
     /// The last press of the current click sequence, as the real host tracks it.
     last_click: Option<(std::time::Instant, u16, Point, u8)>,
     /// The window a key or pointer press last reached, as the real host tracks it.
@@ -85,6 +89,11 @@ pub(crate) fn owner(session_id: u64) -> SessionIdentity {
 
 impl Overlays {
     /// The viewport a producer sees before anything resizes it.
+    /// Queue the environment for a lane that just opened, as a host does after authentication.
+    pub(crate) fn queue_initial_environment(&mut self) {
+        self.queue_environment();
+    }
+
     pub(crate) fn install_viewport(&mut self, width: f64, height: f64) {
         let viewport = Viewport {
             width: Scalar::new(width).expect("test viewport width"),
@@ -102,6 +111,35 @@ impl Overlays {
         self.viewport = Some(viewport);
         self.viewport_revision += 1;
         self.queue_viewport();
+    }
+
+    /// Set the environment this presenter reports, as a host would on a font or theme change.
+    pub(crate) fn set_environment(&mut self, environment: Environment) {
+        if self.environment == environment || environment.validate().is_err() {
+            return;
+        }
+        self.environment = environment;
+        self.environment_revision = self.environment_revision.max(1).saturating_add(1);
+        self.queue_environment();
+    }
+
+    fn queue_environment(&mut self) {
+        let update = vivid_protocol::overlay::wire::EnvironmentChanged {
+            revision: self.environment_revision.max(1),
+            environment: self.environment.clone(),
+        };
+        if let Ok(payload) = update.payload() {
+            self.pending.push(LaneRecord {
+                record_type: messages::OVERLAY_ENV_CHANGED,
+                object_id: 0,
+                payload,
+            });
+        }
+    }
+
+    /// The environment a producer sees.
+    pub(crate) fn environment(&self) -> &Environment {
+        &self.environment
     }
 
     fn queue_viewport(&mut self) {

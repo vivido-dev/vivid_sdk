@@ -2,6 +2,12 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { OverlaySession, overlay, presenter } from "../../dist/index.js";
 const { Canvas, Path, Brush, decodeOverlayEvent } = overlay;
+class RawEvent {
+  constructor(kind, values, text = "") {
+    this.value = { kind, values, text, revision: (1n << 64n) - 1n, region: (1n << 63n) + 17n };
+  }
+  data() { return this.value; }
+}
 const rect = { x: 0, y: 0, width: 100, height: 80 };
 function drawing() {
   const stops = [{ offset: 0, color: 0xff0000ff }, { offset: 1, color: 0x0000ffff }];
@@ -137,4 +143,21 @@ test("a clipboard write is offered and refused without a gesture", async () => {
   } finally {
     await session.close();
   }
+});
+
+test("environment events decode with honest absence", () => {
+  // Values are [font size, dark flag, reduced motion, refresh interval, revision]; a negative
+  // optional field is the host saying it cannot tell, which is not the same as "false".
+  const known = decodeOverlayEvent(new RawEvent("environment", [13.5, 1, 1, 16667, 3], "Iosevka Term"));
+  assert.equal(known.kind, "environment");
+  assert.equal(known.environment.fontFamily, "Iosevka Term");
+  assert.equal(known.environment.fontSize, 13.5);
+  assert.equal(known.environment.appearance, "dark");
+  assert.equal(known.environment.reducedMotion, true);
+  assert.equal(known.environment.refreshIntervalUs, 16667);
+
+  const unknown = decodeOverlayEvent(new RawEvent("environment", [16, 0, -1, -1, 1], ""));
+  assert.equal(unknown.environment.appearance, "light");
+  assert.equal(unknown.environment.reducedMotion, undefined);
+  assert.equal(unknown.environment.refreshIntervalUs, undefined);
 });

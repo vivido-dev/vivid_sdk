@@ -440,6 +440,7 @@ fn spawn_interactive_reader(
                                     | messages::OVERLAY_INPUT_EVENT
                                     | messages::OVERLAY_SUBMISSION_OUTCOME
                                     | messages::OVERLAY_VIEWPORT_CHANGED
+                                    | messages::OVERLAY_ENV_CHANGED
                             )
                     } else {
                         matches!(
@@ -540,6 +541,19 @@ fn spawn_interactive_reader(
                                 payload: envelope.payload,
                             }
                         }
+                        messages::OVERLAY_ENV_CHANGED => {
+                            // Validated here as well as when it is handed out, so a malformed
+                            // snapshot closes the lane rather than surfacing to an application.
+                            vivid_protocol::overlay::wire::EnvironmentChanged::decode(
+                                record.object_id,
+                                &Value::Map(envelope.payload.clone()),
+                            )?;
+                            InputLaneEvent::Input {
+                                record_type: record.record_type,
+                                surface_id: record.object_id,
+                                payload: envelope.payload,
+                            }
+                        }
                         messages::KEY_INPUT
                         | messages::POINTER_MOTION
                         | messages::POINTER_BUTTON
@@ -628,7 +642,11 @@ pub enum OverlayLaneEvent {
     Input(vivid_protocol::overlay::wire::InputEvent),
     Outcome(vivid_protocol::overlay::wire::SubmissionOutcome),
     Viewport(vivid_protocol::overlay::wire::ViewportChanged),
-    ConnectionLost { diagnostic: String },
+    /// The host's defaults: its font, appearance, motion preference, and display rate.
+    Environment(vivid_protocol::overlay::wire::EnvironmentChanged),
+    ConnectionLost {
+        diagnostic: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -757,6 +775,16 @@ impl OverlayInputLane {
                 payload,
             }) => Ok(Some(OverlayLaneEvent::Viewport(
                 vivid_protocol::overlay::wire::ViewportChanged::decode(
+                    surface_id,
+                    &Value::Map(payload),
+                )?,
+            ))),
+            Some(InputLaneEvent::Input {
+                record_type: messages::OVERLAY_ENV_CHANGED,
+                surface_id,
+                payload,
+            }) => Ok(Some(OverlayLaneEvent::Environment(
+                vivid_protocol::overlay::wire::EnvironmentChanged::decode(
                     surface_id,
                     &Value::Map(payload),
                 )?,

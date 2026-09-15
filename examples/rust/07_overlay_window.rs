@@ -21,7 +21,8 @@ const HEIGHT: f64 = 180.;
 /// Application-chosen hit region ID. Nonzero and unique within one display list.
 const PANEL: u64 = 1;
 
-fn panel(label: &str) -> io::Result<Canvas> {
+/// An empty family asks the host for its default, which the environment then names.
+fn panel(label: &str, font: Option<&(String, f64)>) -> io::Result<Canvas> {
     let bounds = Rect::new(0., 0., WIDTH, HEIGHT).map_err(io::Error::other)?;
     let face = Path::rounded_rectangle(bounds, 12.).map_err(io::Error::other)?;
     let mut canvas = Canvas::new();
@@ -35,9 +36,10 @@ fn panel(label: &str) -> io::Result<Canvas> {
         .push(Command::Text(Text {
             text: label.to_owned(),
             origin: Point::new(20., 24.).map_err(io::Error::other)?,
-            size: vivid_sdk::overlay::Scalar::new(18.).map_err(io::Error::other)?,
+            size: vivid_sdk::overlay::Scalar::new(font.map_or(18., |(_, size)| *size))
+                .map_err(io::Error::other)?,
             // An empty family asks the host for its default; custom font bytes are not supported.
-            family: String::new(),
+            family: font.map_or_else(String::new, |(family, _)| family.clone()),
             weight: 400,
             italic: false,
             color: Color(0xffffffff),
@@ -66,7 +68,8 @@ fn main() -> io::Result<()> {
         WindowMode::Floating,
     ))?;
 
-    window.present(panel("Click the panel, or press Escape.")?)?;
+    let mut font: Option<(String, f64)> = None;
+    window.present(panel("Click the panel, or press Escape.", font.as_ref())?)?;
     window.center()?;
     window.request_focus()?;
 
@@ -100,6 +103,15 @@ fn main() -> io::Result<()> {
                         break;
                     }
                     _ => {}
+                }
+            }
+            // The host says which font it draws plain text in, so the panel adopts it rather
+            // than guessing and looking foreign in the pane.
+            OverlayLaneEvent::Environment(update) => {
+                let env = &update.environment;
+                if !env.font_family.is_empty() {
+                    font = Some((env.font_family.clone(), env.font_size.get()));
+                    window.present(panel("Click the panel, or press Escape.", font.as_ref())?)?;
                 }
             }
             // Submission outcomes and viewport snapshots share this lane; a drawing-only

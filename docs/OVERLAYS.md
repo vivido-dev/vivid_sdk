@@ -7,8 +7,9 @@ and GPUI-inspired UI plan has not passed live pane acceptance.
 
 The terminating SDK presenter and terminating gateways still reject these profiles explicitly.
 Vivido offers them only for terminal targets with native viewport geometry installed: the window,
-vector, input, paint, pointer, and clipboard bundles, with cursor and hover behaviour applied
-where the platform reports it.
+vector, input, paint, pointer, clipboard, and environment bundles, with cursor and hover
+behaviour applied where the platform reports it. It reports the desktop appearance and the
+display refresh rate, and reports no reduced-motion preference because it cannot read one.
 Example 07 in each language draws an interactive overlay panel and pumps its input lane.
 
 For tests, `vivid_sdk::testing::TestPresenter` serves the profile bundle headlessly: it keeps
@@ -261,6 +262,28 @@ ceiling, so a producer cannot bank a gesture and use it later.
 
 A successful reply means the host accepted the text, not that nothing else observed it: on a
 shared display server the clipboard may be published to other applications immediately.
+
+## Host environment
+
+Connection helpers optionally negotiate `overlay-env-v1`. The host publishes its defaults on the
+interactive lane beside the viewport snapshot: the font a plain `Text` or an empty `TextStyle`
+family resolves to, the desktop appearance, the user's motion preference, and how often the
+display refreshes. Rust, Python, and TypeScript surface it as an `Environment` on the lane event
+(`OverlayLaneEvent::Environment`, `EnvironmentEvent`, `kind: "environment"`).
+
+It is a record of its own rather than more keys on the viewport snapshot, because appearance and
+motion preference change independently of geometry. Layout cached per viewport revision must not
+be rebuilt because the user switched their desktop theme, and sharing one revision would force
+exactly that. Revisions strictly increase when any field changes; queued snapshots may coalesce.
+
+`reduced_motion` is absent rather than false when the host cannot read the preference — a host
+that has no such signal must not assert one, exactly as with pointer pressure. A producer that
+receives `None`/`undefined` decides for itself, and animating is a reasonable default. Vivido
+currently reports absence here, because it has no reduced-motion signal to read.
+
+`refresh_interval_us` is the display's, and absent when the host cannot tell. A producer must
+still respect its own track's record ceiling, which may be lower: a 60 rec/s track does not
+become faster because the display refreshes at 144 Hz.
 
 ## Host text measurement and editor geometry
 

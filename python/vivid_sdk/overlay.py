@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -406,6 +406,28 @@ class ConnectionLostEvent(OverlayEvent):
     kind: ClassVar[str] = "connection-lost"
     diagnostic: str
 
+Appearance = Literal["light", "dark"]
+
+@dataclass(frozen=True)
+class Environment:
+    """The host's defaults: its font, appearance, motion preference, and display rate.
+
+    `reduced_motion` is None when the host cannot read the preference, which is a different
+    claim from the user having expressed none. `refresh_interval_us` is None when the host
+    cannot tell; a producer must still respect its own track's record ceiling.
+    """
+    font_family: str
+    font_size: float
+    appearance: Appearance
+    reduced_motion: Optional[bool]
+    refresh_interval_us: Optional[float]
+
+@dataclass(frozen=True)
+class EnvironmentEvent(OverlayEvent):
+    kind: ClassVar[str] = "environment"
+    environment: Environment
+    revision: int
+
 @dataclass(frozen=True)
 class ViewportEvent(OverlayEvent):
     kind: ClassVar[str] = "viewport"
@@ -433,6 +455,17 @@ def _event(raw: Any) -> OverlayEvent:
             int(values[3]), pressure,
         )
     if kind == "hover": return HoverEvent(revision, raw, data["region"], bool(values[0]))
+    if kind == "environment":
+        return EnvironmentEvent(
+            revision, raw,
+            Environment(
+                data["text"], values[0],
+                "dark" if values[1] else "light",
+                None if values[2] < 0 else bool(values[2]),
+                None if values[3] < 0 else values[3],
+            ),
+            int(values[4]),
+        )
     if kind == "wheel": return WheelEvent(revision, raw, Point(*values[:2]), values[2], values[3], int(values[4]), bool(values[5]), _SCROLL_PHASES[int(values[6])])
     if kind == "key": return KeyEvent(revision, raw, int(values[0]), bool(values[1]), bool(values[2]), int(values[3]))
     if kind == "text": return TextEvent(revision, raw, text)
@@ -455,7 +488,7 @@ class OverlaySession:
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
         required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD) if p not in required})
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))

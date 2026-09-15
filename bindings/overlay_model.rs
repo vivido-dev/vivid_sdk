@@ -544,6 +544,26 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
                     f64::from(v.scale_denominator),
                 ];
             }
+            vivid_sdk::OverlayLaneEvent::Environment(update) => {
+                data.kind = "environment";
+                data.revision = update.revision;
+                data.text = update.environment.font_family.clone();
+                let env = &update.environment;
+                data.values = vec![
+                    env.font_size.get(),
+                    // Appearance and the two optional readings are flattened; a negative value
+                    // is absence, which the languages turn back into None.
+                    if env.appearance == vivid_sdk::overlay::Appearance::Dark {
+                        1.
+                    } else {
+                        0.
+                    },
+                    env.reduced_motion
+                        .map_or(-1., |on| if on { 1. } else { 0. }),
+                    env.refresh_interval_us.map_or(-1., |us| us as f64),
+                    update.revision as f64,
+                ];
+            }
             vivid_sdk::OverlayLaneEvent::Outcome(result) => {
                 data.kind = "submission-outcome";
                 data.revision = result.submission.revision;
