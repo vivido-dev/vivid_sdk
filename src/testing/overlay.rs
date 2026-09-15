@@ -869,6 +869,7 @@ impl Overlays {
         position: Point,
         button: Option<(u16, bool)>,
         modifiers: u32,
+        pressure: Option<vivid_protocol::vector::Scalar>,
     ) -> bool {
         let clicks = self.count_clicks(position, button);
         let scenes: Vec<PresentedScene> = self.displayed.values().cloned().collect();
@@ -878,7 +879,7 @@ impl Overlays {
                 button,
                 modifiers,
                 clicks,
-                pressure: None,
+                pressure,
             },
             |id, point| {
                 scenes

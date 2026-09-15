@@ -466,7 +466,7 @@ impl TestPresenter {
             .lock()
             .expect("shared")
             .overlays
-            .pointer(1, position, button, modifiers);
+            .pointer(1, position, button, modifiers, None);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -493,6 +493,20 @@ impl TestPresenter {
             .expect("shared")
             .overlays
             .wheel(1, position, scroll, modifiers);
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(consumed)
+    }
+
+    /// Deliver a pressure sample, as a device that has one reports.
+    pub fn overlay_pressure(&self, x: f64, y: f64, pressure: f64) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let consumed = self.shared.lock().expect("shared").overlays.pointer(
+            1,
+            position,
+            None,
+            0,
+            Some(vivid_protocol::vector::Scalar::new(pressure).map_err(io::Error::other)?),
+        );
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
