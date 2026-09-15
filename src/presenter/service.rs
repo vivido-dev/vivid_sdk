@@ -492,6 +492,18 @@ pub struct MediaEvent {
     pub body: Vec<u8>,
 }
 
+/// Where a runtime sends the media records its tracks accept.
+enum MediaEventDelivery {
+    /// Hand each accepted record to the host, which retires every delivery with
+    /// [`VirtualVivid::complete_bridge_delivery`] or [`VirtualVivid::release_bridge_delivery`].
+    Push(mpsc::SyncSender<MediaEvent>),
+    /// The runtime owns a bounded queue that a [`VirtualVivid::wait_media_event`] caller drains.
+    Pull,
+    /// Terminate media at the runtime. Successful validation is immediately reusable flow, no
+    /// event is ever queued, and no delivery needs retirement.
+    Eventless,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayLeaseReady {
     pub context_id: u64,
@@ -846,10 +858,38 @@ impl VirtualVivid {
         Self::start_configured(listener, PresenterConfig::terminal(config), events)
     }
 
+    /// Start a runtime that terminates media locally.
+    ///
+    /// Accepted records never become bridge deliveries: successful validation is immediately
+    /// reusable flow, no [`MediaEvent`] is queued, and no delivery needs retirement. Focused
+    /// presenter and bridge tests use this to exercise media flow without hosting a consumer.
+    pub fn start_eventless<L: PresenterListener>(
+        listener: L,
+        config: MediaConfig,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(
+            listener,
+            PresenterConfig::terminal(config),
+            MediaEventDelivery::Eventless,
+        )
+    }
+
     pub fn start_configured<L: PresenterListener>(
         listener: L,
-        mut config: PresenterConfig,
+        config: PresenterConfig,
         events: Option<mpsc::SyncSender<MediaEvent>>,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(
+            listener,
+            config,
+            events.map_or(MediaEventDelivery::Pull, MediaEventDelivery::Push),
+        )
+    }
+
+    fn start_with_delivery<L: PresenterListener>(
+        listener: L,
+        mut config: PresenterConfig,
+        delivery: MediaEventDelivery,
     ) -> io::Result<Self> {
         config.supported_profiles.sort();
         config.supported_profiles.dedup();
@@ -892,11 +932,13 @@ impl VirtualVivid {
         // `wait_media_event` without supplying a Rust channel or a callback. The bound is what
         // keeps a stalled reader from growing retention without limit; overflow takes the same
         // recovery path as a busy push consumer.
-        let (media_events, events) = if let Some(caller) = events {
-            (Mutex::new(None), Some(caller))
-        } else {
-            let (sender, receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE_BOUND);
-            (Mutex::new(Some(receiver)), Some(sender))
+        let (media_events, events) = match delivery {
+            MediaEventDelivery::Push(caller) => (Mutex::new(None), Some(caller)),
+            MediaEventDelivery::Pull => {
+                let (sender, receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE_BOUND);
+                (Mutex::new(Some(receiver)), Some(sender))
+            }
+            MediaEventDelivery::Eventless => (Mutex::new(None), None),
         };
         registry::validate_profile_set(config.supported_profiles.iter().map(String::as_str))
             .map_err(io::Error::other)?;
@@ -980,7 +1022,7 @@ impl VirtualVivid {
         let Some(receiver) = receiver.as_ref() else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this runtime delivers media events through the channel given at startup",
+                "this runtime has no pull-mode media event queue",
             ));
         };
         match receiver.recv_timeout(timeout) {
