@@ -383,6 +383,39 @@ impl TestPresenter {
             .to_vec()
     }
 
+    /// The semantic tree this presenter holds for the only window that has one, as the
+    /// accessibility adapter would read it.
+    pub fn overlay_semantics(&self) -> Option<vivid_protocol::overlay::Semantics> {
+        let guard = self.shared.lock().expect("shared");
+        guard
+            .overlays
+            .windows_with_semantics()
+            .into_iter()
+            .next()
+            .map(|(_, s)| s.clone())
+    }
+
+    /// Deliver an assistive-technology action for a node, exactly as the adapter would.
+    pub fn overlay_accessibility_action(
+        &self,
+        node: u64,
+        action: vivid_protocol::overlay::AccessibleAction,
+    ) -> io::Result<bool> {
+        let queued = {
+            let guard = self.shared.lock().expect("shared");
+            let Some((window, _)) = guard.overlays.windows_with_semantics().into_iter().next()
+            else {
+                return Ok(false);
+            };
+            let window = *window;
+            drop(guard);
+            let mut guard = self.shared.lock().expect("shared");
+            guard.overlays.queue_accessibility(window, node, action)
+        };
+        flush_overlay_lane(&self.shared, &self.lane_writer);
+        Ok(queued)
+    }
+
     /// The cursor the currently hovered overlay region asks for, as the display layer sees it.
     pub fn overlay_cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
         self.shared.lock().expect("shared").overlays.cursor()
@@ -899,7 +932,8 @@ fn serve(serving: Serving) -> io::Result<()> {
             messages::SET_OVERLAY_WINDOW
             | messages::OVERLAY_ACTION
             | messages::QUERY_OVERLAY
-            | messages::SET_OVERLAY_CLIPBOARD => {
+            | messages::SET_OVERLAY_CLIPBOARD
+            | messages::SET_OVERLAY_SEMANTICS => {
                 let mut guard = shared.lock().expect("shared");
                 let overlays = &mut guard.overlays;
                 let outcome = match record.record_type {
@@ -911,6 +945,9 @@ fn serve(serving: Serving) -> io::Result<()> {
                     }
                     messages::SET_OVERLAY_CLIPBOARD => {
                         overlays.set_clipboard(welcome.session_id, record.object_id, &payload)
+                    }
+                    messages::SET_OVERLAY_SEMANTICS => {
+                        overlays.set_semantics(welcome.session_id, record.object_id, &payload)
                     }
                     _ => overlays.status(welcome.session_id, record.object_id, &payload),
                 };

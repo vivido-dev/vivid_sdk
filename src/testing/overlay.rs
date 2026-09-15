@@ -16,10 +16,10 @@ use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIden
 use vivid_protocol::messages::{self, PayloadMap};
 use vivid_protocol::overlay::wire::Environment;
 use vivid_protocol::overlay::wire::{
-    Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetWindow, Status, Submission,
-    SubmissionOutcome, Viewport, WindowAddress,
+    Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetSemantics, SetWindow, Status,
+    Submission, SubmissionOutcome, Viewport, WindowAddress,
 };
-use vivid_protocol::overlay::{Event, PointerReport, Scroll, Windows};
+use vivid_protocol::overlay::{AccessibleAction, Event, PointerReport, Scroll, Semantics, Windows};
 use vivid_protocol::vector::{Canvas, Frame, Limits, Point, Scalar};
 
 /// A display list the presenter accepted, with the identity a real host would key it by.
@@ -76,6 +76,8 @@ pub(crate) struct Overlays {
     /// Clipboard text this presenter accepted, in acceptance order. A refused write leaves no
     /// trace here, so asserting on this is asserting the guard allowed it.
     clipboard: Vec<String>,
+    /// Each window's semantic tree, retired when the scene it described is replaced.
+    semantics: HashMap<SurfaceIdentity, Semantics>,
 }
 
 /// The producer names its own session with a placeholder presenter instance, so the presenter
@@ -357,6 +359,39 @@ impl Overlays {
             .map_err(|_| "overlay status could not be encoded")
     }
 
+    /// A semantic tree, refused unless it describes the scene the window is showing.
+    pub(crate) fn set_semantics(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> OverlayReply {
+        let owner = owner(session_id);
+        let Ok(request) = SetSemantics::decode(object_id, &Value::Map(payload.clone())) else {
+            return Err("invalid overlay semantics");
+        };
+        let Ok(id) = request.address.identity(owner) else {
+            return Err("invalid overlay identity");
+        };
+        let Some(window) = self.windows.get(id) else {
+            return Err("overlay window is absent");
+        };
+        if window.generation != request.address.generation {
+            return Err("stale overlay window generation");
+        }
+        let presented = self.displayed.get(&id).map_or(0, |scene| scene.revision);
+        if request.semantics.scene_revision != presented {
+            return Err("semantics must describe the currently published scene");
+        }
+        self.semantics.insert(id, request.semantics);
+        Ok((messages::OK, Vec::new()))
+    }
+
+    /// Every window with a live semantic tree, in a stable order.
+    pub(crate) fn windows_with_semantics(&self) -> Vec<(&SurfaceIdentity, &Semantics)> {
+        self.semantics.iter().collect()
+    }
+
     /// A clipboard write, refused with the reason a real host would give.
     pub(crate) fn set_clipboard(
         &mut self,
@@ -382,6 +417,50 @@ impl Overlays {
         }
         self.clipboard.push(request.text);
         Ok((messages::OK, Vec::new()))
+    }
+
+    /// Queue an action for the producer, as the accessibility adapter does.
+    pub(crate) fn queue_accessibility(
+        &mut self,
+        window: SurfaceIdentity,
+        node: u64,
+        action: AccessibleAction,
+    ) -> bool {
+        let Some(current) = self.windows.get(window) else {
+            return false;
+        };
+        // An adapter builds its tree from what was published, so a node the live tree no longer
+        // names is one the user is not looking at: the scene was replaced while the asker held
+        // the old tree.
+        if !self
+            .semantics
+            .get(&window)
+            .is_some_and(|tree| tree.nodes.iter().any(|n| n.id == node))
+        {
+            return false;
+        }
+        let event = vivid_protocol::overlay::wire::InputEvent {
+            address: vivid_protocol::overlay::wire::WindowAddress {
+                context_id: window.context.context_id,
+                surface_id: window.surface_id,
+                generation: current.generation,
+            },
+            scene_revision: self
+                .displayed
+                .get(&window)
+                .map_or(0, |scene| scene.revision),
+            event: Event::Accessibility { node, action },
+        };
+        let Ok(payload) = event.payload() else {
+            return false;
+        };
+        // The lane flush writes whatever is pending; this presenter serves one session.
+        self.pending.push(LaneRecord {
+            record_type: messages::OVERLAY_INPUT_EVENT,
+            object_id: window.surface_id,
+            payload,
+        });
+        true
     }
 
     /// Whether a clipboard write from this window would be honored. This presenter applies the
@@ -497,6 +576,8 @@ impl Overlays {
         {
             return false;
         }
+        // A tree described the scene that was just replaced, so it no longer describes anything.
+        self.semantics.remove(&window);
         self.displayed.insert(
             window,
             PresentedScene {

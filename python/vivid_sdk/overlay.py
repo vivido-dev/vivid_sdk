@@ -178,6 +178,41 @@ class StrokeStyle:
     dashes: Tuple[float, ...] = ()
     dash_offset: float = 0.0
 
+SemanticRole = Literal[
+    "generic", "application", "group", "heading", "text", "button", "switch",
+    "checkbox", "radio-button", "text-input", "slider", "spin-button",
+    "progress-indicator", "list", "list-item", "image", "link", "dialog", "tab",
+    "separator",
+]
+AccessibleAction = Literal[
+    "default", "focus", "click", "increment", "decrement", "expand", "collapse",
+]
+Toggled = Literal["off", "on", "mixed"]
+
+@dataclass(frozen=True)
+class SemanticNode:
+    """One node of an application's own accessibility tree.
+
+    Node IDs are the application's, so an action arrives naming the same ID it published here.
+    """
+    id: int
+    role: SemanticRole
+    bounds: Rect
+    label: str = ""
+    numeric: Optional[Tuple[float, float, float]] = None
+    level: Optional[int] = None
+    set: Optional[Tuple[int, int]] = None
+    toggled: Optional[Toggled] = None
+    disabled: bool = False
+    actions: Tuple[AccessibleAction, ...] = ()
+    children: Tuple[int, ...] = ()
+
+@dataclass(frozen=True)
+class Semantics:
+    """A complete tree for one published scene revision. A node it omits stops existing."""
+    scene_revision: int
+    nodes: Tuple[SemanticNode, ...]
+
 class Canvas:
     def __init__(self) -> None: self._raw = _native.OverlayCanvas()
     def snapshot(self) -> Canvas:
@@ -423,6 +458,12 @@ class Environment:
     refresh_interval_us: Optional[float]
 
 @dataclass(frozen=True)
+class AccessibilityEvent(OverlayEvent):
+    kind: ClassVar[str] = "accessibility"
+    application_id: int
+    action: AccessibleAction
+
+@dataclass(frozen=True)
 class EnvironmentEvent(OverlayEvent):
     kind: ClassVar[str] = "environment"
     environment: Environment
@@ -455,6 +496,7 @@ def _event(raw: Any) -> OverlayEvent:
             int(values[3]), pressure,
         )
     if kind == "hover": return HoverEvent(revision, raw, data["region"], bool(values[0]))
+    if kind == "accessibility": return AccessibilityEvent(revision, raw, data["region"], data["text"])
     if kind == "environment":
         return EnvironmentEvent(
             revision, raw,
@@ -528,6 +570,29 @@ class OverlayWindow:
     def measure_text(self, text: str, size: float, *, family: str = "", weight: int = 400, italic: bool = False, max_width: Optional[float] = None) -> TextMeasurement:
         canvas = Canvas().text(text, Point(0, 0), size, 0xFFFFFFFF, family=family, weight=weight, italic=italic, max_width=max_width)
         return _text_measurement(self._raw.measure_text(canvas._raw))
+    def set_semantics(self, semantics: Semantics) -> None:
+        """Publish this window's accessibility tree for the scene revision it describes.
+
+        The host refuses a tree whose revision is not the currently published scene, so assistive
+        technology is never told about a control that is not on screen. Actions arrive as
+        `AccessibilityEvent` naming the application's own node ID.
+        """
+        self._raw.set_semantics(
+            semantics.scene_revision,
+            [
+                _native.OverlaySemanticNode(
+                    node.id, node.role, node.bounds._values(), node.label,
+                    list(node.numeric) if node.numeric else None,
+                    node.level,
+                    list(node.set) if node.set else None,
+                    node.toggled,
+                    node.disabled,
+                    list(node.actions),
+                    list(node.children),
+                )
+                for node in semantics.nodes
+            ],
+        )
     def set_clipboard(self, text: str) -> None:
         """Place text on the user's clipboard.
 

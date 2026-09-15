@@ -1,5 +1,6 @@
 //! Shared conversion helpers for the Python and Node overlay bindings. No language callbacks.
 use std::io;
+use vivid_protocol::overlay::{AccessibleAction, SemanticNode, SemanticRole, Semantics, Toggled};
 use vivid_protocol::vector::*;
 use vivid_sdk::overlay::{OverlayWindowOptions, WindowMode};
 
@@ -442,6 +443,123 @@ pub fn stroke_style(
             .map_err(|_| invalid("dash offset is out of range"))?,
     })
 }
+/// One semantic node as a language binding hands it over, before validation.
+pub struct SemanticNodeInput {
+    pub id: u64,
+    pub role: String,
+    pub bounds: Vec<f64>,
+    pub label: String,
+    pub numeric: Option<Vec<f64>>,
+    pub level: Option<u8>,
+    pub set: Option<Vec<u16>>,
+    pub toggled: Option<String>,
+    pub disabled: bool,
+    pub actions: Vec<String>,
+    pub children: Vec<u32>,
+}
+
+/// A complete semantic tree from the language-side nodes.
+pub fn semantics(scene_revision: u64, nodes: Vec<SemanticNodeInput>) -> io::Result<Semantics> {
+    let mut parsed = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let numeric = match node.numeric {
+            None => None,
+            Some(values) => {
+                let [value, minimum, maximum] = values.as_slice() else {
+                    return Err(invalid("numeric requires value, minimum and maximum"));
+                };
+                Some([
+                    Scalar::new(*value).map_err(|_| invalid("numeric value is out of range"))?,
+                    Scalar::new(*minimum)
+                        .map_err(|_| invalid("numeric minimum is out of range"))?,
+                    Scalar::new(*maximum)
+                        .map_err(|_| invalid("numeric maximum is out of range"))?,
+                ])
+            }
+        };
+        let set = match node.set {
+            None => None,
+            Some(values) => {
+                let [position, size] = values.as_slice() else {
+                    return Err(invalid("a set requires a position and a size"));
+                };
+                Some([*position, *size])
+            }
+        };
+        let toggled = match node.toggled.as_deref() {
+            None => None,
+            Some("off") => Some(Toggled::Off),
+            Some("on") => Some(Toggled::On),
+            Some("mixed") => Some(Toggled::Mixed),
+            Some(_) => return Err(invalid("toggled is off, on, or mixed")),
+        };
+        let actions = node
+            .actions
+            .iter()
+            .map(|action| accessible_action(action))
+            .collect::<io::Result<Vec<_>>>()?;
+        parsed.push(SemanticNode {
+            id: node.id,
+            role: semantic_role(&node.role)?,
+            bounds: rect(&node.bounds)?,
+            label: node.label,
+            numeric,
+            level: node.level,
+            set,
+            toggled,
+            disabled: node.disabled,
+            actions,
+            children: node.children,
+        });
+    }
+    let semantics = Semantics {
+        scene_revision,
+        nodes: parsed,
+    };
+    semantics.validate().map_err(io::Error::other)?;
+    Ok(semantics)
+}
+
+/// The protocol's closed role set by name, so a binding cannot invent one.
+fn semantic_role(role: &str) -> io::Result<SemanticRole> {
+    Ok(match role {
+        "generic" => SemanticRole::Generic,
+        "application" => SemanticRole::Application,
+        "group" => SemanticRole::Group,
+        "heading" => SemanticRole::Heading,
+        "text" => SemanticRole::Text,
+        "button" => SemanticRole::Button,
+        "switch" => SemanticRole::Switch,
+        "checkbox" => SemanticRole::CheckBox,
+        "radio-button" => SemanticRole::RadioButton,
+        "text-input" => SemanticRole::TextInput,
+        "slider" => SemanticRole::Slider,
+        "spin-button" => SemanticRole::SpinButton,
+        "progress-indicator" => SemanticRole::ProgressIndicator,
+        "list" => SemanticRole::List,
+        "list-item" => SemanticRole::ListItem,
+        "image" => SemanticRole::Image,
+        "link" => SemanticRole::Link,
+        "dialog" => SemanticRole::Dialog,
+        "tab" => SemanticRole::Tab,
+        "separator" => SemanticRole::Separator,
+        _ => return Err(invalid("unknown semantic role")),
+    })
+}
+
+fn accessible_action(action: &str) -> io::Result<AccessibleAction> {
+    Ok(match action {
+        "default" => AccessibleAction::Default,
+        "focus" => AccessibleAction::Focus,
+        "click" => AccessibleAction::Click,
+        "increment" => AccessibleAction::Increment,
+        "decrement" => AccessibleAction::Decrement,
+        "expand" => AccessibleAction::Expand,
+        "collapse" => AccessibleAction::Collapse,
+        _ => return Err(invalid("unknown accessible action")),
+    })
+}
+
 pub fn state(kind: &str, values: &[f64]) -> io::Result<Command> {
     match (kind, values) {
         ("save", []) => Ok(Command::Save),
@@ -500,6 +618,20 @@ pub fn timeout(seconds: f64) -> io::Result<std::time::Duration> {
     std::time::Duration::try_from_secs_f64(seconds).map_err(io::Error::other)
 }
 
+/// The language-facing name of an accessible action.
+fn accessible_action_name(action: vivid_sdk::overlay::AccessibleAction) -> &'static str {
+    use vivid_sdk::overlay::AccessibleAction as Action;
+    match action {
+        Action::Default => "default",
+        Action::Focus => "focus",
+        Action::Click => "click",
+        Action::Increment => "increment",
+        Action::Decrement => "decrement",
+        Action::Expand => "expand",
+        Action::Collapse => "collapse",
+    }
+}
+
 /// The language-facing scroll phase index, matching the protocol's wire order.
 fn scroll_phase(phase: vivid_sdk::overlay::ScrollPhase) -> u8 {
     use vivid_sdk::overlay::ScrollPhase;
@@ -543,6 +675,11 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
                     f64::from(v.scale_numerator),
                     f64::from(v.scale_denominator),
                 ];
+            }
+            vivid_sdk::OverlayLaneEvent::Accessibility { node, action, .. } => {
+                data.kind = "accessibility";
+                data.region = *node;
+                data.text = accessible_action_name(*action).to_owned();
             }
             vivid_sdk::OverlayLaneEvent::Environment(update) => {
                 data.kind = "environment";
@@ -601,6 +738,11 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
             }
             // Absent pressure is reported as a negative sentinel, which no real value can be.
             data.values.push(pressure.map_or(-1., |p| p.get()));
+        }
+        Event::Accessibility { node, action } => {
+            data.kind = "accessibility";
+            data.region = *node;
+            data.text = accessible_action_name(*action).to_owned();
         }
         Event::Hover { region, entered } => {
             data.kind = "hover";

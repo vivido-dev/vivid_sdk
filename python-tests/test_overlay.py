@@ -211,3 +211,31 @@ def test_environment_events_decode_with_honest_absence() -> None:
     assert unknown.environment.appearance == "light"
     assert unknown.environment.reduced_motion is None
     assert unknown.environment.refresh_interval_us is None
+
+def test_semantics_validate_locally_and_refuse_a_stale_revision() -> None:
+    from vivid_sdk.overlay import AccessibleAction, SemanticNode, SemanticRole, Semantics
+    node = SemanticNode(1, "group", Rect(0, 0, 10, 10))
+    with OverlaySession.connect(dry_run=True) as session:
+        window = session.create_window(OverlayWindowOptions(Rect(0, 0, 100, 80)))
+        # A dry-run session has no assistive technology to describe anything to.
+        with pytest.raises((ValueError, OSError)):
+            window.set_semantics(Semantics(1, (node,)))
+        # A malformed tree is refused locally rather than sent: the host would refuse it too.
+        with pytest.raises((ValueError, OSError)):
+            window.set_semantics(
+                Semantics(1, (SemanticNode(1, "group", Rect(0, 0, 10, 10), children=(0,)),))
+            )
+        with pytest.raises((ValueError, OSError)):
+            window.set_semantics(Semantics(1, (SemanticNode(0, "group", Rect(0, 0, 10, 10)),)))
+        with pytest.raises((ValueError, OSError)):
+            window.set_semantics(
+                Semantics(1, (SemanticNode(1, "group", Rect(0, 0, 10, 10), set=(3, 2)),))
+            )
+        # The optional detail survives the round trip through the native layer.
+        spin = SemanticNode(
+            2, "spin-button", Rect(0, 0, 10, 10), "Count",
+            numeric=(5.0, 0.0, 10.0), toggled="mixed",
+            actions=("increment", "decrement"),
+        )
+        assert spin.numeric == (5.0, 0.0, 10.0)
+        assert AccessibleAction is not None and SemanticRole is not None

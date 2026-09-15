@@ -285,6 +285,57 @@ currently reports absence here, because it has no reduced-motion signal to read.
 still respect its own track's record ceiling, which may be lower: a 60 rec/s track does not
 become faster because the display refreshes at 144 Hz.
 
+## Application semantics
+
+Connection helpers optionally negotiate `overlay-a11y-v1`. It publishes a bounded tree describing
+what the overlay is showing, so a screen reader sees named controls instead of a single opaque
+canvas. Rust calls `window.set_semantics(&semantics)`, Python `window.set_semantics(semantics)`,
+and TypeScript `await window.setSemantics(semantics)`. Unsupported hosts fail explicitly with
+`presenter does not support overlay-a11y-v1`.
+
+A tree describes exactly one published scene, and says which: `scene_revision` must be the
+revision of the scene currently shown. A tree naming any other revision is refused rather than
+stored, so a producer cannot describe a frame the user is not looking at. Publishing a new scene
+retires its tree until the next one is set — a stale description is worse than no description,
+because it would announce a button that no longer exists at a position where something else is.
+
+Node IDs are the application's own, nonzero and unique within the tree. They are what comes back
+when a user acts, so they need not relate to hit-region IDs or to scene revisions. Roles are a
+closed set — generic, application, group, heading, text, button, switch, checkbox, radio button,
+text input, slider, spin button, progress indicator, list, list item, image, link, dialog, tab,
+separator — and an unknown role is rejected. Actions are a closed set of seven: default, focus,
+click, increment, decrement, expand, collapse. Each has a counterpart in the toolkits a host
+builds on; nothing is advertised that a host would then have to ignore.
+
+The tree is kept acyclic and complete by construction rather than by a traversal:
+
+- A child index is **strictly greater** than its parent's index, so no cycle is possible.
+- Every node except the root is claimed as a child exactly once. There are no orphans, so the
+  root reaches everything.
+- Depth is bounded separately, because index ordering alone does not bound it. A chain of 256
+  nodes each numbered above its parent satisfies the first rule and is still refused.
+
+The remaining bounds are 256 nodes, 32 levels, a 256-byte label, three optional numerics
+(value, minimum, maximum) that must be ordered, and a bounded action list per node. Set
+membership (`position_in_set` / `size_of_set`) is checked against its own size. Bounds and every
+child index are validated with checked arithmetic before anything is stored or walked.
+
+An action the user takes arrives on the interactive lane as `OVERLAY_INPUT_EVENT` type 10 carrying
+the node ID and the action. Rust reports `OverlayLaneEvent::Accessibility { address,
+scene_revision, node, action }`, Python an `AccessibilityEvent`, TypeScript `kind:
+"accessibility"`. The node ID is the application's own, so a handler dispatches on it directly.
+An action is only ever delivered for a node the window's live tree still names, so an asker
+holding a tree from before a scene was replaced is refused rather than sending an action for a
+control that is no longer on screen. The `scene_revision` on the event says which scene the node
+belonged to.
+
+Vivido maps the tree into its existing AccessKit adapter: overlay nodes become children of the
+window root, and a user action routes back to the producer as the event above. That path is Linux
+and Windows only. On macOS the native adapter builds its own tree from the terminal snapshot and
+never reads the overlay nodes, so a tree set there is accepted, validated and reported in
+`inspect`, but reaches no assistive technology and returns no actions. Publishing one is not an
+error there; it is simply not yet visible.
+
 ## Host text measurement and editor geometry
 
 Connection helpers optionally negotiate `overlay-text-v1`. Measurement and editor operations
@@ -491,8 +542,9 @@ overlay focus, Unicode typing, and a physical IME cursor area derived from the f
 reported logical editor rectangle `(112,186,2,24)` became physical `(140,232.5,2.5,30)`. The native
 accessibility adapter now remains installed on Windows and Linux with a bounded window tree even
 though retained terminal scrollback is disabled there; while an overlay owns focus, the terminal
-is no longer exposed as the focused accessibility element. Low-level Canvas windows do not yet
-publish application semantic nodes.
+is no longer exposed as the focused accessibility element. Canvas windows describe nothing on
+their own: an overlay that negotiates `overlay-a11y-v1` publishes a bounded tree, and assistive
+technology reading it has not yet been verified on either platform.
 
 The release-mode movement benchmark
 `cargo test --release -p vivido vivid::tests::overlay_window_movement_performance_measurement -- --ignored --exact --nocapture`
@@ -504,8 +556,9 @@ recompiles content.
 
 Remaining platform acceptance is native IME candidate UI and assistive-technology interaction on
 Windows, macOS VoiceOver and IME, Linux Wayland IME/accessibility, and pressure-capable pointer
-hardware. The declarative UI engine will supply bounded application semantic trees and editable
-selection/copy actions; those are not inferred from low-level drawing commands.
+hardware. The declarative UI engine will supply editable selection and copy actions for text it lays out;
+nothing is inferred from low-level drawing commands, so an overlay that draws a button without
+describing one is not announced as a button.
 
 The new socket integration regression exercises two producers reusing local IDs, window movement,
 modal focus protection, popup dismissal, IME event delivery, capture, and independent cleanup.

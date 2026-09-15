@@ -684,3 +684,201 @@ fn an_environment_snapshot_precedes_the_first_viewport_and_carries_a_revision() 
 
     overlays.close().unwrap();
 }
+
+#[test]
+fn a_semantic_tree_reaches_the_host_and_an_action_comes_back() {
+    use vivid_sdk::overlay::{AccessibleAction, SemanticNode, SemanticRole, Semantics};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 200., 100.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let receipt = window.submit(panel().0).unwrap();
+    receipt.wait(Duration::from_secs(5)).unwrap();
+
+    let mut spin = SemanticNode {
+        id: 7,
+        role: SemanticRole::SpinButton,
+        bounds: Rect::new(10., 10., 60., 20.).unwrap(),
+        label: "Count".to_owned(),
+        numeric: Some([
+            Scalar::new(5.).unwrap(),
+            Scalar::new(0.).unwrap(),
+            Scalar::new(10.).unwrap(),
+        ]),
+        level: None,
+        set: None,
+        toggled: None,
+        disabled: false,
+        actions: vec![AccessibleAction::Increment, AccessibleAction::Decrement],
+        children: Vec::new(),
+    };
+    spin.set = None;
+    let semantics = Semantics {
+        scene_revision: receipt.revision(),
+        nodes: vec![
+            SemanticNode {
+                id: 1,
+                role: SemanticRole::Application,
+                bounds: Rect::new(0., 0., 200., 100.).unwrap(),
+                label: "Panel".to_owned(),
+                numeric: None,
+                level: None,
+                set: None,
+                toggled: None,
+                disabled: false,
+                actions: Vec::new(),
+                children: vec![1],
+            },
+            spin,
+        ],
+    };
+    window.set_semantics(&semantics).unwrap();
+    assert_eq!(presenter.overlay_semantics(), Some(semantics));
+
+    // Assistive technology invoking a node reaches the producer as its own event.
+    assert!(
+        presenter
+            .overlay_accessibility_action(7, AccessibleAction::Increment)
+            .unwrap()
+    );
+    let mut seen = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Accessibility { node, action, .. } = event {
+            seen = Some((node, action));
+            break;
+        }
+    }
+    assert_eq!(seen, Some((7, AccessibleAction::Increment)));
+
+    // A node the live tree does not name is refused rather than sent: an adapter that asks about
+    // one is holding a tree the host no longer describes anything with.
+    assert!(
+        !presenter
+            .overlay_accessibility_action(8, AccessibleAction::Click)
+            .unwrap()
+    );
+
+    // A tree that described the scene just replaced describes nothing. The publish travels on
+    // the bulk channel, so the receipt is what says it landed.
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(presenter.overlay_semantics(), None);
+
+    // An action naming a node the live tree no longer describes is refused rather than sent: the
+    // asker is holding a tree the host has already retired.
+    assert!(
+        !presenter
+            .overlay_accessibility_action(7, AccessibleAction::Click)
+            .unwrap()
+    );
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_stale_semantic_tree_is_refused() {
+    use vivid_sdk::overlay::{SemanticNode, SemanticRole, Semantics};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    // Nothing has been published, so no revision is current.
+    let error = window
+        .set_semantics(&Semantics {
+            scene_revision: 1,
+            nodes: vec![SemanticNode {
+                id: 1,
+                role: SemanticRole::Group,
+                bounds: Rect::new(0., 0., 10., 10.).unwrap(),
+                label: String::new(),
+                numeric: None,
+                level: None,
+                set: None,
+                toggled: None,
+                disabled: false,
+                actions: Vec::new(),
+                children: Vec::new(),
+            }],
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("published scene"),
+        "unexpected diagnosis: {error}"
+    );
+    assert_eq!(presenter.overlay_semantics(), None);
+
+    overlays.close().unwrap();
+}
+
+/// One node at `id`, describing a scene at `scene_revision`, with the app's own identity in it.
+fn describing(scene_revision: u64, id: u64) -> vivid_sdk::overlay::Semantics {
+    use vivid_sdk::overlay::{SemanticNode, SemanticRole, Semantics};
+
+    Semantics {
+        scene_revision,
+        nodes: vec![SemanticNode {
+            id,
+            role: SemanticRole::Group,
+            bounds: Rect::new(0., 0., 100., 100.).unwrap(),
+            label: format!("owner {id}"),
+            numeric: None,
+            level: None,
+            set: None,
+            toggled: None,
+            disabled: false,
+            actions: Vec::new(),
+            children: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn a_semantic_tree_is_refused_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    // A plain scene, since this session deliberately did not negotiate the pointer profile
+    // either.
+    let mut plain = Canvas::new();
+    plain
+        .fill(
+            Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            Brush::Solid(Color(0x203050ff)),
+        )
+        .unwrap();
+    window
+        .submit(plain)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // Refused before anything is sent, so the producer gets a local diagnosis rather than a
+    // channel failure, and the host is never asked to describe a window to assistive technology.
+    let error = window.set_semantics(&describing(1, 1)).unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-a11y-v1"),
+        "unexpected diagnosis: {error}"
+    );
+    assert!(presenter.overlay_semantics().is_none());
+
+    overlays.close().unwrap();
+}

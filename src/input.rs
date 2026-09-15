@@ -644,6 +644,13 @@ pub enum OverlayLaneEvent {
     Viewport(vivid_protocol::overlay::wire::ViewportChanged),
     /// The host's defaults: its font, appearance, motion preference, and display rate.
     Environment(vivid_protocol::overlay::wire::EnvironmentChanged),
+    /// Assistive technology invoked one of the application's semantic nodes.
+    Accessibility {
+        address: vivid_protocol::overlay::wire::WindowAddress,
+        scene_revision: u64,
+        node: u64,
+        action: vivid_protocol::overlay::AccessibleAction,
+    },
     ConnectionLost {
         diagnostic: String,
     },
@@ -793,12 +800,27 @@ impl OverlayInputLane {
                 record_type: messages::OVERLAY_INPUT_EVENT,
                 surface_id,
                 payload,
-            }) => Ok(Some(OverlayLaneEvent::Input(
-                vivid_protocol::overlay::wire::InputEvent::decode(
+            }) => {
+                let input = vivid_protocol::overlay::wire::InputEvent::decode(
                     surface_id,
                     &Value::Map(payload),
-                )?,
-            ))),
+                )?;
+                // An assistive-technology action rides the input lane but is not pointer traffic,
+                // so it is surfaced as itself rather than as a pointer event with no position.
+                match input.event {
+                    vivid_protocol::overlay::Event::Accessibility { node, action } => {
+                        Ok(Some(OverlayLaneEvent::Accessibility {
+                            address: input.address,
+                            scene_revision: input.scene_revision,
+                            node,
+                            action,
+                        }))
+                    }
+                    event => Ok(Some(OverlayLaneEvent::Input(
+                        vivid_protocol::overlay::wire::InputEvent { event, ..input },
+                    ))),
+                }
+            }
             Some(InputLaneEvent::LaneClosed { diagnostic }) => {
                 Ok(Some(OverlayLaneEvent::ConnectionLost { diagnostic }))
             }

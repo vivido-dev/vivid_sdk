@@ -161,3 +161,32 @@ test("environment events decode with honest absence", () => {
   assert.equal(unknown.environment.reducedMotion, undefined);
   assert.equal(unknown.environment.refreshIntervalUs, undefined);
 });
+
+test("semantic trees validate locally before they reach a host", async () => {
+  const session = await OverlaySession.connect({ offline: true });
+  try {
+    const window = await session.createWindow({ bounds: rect });
+    const group = { id: 1n, role: "group", bounds: rect };
+    // A dry-run session has no assistive technology to describe anything to.
+    await assert.rejects(window.setSemantics({ sceneRevision: 1n, nodes: [group] }));
+    // Structural rules are enforced locally, not just by the host: a child must follow its
+    // parent, so a self-parenting node cannot be built at all.
+    await assert.rejects(
+      window.setSemantics({ sceneRevision: 1n, nodes: [{ ...group, children: [0] }] }),
+    );
+    // Zero is not an identity.
+    await assert.rejects(
+      window.setSemantics({ sceneRevision: 1n, nodes: [{ ...group, id: 0n }] }),
+    );
+    // A set position outside its size.
+    await assert.rejects(
+      window.setSemantics({ sceneRevision: 1n, nodes: [{ ...group, set: [3, 2] }] }),
+    );
+    // An unknown role is refused rather than mapped onto something generic.
+    await assert.rejects(
+      window.setSemantics({ sceneRevision: 1n, nodes: [{ ...group, role: "wand" }] }),
+    );
+  } finally {
+    await session.close();
+  }
+});

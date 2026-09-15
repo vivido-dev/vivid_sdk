@@ -369,6 +369,34 @@ impl PyOverlayWindow {
         py.detach(|| self.inner.release_text_layout(layout))
             .map_err(io_error)
     }
+    /// Publish this window's accessibility tree for the scene revision it describes.
+    fn set_semantics(
+        &self,
+        py: Python<'_>,
+        scene_revision: u64,
+        nodes: Vec<PyRef<PySemanticNode>>,
+    ) -> PyResult<()> {
+        let nodes = nodes
+            .iter()
+            .map(|node| model::SemanticNodeInput {
+                id: node.id,
+                role: node.role.clone(),
+                bounds: node.bounds.clone(),
+                label: node.label.clone(),
+                numeric: node.numeric.clone(),
+                level: node.level,
+                set: node.set.clone(),
+                toggled: node.toggled.clone(),
+                disabled: node.disabled,
+                actions: node.actions.clone(),
+                children: node.children.clone(),
+            })
+            .collect();
+        let semantics = model::semantics(scene_revision, nodes).map_err(value_error)?;
+        py.detach(|| self.inner.set_semantics(&semantics))
+            .map_err(io_error)
+    }
+
     /// Place text on the user's clipboard. Requires overlay-clipboard-v1, and the host honors
     /// it only for a focused window just after a key or pointer press it delivered there.
     fn set_clipboard(&self, py: Python<'_>, text: String) -> PyResult<()> {
@@ -523,6 +551,7 @@ impl PyOverlayEvent {
 }
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStyledText>()?;
+    module.add_class::<PySemanticNode>()?;
     module.add_class::<PyTextLayout>()?;
     module.add_class::<PyCanvas>()?;
     module.add_class::<PyOverlaySession>()?;
@@ -531,6 +560,56 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyOverlayEvent>()?;
     module.add_class::<PyOverlaySubmission>()?;
     Ok(())
+}
+
+/// One node of an application accessibility tree. Built natively, like styled text, because a
+/// node carries too much optional detail to cross as a positional tuple.
+#[pyclass(name = "OverlaySemanticNode", module = "vivid_sdk._native")]
+struct PySemanticNode {
+    id: u64,
+    role: String,
+    bounds: Vec<f64>,
+    label: String,
+    numeric: Option<Vec<f64>>,
+    level: Option<u8>,
+    set: Option<Vec<u16>>,
+    toggled: Option<String>,
+    disabled: bool,
+    actions: Vec<String>,
+    children: Vec<u32>,
+}
+#[pymethods]
+impl PySemanticNode {
+    #[new]
+    #[pyo3(signature = (id, role, bounds, label, numeric, level, set, toggled, disabled, actions, children))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: u64,
+        role: String,
+        bounds: Vec<f64>,
+        label: String,
+        numeric: Option<Vec<f64>>,
+        level: Option<u8>,
+        set: Option<Vec<u16>>,
+        toggled: Option<String>,
+        disabled: bool,
+        actions: Vec<String>,
+        children: Vec<u32>,
+    ) -> Self {
+        Self {
+            id,
+            role,
+            bounds,
+            label,
+            numeric,
+            level,
+            set,
+            toggled,
+            disabled,
+            actions,
+            children,
+        }
+    }
 }
 
 #[pyclass(name = "OverlayStyledText", module = "vivid_sdk._native")]

@@ -117,6 +117,9 @@ fn main() -> io::Result<()> {
             // Submission outcomes and viewport snapshots share this lane; a drawing-only
             // example has nothing to do with them.
             OverlayLaneEvent::Outcome(_) | OverlayLaneEvent::Viewport(_) => {}
+            // An action can only come back for a semantic tree this window published, and a
+            // drawing-only example publishes none.
+            OverlayLaneEvent::Accessibility { .. } => {}
         }
     }
 

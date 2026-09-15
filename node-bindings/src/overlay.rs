@@ -405,6 +405,36 @@ impl OverlayWindow {
         let window = self.inner.clone();
         blocking(move || window.release_text_layout(&layout).map_err(io_error)).await
     }
+    /// Publish this window's accessibility tree for the scene revision it describes.
+    #[napi]
+    pub async fn set_semantics(
+        &self,
+        scene_revision: BigInt,
+        nodes: Vec<SemanticNodeInput>,
+    ) -> Result<()> {
+        let revision = u64::try_from(scene_revision.get_i64().0)
+            .map_err(|_| value_error("scene revision is out of range"))?;
+        let nodes = nodes
+            .into_iter()
+            .map(|node| model::SemanticNodeInput {
+                id: u64::try_from(node.id.get_i64().0).unwrap_or(u64::MAX),
+                role: node.role,
+                bounds: node.bounds,
+                label: node.label,
+                numeric: node.numeric,
+                level: node.level,
+                set: node.set,
+                toggled: node.toggled,
+                disabled: node.disabled,
+                actions: node.actions,
+                children: node.children,
+            })
+            .collect();
+        let semantics = model::semantics(revision, nodes).map_err(value_error)?;
+        let window = self.inner.clone();
+        blocking(move || window.set_semantics(&semantics).map_err(io_error)).await
+    }
+
     /// Place text on the user's clipboard. Requires overlay-clipboard-v1, and the host honors
     /// it only for a focused window just after a key or pointer press it delivered there.
     #[napi]
@@ -539,6 +569,21 @@ impl OverlayImage {
     pub fn id(&self) -> BigInt {
         BigInt::from(self.inner.id())
     }
+}
+/// One node of an application accessibility tree.
+#[napi(object)]
+pub struct SemanticNodeInput {
+    pub id: BigInt,
+    pub role: String,
+    pub bounds: Vec<f64>,
+    pub label: String,
+    pub numeric: Option<Vec<f64>>,
+    pub level: Option<u8>,
+    pub set: Option<Vec<u16>>,
+    pub toggled: Option<String>,
+    pub disabled: bool,
+    pub actions: Vec<String>,
+    pub children: Vec<u32>,
 }
 #[napi(object)]
 pub struct OverlayWindowStatus {

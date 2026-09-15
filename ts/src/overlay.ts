@@ -10,6 +10,48 @@ export interface Viewport { readonly width: number; readonly height: number; rea
 export type WindowMode = "floating" | "popup" | "modal";
 export type HitRole = "input" | "drag" | "resize" | "transparent";
 export type ScrollPhase = "none" | "began" | "changed" | "ended" | "cancelled";
+export type SemanticRole =
+  | "generic" | "application" | "group" | "heading" | "text" | "button" | "switch"
+  | "checkbox" | "radio-button" | "text-input" | "slider" | "spin-button"
+  | "progress-indicator" | "list" | "list-item" | "image" | "link" | "dialog" | "tab"
+  | "separator";
+export type AccessibleActionName =
+  | "default" | "focus" | "click" | "increment" | "decrement" | "expand" | "collapse";
+export type ToggledState = "off" | "on" | "mixed";
+/** One node of an application's own accessibility tree. Node IDs are the application's, so an
+ * action arrives naming the same ID it published here. */
+export interface SemanticNode {
+  readonly id: bigint;
+  readonly role: SemanticRole;
+  readonly bounds: Rect;
+  readonly label?: string;
+  readonly numeric?: readonly [number, number, number];
+  readonly level?: number;
+  readonly set?: readonly [number, number];
+  readonly toggled?: ToggledState;
+  readonly disabled?: boolean;
+  readonly actions?: readonly AccessibleActionName[];
+  readonly children?: readonly number[];
+}
+/** A complete tree for one published scene revision. A node it omits stops existing. */
+export interface Semantics {
+  readonly sceneRevision: bigint;
+  readonly nodes: readonly SemanticNode[];
+}
+/** @internal The native shape; bigint and tuples do not cross the addon. */
+interface SemanticNodeInput {
+  id: bigint;
+  role: string;
+  bounds: number[];
+  label: string;
+  numeric?: number[];
+  level?: number;
+  set?: number[];
+  toggled?: string;
+  disabled: boolean;
+  actions: string[];
+  children: number[];
+}
 export type Appearance = "light" | "dark";
 /** The host's defaults. `reducedMotion` and `refreshIntervalUs` are absent when the host cannot
  * read them, which is a different claim from the user having expressed none. */
@@ -59,6 +101,7 @@ interface NativeWindow {
   releaseTextLayout(layout: NativeTextLayout): Promise<void>;
   measureText(canvas: NativeCanvas): Promise<{ width: number; height: number; lines: number[][]; clusters: number[][] }>;
   setClipboard(text: string): Promise<void>;
+  setSemantics(sceneRevision: bigint, nodes: SemanticNodeInput[]): Promise<void>;
   setEditorGeometry(sceneRevision: bigint, caret?: number[]): Promise<void>;
   submit(canvas: NativeCanvas): Promise<NativeSubmission>;
   replaceTrack(canvas: NativeCanvas): Promise<NativeSubmission>;
@@ -268,6 +311,7 @@ export type OverlayEvent = EventBase & (
   | { readonly kind: "pointer"; readonly position: Point; readonly applicationId: bigint; readonly modifiers: number; readonly button?: number; readonly down?: boolean; readonly clicks: number; readonly pressure?: number }
   | { readonly kind: "hover"; readonly applicationId: bigint; readonly entered: boolean }
   | { readonly kind: "environment"; readonly environment: Environment }
+  | { readonly kind: "accessibility"; readonly applicationId: bigint; readonly action: AccessibleActionName }
   | { readonly kind: "wheel"; readonly position: Point; readonly dx: number; readonly dy: number; readonly modifiers: number; readonly precise: boolean; readonly phase: ScrollPhase }
   | { readonly kind: "key"; readonly physical: number; readonly down: boolean; readonly repeat: boolean; readonly modifiers: number }
   | { readonly kind: "text"; readonly text: string }
@@ -300,6 +344,7 @@ export function decodeOverlayEvent(raw: NativeEvent): OverlayEvent {
       pressure: v[v.length - 1]! >= 0 ? v[v.length - 1] : undefined,
     };
     case "hover": return { ...base, kind: "hover", applicationId: data.region, entered: Boolean(v[0]) };
+    case "accessibility": return { ...base, kind: "accessibility", applicationId: data.region, action: data.text as AccessibleActionName };
     // The revision rides in the values as a float; revisions stay exact well past 2^53.
     case "environment": return {
       ...base, kind: "environment",
@@ -388,6 +433,25 @@ export class OverlayWindow {
    */
   async setClipboard(text: string): Promise<void> {
     await call(this.raw.setClipboard(text));
+  }
+
+  /** Publish this window's accessibility tree for the scene revision it describes.
+   *
+   * The host refuses a tree whose revision is not the currently published scene, so assistive
+   * technology is never told about a control that is not on screen. Actions arrive as
+   * `kind: "accessibility"` naming the application's own node ID.
+   */
+  async setSemantics(semantics: Semantics): Promise<void> {
+    await call(this.raw.setSemantics(semantics.sceneRevision, semantics.nodes.map(node => ({
+      id: node.id, role: node.role, bounds: values(node.bounds), label: node.label ?? "",
+      numeric: node.numeric ? [...node.numeric] : undefined,
+      level: node.level,
+      set: node.set ? [...node.set] : undefined,
+      toggled: node.toggled,
+      disabled: node.disabled ?? false,
+      actions: [...(node.actions ?? [])],
+      children: [...(node.children ?? [])],
+    }))));
   }
 
     async setEditorGeometry(sceneRevision: bigint, caret?: Rect): Promise<void> {

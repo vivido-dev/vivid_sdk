@@ -17,13 +17,14 @@ pub use vivid_protocol::overlay::wire::Viewport;
 use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText};
 pub use vivid_protocol::overlay::wire::text::{TextGeometry, TextMeasurement};
 use vivid_protocol::overlay::wire::{
-    Action, Clipboard, Query, SetWindow, Status, WindowAction, WindowAddress,
+    Action, Clipboard, Query, SetSemantics, SetWindow, Status, WindowAction, WindowAddress,
 };
 pub use vivid_protocol::overlay::wire::{
     Appearance, Environment, EnvironmentChanged, PresentationOutcome,
 };
 pub use vivid_protocol::overlay::{
-    DismissReason, Event, Scroll, ScrollPhase, WindowMode, buttons, keys, modifiers,
+    AccessibleAction, DismissReason, Event, Scroll, ScrollPhase, SemanticNode, SemanticRole,
+    Semantics, Toggled, WindowMode, buttons, keys, modifiers,
 };
 use vivid_protocol::vector::Frame;
 pub use vivid_protocol::vector::{
@@ -159,6 +160,9 @@ impl OverlaySession {
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_ENV.into());
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::OVERLAY_A11Y.into());
         config
             .optional_profiles
             .push(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT.into());
@@ -414,6 +418,41 @@ impl OverlayWindow {
                     .map_err(io::Error::other)?;
             result.validate_text(&text.text).map_err(io::Error::other)?;
             Ok(result)
+        })
+    }
+
+    /// Publish the window's semantic tree for the scene revision it describes.
+    ///
+    /// A tree is a complete replacement, so a node it no longer names stops existing. The host
+    /// refuses a tree whose revision is not the currently published scene, so assistive
+    /// technology is never told about a control that is not on screen. Requires
+    /// `overlay-a11y-v1`; actions arrive as `OverlayLaneEvent::Accessibility`.
+    pub fn set_semantics(&self, semantics: &Semantics) -> io::Result<()> {
+        semantics.validate().map_err(io::Error::other)?;
+        self.with_state(|session, _| {
+            if !session.supports(vivid_protocol::registry::OVERLAY_A11Y) {
+                return Err(invalid_input("presenter does not support overlay-a11y-v1"));
+            }
+            let request = SetSemantics {
+                address: self.address,
+                semantics: semantics.clone(),
+            };
+            let reply = session.request(
+                messages::SET_OVERLAY_SEMANTICS,
+                self.address.surface_id,
+                request.payload().map_err(io::Error::other)?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?;
+            let Some(reply) = reply else {
+                // A dry-run presenter has no assistive technology to describe anything to.
+                return Err(invalid_input(
+                    "offline presenter has no accessibility service",
+                ));
+            };
+            expect_record(&reply, messages::OK, self.address.surface_id)?;
+            Ok(())
         })
     }
 
