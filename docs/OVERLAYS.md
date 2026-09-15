@@ -556,9 +556,19 @@ recompiles content.
 
 Remaining platform acceptance is native IME candidate UI and assistive-technology interaction on
 Windows, macOS VoiceOver and IME, Linux Wayland IME/accessibility, and pressure-capable pointer
-hardware. The declarative UI engine will supply editable selection and copy actions for text it lays out;
-nothing is inferred from low-level drawing commands, so an overlay that draws a button without
-describing one is not announced as a button.
+hardware. Nothing is inferred from low-level drawing commands, so an overlay that draws a button
+without describing one is not announced as a button.
+
+The declarative UI engine is `vivid_ui/`, and it now supplies what that sentence anticipated:
+bounded semantic trees built from its element tree and republished for each presented scene,
+editable text with selection and copy, and the six optional profiles driven from one place.
+Every one of its examples is exercised end to end against the SDK's in-process presenter, which
+is the real handshake, the real framing and the real display list — but not a real display. None
+has yet been run in a live Vivido pane, so the following remain unconfirmed on any platform:
+that the display lists it builds render as intended, that its semantic trees reach a screen
+reader through Vivido's AccessKit adapter and that actions come back, that its editor geometry
+places a native IME candidate window, and that its frame pacing holds against a real compositor
+rather than against a test presenter's timings.
 
 The new socket integration regression exercises two producers reusing local IDs, window movement,
 modal focus protection, popup dismissal, IME event delivery, capture, and independent cleanup.
