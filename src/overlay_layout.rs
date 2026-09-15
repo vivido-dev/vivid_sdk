@@ -13,6 +13,12 @@ impl RetainedTextLayout {
     pub fn measurement(&self) -> &TextMeasurement {
         &self.measurement
     }
+
+    /// The identity a scene draws through. A layout outlives the frame that shaped it, so a
+    /// caller that keeps one needs to be able to name it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// Paint commands exist only under `overlay-paint-v1`. Failing here, before anything is sent,

@@ -88,6 +88,10 @@ pub(crate) struct Overlays {
 }
 
 /// The synthetic metric one run is measured with.
+///
+/// A run is char-count times 0.6 of its size wide and, wrapped to `max_width`, as many lines as
+/// that width needs — so a layout that depends on a wrapped height is exercised here. It is a
+/// model, not a font: nothing here knows a glyph.
 fn measurement_of(text: &StyledText) -> TextMeasurement {
     let style = text
         .runs
@@ -96,22 +100,37 @@ fn measurement_of(text: &StyledText) -> TextMeasurement {
         .unwrap_or_default();
     let size = style.size.get() as f32;
     let characters = text.text().chars().count() as f32;
-    let width = Scalar::new((characters * size * 0.6) as f64).unwrap_or(Scalar::ZERO);
-    let height = Scalar::new((size * 1.2) as f64).unwrap_or(Scalar::ZERO);
+    let natural = characters * size * 0.6;
+    let (width, mut lines) = match (text.wrap, text.max_width) {
+        (true, Some(limit)) if limit.get() as f32 > 0. => {
+            let limit = limit.get() as f32;
+            (limit, (natural / limit).ceil().max(1.))
+        }
+        _ => (natural, 1.),
+    };
+    if let Some(ceiling) = text.max_lines {
+        lines = lines.min(f32::from(ceiling).max(1.));
+    }
+    let line_height = size * 1.2;
+    let width = Scalar::new(width as f64).unwrap_or(Scalar::ZERO);
+    let height = Scalar::new((lines * line_height) as f64).unwrap_or(Scalar::ZERO);
     TextMeasurement {
         truncated_at: None,
         width,
         height,
-        lines: vec![TextGeometry {
-            start: 0,
-            end: text.text().len() as u32,
-            x: Scalar::ZERO,
-            y: Scalar::ZERO,
-            width,
-            height,
-            baseline: Scalar::new((size * 0.8) as f64).unwrap_or(Scalar::ZERO),
-            rtl: false,
-        }],
+        lines: (0..lines as u32)
+            .map(|line| TextGeometry {
+                start: 0,
+                end: text.text().len() as u32,
+                x: Scalar::ZERO,
+                y: Scalar::new((line as f32 * line_height) as f64).unwrap_or(Scalar::ZERO),
+                width,
+                height: Scalar::new(line_height as f64).unwrap_or(Scalar::ZERO),
+                baseline: Scalar::new((line as f32 * line_height + size * 0.8) as f64)
+                    .unwrap_or(Scalar::ZERO),
+                rtl: false,
+            })
+            .collect(),
         clusters: Vec::new(),
     }
 }
