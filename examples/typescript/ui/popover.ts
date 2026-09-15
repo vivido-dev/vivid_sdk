@@ -34,10 +34,14 @@ async function render(state: Popover, f: Frame): Promise<void> {
   f.region("scrim", rect(0, 0, f.width, f.height), { onClick: close });
   f.box(rect(0, 0, f.width, f.height), { bg: 0x00000066 });
 
-  // The menu paints after the scrim, so it sits over it: paint order is z-order.
+  // The menu paints after the scrim, so it sits over it: paint order is z-order, and a
+  // region painted later is the one the host reports. The panel needs a region of its own
+  // for exactly that reason — without it a click on a row that answers nothing falls
+  // through to the scrim, and the menu closes when you press one of its own entries.
   const menu = rect(0, 46, 200, 72);
   f.shadowBox(menu, "lg", 8);
   f.box(menu, { bg: 0x24243aff, radius: 8 });
+  f.region("menu", menu, { radius: 8 });
   f.region("menu-copy", rect(6, 52, 120, 20), { onClick: close });
   for (const [index, label] of ["Copy", "Paste", "Select all"].entries()) {
     await f.label(label, rect(6, 52 + index * 20, 120, 20), { size: 14, color: 0xe6e6f0ff });

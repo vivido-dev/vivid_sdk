@@ -39,10 +39,14 @@ def render(state: Popover, f: Frame) -> None:
     f.region("scrim", Rect(0, 0, f.width, f.height), on_click=close(state, f))
     f.box(Rect(0, 0, f.width, f.height), bg=0x00000066)
 
-    # The menu paints after the scrim, so it sits over it: paint order is z-order.
+    # The menu paints after the scrim, so it sits over it: paint order is z-order, and a
+    # region painted later is the one the host reports. The panel needs a region of its own
+    # for exactly that reason — without it a click on a row that answers nothing falls
+    # through to the scrim, and the menu closes when you press one of its own entries.
     menu = Rect(0, 46, 200, 72)
     f.shadow_box(menu, "lg", radius=8)
     f.box(menu, bg=0x24243AFF, radius=8)
+    f.region("menu", menu, radius=8)
     f.region("menu-copy", Rect(6, 52, 120, 20), on_click=close(state, f))
     f.label("Copy", Rect(6, 52, 120, 20), size=14, color=0xE6E6F0FF)
     f.label("Paste", Rect(6, 72, 120, 20), size=14, color=0xE6E6F0FF)
