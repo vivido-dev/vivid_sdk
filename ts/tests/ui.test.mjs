@@ -351,6 +351,47 @@ test("a window with a field in it spends q on typing", async () => {
   assert.equal(ui.quitting(), true);
 });
 
+test("an example run as the entry point actually starts", async () => {
+  // The tests above import `makeUi` and drive it by hand, which is exactly the path that
+  // does *not* launch anything — so nothing here would notice if the launch guard stopped
+  // matching and every example quietly exited 0. Run one for real instead.
+  //
+  // With no Vivid host in the environment it must fail loudly while connecting. Exiting 0
+  // with nothing on stderr is the failure this test exists for.
+  const { spawnSync } = await import("node:child_process");
+  const withoutVivid = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith("VIVID_")),
+  );
+  for (const name of ["hello_world", "a11y"]) {
+    const run = spawnSync(process.execPath, [resolve(BUILT, `${name}.js`)], {
+      env: withoutVivid,
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    assert.notEqual(run.status, 0, `${name} exited 0 without a host: it never started`);
+    assert.match(run.stderr, /VIVID|Error/, `${name} said nothing about why it stopped`);
+  }
+});
+
+test("every example hands the launch guard its own module", async () => {
+  // `runMain` compares the runtime's entry against the URL it is given. `import.meta` is
+  // lexically scoped, so an example that let the helper read its own would be comparing
+  // against `ui.ts` and would never run. Every example has to pass its own.
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const sources = readdirSync("examples/typescript/ui").filter(
+    (file) => file.endsWith(".ts") && file !== "ui.ts",
+  );
+  assert.equal(sources.length, 32);
+  for (const file of sources) {
+    const text = readFileSync(resolve("examples/typescript/ui", file), "utf8");
+    assert.match(
+      text,
+      /runMain\(makeUi, import\.meta\.url\)/,
+      `${file} does not hand runMain its own module url`,
+    );
+  }
+});
+
 test("every example builds a frame the protocol accepts", async () => {
   // Each example, painted twice: once cold, once with the caches warm. A frame the wire
   // would refuse fails inside `paint`, so reaching the end is the assertion.

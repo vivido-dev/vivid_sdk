@@ -53,4 +53,4 @@ export function makeUi(): Ui<Rows> {
   return new Ui(new Rows(), render, { width: 320, height: 260 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

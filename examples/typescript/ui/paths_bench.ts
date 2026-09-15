@@ -95,4 +95,4 @@ export function makeUi(): Ui<PathsBench> {
   return new Ui(new PathsBench(), render, { width: 640, height: 420 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

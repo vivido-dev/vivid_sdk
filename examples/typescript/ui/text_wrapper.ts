@@ -51,4 +51,4 @@ export function makeUi(): Ui<TextWrapper> {
   return new Ui(new TextWrapper(), render, { width: 560, height: 320 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

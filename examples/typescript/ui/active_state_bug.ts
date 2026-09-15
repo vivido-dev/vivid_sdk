@@ -34,4 +34,4 @@ export function makeUi(): Ui<Toggle> {
   return new Ui(new Toggle(), render, { width: 320, height: 160 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

@@ -47,4 +47,4 @@ export function makeUi(): Ui<DeepTree> {
   return new Ui(new DeepTree(), render, { width: 500, height: 500 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

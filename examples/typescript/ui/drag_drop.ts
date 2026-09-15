@@ -96,4 +96,4 @@ export function makeUi(): Ui<DragDrop> {
   return ui;
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

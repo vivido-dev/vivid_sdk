@@ -155,4 +155,4 @@ export function makeUi(): Ui<Panel> {
   return new Ui(new Panel(), render, { width: 360, height: 340 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

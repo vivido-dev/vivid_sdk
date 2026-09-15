@@ -15,7 +15,8 @@
 //
 // Region ids and revisions are bigint, as the wire carries them. Colors are straight-alpha
 // sRGB 0xRRGGBBAA numbers.
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { overlay, OverlaySession } from "@vivido/vivid-sdk";
 import { duration } from "../support.js";
@@ -1274,10 +1275,25 @@ function now(): number {
   return Date.now() / 1000;
 }
 
-/** Run an example's ui when its file is the one node was pointed at. Importing the module
- *  from a test does nothing — the same protection `if __name__ == "__main__"` gives the
- *  Python twins. */
-export async function runMain(make: () => Ui<any>): Promise<void> {
-  const entry = process.argv[1] !== undefined ? pathToFileURL(process.argv[1]).href : "";
-  if (entry === import.meta.url) await make().run();
+/** Run an example's ui when its own file is the one the runtime was pointed at. Importing
+ *  the module from a test does nothing — the same protection `if __name__ == "__main__"`
+ *  gives the Python twins.
+ *
+ *  `self` is the caller's own `import.meta.url`, and it has to be passed: `import.meta` is
+ *  lexically scoped, so reading it here would compare the runtime's entry against *this*
+ *  module every time and never match anything.
+ *
+ *  Paths are compared through `realpath`, because a runtime may hand back the resolved path
+ *  where the URL kept a symlink (`/tmp` against `/private/tmp` on macOS, say). */
+export async function runMain(make: () => Ui<any>, self: string): Promise<void> {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return;
+  const same = (() => {
+    try {
+      return realpathSync(invoked) === realpathSync(fileURLToPath(self));
+    } catch {
+      return pathToFileURL(invoked).href === self;
+    }
+  })();
+  if (same) await make().run();
 }

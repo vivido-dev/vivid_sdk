@@ -35,4 +35,4 @@ export function makeUi(): Ui<Counter> {
   return new Ui(new Counter(), render, { width: 420, height: 240 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

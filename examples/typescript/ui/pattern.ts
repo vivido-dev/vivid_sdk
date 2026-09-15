@@ -48,4 +48,4 @@ export function makeUi(): Ui<Patterned> {
   return new Ui(new Patterned(), render, { width: 400, height: 300 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

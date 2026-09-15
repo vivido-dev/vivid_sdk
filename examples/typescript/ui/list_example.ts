@@ -89,4 +89,4 @@ export function makeUi(): Ui<Log> {
   return ui;
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

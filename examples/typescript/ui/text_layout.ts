@@ -78,4 +78,4 @@ export function makeUi(): Ui<TextLayout> {
   return new Ui(new TextLayout(), render, { width: 420, height: 460 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

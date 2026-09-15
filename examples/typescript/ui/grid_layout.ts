@@ -59,4 +59,4 @@ export function makeUi(): Ui<Page> {
   return new Ui(new Page(), render, { width: 640, height: 360 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

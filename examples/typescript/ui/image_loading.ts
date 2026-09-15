@@ -81,4 +81,4 @@ export function makeUi(): Ui<Loading> {
   return new Ui(new Loading(), render, { width: 440, height: 240 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

@@ -75,4 +75,4 @@ export function makeUi(): Ui<Shadows> {
   return new Ui(new Shadows(), render, { width: 440, height: 420 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

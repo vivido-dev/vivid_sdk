@@ -110,4 +110,4 @@ export function makeUi(): Ui<Table> {
   return new Ui(new Table(), render, { width: 460, height: 300 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

@@ -52,4 +52,4 @@ export function makeUi(): Ui<Popover> {
   return new Ui(new Popover(), render, { width: 420, height: 300 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

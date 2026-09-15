@@ -94,4 +94,4 @@ export function makeUi(): Ui<Animated> {
   return ui;
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

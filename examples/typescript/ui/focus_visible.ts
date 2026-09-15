@@ -46,4 +46,4 @@ export function makeUi(): Ui<FocusRings> {
   return ui;
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

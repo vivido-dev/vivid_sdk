@@ -78,4 +78,4 @@ export function makeUi(): Ui<TabStops> {
   return ui;
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

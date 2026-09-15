@@ -56,4 +56,4 @@ export function makeUi(): Ui<WindowFrame> {
   return new Ui(new WindowFrame(), render, { width: 360, height: 260 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

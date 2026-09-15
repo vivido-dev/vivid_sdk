@@ -163,6 +163,9 @@ python examples/python/ui/hello_world.py [--duration 10]
 
 npm run build:examples
 node target/examples-typescript/ui/hello_world.js [--duration 10]
+
+# or straight from the source, which needs no build step
+bun run examples/typescript/ui/hello_world.ts [--duration 10]
 ```
 
 **Escape or `q` closes any of them**, and `--duration` bounds the loop for an unattended run.

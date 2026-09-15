@@ -45,4 +45,4 @@ export function makeUi(): Ui<Anchors> {
   return new Ui(new Anchors(), render, { width: 420, height: 260 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

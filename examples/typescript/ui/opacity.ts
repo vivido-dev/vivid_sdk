@@ -53,4 +53,4 @@ export function makeUi(): Ui<Fade> {
   return new Ui(new Fade(), render, { width: WIDTH, height: HEIGHT });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

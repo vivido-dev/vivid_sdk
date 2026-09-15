@@ -52,4 +52,4 @@ export function makeUi(): Ui<Scrollable> {
   return new Ui(new Scrollable(), render, { width: 300, height: VISIBLE_ROWS * ROW_HEIGHT });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

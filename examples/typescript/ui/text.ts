@@ -114,4 +114,4 @@ export function makeUi(): Ui<Specimen> {
   return new Ui(new Specimen(), render, { width: 520, height: 400 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

@@ -149,4 +149,4 @@ export function makeUi(): Ui<Painting> {
   return new Ui(new Painting(), render, { width: 472, height: 300 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

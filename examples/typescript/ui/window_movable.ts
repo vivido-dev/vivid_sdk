@@ -68,4 +68,4 @@ export function makeUi(): Ui<Movable> {
   return new Ui(new Movable(), render, { width: 384, height: 264 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

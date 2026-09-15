@@ -38,4 +38,4 @@ export function makeUi(): Ui<Gradients> {
   return new Ui(new Gradients(), render, { width: 420, height: 300 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);

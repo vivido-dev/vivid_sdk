@@ -72,4 +72,4 @@ export function makeUi(): Ui<Pressure> {
   return new Ui(new Pressure(), render, { width: 420, height: 280 });
 }
 
-await runMain(makeUi);
+await runMain(makeUi, import.meta.url);
