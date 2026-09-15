@@ -414,6 +414,56 @@ def test_an_accessibility_action_arrives_by_the_same_identity_a_click_uses() -> 
         assert ui.read(lambda state: state.applied) == 1
 
 
+def test_escape_and_q_end_an_example() -> None:
+    from _ui import Keys, Mods
+
+    # Escape ends it.
+    ui, _module, session = _started("hello_world")
+    with session:
+        assert not ui.quitting()
+        ui.dispatch(key(Keys.ESCAPE))
+        assert ui.quitting()
+
+    # So does `q`, which is what a hand on the keyboard reaches for first.
+    ui, _module, session = _started("hello_world")
+    with session:
+        ui.dispatch(key(Keys.letter("q")))
+        assert ui.quitting()
+
+    # A chord is somebody else's shortcut: control-q is not this.
+    ui, _module, session = _started("hello_world")
+    with session:
+        ui.dispatch(key(Keys.letter("q"), Mods.CONTROL))
+        assert not ui.quitting()
+
+    # Neither is a release, or a key repeat.
+    ui, _module, session = _started("hello_world")
+    with session:
+        ui.dispatch(key(Keys.ESCAPE, down=False))
+        ui.dispatch(key(Keys.letter("q"), repeat=True))
+        assert not ui.quitting()
+
+
+def test_a_window_with_a_field_in_it_spends_q_on_typing() -> None:
+    from _ui import Keys
+
+    # An example that accepts typed text cannot spend a letter on quitting: `q` goes into
+    # the field, and escape is the way out.
+    ui, _module, session = _started("input")
+    with session:
+        ui.dispatch(pointer(ui.region_id("field"), button=0, down=True, clicks=1))
+        ui.dispatch(pointer(ui.region_id("field"), button=0, down=False))
+        ui.dispatch(TextEvent(0, _Raw(), "q"))
+        assert not ui.quitting()
+        assert ui.read(lambda state: state.field.text) == "q"
+
+        ui.dispatch(key(Keys.letter("q")))
+        assert not ui.quitting()
+
+        ui.dispatch(key(Keys.ESCAPE))
+        assert ui.quitting()
+
+
 def test_a_gallery_holds_no_more_pictures_than_it_budgeted_for() -> None:
     ui, module, session = _started("image_gallery")
     with session:

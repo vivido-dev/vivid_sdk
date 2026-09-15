@@ -311,6 +311,46 @@ test("an accessibility action arrives by the same identity a click uses", async 
   assert.equal(ui.read((state) => state.applied), 1);
 });
 
+test("escape and q end an example", async () => {
+  // Escape ends it.
+  let started_ = await started("hello_world");
+  await started_.ui.dispatch(key(Keys.escape));
+  assert.equal(started_.ui.quitting(), true);
+
+  // So does `q`, which is what a hand on the keyboard reaches for first.
+  started_ = await started("hello_world");
+  await started_.ui.dispatch(key(Keys.letter("q")));
+  assert.equal(started_.ui.quitting(), true);
+
+  // A chord is somebody else's shortcut: control-q is not this.
+  started_ = await started("hello_world");
+  await started_.ui.dispatch(key(Keys.letter("q"), Mods.control));
+  assert.equal(started_.ui.quitting(), false);
+
+  // Neither is a release, or a key repeat.
+  started_ = await started("hello_world");
+  await started_.ui.dispatch(key(Keys.escape, 0, false));
+  await started_.ui.dispatch(key(Keys.letter("q"), 0, true, true));
+  assert.equal(started_.ui.quitting(), false);
+});
+
+test("a window with a field in it spends q on typing", async () => {
+  // An example that accepts typed text cannot spend a letter on quitting: `q` goes into the
+  // field, and escape is the way out.
+  const { ui } = await started("input");
+  await ui.dispatch(pointer(ui.regionId("field"), 0, 0, 0, true, 1));
+  await ui.dispatch(pointer(ui.regionId("field"), 0, 0, 0, false));
+  await ui.dispatch(text("q"));
+  assert.equal(ui.quitting(), false);
+  assert.equal(ui.read((state) => state.field.text), "q");
+
+  await ui.dispatch(key(Keys.letter("q")));
+  assert.equal(ui.quitting(), false);
+
+  await ui.dispatch(key(Keys.escape));
+  assert.equal(ui.quitting(), true);
+});
+
 test("every example builds a frame the protocol accepts", async () => {
   // Each example, painted twice: once cold, once with the caches warm. A frame the wire
   // would refuse fails inside `paint`, so reaching the end is the assertion.

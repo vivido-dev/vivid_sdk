@@ -165,6 +165,11 @@ npm run build:examples
 node target/examples-typescript/ui/hello_world.js [--duration 10]
 ```
 
+**Escape or `q` closes any of them**, and `--duration` bounds the loop for an unattended run.
+These windows are floating, and the protocol dismisses only a *popup* on escape or an outside
+press, so a floating example has to give itself a way out. `input` and `tab_stop` spend `q` on
+typing, as any window with a field in it must; escape still closes them.
+
 | Example | What it shows | Rust original |
 |---|---|---|
 | `hello_world` | A counter, a button, and the smallest app skeleton | `vivid_ui/examples/hello_world` |

@@ -861,6 +861,11 @@ export class Ui<S> {
     return f(this.state);
   }
 
+  /** Whether the loop is on its way out — escape, `q`, a dismissal, or a lost host. */
+  quitting(): boolean {
+    return this.quitFlag;
+  }
+
   elapsed(): number {
     return now() - this.t0;
   }
@@ -948,6 +953,12 @@ export class Ui<S> {
         await this.fire(this.hovered, "wheel", event);
         break;
       case "key":
+        if (this.isQuitKey(event)) {
+          this.quitFlag = true;
+          break;
+        }
+        await this.focusRouted(event);
+        break;
       case "text":
       case "ime":
         await this.focusRouted(event);
@@ -1043,6 +1054,22 @@ export class Ui<S> {
       mouse_down: this.onMouseDown,
       mouse_up: this.onMouseUp,
     } as Record<string, Handler | undefined>)[slot];
+  }
+
+  /** Whether this key ends the example.
+   *
+   *  These windows are floating, and the protocol only dismisses a *popup* on escape or an
+   *  outside press — so a floating example has no way out of its own unless it gives itself
+   *  one. Escape always ends it. `q` does too, except where something in the window accepts
+   *  typed text: a window with a field in it cannot spend a letter on quitting, so there
+   *  escape is the only way. */
+  private isQuitKey(event: Extract<OverlayEvent, { kind: "key" }>): boolean {
+    if (!event.down || event.repeat) return false;
+    if (event.physical === Keys.escape) return true;
+    if (event.physical !== Keys.letter("q")) return false;
+    // A chord is somebody else's shortcut, not this.
+    if (event.modifiers & (Mods.control | Mods.alt | Mods.super)) return false;
+    return this.onText === undefined;
   }
 
   private cancelPress(): void {

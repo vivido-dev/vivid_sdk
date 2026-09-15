@@ -920,6 +920,10 @@ class Ui:
         """Look at the state without handing it out — the test seam."""
         return f(self._state)
 
+    def quitting(self) -> bool:
+        """Whether the loop is on its way out — escape, `q`, a dismissal, or a lost host."""
+        return self._quit
+
     def elapsed(self) -> float:
         return time.monotonic() - self._t0
 
@@ -1001,6 +1005,8 @@ class Ui:
             self._hover(event)
         elif isinstance(event, WheelEvent):
             self._fire(self._hovered, "wheel", event)
+        elif isinstance(event, KeyEvent) and self._is_quit_key(event):
+            self._quit = True
         elif isinstance(event, (KeyEvent, TextEvent, ImeEvent)):
             self._focus_routed(event)
         elif isinstance(event, FocusEvent):
@@ -1088,6 +1094,26 @@ class Ui:
             handler = getattr(self, f"on_{slot}", None)
             if handler is not None:
                 handler(event)
+
+    def _is_quit_key(self, event: KeyEvent) -> bool:
+        """Whether this key ends the example.
+
+        These windows are floating, and the protocol only dismisses a *popup* on escape or
+        an outside press — so a floating example has no way out of its own unless it gives
+        itself one. Escape always ends it. `q` does too, except where something in the
+        window accepts typed text: a window with a field in it cannot spend a letter on
+        quitting, so there escape is the only way.
+        """
+        if not (event.down and not event.repeat):
+            return False
+        if event.physical == Keys.ESCAPE:
+            return True
+        if event.physical != Keys.letter("q"):
+            return False
+        # A chord is somebody else's shortcut, not this.
+        if event.modifiers & (Mods.CONTROL | Mods.ALT | Mods.SUPER):
+            return False
+        return self.on_text is None
 
     def _cancel_press(self) -> None:
         if self._pressed is not None:
