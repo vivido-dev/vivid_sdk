@@ -37,7 +37,7 @@ use crate::*;
 
 #[path = "overlay_layout.rs"]
 mod layout;
-pub use layout::RetainedTextLayout;
+pub use layout::{OverlayHostHandle, RetainedTextLayout};
 pub use vivid_protocol::overlay::wire::text::styled::{
     StyledText, TextAlignment, TextOverflow, TextRun, TextStyle, Typography,
 };

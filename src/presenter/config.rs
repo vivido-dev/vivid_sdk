@@ -224,6 +224,9 @@ impl PresenterConfig {
     /// stored semantic tree reaches no assistive technology, so advertising them would promise
     /// behavior that silently does not happen. A producer that finds them missing degrades, which
     /// is the honest outcome. See `overlay_host` for what the measurement service actually is.
+    /// A terminating gateway enables `VirtualVivid::enable_overlay_host_relay` and installs the
+    /// physical host's negotiated optional profiles with `set_overlay_host_profiles`; in that
+    /// mode measurements and these services are answered by the physical host.
     pub fn terminal_with_overlay(media: MediaConfig) -> Self {
         let mut config = Self::terminal(media);
         config.supported_profiles.extend([
@@ -423,10 +426,18 @@ pub struct BridgeSurface {
     /// terminating bridge translates this into its own outer coordinate space and re-issues
     /// `SET_OVERLAY_WINDOW` rather than forwarding it byte-for-byte.
     pub overlay_window: Option<BridgeOverlayWindow>,
+    #[serde(default)]
+    pub overlay_layouts: Vec<super::OverlayLayout>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BridgeOverlayWindow {
+    pub parent: Option<BridgeSurfaceKey>,
+    pub min_width: i64,
+    pub min_height: i64,
+    /// Pane translation applied by the embedding multiplexer, for native geometry events.
+    pub offset_x: i64,
+    pub offset_y: i64,
     pub generation: u64,
     pub revision: u64,
     pub x: i64,

@@ -23,10 +23,9 @@ const CELL: (u16, u16) = (8, 16);
 fn presenter() -> (VirtualVivid, String) {
     let listener = SocketListener::bind("tcp:127.0.0.1:0").expect("bind");
     let endpoint = listener.endpoint();
-    let presenter = VirtualVivid::start_configured(
+    let presenter = VirtualVivid::start_configured_eventless(
         listener,
         PresenterConfig::terminal_with_overlay(MediaConfig::default()),
-        None,
     )
     .expect("overlay-hosting presenter");
     (presenter, endpoint)

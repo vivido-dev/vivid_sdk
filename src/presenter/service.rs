@@ -213,7 +213,13 @@ impl ProjectionSnapshot {
                 logical_height: surface.logical_height,
                 capture_policy: surface.capture_policy,
                 descriptor: bridge_semantic_descriptor(&surface.semantic_descriptor),
+                overlay_layouts: surface.overlay_layouts.clone(),
                 overlay_window: surface.overlay_window.map(|window| BridgeOverlayWindow {
+                    parent: window.parent,
+                    min_width: window.min_width,
+                    min_height: window.min_height,
+                    offset_x: 0,
+                    offset_y: 0,
                     generation: window.generation,
                     revision: window.revision,
                     x: window.x,
@@ -374,6 +380,9 @@ fn bridge_source_kind(source: &SnapshotSource) -> BridgeSourceKind {
 /// logical pixels, matching every other geometry field this bridge model carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotOverlayWindow {
+    pub parent: Option<BridgeSurfaceKey>,
+    pub min_width: i64,
+    pub min_height: i64,
     pub generation: u64,
     pub revision: u64,
     pub x: i64,
@@ -399,6 +408,7 @@ pub struct SnapshotSurface {
     pub capture_policy: u64,
     pub semantic_descriptor: SemanticDescriptor,
     pub overlay_window: Option<SnapshotOverlayWindow>,
+    pub overlay_layouts: Vec<super::OverlayLayout>,
 }
 
 fn window_mode_wire(mode: vivid_protocol::overlay::WindowMode) -> u64 {
@@ -417,10 +427,12 @@ pub struct SnapshotSource {
     pub live: bool,
     pub active: bool,
     pub audio_gain: Option<AudioGain>,
-    /// Retained immutable media body, currently used by encoded-image tracks.
+    /// Retained immutable image body or latest vector frame.
     pub retained: Option<Arc<[u8]>>,
     /// The fully composed latest raster, independent of the producer's delta chain.
     pub retained_raster: Option<RetainedRaster>,
+    /// Ordered assets, latest scene, and releases needed to rebuild an overlay track.
+    pub retained_vector: Vec<(u16, Arc<[u8]>)>,
     pub first_visible_presented: bool,
     pub playing: bool,
     pub play_request: PlayRequest,
@@ -687,6 +699,7 @@ struct TrackEntry {
     channel_writer: Option<Arc<Writer>>,
     retained: Option<Arc<[u8]>>,
     retained_raster: Option<RetainedRaster>,
+    retained_vector: super::vector_retention::VectorRetention,
     playing: bool,
     play_request: PlayRequest,
     eos_epoch: Option<u32>,
@@ -795,6 +808,9 @@ struct State {
     /// Only populated when `config.overlay` is set; otherwise no session ever negotiates the
     /// profiles that would let anything reach it.
     overlays: crate::presenter::overlay_host::Overlays,
+    overlay_relay: super::overlay_relay::OverlayRelay,
+    overlay_layouts: HashMap<SurfaceKey, Vec<super::OverlayLayout>>,
+    released_overlay_layouts: HashSet<(SurfaceKey, u64)>,
 }
 
 fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
@@ -829,6 +845,82 @@ pub struct VirtualVivid {
 }
 
 impl VirtualVivid {
+    pub fn pane_for_overlay_surface(&self, surface: BridgeSurfaceKey) -> Option<PaneId> {
+        let state = lock(&self.state);
+        state.surfaces.get(&SurfaceKey {
+            session: surface.producer,
+            context: surface.context,
+            surface: surface.surface,
+        })?;
+        state
+            .sessions
+            .get(&surface.producer)
+            .map(|session| session.pane)
+    }
+    pub fn relay_overlay_input(&self, surface: BridgeSurfaceKey, body: &[u8]) -> io::Result<bool> {
+        let envelope = messages::decode_control(body)?;
+        let input = vivid_protocol::overlay::wire::InputEvent::decode(
+            surface.surface,
+            &Value::Map(envelope.payload),
+        )?;
+        if input.address.context_id != surface.context {
+            return Err(invalid("overlay input owner mismatch"));
+        }
+        let mut state = lock(&self.state);
+        let changes_projection = matches!(
+            input.event,
+            vivid_protocol::overlay::Event::Geometry { .. }
+                | vivid_protocol::overlay::Event::Focus(_)
+        );
+        let accepted = state.overlays.relay_input(surface.producer, input);
+        if accepted && changes_projection {
+            advance_projection(&mut state);
+        }
+        flush_overlay_lane(&mut state, surface.producer);
+        Ok(accepted)
+    }
+
+    /// Route font measurement and retained-layout requests to the physical presenter.
+    pub fn enable_overlay_host_relay(&self) {
+        lock(&self.state).overlay_relay.enabled = true;
+    }
+
+    /// Only offer optional host services that the current physical presenter negotiated.
+    pub fn set_overlay_host_profiles(&self, profiles: &[String]) {
+        let mut state = lock(&self.state);
+        for profile in [
+            registry::OVERLAY_CLIPBOARD,
+            registry::OVERLAY_A11Y,
+            registry::OVERLAY_TYPOGRAPHY,
+        ] {
+            state
+                .config
+                .supported_profiles
+                .retain(|supported| supported != profile);
+            if profiles.iter().any(|supported| supported == profile) {
+                state.config.supported_profiles.push(profile.into());
+            }
+        }
+        state.config.supported_profiles.sort();
+    }
+
+    pub fn take_overlay_host_requests(&self) -> Vec<super::OverlayHostRequest> {
+        lock(&self.state).overlay_relay.queued.drain(..).collect()
+    }
+
+    pub fn complete_overlay_host_request(&self, id: u64, response: Result<Vec<u8>, String>) {
+        if let Some(sender) = lock(&self.state).overlay_relay.pending.get(&id) {
+            let response = response.and_then(|body| {
+                if body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
+                    Err("overlay host reply exceeds transport budget".into())
+                } else {
+                    Ok(body)
+                }
+            });
+            let _ = sender.try_send(response);
+        }
+    }
+
     /// Microphones are independent of viewport visibility and presentation-slot projection.
     pub fn microphone_requests(&self) -> Vec<super::MicrophoneRequest> {
         let state = lock(&self.state);
@@ -940,6 +1032,14 @@ impl VirtualVivid {
         )
     }
 
+    /// Start a configured presenter whose consumer terminates accepted media locally.
+    pub fn start_configured_eventless<L: PresenterListener>(
+        listener: L,
+        config: PresenterConfig,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(listener, config, MediaEventDelivery::Eventless)
+    }
+
     fn start_with_delivery<L: PresenterListener>(
         listener: L,
         mut config: PresenterConfig,
@@ -1036,6 +1136,9 @@ impl VirtualVivid {
             connections: 0,
             delivery_metrics: DeliveryMetrics::default(),
             overlays: crate::presenter::overlay_host::Overlays::default(),
+            overlay_relay: Default::default(),
+            overlay_layouts: HashMap::new(),
+            released_overlay_layouts: HashSet::new(),
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1631,7 +1734,7 @@ impl VirtualVivid {
                 KindConfiguration::EncodedImage(_) => ("image", true),
                 KindConfiguration::Video(_) => ("video", true),
                 KindConfiguration::Audio(_) => ("audio", false),
-                KindConfiguration::VectorScene(_) => ("vector", true),
+                KindConfiguration::VectorScene(_) => ("vector", false),
             };
             tracks.push(PaneTrackSummary {
                 source: bridge_track_key(*key),
@@ -1677,6 +1780,13 @@ impl VirtualVivid {
                     .and_then(|context| context.surface(key.surface).ok())
                     .and_then(|identity| state.overlays.window(identity))
                     .map(|window| SnapshotOverlayWindow {
+                        parent: window.options.parent.map(|parent| BridgeSurfaceKey {
+                            producer: parent.context.session.session_id,
+                            context: parent.context.context_id,
+                            surface: parent.surface_id,
+                        }),
+                        min_width: window.options.min_width.get().round() as i64,
+                        min_height: window.options.min_height.get().round() as i64,
                         generation: window.generation,
                         revision: window.revision,
                         x: window.options.bounds.origin.x.get().round() as i64,
@@ -1687,6 +1797,7 @@ impl VirtualVivid {
                         visible: window.options.visible,
                     });
                 SnapshotSurface {
+                    overlay_layouts: state.overlay_layouts.get(key).cloned().unwrap_or_default(),
                     overlay_window,
                     producer: key.session,
                     pane: state
@@ -1731,6 +1842,7 @@ impl VirtualVivid {
                         .then_some(track.audio_gain),
                         retained: track.retained.clone(),
                         retained_raster: track.retained_raster.clone(),
+                        retained_vector: track.retained_vector.snapshot(),
                         first_visible_presented: track.outer_presented,
                         playing: track.playing,
                         play_request: track.play_request,
@@ -2698,7 +2810,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
         {
             break;
         }
-        let outcome: OverlayReply = match record.record_type {
+        let mut outcome: OverlayReply = match record.record_type {
             messages::OVERLAY_INPUT_RENEW => {
                 state
                     .overlays
@@ -2711,6 +2823,56 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
             }
             _ => Err("record is not carried on the overlay interactive lane"),
         };
+        if outcome.is_ok()
+            && state.overlay_relay.enabled
+            && record.record_type == messages::OVERLAY_INPUT_CAPTURE
+        {
+            let capture = vivid_protocol::overlay::wire::Capture::decode(
+                record.object_id,
+                &Value::Map(envelope.payload.clone()),
+            )?;
+            if state.overlay_relay.pending.len() >= 64 {
+                outcome = Err("overlay host request capacity exhausted");
+            } else {
+                let id = state
+                    .overlay_relay
+                    .next_id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("host request ID exhausted"))?;
+                state.overlay_relay.next_id = id;
+                let (sender, receiver) = mpsc::sync_channel(1);
+                state.overlay_relay.pending.insert(id, sender);
+                state
+                    .overlay_relay
+                    .queued
+                    .push_back(super::OverlayHostRequest {
+                        id,
+                        surface: BridgeSurfaceKey {
+                            producer: session_id,
+                            context: capture.address.context_id,
+                            surface: capture.address.surface_id,
+                        },
+                        record_type: record.record_type,
+                        body: record.body.clone(),
+                        layout_ids: Vec::new(),
+                    });
+                let wakeup = state.media_wakeup.clone();
+                drop(state);
+                if let Some(wakeup) = wakeup {
+                    wakeup();
+                }
+                let response = receiver.recv_timeout(Duration::from_secs(2));
+                state = lock(shared);
+                state.overlay_relay.pending.remove(&id);
+                state
+                    .overlay_relay
+                    .queued
+                    .retain(|request| request.id != id);
+                if !matches!(response, Ok(Ok(_))) {
+                    outcome = Err("outer pointer capture failed");
+                }
+            }
+        }
         let (reply_type, body) = match outcome {
             Ok((reply, fields)) => (reply, Envelope::new(envelope.request_id, fields).encode()?),
             Err(reason) => (
@@ -3669,10 +3831,28 @@ impl VirtualVivid {
     /// Delivers a physical key transition to a pane's overlay windows. `usage` is a USB HID
     /// keyboard-page usage. Escape dismissal is the host's policy, keyed off the usage.
     pub fn overlay_key(&self, pane: PaneId, usage: u32, down: bool, modifiers: u32) -> bool {
+        self.overlay_key_event(pane, usage, down, false, modifiers)
+    }
+
+    pub fn overlay_has_focus(&self, pane: PaneId) -> bool {
+        let state = lock(&self.state);
+        state
+            .overlays
+            .focus_belongs_to(&overlay_sessions_for_pane(&state, pane))
+    }
+
+    pub fn overlay_key_event(
+        &self,
+        pane: PaneId,
+        usage: u32,
+        down: bool,
+        repeat: bool,
+        modifiers: u32,
+    ) -> bool {
         let event = vivid_protocol::overlay::Event::Key {
             physical: usage,
             down,
-            repeat: false,
+            repeat,
             modifiers,
         };
         let escape = usage == 0x29;
@@ -3724,6 +3904,289 @@ fn dispatch_control(
         return Err(ControlError::missing("session does not exist"));
     }
     admit_session_post_hello(&mut state, session_id);
+    if state.overlay_relay.enabled
+        && matches!(
+            record.record_type,
+            messages::MEASURE_OVERLAY_TEXT_BATCH
+                | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
+                | messages::SET_OVERLAY_EDITOR
+                | messages::SET_OVERLAY_CLIPBOARD
+                | messages::SET_OVERLAY_SEMANTICS
+        )
+    {
+        use vivid_protocol::overlay::wire::text::styled::{MeasureBatch, ReleaseLayouts};
+        if record.body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
+            return Err(ControlError::bad(
+                "overlay host request exceeds transport budget",
+            ));
+        }
+        let profile = match record.record_type {
+            messages::SET_OVERLAY_EDITOR => registry::OVERLAY_TEXT,
+            messages::SET_OVERLAY_CLIPBOARD => registry::OVERLAY_CLIPBOARD,
+            messages::SET_OVERLAY_SEMANTICS => registry::OVERLAY_A11Y,
+            _ => registry::OVERLAY_TEXT_LAYOUT,
+        };
+        if !state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.accepted_profiles.contains(profile))
+        {
+            return Err(ControlError::state(
+                "overlay host profile was not negotiated",
+            ));
+        }
+        let address = match record.record_type {
+            messages::MEASURE_OVERLAY_TEXT_BATCH => {
+                MeasureBatch::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text measurement request"))?
+                    .address
+            }
+            messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
+                ReleaseLayouts::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text layout release"))?
+                    .address
+            }
+            messages::SET_OVERLAY_EDITOR => {
+                state
+                    .overlays
+                    .set_editor_geometry(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::text::EditorGeometry::decode(
+                    record.object_id,
+                    &value,
+                )
+                .map_err(|_| ControlError::bad("invalid editor geometry"))?
+                .address
+            }
+            messages::SET_OVERLAY_CLIPBOARD => {
+                state
+                    .overlays
+                    .set_clipboard(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::Clipboard::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid clipboard request"))?
+                    .address
+            }
+            messages::SET_OVERLAY_SEMANTICS => {
+                state
+                    .overlays
+                    .set_semantics(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::SetSemantics::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid semantics"))?
+                    .address
+            }
+            _ => unreachable!(),
+        };
+        let key = SurfaceKey {
+            session: session_id,
+            context: address.context_id,
+            surface: address.surface_id,
+        };
+        if !state
+            .surfaces
+            .get(&key)
+            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+        {
+            return Err(ControlError::missing("overlay surface is absent or stale"));
+        }
+        if state.overlay_relay.pending.len() >= 64 {
+            return Err(ControlError::state(
+                "overlay host request capacity exhausted",
+            ));
+        }
+        let measurement = (record.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH)
+            .then(|| MeasureBatch::decode(record.object_id, &value))
+            .transpose()
+            .map_err(|_| ControlError::bad("invalid text measurement request"))?;
+        if measurement.as_ref().is_some_and(|query| {
+            query
+                .texts
+                .iter()
+                .any(|text| text.typography != Default::default())
+        }) && !state.sessions.get(&session_id).is_some_and(|session| {
+            session
+                .accepted_profiles
+                .contains(registry::OVERLAY_TYPOGRAPHY)
+        }) {
+            return Err(ControlError::state(
+                "overlay typography profile was not negotiated",
+            ));
+        }
+        let mut retained_layouts = Vec::new();
+        if let Some(query) = measurement.as_ref().filter(|query| query.retain) {
+            let current = state.overlay_layouts.get(&key);
+            let reserved_count: usize = state
+                .overlay_relay
+                .reservations
+                .values()
+                .filter(|(surface, _, _)| {
+                    surface.producer == session_id
+                        && surface.context == key.context
+                        && surface.surface == key.surface
+                })
+                .map(|(_, count, _)| count)
+                .sum();
+            if current.map_or(0, Vec::len) + reserved_count + query.texts.len() > 256 {
+                return Err(ControlError::state(
+                    "retained overlay layout limit exceeded",
+                ));
+            }
+            let mut bytes = state
+                .overlay_layouts
+                .values()
+                .flatten()
+                .map(|layout| layout.body.len())
+                .sum::<usize>()
+                + state
+                    .overlay_relay
+                    .reservations
+                    .values()
+                    .map(|(_, _, bytes)| bytes)
+                    .sum::<usize>();
+            for text in &query.texts {
+                let single = MeasureBatch {
+                    address,
+                    texts: vec![text.clone()],
+                    retain: true,
+                };
+                let body = Envelope::new(
+                    1,
+                    single
+                        .payload()
+                        .map_err(|_| ControlError::bad("invalid text"))?,
+                )
+                .encode()
+                .map_err(|_| ControlError::bad("invalid text"))?;
+                bytes = bytes
+                    .checked_add(body.len())
+                    .ok_or_else(|| ControlError::state("layout budget overflow"))?;
+                if bytes > super::overlay_relay::MAX_RETAINED_LAYOUT_BYTES {
+                    return Err(ControlError::state("retained layout byte limit exceeded"));
+                }
+                state.overlay_relay.next_layout = state
+                    .overlay_relay
+                    .next_layout
+                    .checked_add(1)
+                    .ok_or_else(|| ControlError::state("layout ID exhausted"))?;
+                retained_layouts.push(super::OverlayLayout {
+                    id: state.overlay_relay.next_layout,
+                    body,
+                });
+            }
+        }
+        let id = state
+            .overlay_relay
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| ControlError::state("overlay host request ID exhausted"))?;
+        state.overlay_relay.next_id = id;
+        state.overlay_relay.reservations.insert(
+            id,
+            (
+                BridgeSurfaceKey {
+                    producer: session_id,
+                    context: key.context,
+                    surface: key.surface,
+                },
+                retained_layouts.len(),
+                retained_layouts
+                    .iter()
+                    .map(|layout| layout.body.len())
+                    .sum(),
+            ),
+        );
+        let (sender, receiver) = mpsc::sync_channel(1);
+        state.overlay_relay.pending.insert(id, sender);
+        state
+            .overlay_relay
+            .queued
+            .push_back(super::OverlayHostRequest {
+                id,
+                surface: BridgeSurfaceKey {
+                    producer: session_id,
+                    context: address.context_id,
+                    surface: address.surface_id,
+                },
+                record_type: record.record_type,
+                body: record.body.clone(),
+                layout_ids: retained_layouts.iter().map(|layout| layout.id).collect(),
+            });
+        let wakeup = state.media_wakeup.clone();
+        drop(state);
+        if let Some(wakeup) = wakeup {
+            wakeup();
+        }
+        // This is the connection worker, never the session actor or the global state lock.
+        let response = receiver.recv_timeout(Duration::from_secs(10));
+        let mut state = lock(shared);
+        state.overlay_relay.pending.remove(&id);
+        state.overlay_relay.reservations.remove(&id);
+        state
+            .overlay_relay
+            .queued
+            .retain(|request| request.id != id);
+        let body = response
+            .map_err(|_| ControlError::state("overlay host request timed out"))?
+            .map_err(|_| ControlError::state("outer overlay host refused request"))?;
+        if !state
+            .surfaces
+            .get(&key)
+            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+        {
+            return Err(ControlError::missing(
+                "overlay surface disappeared during host request",
+            ));
+        }
+        let response = messages::decode_control(&body)
+            .map_err(|_| ControlError::bad("invalid outer overlay reply"))?;
+        if let Some(query) = measurement {
+            let answer = vivid_protocol::overlay::wire::text::styled::BatchMeasured::decode(
+                address,
+                &Value::Map(response.payload.clone()),
+            )
+            .map_err(|_| ControlError::bad("invalid outer measurement"))?;
+            if answer.layouts.len() != query.texts.len() {
+                return Err(ControlError::bad("outer measurement count mismatch"));
+            }
+            for (index, ((id, metrics), text)) in
+                answer.layouts.iter().zip(&query.texts).enumerate()
+            {
+                if *id != retained_layouts.get(index).map_or(0, |layout| layout.id) {
+                    return Err(ControlError::bad("outer layout identity mismatch"));
+                }
+                metrics
+                    .validate_text(&text.text())
+                    .map_err(|_| ControlError::bad("invalid outer text geometry"))?;
+            }
+            state
+                .overlay_layouts
+                .entry(key)
+                .or_default()
+                .extend(retained_layouts);
+            advance_projection(&mut state);
+        } else if record.record_type == messages::RELEASE_OVERLAY_TEXT_LAYOUTS {
+            let release = ReleaseLayouts::decode(record.object_id, &value)
+                .map_err(|_| ControlError::bad("invalid layout release"))?;
+            state
+                .released_overlay_layouts
+                .extend(release.ids.into_iter().map(|id| (key, id)));
+            prune_overlay_layouts(&mut state, key);
+            advance_projection(&mut state);
+        }
+        let kind = if record.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH {
+            messages::OVERLAY_TEXT_BATCH_MEASURED
+        } else {
+            messages::OK
+        };
+        return Ok(Some((
+            kind,
+            record.object_id,
+            Envelope::new(request_id, response.payload)
+                .encode()
+                .map_err(|_| ControlError::bad("invalid outer overlay reply"))?,
+        )));
+    }
     let projection_revision_before = state.projection_revision;
     let mutation_cache = if is_idempotent_mutation(record.record_type) {
         envelope.idempotency_key.map(|key| {
@@ -3960,6 +4423,7 @@ fn dispatch_control(
                     channel_writer: None,
                     retained: None,
                     retained_raster: None,
+                    retained_vector: Default::default(),
                     playing: false,
                     play_request: PlayRequest::baseline(),
                     eos_epoch: None,
@@ -4927,7 +5391,7 @@ fn handle_track(
     }
     reader.clear_read_deadline()?;
     let result = if is_vector_scene {
-        vector_track_loop(reader, shared, key, generation)
+        vector_track_loop(reader, shared, changed, key, generation)
     } else {
         track_loop(reader, shared, changed, key, generation)
     };
@@ -5347,15 +5811,12 @@ fn track_loop(
     }
 }
 
-/// Serves an overlay window's vector-scene track. Deliberately shares nothing with `track_loop`:
-/// a display list has no PTS, keyframe, or flow-credit-consuming delivery to pace, so none of the
-/// timed-media recovery, projection-blocking, or backpressure machinery applies. Validation and
-/// acceptance are entirely [`crate::presenter::overlay_host::Overlays::media_record`]'s job; a
-/// refusal fails the channel, exactly as the timed path fails a channel whose producer broke its
-/// contract.
+/// Validate overlay records and deliver them through the same bounded, acknowledged bridge
+/// path as other media. Only an eventless presenter can return credit at local acceptance.
 fn vector_track_loop(
     reader: &mut Reader,
     shared: &Arc<Mutex<State>>,
+    changed: &Arc<Condvar>,
     key: TrackKey,
     generation: ChannelGeneration,
 ) -> io::Result<()> {
@@ -5387,35 +5848,164 @@ fn vector_track_loop(
         if track.state.flow.admit(length).is_err() {
             return Err(invalid("vector record exceeded its channel flow grant"));
         }
+        let retained_bytes = state
+            .tracks
+            .values()
+            .map(|track| track.retained_vector.bytes())
+            .sum::<u64>();
+        if record.record_type != messages::VECTOR_ASSET_RELEASE
+            && u64::from(length)
+                > state
+                    .config
+                    .media
+                    .aggregate_retained_bytes
+                    .saturating_sub(retained_bytes)
+        {
+            return Err(invalid("aggregate retained vector budget exceeded"));
+        }
+        if record.record_type == messages::VECTOR_FRAME && state.overlay_relay.enabled {
+            let frame =
+                vivid_protocol::vector::Frame::decode(&record.body).map_err(io::Error::other)?;
+            for command in frame.canvas.commands() {
+                if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command
+                    && (state
+                        .released_overlay_layouts
+                        .contains(&(key.surface, *layout))
+                        || !state
+                            .overlay_layouts
+                            .get(&key.surface)
+                            .is_some_and(|layouts| {
+                                layouts.iter().any(|candidate| candidate.id == *layout)
+                            }))
+                {
+                    return Err(invalid(
+                        "vector scene references an absent or foreign layout",
+                    ));
+                }
+            }
+        }
+        state
+            .tracks
+            .get_mut(&key)
+            .ok_or_else(|| invalid("vector track disappeared"))?
+            .retained_vector
+            .accept(record.record_type, &record.body)?;
         let accepted = state.overlays.media_record(
             key.surface.session,
             record.record_type,
             key.track,
             &record.body,
         );
-        if accepted && let Some(track) = state.tracks.get_mut(&key) {
-            if record.record_type == messages::VECTOR_FRAME {
-                // A published display list is all the readiness an overlay window has: there is
-                // no decoder to initialize and no picture to wait for. The producer holds its
-                // first `ACTIVATE_TRACK` behind this milestone, so the window would never reach
-                // its slot without it.
-                track.state.milestones |= MILESTONE_OUTPUT_READY;
-            }
-            // A display list is consumed as it is accepted — nothing downstream holds it — so the
-            // allowance it spent comes back now, one bounded window ahead of what has been sent.
-            // Without this a producer sends its first scene and then waits on credit forever.
-            grant_rolling_flow(key, track);
+        if accepted
+            && let Some(track) = state.tracks.get_mut(&key)
+            && record.record_type == messages::VECTOR_FRAME
+        {
+            // A published display list is all the readiness an overlay window has: there is
+            // no decoder to initialize and no picture to wait for. The producer holds its
+            // first `ACTIVATE_TRACK` behind this milestone, so the window would never reach
+            // its slot without it.
+            track.state.milestones |= MILESTONE_OUTPUT_READY;
+            track.retained = track.retained_vector.frame();
         }
         flush_overlay_lane(&mut state, key.surface.session);
-        drop(state);
         if !accepted {
             return Err(invalid("vector track record was refused"));
+        }
+        if record.record_type == messages::VECTOR_FRAME {
+            prune_overlay_layouts(&mut state, key.surface);
+        }
+        let wakeup = state.media_wakeup.clone();
+        if let Some(events) = state.events.clone() {
+            state.next_delivery = state
+                .next_delivery
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("delivery ID exhausted"))?;
+            let delivery_id = state.next_delivery;
+            state.deliveries.insert(
+                delivery_id,
+                PendingDelivery {
+                    track: key,
+                    bytes: u64::from(length),
+                    random_access: false,
+                },
+            );
+            let mut event = MediaEvent {
+                delivery_id,
+                source: bridge_track_key(key),
+                record_type: record.record_type,
+                recovered_keyframe: None,
+                body: record.body,
+            };
+            loop {
+                match events.try_send(event) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        state.deliveries.remove(&delivery_id);
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "bridge media consumer closed",
+                        ));
+                    }
+                    Err(mpsc::TrySendError::Full(pending)) => event = pending,
+                }
+                // Keep this channel's one admitted packet; release the global lock while
+                // another owner drains. No success credit or unbounded spill queue is needed.
+                state = changed
+                    .wait_timeout(state, Duration::from_millis(50))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+                if !state
+                    .tracks
+                    .get(&key)
+                    .is_some_and(|track| track.state.channel_generation == generation)
+                    || !state.deliveries.contains_key(&delivery_id)
+                {
+                    state.deliveries.remove(&delivery_id);
+                    return Ok(());
+                }
+            }
+        } else if let Some(track) = state.tracks.get_mut(&key) {
+            grant_rolling_flow(key, track);
+        }
+        advance_projection(&mut state);
+        drop(state);
+        changed.notify_all();
+        if let Some(wakeup) = wakeup {
+            wakeup();
         }
     }
 }
 
 fn has_retained_media(track: &TrackEntry) -> bool {
     track.retained.is_some() || track.retained_raster.is_some()
+}
+
+fn prune_overlay_layouts(state: &mut State, surface: SurfaceKey) {
+    let mut referenced = HashSet::new();
+    for (key, track) in &state.tracks {
+        if key.surface == surface
+            && matches!(track.configuration.kind, KindConfiguration::VectorScene(_))
+            && let Some(body) = &track.retained
+            && let Ok(frame) = vivid_protocol::vector::Frame::decode(body)
+        {
+            for command in frame.canvas.commands() {
+                if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command {
+                    referenced.insert(*layout);
+                }
+            }
+        }
+    }
+    if let Some(layouts) = state.overlay_layouts.get_mut(&surface) {
+        layouts.retain(|layout| {
+            !state
+                .released_overlay_layouts
+                .contains(&(surface, layout.id))
+                || referenced.contains(&layout.id)
+        });
+    }
+    state
+        .released_overlay_layouts
+        .retain(|(key, id)| *key != surface || referenced.contains(id));
 }
 
 /// Terminate an inner raster delta chain into one owner-scoped latest framebuffer.
@@ -6340,6 +6930,10 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
 }
 
 fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
+    state.overlay_layouts.remove(&surface);
+    state
+        .released_overlay_layouts
+        .retain(|(key, _)| *key != surface);
     let tracks = state
         .tracks
         .keys()
@@ -6388,6 +6982,12 @@ fn flush_overlay_lanes(state: &mut State, sessions: &[u64]) {
 }
 
 fn cleanup_session(state: &mut State, session: u64) {
+    state
+        .overlay_layouts
+        .retain(|key, _| key.session != session);
+    state
+        .released_overlay_layouts
+        .retain(|(key, _)| key.session != session);
     if let Some(runtime) = state.sessions.remove(&session) {
         runtime.writer.close();
         if let Some(lane) = runtime.overlay_lane {

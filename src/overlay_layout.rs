@@ -2,6 +2,127 @@
 use super::*;
 use vivid_protocol::overlay::wire::text::styled::{BatchMeasured, MeasureBatch, ReleaseLayouts};
 
+/// An authenticated, bounded host-service handle usable away from an event-loop thread.
+pub type OverlayHostHandle =
+    Arc<dyn Fn(u16, u64, messages::PayloadMap) -> io::Result<messages::PayloadMap> + Send + Sync>;
+
+impl Session {
+    pub fn query_overlay_window(&self, query: Query) -> io::Result<Status> {
+        let reply = self
+            .request(
+                messages::QUERY_OVERLAY,
+                query.surface_id,
+                query.payload()?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?
+            .ok_or_else(|| invalid_input("offline overlay host"))?;
+        expect_record(&reply, messages::OVERLAY_STATUS, query.surface_id)?;
+        Status::decode(
+            owner(self),
+            query.surface_id,
+            &Value::Map(decoded_payload(&reply)?),
+        )
+        .map_err(io::Error::other)
+    }
+    pub fn overlay_host_handle(&self) -> Option<OverlayHostHandle> {
+        let crate::session::ControlPlane::Live { writer, pending } = &self.control else {
+            return None;
+        };
+        let control = crate::session::ControlPlane::Live {
+            writer: writer.clone(),
+            pending: pending.clone(),
+        };
+        let ids = self.next_request_id.clone();
+        let profiles = self.info.accepted_profiles.clone();
+        Some(Arc::new(move |kind, object, payload| {
+            let (profile, reply_kind) = match kind {
+                messages::MEASURE_OVERLAY_TEXT_BATCH => (
+                    vivid_protocol::registry::OVERLAY_TEXT_LAYOUT,
+                    messages::OVERLAY_TEXT_BATCH_MEASURED,
+                ),
+                messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
+                    (vivid_protocol::registry::OVERLAY_TEXT_LAYOUT, messages::OK)
+                }
+                messages::SET_OVERLAY_EDITOR => {
+                    (vivid_protocol::registry::OVERLAY_TEXT, messages::OK)
+                }
+                messages::SET_OVERLAY_CLIPBOARD => {
+                    (vivid_protocol::registry::OVERLAY_CLIPBOARD, messages::OK)
+                }
+                messages::SET_OVERLAY_SEMANTICS => {
+                    (vivid_protocol::registry::OVERLAY_A11Y, messages::OK)
+                }
+                _ => return Err(invalid_input("unsupported overlay host call")),
+            };
+            if !profiles.iter().any(|accepted| accepted == profile) {
+                return Err(invalid_input("outer overlay host profile is unavailable"));
+            }
+            let id = ids
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |id| id.checked_add(1),
+                )
+                .map_err(|_| invalid_data("request ID exhausted"))?;
+            let body = messages::Envelope::new(id, payload).encode()?;
+            let reply = control
+                .request(id, kind, object, &body)?
+                .ok_or_else(|| invalid_data("missing host reply"))?;
+            if reply.record_type == messages::ERROR {
+                return Err(presenter_error(&reply.body)?);
+            }
+            expect_record(&reply, reply_kind, object)?;
+            decoded_payload(&reply)
+        }))
+    }
+    /// Ask the host to shape text for an existing overlay surface.
+    pub fn measure_overlay_text(&self, request: &MeasureBatch) -> io::Result<BatchMeasured> {
+        if !self.supports(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT) {
+            return Err(invalid_input(
+                "presenter does not support overlay-text-layout-v1",
+            ));
+        }
+        let reply = self
+            .request(
+                messages::MEASURE_OVERLAY_TEXT_BATCH,
+                request.address.surface_id,
+                request.payload().map_err(io::Error::other)?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?
+            .ok_or_else(|| invalid_input("offline presenter has no text service"))?;
+        expect_record(
+            &reply,
+            messages::OVERLAY_TEXT_BATCH_MEASURED,
+            request.address.surface_id,
+        )?;
+        BatchMeasured::decode(request.address, &Value::Map(decoded_payload(&reply)?))
+            .map_err(io::Error::other)
+    }
+
+    pub fn release_overlay_layouts(&self, request: &ReleaseLayouts) -> io::Result<()> {
+        if !self.supports(vivid_protocol::registry::OVERLAY_TEXT_LAYOUT) {
+            return Err(invalid_input(
+                "presenter does not support overlay-text-layout-v1",
+            ));
+        }
+        let reply = self
+            .request(
+                messages::RELEASE_OVERLAY_TEXT_LAYOUTS,
+                request.address.surface_id,
+                request.payload().map_err(io::Error::other)?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?
+            .ok_or_else(|| invalid_input("offline presenter has no text service"))?;
+        expect_record(&reply, messages::OK, request.address.surface_id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RetainedTextLayout {
     session: Weak<Mutex<Option<Session>>>,

@@ -360,6 +360,69 @@ impl Overlays {
 
     // ---- control records -------------------------------------------------------------------
 
+    pub(crate) fn relay_input(
+        &mut self,
+        session: u64,
+        input: vivid_protocol::overlay::wire::InputEvent,
+    ) -> bool {
+        let Ok(id) = input.address.identity(owner(session)) else {
+            return false;
+        };
+        let Some(window) = self.windows.get(id) else {
+            return false;
+        };
+        if window.generation != input.address.generation || !window.options.visible {
+            return false;
+        }
+        if matches!(
+            input.event,
+            Event::Key { down: true, .. }
+                | Event::Pointer {
+                    button: Some((_, true)),
+                    ..
+                }
+        ) {
+            self.last_gesture = Some((id, std::time::Instant::now()));
+        }
+        match input.event {
+            Event::Geometry { bounds, .. } => {
+                if window.options.bounds != bounds {
+                    let mut options = window.options.clone();
+                    options.bounds = bounds;
+                    if self
+                        .windows
+                        .update(id, input.address.generation, window.revision, options)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+            Event::Focus(true) => {
+                let _ = self.windows.request_focus(id);
+            }
+            Event::Focus(false) if self.windows.focus() == Some(id) => {
+                self.windows.set_pane_focus(false)
+            }
+            _ => {}
+        }
+        // Native routing already performed hit testing, click counting, keyboard translation,
+        // and IME handling. Preserve that event instead of inventing a second device sample.
+        while self.windows.take_event(owner(session)).is_some() {}
+        let Ok(payload) = input.payload() else {
+            return false;
+        };
+        self.queue_for(
+            session,
+            LaneRecord {
+                record_type: messages::OVERLAY_INPUT_EVENT,
+                object_id: input.address.surface_id,
+                payload,
+            },
+        );
+        true
+    }
+
     /// Count a press in the current sequence, matching the real host's policy so a producer
     /// testing against this presenter sees the same counts it will see live.
     fn count_clicks(&mut self, position: Point, button: Option<(u16, bool)>) -> u8 {
@@ -1065,7 +1128,7 @@ impl Overlays {
     /// Whether the focused window belongs to one of these owners. Keyboard input follows focus
     /// rather than a position, so routing it for a pane that does not hold the focused window
     /// would deliver a keystroke to another pane's producer.
-    fn focus_belongs_to(&self, sessions: &[u64]) -> bool {
+    pub(crate) fn focus_belongs_to(&self, sessions: &[u64]) -> bool {
         self.windows
             .focus()
             .is_some_and(|id| sessions.contains(&id.context.session.session_id))
