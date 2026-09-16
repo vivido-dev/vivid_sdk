@@ -1502,6 +1502,7 @@ impl VirtualVivid {
         if !state.config.target.accepts_anchors() {
             return;
         }
+        let mut changed = false;
         for session in state
             .sessions
             .values_mut()
@@ -1512,10 +1513,14 @@ impl VirtualVivid {
                 .values_mut()
                 .filter(|anchor| anchor.alternate == alternate)
             {
-                anchor.row = anchor.row.saturating_sub(lines);
+                let row = anchor.row.saturating_sub(lines);
+                changed |= row != anchor.row;
+                anchor.row = row;
             }
         }
-        advance_projection(&mut state);
+        if changed {
+            advance_projection(&mut state);
+        }
     }
 
     pub fn clear_anchors(&self, pane: PaneId, alternate: bool) {
@@ -1523,6 +1528,7 @@ impl VirtualVivid {
         if !state.config.target.accepts_anchors() {
             return;
         }
+        let mut changed = false;
         for session in state
             .sessions
             .values_mut()
@@ -1536,9 +1542,12 @@ impl VirtualVivid {
             for (context, anchor) in removed {
                 session.anchors.remove(&(context, anchor));
                 notify_anchor_gone(session, context, anchor);
+                changed = true;
             }
         }
-        advance_projection(&mut state);
+        if changed {
+            advance_projection(&mut state);
+        }
     }
 
     pub fn set_alternate_screen(&self, pane: PaneId, alternate: bool) {
@@ -7689,6 +7698,24 @@ mod tests {
             optional_profiles: vec![crate::AUDIO_GAIN.into()],
             ..ProducerConfig::default()
         }
+    }
+
+    #[test]
+    fn anchorless_terminal_motion_does_not_advance_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        let revision = presenter.revision();
+
+        for _ in 0..1_000 {
+            presenter.scroll_anchors(7, 1, false);
+            presenter.clear_anchors(7, false);
+        }
+
+        assert_eq!(presenter.revision(), revision);
     }
 
     fn surface(context_id: u64, surface_id: u64) -> SurfaceDefinition {
