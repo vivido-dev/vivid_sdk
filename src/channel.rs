@@ -1377,8 +1377,14 @@ pub(crate) fn spawn_channel_reader(
                             state.needs_recovery = true;
                             state.minimum_recovery_epoch =
                                 state.minimum_recovery_epoch.max(minimum_epoch);
-                            drop(state);
+                            // Publish the event before exposing `needs_recovery` to a sender. If
+                            // the media lock were released first, an interframe could observe the
+                            // new requirement, fail locally, and still find no event to explain
+                            // how to recover. Keeping the lock across the bounded event enqueue
+                            // makes the state transition and its recovery instruction observable
+                            // in one order.
                             push_channel_event(&events, ChannelEvent::NeedKeyframe(payload))?;
+                            drop(state);
                         }
                         messages::NEED_FULL_FRAME => {
                             validate_exact_payload_keys("NEED_FULL_FRAME", &payload, 0..=4)?;
@@ -1388,8 +1394,8 @@ pub(crate) fn spawn_channel_reader(
                                     invalid_data("channel recovery revision exhausted")
                                 })?;
                             state.needs_recovery = true;
-                            drop(state);
                             push_channel_event(&events, ChannelEvent::NeedFullFrame(payload))?;
+                            drop(state);
                         }
                         _ if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 => {}
                         _ => {
