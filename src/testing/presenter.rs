@@ -29,6 +29,10 @@ use vivid_protocol::wire::{HEADER_SIZE, PREFACE_SIZE, Preface, Record, RecordHea
 
 use crate::testing::script::Script;
 
+/// The one session this presenter serves. Overlay state is session-scoped, because a real
+/// presenter serves many panes; here there is only ever this one.
+const TEST_SESSION_ID: u64 = 1;
+
 /// Root secret the harness accepts. Tests place it in `VIVID_ROOT_SECRET`.
 pub const ROOT_SECRET_HEX: &str =
     "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
@@ -65,6 +69,19 @@ impl TargetKind {
             Self::Desktop { height, .. } => height.max(1),
         }
     }
+}
+
+/// A surface's immutable fields, retained from `CREATE_SURFACE` so `QUERY_SURFACE` can echo them
+/// back byte-identical, exactly as a real presenter must.
+#[derive(Debug, Clone)]
+struct SurfaceImmutableFields {
+    semantic_profile: String,
+    coordinate_model: u64,
+    logical_width: u64,
+    logical_height: u64,
+    scale_numerator: u64,
+    scale_denominator: u64,
+    rotation: u64,
 }
 
 /// One control-connection request the presenter observed, in arrival order.
@@ -446,7 +463,8 @@ impl TestPresenter {
                 scale_numerator: scale.max(1),
                 scale_denominator: 1,
             };
-            guard.overlays.set_viewport(viewport);
+            // This presenter serves one session, so its viewport is that session's.
+            guard.overlays.set_viewport(TEST_SESSION_ID, viewport);
         }
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(())
@@ -461,12 +479,13 @@ impl TestPresenter {
         modifiers: u32,
     ) -> io::Result<bool> {
         let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
-        let consumed = self
-            .shared
-            .lock()
-            .expect("shared")
-            .overlays
-            .pointer(1, position, button, modifiers, None);
+        let consumed = self.shared.lock().expect("shared").overlays.pointer(
+            &[TEST_SESSION_ID],
+            position,
+            button,
+            modifiers,
+            None,
+        );
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -487,12 +506,12 @@ impl TestPresenter {
             precise: true,
             phase: vivid_protocol::overlay::ScrollPhase::Changed,
         };
-        let consumed = self
-            .shared
-            .lock()
-            .expect("shared")
-            .overlays
-            .wheel(1, position, scroll, modifiers);
+        let consumed = self.shared.lock().expect("shared").overlays.wheel(
+            &[TEST_SESSION_ID],
+            position,
+            scroll,
+            modifiers,
+        );
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -501,7 +520,7 @@ impl TestPresenter {
     pub fn overlay_pressure(&self, x: f64, y: f64, pressure: f64) -> io::Result<bool> {
         let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
         let consumed = self.shared.lock().expect("shared").overlays.pointer(
-            1,
+            &[TEST_SESSION_ID],
             position,
             None,
             0,
@@ -517,12 +536,12 @@ impl TestPresenter {
             preedit: preedit.to_owned(),
             selection,
         };
-        let consumed = self
-            .shared
-            .lock()
-            .expect("shared")
-            .overlays
-            .keyboard(1, event, false);
+        let consumed =
+            self.shared
+                .lock()
+                .expect("shared")
+                .overlays
+                .keyboard(&[TEST_SESSION_ID], event, false);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -537,12 +556,11 @@ impl TestPresenter {
         };
         // Escape dismissal is the host's policy, and it keys off the usage rather than the text.
         let escape = usage == 0x29;
-        let consumed = self
-            .shared
-            .lock()
-            .expect("shared")
-            .overlays
-            .keyboard(1, event, escape);
+        let consumed = self.shared.lock().expect("shared").overlays.keyboard(
+            &[TEST_SESSION_ID],
+            event,
+            escape,
+        );
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -550,12 +568,12 @@ impl TestPresenter {
     /// Deliver committed text, as a platform text-input path would after a key or an IME commit.
     pub fn overlay_text(&self, text: &str) -> io::Result<bool> {
         let event = vivid_protocol::overlay::Event::Text(text.to_owned());
-        let consumed = self
-            .shared
-            .lock()
-            .expect("shared")
-            .overlays
-            .keyboard(1, event, false);
+        let consumed =
+            self.shared
+                .lock()
+                .expect("shared")
+                .overlays
+                .keyboard(&[TEST_SESSION_ID], event, false);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(consumed)
     }
@@ -566,7 +584,7 @@ impl TestPresenter {
             .lock()
             .expect("shared")
             .overlays
-            .set_pane_focus(1, focused);
+            .set_pane_focus(&[TEST_SESSION_ID], focused);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(())
     }
@@ -785,7 +803,7 @@ fn serve(serving: Serving) -> io::Result<()> {
         )));
     }
     let mut welcome = Welcome {
-        session_id: 1,
+        session_id: TEST_SESSION_ID,
         session_tag: [3; messages::SESSION_TAG_BYTES],
         root_context_id: 1,
         target_generation: 1,
@@ -815,6 +833,7 @@ fn serve(serving: Serving) -> io::Result<()> {
         let mut guard = shared.lock().expect("shared");
         guard.overlay_sessions.insert(welcome.session_id);
         guard.overlays.install_viewport(
+            welcome.session_id,
             f64::from(initial_target.kind.overlay_width()),
             f64::from(initial_target.kind.overlay_height()),
         );
@@ -859,6 +878,9 @@ fn serve(serving: Serving) -> io::Result<()> {
 
     let mut scene_revision = 1_u64;
     let mut surface_revisions: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+    // The immutable fields a real presenter's `QUERY_SURFACE` reply must keep byte-identical to
+    // what the producer created the surface with.
+    let mut surface_definitions: HashMap<(u64, u64), SurfaceImmutableFields> = HashMap::new();
     let mut track_revisions: HashMap<u64, u64> = HashMap::new();
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -882,11 +904,33 @@ fn serve(serving: Serving) -> io::Result<()> {
                 .find(|(candidate, _)| *candidate == key)
                 .and_then(|(_, value)| value.as_u64())
         };
+        let text = |key: u64| {
+            payload
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .and_then(|(_, value)| match value {
+                    Value::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+        };
 
         let (reply_type, reply_body) = match record.record_type {
             messages::CREATE_SURFACE => {
                 let key = (unsigned(0).unwrap_or(0), unsigned(1).unwrap_or(0));
                 surface_revisions.insert(key, (1, 1));
+                surface_definitions.insert(
+                    key,
+                    SurfaceImmutableFields {
+                        semantic_profile: text(2)
+                            .unwrap_or_else(|| crate::GENERIC_CONTENT.to_owned()),
+                        coordinate_model: unsigned(3).unwrap_or(1),
+                        logical_width: unsigned(4).unwrap_or(1),
+                        logical_height: unsigned(5).unwrap_or(1),
+                        scale_numerator: unsigned(6).unwrap_or(1),
+                        scale_denominator: unsigned(7).unwrap_or(1),
+                        rotation: unsigned(8).unwrap_or(0),
+                    },
+                );
                 (
                     messages::SURFACE_READY,
                     ok_payload(
@@ -908,6 +952,54 @@ fn serve(serving: Serving) -> io::Result<()> {
                     state.0 += 1;
                 }
                 (messages::OK, messages::ok(request_id))
+            }
+            messages::QUERY_SURFACE => {
+                let key = (unsigned(0).unwrap_or(0), unsigned(1).unwrap_or(0));
+                let (revision, generation) = surface_revisions.get(&key).copied().unwrap_or((1, 1));
+                let fields = surface_definitions.get(&key).cloned().unwrap_or_else(|| {
+                    SurfaceImmutableFields {
+                        semantic_profile: crate::GENERIC_CONTENT.to_owned(),
+                        coordinate_model: 1,
+                        logical_width: 1,
+                        logical_height: 1,
+                        scale_numerator: 1,
+                        scale_denominator: 1,
+                        rotation: 0,
+                    }
+                });
+                (
+                    messages::SURFACE_STATUS,
+                    ok_payload(
+                        request_id,
+                        vec![
+                            (0, Value::Unsigned(key.0)),
+                            (1, Value::Unsigned(key.1)),
+                            (2, Value::Unsigned(revision)),
+                            (3, Value::Unsigned(generation)),
+                            (4, Value::Text(fields.semantic_profile)),
+                            (5, Value::Unsigned(fields.coordinate_model)),
+                            (6, Value::Unsigned(fields.logical_width)),
+                            (7, Value::Unsigned(fields.logical_height)),
+                            (8, Value::Unsigned(fields.scale_numerator)),
+                            (9, Value::Unsigned(fields.scale_denominator)),
+                            (10, Value::Unsigned(fields.rotation)),
+                            (
+                                11,
+                                Value::Map(vec![
+                                    (0, Value::Unsigned(1)),
+                                    (1, Value::Text(String::new())),
+                                    (2, Value::Unsigned(0)),
+                                    (3, Value::Unsigned(0)),
+                                    (4, Value::Text(String::new())),
+                                ]),
+                            ),
+                            (12, Value::Unsigned(0)),
+                            (13, Value::Map(Vec::new())),
+                            (14, Value::Unsigned(1)),
+                            (15, Value::Map(Vec::new())),
+                        ],
+                    )?,
+                )
             }
             messages::PROBE_TRACK_CONFIG => (
                 messages::TRACK_SUPPORT,
@@ -1412,7 +1504,7 @@ fn serve_interactive_lane(
     lane_writer: Arc<Mutex<Option<(TcpStream, u64)>>>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let session_id = 1;
+    let session_id = TEST_SESSION_ID;
     let open_record = read_record(&mut stream)?;
     if open_record.record_type != messages::LANE_OPEN {
         return Err(io::Error::other("lane connection did not open a lane"));
@@ -1430,7 +1522,7 @@ fn serve_interactive_lane(
         return Err(io::Error::other("LANE_OPEN authentication tag failed"));
     }
 
-    let maximum_body = 64 * 1024_u32;
+    let maximum_body = vivid_protocol::LANE_MAX_RECORD_BODY;
     let accepted = ok_payload(
         envelope.request_id,
         vec![
@@ -1466,7 +1558,7 @@ fn serve_interactive_lane(
             .lock()
             .expect("shared")
             .overlays
-            .queue_initial_environment();
+            .open_lane(session_id);
         flush_overlay_lane(&shared, &lane_writer);
     }
 
@@ -1486,7 +1578,9 @@ fn serve_interactive_lane(
             let envelope = messages::decode_control(&record.body).map_err(io::Error::other)?;
             let mut guard = shared.lock().expect("shared");
             let outcome = if record.record_type == messages::OVERLAY_INPUT_RENEW {
-                guard.overlays.renew(record.object_id, &envelope.payload)
+                guard
+                    .overlays
+                    .renew(session_id, record.object_id, &envelope.payload)
             } else {
                 guard
                     .overlays
@@ -1637,7 +1731,11 @@ fn flush_overlay_lane(
     let Some((stream, sequence)) = guard.as_mut() else {
         return;
     };
-    let pending = shared.lock().expect("shared").overlays.take_pending();
+    let pending = shared
+        .lock()
+        .expect("shared")
+        .overlays
+        .take_pending(TEST_SESSION_ID);
     for record in pending {
         let Ok(body) = Envelope::new(0, record.payload).encode() else {
             continue;

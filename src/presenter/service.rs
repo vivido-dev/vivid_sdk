@@ -38,19 +38,20 @@ use vivid_protocol::track::{
     MILESTONE_CHANNEL_ACCEPTED, MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED,
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_OUTPUT_READY,
     MILESTONE_PRESENTED, RasterConfiguration, TrackConfiguration, TrackMode, TrackState,
-    VideoConfiguration,
+    VectorConfiguration, VideoConfiguration,
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use zeroize::Zeroizing;
 
 use super::config::{
-    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
-    BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, PaneMediaNodeStatus,
-    PaneMediaStatus, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
+    BridgeClipRect, BridgeNode, BridgeOverlayWindow, BridgePlayRequest, BridgeSource,
+    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
+    PaneMediaNodeStatus, PaneMediaStatus, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
 };
 use super::config::{
     DeliveryMetrics, MediaConfig, PaneId, PaneMediaSurfaceDescriptor, PresenterConfig, RelayMetrics,
 };
+use super::overlay_host::OverlayReply;
 use super::transport::{Reader, Writer};
 use crate::presenter::{KEYFRAME_REASON_TRANSPORT_LOSS, PresenterListener, Transport};
 
@@ -107,6 +108,7 @@ pub enum SourceDescriptor {
     Image(ImageConfiguration),
     Video(VideoConfiguration),
     Audio(AudioSourceConfig),
+    VectorScene(VectorConfiguration),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +213,16 @@ impl ProjectionSnapshot {
                 logical_height: surface.logical_height,
                 capture_policy: surface.capture_policy,
                 descriptor: bridge_semantic_descriptor(&surface.semantic_descriptor),
+                overlay_window: surface.overlay_window.map(|window| BridgeOverlayWindow {
+                    generation: window.generation,
+                    revision: window.revision,
+                    x: window.x,
+                    y: window.y,
+                    width: window.width,
+                    height: window.height,
+                    mode: window.mode,
+                    visible: window.visible,
+                }),
             })
             .collect();
         let sources = self
@@ -349,18 +361,52 @@ fn bridge_source_kind(source: &SnapshotSource) -> BridgeSourceKind {
             max_access_unit_bytes: config.max_access_unit_bytes,
             codec_string: config.codec_string.clone(),
         },
+        SourceDescriptor::VectorScene(config) => BridgeSourceKind::VectorScene {
+            width: config.width,
+            height: config.height,
+            maximum_scene_bytes: config.maximum_scene_bytes,
+        },
     }
+}
+
+/// An overlay window's bounds, mode, visibility, generation and revision, present on a
+/// [`SnapshotSurface`] whose surface hosts a `vector-scene-v1` track. Geometry is rounded to
+/// logical pixels, matching every other geometry field this bridge model carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotOverlayWindow {
+    pub generation: u64,
+    pub revision: u64,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    /// `WindowMode` as its wire discriminant: 0 Floating, 1 Popup, 2 Modal.
+    pub mode: u64,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SnapshotSurface {
     pub producer: ProducerId,
+    /// The presentation principal this surface's session authenticated against. A scene node
+    /// carries its own pane, but an overlay window has no node: it is placed by its bounds, and
+    /// a relay needs the pane to know which rectangle those bounds are relative to.
+    pub pane: PaneId,
     pub context: u64,
     pub surface: u64,
     pub logical_width: u64,
     pub logical_height: u64,
     pub capture_policy: u64,
     pub semantic_descriptor: SemanticDescriptor,
+    pub overlay_window: Option<SnapshotOverlayWindow>,
+}
+
+fn window_mode_wire(mode: vivid_protocol::overlay::WindowMode) -> u64 {
+    match mode {
+        vivid_protocol::overlay::WindowMode::Floating => 0,
+        vivid_protocol::overlay::WindowMode::Popup => 1,
+        vivid_protocol::overlay::WindowMode::Modal => 2,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +643,10 @@ struct SessionRuntime {
     lease: Option<(u64, u64)>,
     resume_key: Secret32,
     resume_generation: u64,
+    /// The interactive lane's writer, present once this session's overlay lane authenticates.
+    /// Unsolicited overlay records (window events, submission outcomes, viewport/environment
+    /// snapshots) are pushed here as soon as they are queued, rather than waiting for a request.
+    overlay_lane: Option<Arc<Writer>>,
 }
 
 // An exact authenticated transcript can recognize a lost-response retry after old keys
@@ -741,6 +791,10 @@ struct State {
     play_commands: Vec<BridgeSourceKey>,
     connections: usize,
     delivery_metrics: DeliveryMetrics,
+    /// Overlay window/focus/revision bookkeeping, shared by every session this presenter accepts.
+    /// Only populated when `config.overlay` is set; otherwise no session ever negotiates the
+    /// profiles that would let anything reach it.
+    overlays: crate::presenter::overlay_host::Overlays,
 }
 
 fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
@@ -893,21 +947,23 @@ impl VirtualVivid {
     ) -> io::Result<Self> {
         config.supported_profiles.sort();
         config.supported_profiles.dedup();
-        if config.supported_profiles.iter().any(|profile| {
-            matches!(
-                profile.as_str(),
-                registry::TERMINAL_OVERLAY
-                    | registry::VECTOR_SCENE
-                    | registry::OVERLAY_INPUT
-                    | registry::OVERLAY_TEXT
-                    | registry::OVERLAY_TEXT_LAYOUT
-                    | registry::OVERLAY_TYPOGRAPHY
-                    | registry::OVERLAY_PAINT
-                    | registry::OVERLAY_POINTER
-                    | registry::OVERLAY_ENV
-                    | registry::OVERLAY_A11Y
-            )
-        }) {
+        if !config.overlay
+            && config.supported_profiles.iter().any(|profile| {
+                matches!(
+                    profile.as_str(),
+                    registry::TERMINAL_OVERLAY
+                        | registry::VECTOR_SCENE
+                        | registry::OVERLAY_INPUT
+                        | registry::OVERLAY_TEXT
+                        | registry::OVERLAY_TEXT_LAYOUT
+                        | registry::OVERLAY_TYPOGRAPHY
+                        | registry::OVERLAY_PAINT
+                        | registry::OVERLAY_POINTER
+                        | registry::OVERLAY_ENV
+                        | registry::OVERLAY_A11Y
+                )
+            })
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "this terminating presenter has no vector overlay renderer or pane input router",
@@ -979,6 +1035,7 @@ impl VirtualVivid {
             play_commands: Vec::new(),
             connections: 0,
             delivery_metrics: DeliveryMetrics::default(),
+            overlays: crate::presenter::overlay_host::Overlays::default(),
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1193,6 +1250,15 @@ impl VirtualVivid {
         };
         state.targets.insert(pane, target.clone());
         announce_target_change(&mut state, pane, &target, 0x1f);
+        // An overlay window lays out against the pane it sits in, so a resize moves its viewport.
+        if state.config.overlay
+            && let Some(viewport) = overlay_viewport(&metrics)
+        {
+            for session_id in overlay_sessions_for_pane(&state, pane) {
+                state.overlays.set_viewport(session_id, viewport);
+                flush_overlay_lane(&mut state, session_id);
+            }
+        }
     }
 
     /// Advances one desktop principal's target and announces the new descriptor to its live
@@ -1604,14 +1670,36 @@ impl VirtualVivid {
             .surfaces
             .iter()
             .filter(|(key, _)| sessions.contains(&key.session))
-            .map(|(key, surface)| SnapshotSurface {
-                producer: key.session,
-                context: key.context,
-                surface: key.surface,
-                logical_width: surface.state.definition.logical_width,
-                logical_height: surface.state.definition.logical_height,
-                capture_policy: surface.state.definition.policy,
-                semantic_descriptor: semantic_descriptor(&surface.state.definition.descriptor),
+            .map(|(key, surface)| {
+                let overlay_window = super::overlay_host::owner(key.session)
+                    .context(key.context)
+                    .ok()
+                    .and_then(|context| context.surface(key.surface).ok())
+                    .and_then(|identity| state.overlays.window(identity))
+                    .map(|window| SnapshotOverlayWindow {
+                        generation: window.generation,
+                        revision: window.revision,
+                        x: window.options.bounds.origin.x.get().round() as i64,
+                        y: window.options.bounds.origin.y.get().round() as i64,
+                        width: window.options.bounds.width.get().round() as i64,
+                        height: window.options.bounds.height.get().round() as i64,
+                        mode: window_mode_wire(window.options.mode),
+                        visible: window.options.visible,
+                    });
+                SnapshotSurface {
+                    overlay_window,
+                    producer: key.session,
+                    pane: state
+                        .sessions
+                        .get(&key.session)
+                        .map_or(0, |session| session.pane),
+                    context: key.context,
+                    surface: key.surface,
+                    logical_width: surface.state.definition.logical_width,
+                    logical_height: surface.state.definition.logical_height,
+                    capture_policy: surface.state.definition.policy,
+                    semantic_descriptor: semantic_descriptor(&surface.state.definition.descriptor),
+                }
             })
             .collect::<Vec<_>>();
         let sources =
@@ -2467,22 +2555,26 @@ fn handle_connection(
         ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, state, changed),
         ConnectionKind::Track => handle_track(&mut reader, state, changed),
         ConnectionKind::Lane => {
-            let writer = reader.writer();
-            let first = reader.read_record(ConnectionKind::Lane)?;
-            let request = messages::decode_control(&first.body)
-                .map(|envelope| envelope.request_id)
-                .unwrap_or(0);
-            writer.write_record(
-                messages::ERROR,
-                first.object_id,
-                &protocol_error(
-                    request,
-                    messages::ERROR_UNSUPPORTED_PROFILE,
-                    true,
-                    "this presenter does not serve Vivid lane connections",
-                )?,
-            )?;
-            Ok(())
+            if lock(state).config.overlay {
+                handle_lane(&mut reader, state)
+            } else {
+                let writer = reader.writer();
+                let first = reader.read_record(ConnectionKind::Lane)?;
+                let request = messages::decode_control(&first.body)
+                    .map(|envelope| envelope.request_id)
+                    .unwrap_or(0);
+                writer.write_record(
+                    messages::ERROR,
+                    first.object_id,
+                    &protocol_error(
+                        request,
+                        messages::ERROR_UNSUPPORTED_PROFILE,
+                        true,
+                        "this presenter does not serve Vivid lane connections",
+                    )?,
+                )?;
+                Ok(())
+            }
         }
         ConnectionKind::FileTransfer => {
             let writer = reader.writer();
@@ -2500,6 +2592,152 @@ fn handle_connection(
             Ok(())
         }
     }
+}
+
+/// Serves the overlay interactive lane: one independently authenticated connection per session,
+/// carrying renewal, pointer capture requests, and every unsolicited overlay record the session is
+/// owed. A stalled or malformed bulk track must never delay this connection, so it shares nothing
+/// with `handle_track` but the session lookup.
+fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()> {
+    let writer = reader.writer();
+    let first = reader.read_record(ConnectionKind::Lane)?;
+    if first.record_type != messages::LANE_OPEN {
+        return Err(invalid("lane connection did not open a lane"));
+    }
+    let envelope = messages::decode_control(&first.body)?;
+    let request_id = envelope.request_id;
+    let open = messages::LaneOpen::decode(&first.body)?;
+    let session_id = open.session_id;
+    {
+        let mut state = lock(shared);
+        let Some(session) = state.sessions.get(&session_id) else {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_NOT_FOUND,
+                "session does not exist",
+            ));
+        };
+        if session.closed {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_NOT_FOUND,
+                "session is no longer live",
+            ));
+        }
+        if !session.accepted_profiles.contains(registry::OVERLAY_INPUT) {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_UNSUPPORTED_PROFILE,
+                "overlay-input-v1 was not negotiated",
+            ));
+        }
+        let expected = auth::lane_tag(
+            session.channel_key.expose(),
+            session_id,
+            messages::LaneClass::Interactive as u32,
+            open.lane_generation,
+            &open.client_nonce,
+        );
+        if !auth::verify_tag(&expected, &open.authentication_tag) {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_AUTH_FAILED,
+                "lane authentication failed",
+            ));
+        }
+        let accepted_body = Envelope::new(
+            request_id,
+            vec![
+                (0, Value::Unsigned(session_id)),
+                (1, Value::Unsigned(messages::LaneClass::Interactive as u64)),
+                (2, Value::Unsigned(open.lane_generation)),
+                (
+                    3,
+                    Value::Unsigned(u64::from(vivid_protocol::LANE_MAX_RECORD_BODY)),
+                ),
+            ],
+        )
+        .encode()?;
+        writer.write_record(messages::LANE_ACCEPTED, 0, &accepted_body)?;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("checked above")
+            .overlay_lane = Some(writer.clone());
+        // The spec requires an initial viewport and environment snapshot right after lane
+        // authentication, not on the next unrelated change.
+        state.overlays.open_lane(session_id);
+        flush_overlay_lane(&mut state, session_id);
+    }
+    // Refuse inbound records larger than the allowance just granted. Without this the lane would
+    // accept whatever the connection preface negotiated, which is the bulk ceiling.
+    reader.set_maximum(vivid_protocol::LANE_MAX_RECORD_BODY)?;
+    reader.clear_read_deadline()?;
+    loop {
+        let record = match reader.read_record(ConnectionKind::Lane) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        };
+        let envelope = messages::decode_control(&record.body)?;
+        let mut state = lock(shared);
+        // A session end or a newer lane superseding this one both retire it without error: the
+        // producer's own transport close or replacement lane already explains why.
+        let Some(session) = state.sessions.get(&session_id) else {
+            break;
+        };
+        if session.closed
+            || !session
+                .overlay_lane
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &writer))
+        {
+            break;
+        }
+        let outcome: OverlayReply = match record.record_type {
+            messages::OVERLAY_INPUT_RENEW => {
+                state
+                    .overlays
+                    .renew(session_id, record.object_id, &envelope.payload)
+            }
+            messages::OVERLAY_INPUT_CAPTURE => {
+                state
+                    .overlays
+                    .capture(session_id, record.object_id, &envelope.payload)
+            }
+            _ => Err("record is not carried on the overlay interactive lane"),
+        };
+        let (reply_type, body) = match outcome {
+            Ok((reply, fields)) => (reply, Envelope::new(envelope.request_id, fields).encode()?),
+            Err(reason) => (
+                messages::ERROR,
+                protocol_error(
+                    envelope.request_id,
+                    messages::ERROR_BAD_STATE,
+                    false,
+                    reason,
+                )?,
+            ),
+        };
+        drop(state);
+        writer.write_record(reply_type, record.object_id, &body)?;
+        let mut state = lock(shared);
+        flush_overlay_lane(&mut state, session_id);
+    }
+    let mut state = lock(shared);
+    if let Some(session) = state.sessions.get_mut(&session_id)
+        && session
+            .overlay_lane
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &writer))
+    {
+        session.overlay_lane = None;
+    }
+    Ok(())
 }
 
 fn handle_control(
@@ -3066,6 +3304,15 @@ fn establish_session(
         resume_generation,
         extensions: vec![],
     };
+    if welcome
+        .accepted_profiles
+        .iter()
+        .any(|profile| profile == registry::VECTOR_SCENE)
+    {
+        welcome
+            .extensions
+            .push((15, state.overlays.limits().to_value()));
+    }
     welcome.confirm(&prk)?;
     let candidate_welcome = welcome.encode(request_id)?;
     let fingerprint = profile_fingerprint(target_profile, &welcome.accepted_profiles);
@@ -3187,8 +3434,23 @@ fn establish_session(
             lease: lease_key,
             resume_key: Secret32::new(*keys.resume_key()),
             resume_generation,
+            overlay_lane: None,
         },
     );
+    // Seed this session's viewport from the pane it authenticated against, so its first window
+    // query or action has geometry to answer with. The lane's initial snapshot delivers it; a
+    // later resize is pushed by `update_metrics`.
+    if state.config.overlay
+        && decided
+            .accepted_profiles
+            .iter()
+            .any(|profile| profile == registry::VECTOR_SCENE)
+        && let Some(viewport) = state.metrics.get(&pane).and_then(overlay_viewport)
+    {
+        state
+            .overlays
+            .install_session_viewport(session_id, viewport);
+    }
     if let Some(key) = lease_key
         && let Some(lease) = state.leases.get_mut(&key)
     {
@@ -3293,6 +3555,153 @@ fn recorrelate_cached_reply(body: &[u8], request_id: u64) -> io::Result<Vec<u8>>
     let mut envelope = messages::decode_control(body)?;
     envelope.request_id = request_id;
     envelope.encode().map_err(io::Error::other)
+}
+
+/// Every live, `vector-scene-v1`-negotiated session belonging to `pane`. A pane ordinarily has
+/// exactly one, but nothing here assumes that: two producers can authenticate against the same
+/// pane, and each must be reachable independently.
+fn overlay_sessions_for_pane(state: &State, pane: PaneId) -> Vec<u64> {
+    state
+        .sessions
+        .iter()
+        .filter(|(_, session)| {
+            session.pane == pane
+                && !session.closed
+                && session.accepted_profiles.contains(registry::VECTOR_SCENE)
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The logical-pixel rectangle a pane's overlay windows lay out against.
+///
+/// It is derived from the pane's own cell grid rather than set separately: the two would drift,
+/// and an overlay window laid out against a stale viewport is placed wrong. `update_metrics`
+/// already computes the pixel extent, so there is exactly one source of truth.
+fn overlay_viewport(metrics: &Metrics) -> Option<vivid_protocol::overlay::wire::Viewport> {
+    Some(vivid_protocol::overlay::wire::Viewport {
+        width: vivid_protocol::vector::Scalar::new(f64::from(metrics.viewport_width)).ok()?,
+        height: vivid_protocol::vector::Scalar::new(f64::from(metrics.viewport_height)).ok()?,
+        scale_numerator: 1,
+        scale_denominator: 1,
+    })
+}
+
+impl VirtualVivid {
+    /// Reports the host environment (appearance, font defaults, motion preference) a pane's
+    /// overlay windows should match, and pushes the change to every negotiated session.
+    pub fn set_overlay_environment(
+        &self,
+        pane: PaneId,
+        environment: vivid_protocol::overlay::wire::Environment,
+    ) {
+        let mut state = lock(&self.state);
+        state.overlays.set_environment(environment);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        flush_overlay_lanes(&mut state, &sessions);
+    }
+
+    /// Delivers a pointer event in viewport logical pixels to a pane's overlay windows. `button`
+    /// is `(button, pressed)`. Returns whether any session's overlay consumed it.
+    pub fn overlay_pointer(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state
+            .overlays
+            .pointer(&sessions, position, button, modifiers, None);
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a pressure sample, as a device that has one reports.
+    pub fn overlay_pressure(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        pressure: f64,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let pressure = vivid_protocol::vector::Scalar::new(pressure).map_err(io::Error::other)?;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state
+            .overlays
+            .pointer(&sessions, position, None, 0, Some(pressure));
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a wheel delta in viewport logical pixels to a pane's overlay windows.
+    pub fn overlay_wheel(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let scroll = vivid_protocol::overlay::Scroll {
+            dx: vivid_protocol::vector::Scalar::new(dx).map_err(io::Error::other)?,
+            dy: vivid_protocol::vector::Scalar::new(dy).map_err(io::Error::other)?,
+            // A terminal reports wheel detents, not pixel-precise motion; the caller has already
+            // converted them to logical pixels, which is exactly what `precise` being false means.
+            precise: false,
+            phase: vivid_protocol::overlay::ScrollPhase::Changed,
+        };
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.wheel(&sessions, position, scroll, modifiers);
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a physical key transition to a pane's overlay windows. `usage` is a USB HID
+    /// keyboard-page usage. Escape dismissal is the host's policy, keyed off the usage.
+    pub fn overlay_key(&self, pane: PaneId, usage: u32, down: bool, modifiers: u32) -> bool {
+        let event = vivid_protocol::overlay::Event::Key {
+            physical: usage,
+            down,
+            repeat: false,
+            modifiers,
+        };
+        let escape = usage == 0x29;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.keyboard(&sessions, event, escape);
+        flush_overlay_lanes(&mut state, &sessions);
+        consumed
+    }
+
+    /// Delivers committed text to a pane's overlay windows, as a platform text-input path would
+    /// after a key or an IME commit.
+    pub fn overlay_text(&self, pane: PaneId, text: &str) -> bool {
+        let event = vivid_protocol::overlay::Event::Text(text.to_owned());
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.keyboard(&sessions, event, false);
+        flush_overlay_lanes(&mut state, &sessions);
+        consumed
+    }
+
+    /// Gains or loses native pane focus, which cancels gestures and held input state in every
+    /// overlay window of the pane.
+    pub fn set_overlay_pane_focus(&self, pane: PaneId, focused: bool) {
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        state.overlays.set_pane_focus(&sessions, focused);
+        flush_overlay_lanes(&mut state, &sessions);
+    }
 }
 
 fn dispatch_control(
@@ -3459,7 +3868,12 @@ fn dispatch_control(
                     || state
                         .sessions
                         .get(&session_id)
-                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)));
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)))
+                && (!matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    || state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::VECTOR_SCENE)));
             (
                 messages::TRACK_SUPPORT,
                 0,
@@ -3506,6 +3920,11 @@ fn dispatch_control(
                         .sessions
                         .get(&session_id)
                         .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)))
+                || (matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    && !state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::VECTOR_SCENE)))
             {
                 return Err(ControlError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
@@ -3519,6 +3938,7 @@ fn dispatch_control(
             if state.tracks.contains_key(&key) {
                 return Err(ControlError::state("track identity is already live"));
             }
+            let is_vector_scene = matches!(configuration.kind, KindConfiguration::VectorScene(_));
             if state.tracks.len() >= state.config.media.max_sources {
                 return Err(ControlError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -3557,6 +3977,14 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                 },
             );
+            if is_vector_scene {
+                state.overlays.note_track(
+                    session_id,
+                    key.track,
+                    key.surface.context,
+                    key.surface.surface,
+                );
+            }
             advance_projection(&mut state);
             (
                 messages::TRACK_READY,
@@ -4091,6 +4519,96 @@ fn dispatch_control(
             advance_projection(&mut state);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         }
+        messages::SET_OVERLAY_WINDOW if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_window(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            flush_overlay_lane(&mut state, session_id);
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::OVERLAY_ACTION if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .action(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            flush_overlay_lane(&mut state, session_id);
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::QUERY_OVERLAY if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .status(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_CLIPBOARD if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_clipboard(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_SEMANTICS if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_semantics(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_EDITOR if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_editor_geometry(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::MEASURE_OVERLAY_TEXT_BATCH if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .measure_text_batch(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::RELEASE_OVERLAY_TEXT_LAYOUTS if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .release_text_layouts(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
         _ if record.flags & RECORD_OPTIONAL != 0 => return Ok(None),
         _ => {
             return Err(ControlError {
@@ -4261,6 +4779,7 @@ fn handle_track(
         track: open.track_id,
     };
     let generation = ChannelGeneration::new(open.channel_generation);
+    let is_vector_scene;
     {
         let mut state = lock(shared);
         let session = state
@@ -4404,9 +4923,14 @@ fn handle_track(
             )
             .encode()?,
         )?;
+        is_vector_scene = matches!(track.configuration.kind, KindConfiguration::VectorScene(_));
     }
     reader.clear_read_deadline()?;
-    let result = track_loop(reader, shared, changed, key, generation);
+    let result = if is_vector_scene {
+        vector_track_loop(reader, shared, key, generation)
+    } else {
+        track_loop(reader, shared, changed, key, generation)
+    };
     let mut state = lock(shared);
     let mut changed_payload = None;
     let gain_supported = state
@@ -4819,6 +5343,73 @@ fn track_loop(
         changed.notify_all();
         if let Some(wakeup) = wakeup {
             wakeup();
+        }
+    }
+}
+
+/// Serves an overlay window's vector-scene track. Deliberately shares nothing with `track_loop`:
+/// a display list has no PTS, keyframe, or flow-credit-consuming delivery to pace, so none of the
+/// timed-media recovery, projection-blocking, or backpressure machinery applies. Validation and
+/// acceptance are entirely [`crate::presenter::overlay_host::Overlays::media_record`]'s job; a
+/// refusal fails the channel, exactly as the timed path fails a channel whose producer broke its
+/// contract.
+fn vector_track_loop(
+    reader: &mut Reader,
+    shared: &Arc<Mutex<State>>,
+    key: TrackKey,
+    generation: ChannelGeneration,
+) -> io::Result<()> {
+    loop {
+        let record = match reader.read_record(ConnectionKind::Track) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if record.object_id != key.track {
+            return Err(invalid("track record object ID is not the accepted track"));
+        }
+        if record.record_type == messages::CHANNEL_EOS {
+            // An overlay window's vector track has no timed EOS concept; a producer that stops
+            // updating a window simply lets it be a static, still-valid final scene.
+            return Ok(());
+        }
+        let length = u32::try_from(record.body.len())
+            .map_err(|_| invalid("vector record body exceeds u32"))?;
+        let mut state = lock(shared);
+        let Some(track) = state.tracks.get_mut(&key) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "track disappeared"));
+        };
+        if track.state.channel_generation != generation {
+            return Ok(());
+        }
+        // Charge the record against the grant this channel was given before doing anything with
+        // it: a producer that overran its window broke the channel's contract.
+        if track.state.flow.admit(length).is_err() {
+            return Err(invalid("vector record exceeded its channel flow grant"));
+        }
+        let accepted = state.overlays.media_record(
+            key.surface.session,
+            record.record_type,
+            key.track,
+            &record.body,
+        );
+        if accepted && let Some(track) = state.tracks.get_mut(&key) {
+            if record.record_type == messages::VECTOR_FRAME {
+                // A published display list is all the readiness an overlay window has: there is
+                // no decoder to initialize and no picture to wait for. The producer holds its
+                // first `ACTIVATE_TRACK` behind this milestone, so the window would never reach
+                // its slot without it.
+                track.state.milestones |= MILESTONE_OUTPUT_READY;
+            }
+            // A display list is consumed as it is accepted — nothing downstream holds it — so the
+            // allowance it spent comes back now, one bounded window ahead of what has been sent.
+            // Without this a producer sends its first scene and then waits on credit forever.
+            grant_rolling_flow(key, track);
+        }
+        flush_overlay_lane(&mut state, key.surface.session);
+        drop(state);
+        if !accepted {
+            return Err(invalid("vector track record was refused"));
         }
     }
 }
@@ -5458,7 +6049,7 @@ fn source_descriptor(
     track: &TrackEntry,
 ) -> Option<SourceDescriptor> {
     Some(match &track.configuration.kind {
-        KindConfiguration::VectorScene(_) => return None,
+        KindConfiguration::VectorScene(config) => SourceDescriptor::VectorScene(config.clone()),
         KindConfiguration::Raster(config) => SourceDescriptor::Raster(config.clone()),
         KindConfiguration::EncodedImage(config) => SourceDescriptor::Image(config.clone()),
         KindConfiguration::Video(config) => SourceDescriptor::Video(config.clone()),
@@ -5499,7 +6090,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
     if configuration.direction == crate::TrackDirection::Uplink {
         return vivid_protocol::audio_input::supports(configuration);
     }
-    (1..=4).contains(&configuration.slot)
+    (1..=5).contains(&configuration.slot)
         && match &configuration.kind {
             KindConfiguration::Video(video) => {
                 media::is_portable_packetization(&video.codec, &video.packetization)
@@ -5513,7 +6104,9 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             )
             .is_ok(),
             KindConfiguration::Raster(_) | KindConfiguration::EncodedImage(_) => true,
-            KindConfiguration::VectorScene(_) => false,
+            // Structurally supported; whether this session negotiated `vector-scene-v1` at all is
+            // checked at the CREATE_TRACK/PROBE_TRACK_CONFIG call sites, which have the session.
+            KindConfiguration::VectorScene(_) => true,
         }
 }
 
@@ -5763,10 +6356,45 @@ fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
     });
 }
 
+/// Write every overlay lane record queued for one session, in arrival order. A session whose lane
+/// has not authenticated yet simply keeps its queue; the initial snapshot [`Overlays::open_lane`]
+/// queues on lane authentication drains it once the writer exists.
+fn flush_overlay_lane(state: &mut State, session_id: u64) {
+    let Some(writer) = state
+        .sessions
+        .get(&session_id)
+        .and_then(|session| session.overlay_lane.clone())
+    else {
+        return;
+    };
+    for record in state.overlays.take_pending(session_id) {
+        let Ok(body) = Envelope::new(0, record.payload).encode() else {
+            continue;
+        };
+        if writer
+            .write_record(record.record_type, record.object_id, &body)
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Write every overlay lane record queued for each of these sessions.
+fn flush_overlay_lanes(state: &mut State, sessions: &[u64]) {
+    for session_id in sessions {
+        flush_overlay_lane(state, *session_id);
+    }
+}
+
 fn cleanup_session(state: &mut State, session: u64) {
     if let Some(runtime) = state.sessions.remove(&session) {
         runtime.writer.close();
+        if let Some(lane) = runtime.overlay_lane {
+            lane.close();
+        }
     }
+    state.overlays.remove_session(session);
     let surfaces = state
         .surfaces
         .keys()

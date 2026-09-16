@@ -180,6 +180,11 @@ pub struct PresenterConfig {
     pub supported_profiles: Vec<String>,
     /// Optional explicit contract. When absent, a bounded contract is derived from `media`.
     pub resource_contract: Option<ResourceContract>,
+    /// Whether this presenter hosts the Vivid overlay bundle (window/focus/revision bookkeeping,
+    /// a lane server, and vector-scene tracks). A `supported_profiles` set that advertises any
+    /// overlay-family profile without this is refused at startup: advertising a profile this
+    /// presenter cannot actually service is a configuration error, not a runtime fallback.
+    pub overlay: bool,
 }
 
 impl PresenterConfig {
@@ -197,7 +202,42 @@ impl PresenterConfig {
                 registry::TIMED_MEDIA.into(),
             ],
             resource_contract: None,
+            overlay: false,
         }
+    }
+
+    /// A terminal presenter that additionally hosts overlay windows.
+    ///
+    /// `terminal-overlay-v1`, `vector-scene-v1` and `overlay-input-v1` are what every overlay
+    /// producer requires; `overlay-paint-v1` and `overlay-pointer-v1` are needed for anything
+    /// beyond flat, static, non-interactive content.
+    ///
+    /// The text pair is here because a declarative toolkit has no font system of its own: it asks
+    /// the host to measure every string it is about to draw, so a presenter that withholds
+    /// `overlay-text-layout-v1` cannot run such a program at all, not even one whose window is a
+    /// label and a button. `overlay-text-v1` comes with it as its prerequisite, and
+    /// `overlay-env-v1` because this host pushes a host-environment snapshot down every lane it
+    /// opens, which should be a profile the producer agreed to rather than an unsolicited record.
+    ///
+    /// Clipboard, accessibility and typography are deliberately absent. This host would accept
+    /// those records and keep them, but a stored clipboard write reaches no system clipboard and a
+    /// stored semantic tree reaches no assistive technology, so advertising them would promise
+    /// behavior that silently does not happen. A producer that finds them missing degrades, which
+    /// is the honest outcome. See `overlay_host` for what the measurement service actually is.
+    pub fn terminal_with_overlay(media: MediaConfig) -> Self {
+        let mut config = Self::terminal(media);
+        config.supported_profiles.extend([
+            registry::TERMINAL_OVERLAY.into(),
+            registry::VECTOR_SCENE.into(),
+            registry::OVERLAY_INPUT.into(),
+            registry::OVERLAY_PAINT.into(),
+            registry::OVERLAY_POINTER.into(),
+            registry::OVERLAY_TEXT.into(),
+            registry::OVERLAY_TEXT_LAYOUT.into(),
+            registry::OVERLAY_ENV.into(),
+        ]);
+        config.overlay = true;
+        config
     }
 
     pub fn desktop(media: MediaConfig, target: DesktopTarget) -> Self {
@@ -211,6 +251,7 @@ impl PresenterConfig {
                 registry::OBSERVABILITY.into(),
             ],
             resource_contract: None,
+            overlay: false,
         }
     }
 
@@ -221,6 +262,13 @@ impl PresenterConfig {
 
     pub fn with_supported_profiles(mut self, profiles: Vec<String>) -> Self {
         self.supported_profiles = profiles;
+        self
+    }
+
+    /// Declares whether this presenter hosts the overlay bundle. Only meaningful together with
+    /// overlay profiles in `supported_profiles`; see [`PresenterConfig::terminal_with_overlay`].
+    pub fn with_overlay_host(mut self, enabled: bool) -> Self {
+        self.overlay = enabled;
         self
     }
 }
@@ -370,6 +418,24 @@ pub struct BridgeSurface {
     pub logical_height: u64,
     pub capture_policy: u64,
     pub descriptor: BridgeSourceDescriptor,
+    /// Present when this surface hosts a `vector-scene-v1` track: its bounds, mode, visibility,
+    /// generation and revision, in the inner producer's own pane-local coordinate space. A
+    /// terminating bridge translates this into its own outer coordinate space and re-issues
+    /// `SET_OVERLAY_WINDOW` rather than forwarding it byte-for-byte.
+    pub overlay_window: Option<BridgeOverlayWindow>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeOverlayWindow {
+    pub generation: u64,
+    pub revision: u64,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    /// `WindowMode` as its wire discriminant: 0 Floating, 1 Popup, 2 Modal.
+    pub mode: u64,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -442,6 +508,12 @@ pub enum BridgeSourceKind {
         bitrate: u64,
         max_access_unit_bytes: u32,
         codec_string: Option<String>,
+    },
+    /// An overlay window's vector-scene track: display-list content, never a raster stream.
+    VectorScene {
+        width: u32,
+        height: u32,
+        maximum_scene_bytes: u32,
     },
 }
 

@@ -870,6 +870,28 @@ fn closed() -> io::Error {
     )
 }
 
+impl Session {
+    /// Issue `SET_OVERLAY_WINDOW` directly on this session and await `OVERLAY_WINDOW_READY`,
+    /// without opening a dedicated [`OverlaySession`]. For a caller that already owns a plain
+    /// `Session` for other purposes and only needs one-shot window control — a terminating
+    /// gateway relaying a nested producer's overlay window to its own outer session, for example,
+    /// alongside the ordinary surfaces and tracks it creates on that same session directly.
+    ///
+    /// Refused before anything is sent unless this session negotiated `terminal-overlay-v1` and
+    /// `vector-scene-v1`, matching the spec's requirement that a producer which did not negotiate
+    /// the profile must not send this record.
+    pub fn set_overlay_window(&self, request: &SetWindow) -> io::Result<SetWindow> {
+        if !self.supports(vivid_protocol::registry::TERMINAL_OVERLAY)
+            || !self.supports(vivid_protocol::registry::VECTOR_SCENE)
+        {
+            return Err(invalid_input(
+                "session did not negotiate terminal-overlay-v1 and vector-scene-v1",
+            ));
+        }
+        set_window(self, request)
+    }
+}
+
 fn set_window(session: &Session, request: &SetWindow) -> io::Result<SetWindow> {
     let reply = session.request(
         messages::SET_OVERLAY_WINDOW,

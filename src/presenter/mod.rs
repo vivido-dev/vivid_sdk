@@ -14,6 +14,7 @@
 
 mod config;
 mod listener;
+pub(crate) mod overlay_host;
 pub(crate) mod resource;
 mod service;
 mod socket;

@@ -368,7 +368,7 @@ impl Session {
             }
             required_u32(&payload, 3)?
         };
-        if maximum_body == 0 || maximum_body > 64 * 1024 {
+        if maximum_body == 0 || maximum_body > vivid_protocol::LANE_MAX_RECORD_BODY {
             return Err(invalid_data(
                 "LANE_ACCEPTED maximum body is outside 1..=65536",
             ));
