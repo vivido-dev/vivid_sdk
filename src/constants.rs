@@ -123,6 +123,10 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("PROFILE_CANVAS_SURFACE", Text(CANVAS_SURFACE)),
     ("PROFILE_LIVE_MEDIA", Text(LIVE_MEDIA)),
     ("PROFILE_TIMED_MEDIA", Text(TIMED_MEDIA)),
+    (
+        "PROFILE_TIMED_MEDIA_SYNC",
+        Text(vivid_protocol::registry::TIMED_MEDIA_SYNC),
+    ),
     ("PROFILE_AUDIO_GAIN", Text(AUDIO_GAIN)),
     ("PROFILE_AUDIO_INPUT", Text(AUDIO_INPUT)),
     ("PROFILE_DESKTOP_INPUT", Text(DESKTOP_INPUT)),

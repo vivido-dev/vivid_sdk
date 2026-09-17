@@ -225,7 +225,12 @@ impl Default for ProducerConfig {
             producer_version: env!("CARGO_PKG_VERSION").into(),
             target_profile: TERMINAL_SURFACE.into(),
             required_profiles: vec![TERMINAL_SURFACE.into(), CORE_CONTROL.into()],
-            optional_profiles: vec![LIVE_MEDIA.into(), OBSERVABILITY.into(), TIMED_MEDIA.into()],
+            optional_profiles: vec![
+                LIVE_MEDIA.into(),
+                OBSERVABILITY.into(),
+                vivid_protocol::registry::TIMED_MEDIA_SYNC.into(),
+                TIMED_MEDIA.into(),
+            ],
             maximum_control_body: DEFAULT_CONTROL_BODY,
             dry_run: false,
             trace_dir: None,

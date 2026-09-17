@@ -231,6 +231,25 @@ export interface SessionInfo {
   readonly resumeGeneration: number;
 }
 
+export interface HeldPosition {
+  readonly trackId: number;
+  readonly channelGeneration: number;
+  readonly epoch: number;
+  readonly ptsUs: number;
+  readonly estimated: boolean;
+}
+
+export interface PlaybackHold {
+  readonly contextId: number;
+  readonly surfaceId: number;
+  readonly serial: number;
+  readonly held: boolean;
+  readonly reasons: number;
+  readonly playingIntent: boolean;
+  readonly recoveryRequired: boolean;
+  readonly position?: HeldPosition;
+}
+
 /** One session event, flattened by `kind`. */
 export interface SessionEvent {
   readonly kind:
@@ -239,6 +258,7 @@ export interface SessionEvent {
     | "anchorGone"
     | "trackLost"
     | "contextChanged"
+    | "playbackHold"
     | "fileDropOffered"
     | "fileDropCancelled"
     | "other"
@@ -249,6 +269,7 @@ export interface SessionEvent {
   readonly recordType?: number;
   readonly diagnostic?: string;
   readonly payload?: Payload;
+  readonly hold?: PlaybackHold;
 }
 
 /** One reverse-channel event. */
@@ -386,8 +407,8 @@ export class Session {
     await call(this.raw.destroyTrack(track.raw));
   }
 
-  async queryTrack(track: Track): Promise<Record<string, unknown>> {
-    return (await call(this.raw.queryTrack(track.raw))) as Record<string, unknown>;
+  async queryTrack(track: Track): Promise<Record<string, unknown> & { readonly playbackHold?: PlaybackHold }> {
+    return (await call(this.raw.queryTrack(track.raw))) as Record<string, unknown> & { readonly playbackHold?: PlaybackHold };
   }
 
   /** Whether the presenter would admit this track, without creating it. */
@@ -459,6 +480,8 @@ export class Session {
       readonly startPtsUs?: number;
       readonly minimumBufferUs?: number;
       readonly maximumLatencyUs?: number;
+      readonly synchronized?: boolean;
+      readonly holdSerial?: number;
     } = {},
   ): Promise<void> {
     await call(
@@ -467,6 +490,8 @@ export class Session {
         options.startPtsUs ?? 0,
         options.minimumBufferUs ?? 0,
         options.maximumLatencyUs ?? 0,
+        options.synchronized ?? false,
+        options.holdSerial,
       ),
     );
   }

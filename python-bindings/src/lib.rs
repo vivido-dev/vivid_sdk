@@ -1262,6 +1262,13 @@ fn payload_to_pydict<'py>(py: Python<'py>, payload: &PayloadMap) -> PyResult<Bou
 fn session_event_to_pydict(py: Python<'_>, event: SessionEvent) -> PyResult<Bound<'_, PyDict>> {
     let dict = PyDict::new(py);
     match event {
+        SessionEvent::PlaybackHold(hold) => {
+            dict.set_item("kind", "playback_hold")?;
+            dict.set_item(
+                "payload",
+                payload_to_pydict(py, &hold.payload().map_err(io_error)?)?,
+            )?;
+        }
         SessionEvent::TargetChanged(payload) => {
             dict.set_item("kind", "target_changed")?;
             dict.set_item("payload", payload_to_pydict(py, &payload)?)?;
@@ -1413,6 +1420,14 @@ fn query_surface(
 
 fn track_status_to_pydict(py: Python<'_>, status: &TrackStatus) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(hold) = &status.playback_hold {
+        dict.set_item(
+            "playback_hold",
+            payload_to_pydict(py, &hold.payload().map_err(io_error)?)?,
+        )?;
+    } else {
+        dict.set_item("playback_hold", PyNone::get(py))?;
+    }
     dict.set_item("context_id", status.context_id)?;
     dict.set_item("surface_id", status.surface_id)?;
     dict.set_item("track_id", status.track_id)?;
@@ -1724,6 +1739,7 @@ fn advance_channel(
 // ---------------------------------------------------------------------------
 
 #[pyfunction]
+#[pyo3(signature = (session, track, start_pts_us, minimum_buffer_us, maximum_latency_us, synchronized=false, hold_serial=None))]
 fn play(
     py: Python<'_>,
     session: PyRef<'_, PySession>,
@@ -1731,12 +1747,29 @@ fn play(
     start_pts_us: i64,
     minimum_buffer_us: u64,
     maximum_latency_us: u64,
+    synchronized: bool,
+    hold_serial: Option<u64>,
 ) -> PyResult<()> {
     let track = track.inner.clone();
     let mut guard = lock(&session.inner, "session")?;
     let session = guard.as_mut().ok_or_else(closed_session)?;
-    py.detach(|| session.play(&track, start_pts_us, minimum_buffer_us, maximum_latency_us))
-        .map_err(io_error)
+    py.detach(|| {
+        session.play_with(
+            &track,
+            vivid_sdk::PlayOptions {
+                start_pts_us,
+                minimum_buffer_us,
+                maximum_latency_us,
+                hold_serial,
+                start_policy: if synchronized {
+                    vivid_sdk::StartPolicy::Synchronized
+                } else {
+                    vivid_sdk::StartPolicy::AfterMinimumBuffer
+                },
+            },
+        )
+    })
+    .map_err(io_error)
 }
 
 #[pyfunction]

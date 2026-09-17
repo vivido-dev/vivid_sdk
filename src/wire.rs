@@ -22,6 +22,15 @@ pub(crate) fn session_event(
     payload: PayloadMap,
 ) -> io::Result<SessionEvent> {
     Ok(match record_type {
+        messages::PLAYBACK_HOLD => {
+            let hold = PlaybackHold::decode(&Value::Map(payload))?;
+            if hold.surface_id != object_id {
+                return Err(invalid_data(
+                    "PLAYBACK_HOLD surface does not match object ID",
+                ));
+            }
+            SessionEvent::PlaybackHold(hold)
+        }
         messages::TARGET_CHANGED => SessionEvent::TargetChanged(payload),
         messages::ANCHOR_READY => SessionEvent::AnchorReady {
             context_id: optional_u64(&payload, 0)

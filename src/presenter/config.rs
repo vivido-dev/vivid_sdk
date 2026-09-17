@@ -199,6 +199,7 @@ impl PresenterConfig {
                 registry::LIVE_MEDIA.into(),
                 registry::OBSERVABILITY.into(),
                 registry::TERMINAL_SURFACE.into(),
+                registry::TIMED_MEDIA_SYNC.into(),
                 registry::TIMED_MEDIA.into(),
             ],
             resource_contract: None,
@@ -581,6 +582,7 @@ pub struct BridgePlayRequest {
     pub late_policy: u64,
     pub loop_count: u64,
     pub start_policy: u64,
+    pub hold_serial: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,4 +620,14 @@ pub struct BridgePositionSnapshot {
     pub decoded_pts_us: i64,
     pub presented_pts_us: i64,
     pub presentation_id: u64,
+}
+
+/// A downstream hold translated into a gateway-owned track namespace. No downstream epoch,
+/// generation, or local track ID is re-used as inner authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeHoldSnapshot {
+    pub decoder_reset_serial: u64,
+    pub held: bool,
+    pub position_pts_us: Option<i64>,
+    pub estimated: bool,
 }

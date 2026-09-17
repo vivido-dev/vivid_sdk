@@ -120,6 +120,7 @@ pub struct PlayRequest {
     pub late_policy: u64,
     pub loop_count: u64,
     pub start_policy: u64,
+    pub hold_serial: Option<u64>,
 }
 
 impl PlayRequest {
@@ -132,6 +133,7 @@ impl PlayRequest {
             late_policy: 1,
             loop_count: 0,
             start_policy: 1,
+            hold_serial: None,
         }
     }
 }
@@ -255,6 +257,7 @@ impl ProjectionSnapshot {
                     late_policy: source.play_request.late_policy,
                     loop_count: source.play_request.loop_count,
                     start_policy: source.play_request.start_policy,
+                    hold_serial: source.play_request.hold_serial,
                 },
                 eos_epoch: source.eos_epoch,
                 causation_id: source.causation_id,
@@ -686,6 +689,7 @@ struct LeaseEntry {
 struct SurfaceEntry {
     state: SurfaceState,
     active_slots: HashMap<u64, u64>,
+    hold: Option<crate::PlaybackHold>,
 }
 
 struct TrackEntry {
@@ -693,6 +697,7 @@ struct TrackEntry {
     configuration: TrackConfiguration,
     state: TrackState,
     decoder_reset_serial: u64,
+    hold_pause_decoder: Option<u64>,
     flush_pending_channel_advance: bool,
     channel_advance_pending_flush: bool,
     audio_gain: AudioGain,
@@ -1828,6 +1833,7 @@ impl VirtualVivid {
                 .iter()
                 .filter(|(key, track)| {
                     sessions.contains(&key.surface.session)
+                        && !track.state.lost
                         && track.configuration.direction != crate::TrackDirection::Uplink
                 })
                 .filter_map(|(key, track)| {
@@ -1915,6 +1921,23 @@ impl VirtualVivid {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        let timed_surfaces = state
+            .tracks
+            .iter()
+            .filter(|(_, track)| track.configuration.mode == TrackMode::Timed)
+            .map(|(key, _)| key.surface)
+            .collect::<HashSet<_>>();
+        for surface in timed_surfaces {
+            let visible = projected_sources
+                .iter()
+                .any(|source| inner_track_key(*source).surface == surface);
+            set_playback_hold(
+                &mut state,
+                surface,
+                !visible,
+                vivid_protocol::timed::HOLD_NOT_VISIBLE,
+            );
+        }
         let projected_decoder_resets = sources
             .iter()
             .map(|source| (source.key, source.decoder_reset_serial))
@@ -1930,10 +1953,13 @@ impl VirtualVivid {
             .map(inner_track_key)
             .collect::<HashSet<_>>();
         for source in &hidden_sources {
+            retire_held_decoder(&mut state, inner_track_key(*source));
             let Some(track) = state.tracks.get_mut(&inner_track_key(*source)) else {
                 continue;
             };
-            if track.playing && matches!(track.configuration.kind, KindConfiguration::Video(_)) {
+            if track.configuration.mode == TrackMode::Timed
+                && matches!(track.configuration.kind, KindConfiguration::Video(_))
+            {
                 // A hidden tab removes its outer decoder just like a detached foreground client.
                 // Re-arm recovery before allowing the source into a later projection so no
                 // inter-frame packet can become the first input to the replacement decoder.
@@ -2038,10 +2064,30 @@ impl VirtualVivid {
 
     pub fn deactivate_bridge(&self) {
         let mut state = lock(&self.state);
+        let surfaces = state
+            .tracks
+            .iter()
+            .filter(|(_, track)| track.configuration.mode == TrackMode::Timed)
+            .map(|(key, _)| key.surface)
+            .collect::<HashSet<_>>();
+        for surface in surfaces {
+            set_playback_hold(
+                &mut state,
+                surface,
+                true,
+                vivid_protocol::timed::HOLD_DETACHED,
+            );
+        }
+        let retiring = state.projected_sources.iter().copied().collect::<Vec<_>>();
+        for source in retiring {
+            retire_held_decoder(&mut state, inner_track_key(source));
+        }
         state.projected_sources.clear();
         state.projected_decoder_resets.clear();
         for track in state.tracks.values_mut() {
-            if matches!(track.configuration.kind, KindConfiguration::Video(_)) && track.playing {
+            if matches!(track.configuration.kind, KindConfiguration::Video(_))
+                && track.configuration.mode == TrackMode::Timed
+            {
                 track.recovery_pending = true;
                 // A later foreground presenter owns a fresh decoder. Re-arm producer recovery for
                 // that handoff instead of damping its first NEED_KEYFRAME against the request
@@ -2172,6 +2218,10 @@ impl VirtualVivid {
     ) -> KeyframeRequestOutcome {
         let mut state = lock(&self.state);
         let key = inner_track_key(source);
+        let hold = state
+            .surfaces
+            .get(&key.surface)
+            .and_then(|surface| surface.hold.clone());
         let recovery_inflight = state
             .deliveries
             .values()
@@ -2199,7 +2249,28 @@ impl VirtualVivid {
                 .unwrap_or(0)
                 .max(track.state.media_epoch.saturating_add(1))
         };
-        if !send_need_keyframe(key, track, requested_epoch, reason) {
+        let delivered = if let Some(hold) = hold.filter(|hold| !hold.held && hold.recovery_required)
+        {
+            let mut payload = vivid_protocol::track::need_keyframe_payload(
+                track_address(key, track),
+                requested_epoch,
+                vivid_protocol::timed::PRESENTATION_RESUMED,
+            );
+            if let Some(position) = hold.position {
+                payload.push((7, signed(position.pts_us)));
+            }
+            payload.push((8, Value::Unsigned(hold.serial)));
+            Envelope::new(0, payload).encode().ok().is_some_and(|body| {
+                track.channel_writer.as_ref().is_some_and(|writer| {
+                    writer
+                        .write_record(messages::NEED_KEYFRAME, key.track, &body)
+                        .is_ok()
+                })
+            })
+        } else {
+            send_need_keyframe(key, track, requested_epoch, reason)
+        };
+        if !delivered {
             return KeyframeRequestOutcome::Ignored;
         }
         track.recovery_requested = true;
@@ -2227,19 +2298,170 @@ impl VirtualVivid {
         }
     }
 
+    pub fn reject_incompatible_playback(&self, source: SourceKey, decoder_reset_serial: u64) {
+        let mut state = lock(&self.state);
+        let key = inner_track_key(source);
+        let Some(track) = state.tracks.get_mut(&key) else {
+            return;
+        };
+        if track.decoder_reset_serial != decoder_reset_serial || track.state.lost {
+            return;
+        }
+        if track.state.lose().is_err() {
+            return;
+        }
+        if let Some(writer) = track.channel_writer.take() {
+            writer.close();
+        }
+        let revision = track.state.revision.get();
+        let body = Envelope::new(0, vec![
+            (0, Value::Unsigned(key.surface.context)), (1, Value::Unsigned(key.surface.surface)),
+            (2, Value::Unsigned(key.track)), (3, Value::Unsigned(messages::ERROR_UNSUPPORTED_PROFILE)),
+            (4, Value::Unsigned(revision)), (5, Value::Map(vec![])),
+            (6, Value::Text("downstream presenter does not support timed-media-sync-v1; synchronized playback cannot be downgraded".into())),
+        ]).encode();
+        if let Ok(body) = body
+            && let Some(session) = state.sessions.get(&key.surface.session)
+        {
+            let _ = session
+                .writer
+                .write_record(messages::TRACK_LOST, key.track, &body);
+        }
+        retire_track_deliveries(&mut state, key);
+        advance_projection(&mut state);
+    }
+
+    pub fn apply_downstream_hold(&self, source: SourceKey, observed: super::BridgeHoldSnapshot) {
+        let mut state = lock(&self.state);
+        let key = inner_track_key(source);
+        let Some(track) = state.tracks.get(&key) else {
+            return;
+        };
+        if track.decoder_reset_serial != observed.decoder_reset_serial {
+            return;
+        }
+        let position = observed.position_pts_us.map(|pts_us| crate::HeldPosition {
+            track_id: key.track,
+            channel_generation: track.state.channel_generation.get(),
+            epoch: track.state.media_epoch,
+            pts_us,
+            estimated: observed.estimated,
+        });
+        set_playback_hold(
+            &mut state,
+            key.surface,
+            observed.held,
+            vivid_protocol::timed::HOLD_DOWNSTREAM,
+        );
+        if let Some(position) = position
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key.surface)
+                .and_then(|surface| surface.hold.as_mut())
+            && hold.position != Some(position)
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.position = Some(position);
+            hold.serial = serial;
+            if let Ok(payload) = hold.payload()
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.surface.session)
+            {
+                let _ = session.writer.write_record(
+                    messages::PLAYBACK_HOLD,
+                    key.surface.surface,
+                    &body,
+                );
+            }
+        }
+    }
+
     pub fn apply_outer_position(&self, source: SourceKey, position: super::BridgePositionSnapshot) {
         let mut state = lock(&self.state);
+        let held = state
+            .surfaces
+            .get(&inner_track_key(source).surface)
+            .and_then(|surface| surface.hold.as_ref())
+            .is_some_and(|hold| hold.held);
         let Some(track) = state.tracks.get_mut(&inner_track_key(source)) else {
             return;
         };
-        if position.decoder_reset_serial != track.decoder_reset_serial
+        let frozen_reply = held
+            && position.state == 3
+            && track.hold_pause_decoder == Some(position.decoder_reset_serial);
+        if (!frozen_reply && position.decoder_reset_serial != track.decoder_reset_serial)
             || position.playing != track.playing
             || position.start_pts_us != track.play_request.start_pts_us
             || position.state > 5
         {
             return;
         }
+        if frozen_reply {
+            track.hold_pause_decoder = None;
+        }
         track.outer_position = Some(position);
+        if position.state == 2 {
+            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+        }
+        let clock_generation = track.state.channel_generation.get();
+        let clock_epoch = track.state.media_epoch;
+        let resume_serial = track.play_request.hold_serial;
+        let key = inner_track_key(source).surface;
+        if position.state == 2
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key)
+                .and_then(|surface| surface.hold.as_mut())
+            && !hold.held
+            && hold.recovery_required
+            && resume_serial == Some(hold.serial)
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.serial = serial;
+            hold.recovery_required = false;
+            hold.position = position.clock_pts_us.map(|pts_us| crate::HeldPosition {
+                track_id: source.track,
+                channel_generation: clock_generation,
+                epoch: clock_epoch,
+                pts_us,
+                estimated: false,
+            });
+            if let Ok(payload) = hold.payload()
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.session)
+            {
+                let _ = session
+                    .writer
+                    .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+            }
+        }
+        if frozen_reply
+            && let Some(pts_us) = position.clock_pts_us
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key)
+                .and_then(|surface| surface.hold.as_mut())
+            && hold.held
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.serial = serial;
+            hold.position = Some(crate::HeldPosition {
+                track_id: source.track,
+                channel_generation: clock_generation,
+                epoch: clock_epoch,
+                pts_us,
+                estimated: false,
+            });
+            let payload = hold.payload();
+            if let Ok(payload) = payload
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.session)
+            {
+                let _ = session
+                    .writer
+                    .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+            }
+        }
     }
 
     pub fn apply_outer_playback(
@@ -2255,7 +2477,7 @@ impl VirtualVivid {
             if track.decoder_reset_serial != decoder_reset_serial {
                 return;
             }
-            if state_value >= 2 {
+            if state_value == 2 {
                 track.state.milestones |= MILESTONE_CLOCK_STARTED;
             }
             if eos_state >= 1 {
@@ -4248,6 +4470,7 @@ fn dispatch_control(
                 SurfaceEntry {
                     state: surface,
                     active_slots: HashMap::new(),
+                    hold: None,
                 },
             );
             advance_projection(&mut state);
@@ -4426,6 +4649,7 @@ fn dispatch_control(
                     configuration,
                     state: track_state,
                     decoder_reset_serial: 1,
+                    hold_pause_decoder: None,
                     flush_pending_channel_advance: false,
                     channel_advance_pending_flush: false,
                     audio_gain: AudioGain::UNITY,
@@ -4481,11 +4705,24 @@ fn dispatch_control(
                 .tracks
                 .get(&key)
                 .ok_or_else(|| ControlError::missing("track does not exist"))?;
+            let mut payload = track_status_payload(key, track, gain_supported);
+            if let Some(hold) = state
+                .surfaces
+                .get(&key.surface)
+                .and_then(|surface| surface.hold.as_ref())
+            {
+                payload.push((
+                    24,
+                    Value::Map(
+                        hold.payload()
+                            .map_err(|_| ControlError::state("invalid hold state"))?,
+                    ),
+                ));
+            }
             (
                 messages::TRACK_STATUS,
                 record.object_id,
-                Envelope::new(request_id, track_status_payload(key, track, gain_supported))
-                    .encode(),
+                Envelope::new(request_id, payload).encode(),
             )
         }
         messages::ADVANCE_CHANNEL => {
@@ -4515,6 +4752,7 @@ fn dispatch_control(
                     track.channel_advance_pending_flush = true;
                 }
                 track.channel_writer = None;
+                track.hold_pause_decoder = None;
                 track.eos_epoch = None;
                 track.outer_position = None;
                 track.microphone.take();
@@ -4828,6 +5066,18 @@ fn dispatch_control(
                     message: "track wait generation is stale",
                 });
             }
+            if matches!(condition, 3..=6)
+                && state
+                    .surfaces
+                    .get(&key.surface)
+                    .and_then(|surface| surface.hold.as_ref())
+                    .is_some_and(|hold| hold.held)
+            {
+                return Err(ControlError {
+                    code: messages::ERROR_NOT_VISIBLE,
+                    message: "timed surface is held",
+                });
+            }
             if let Some(observed) = evaluate_wait(track, condition, condition_value) {
                 (
                     messages::WAIT_SATISFIED,
@@ -4874,6 +5124,22 @@ fn dispatch_control(
         }
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
             let key = track_key_from_value(session_id, &value)?;
+            if record.record_type == messages::PLAY {
+                let requested = value.map_value(11).and_then(Value::as_u64);
+                let current = state
+                    .surfaces
+                    .get(&key.surface)
+                    .and_then(|surface| surface.hold.as_ref())
+                    .map(|hold| hold.serial);
+                if requested.is_some() && requested != current {
+                    return Err(ControlError::state("PLAY names a stale hold transition"));
+                }
+            }
+            let sync_supported = state.sessions.get(&session_id).is_some_and(|session| {
+                session
+                    .accepted_profiles
+                    .contains(registry::TIMED_MEDIA_SYNC)
+            });
             let mut linked_play = None;
             let mut linked_pause = false;
             let mut retire_deliveries = false;
@@ -4883,8 +5149,9 @@ fn dispatch_control(
                 .ok_or_else(|| ControlError::missing("track does not exist"))?;
             match record.record_type {
                 messages::PLAY => {
-                    let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-                        .map_err(|_| ControlError::bad("invalid PLAY"))?;
+                    let map =
+                        StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+                            .map_err(|_| ControlError::bad("invalid PLAY"))?;
                     let request = PlayRequest {
                         start_pts_us: map
                             .required(3)
@@ -4901,9 +5168,18 @@ fn dispatch_control(
                         late_policy: required_u64(&map, 7)?,
                         loop_count: required_u64(&map, 8)?,
                         start_policy: required_u64(&map, 9)?,
+                        hold_serial: map
+                            .optional_u64(11)
+                            .map_err(|_| ControlError::bad("invalid hold serial"))?,
                     };
                     if request.minimum_buffer_us > request.maximum_latency_us
                         || request.rate_32_32 != 1_i64 << 32
+                        || request.late_policy != 1
+                        || request.loop_count != 0
+                        || !(request.start_policy == 1
+                            || (sync_supported && request.start_policy == 2))
+                        || request.hold_serial == Some(0)
+                        || (request.hold_serial.is_some() && request.start_policy != 2)
                         || required_u64(&map, 10)? != track.state.channel_generation.get()
                     {
                         return Err(ControlError::state("PLAY policy or generation is invalid"));
@@ -4911,7 +5187,12 @@ fn dispatch_control(
                     track.outer_position = None;
                     track.playing = true;
                     track.play_request = request;
-                    track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                    track.hold_pause_decoder = None;
+                    if request.start_policy == 1 {
+                        track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                    } else {
+                        track.state.milestones &= !MILESTONE_CLOCK_STARTED;
+                    }
                     linked_play = Some(request);
                     #[cfg(any(test, feature = "testing"))]
                     state.play_commands.push(bridge_track_key(key));
@@ -4933,6 +5214,7 @@ fn dispatch_control(
                     track.state.last_media_id = 0;
                     track.eos_epoch = None;
                     track.outer_position = None;
+                    track.hold_pause_decoder = None;
                     track.state.milestones &= !(MILESTONE_EOS_ACCEPTED
                         | MILESTONE_BUFFERED_ENDED
                         | MILESTONE_OUTPUT_READY
@@ -4980,7 +5262,11 @@ fn dispatch_control(
                     if let Some(request) = linked_play {
                         track.playing = true;
                         track.play_request = request;
-                        track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                        if request.start_policy == 1 {
+                            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                        } else {
+                            track.state.milestones &= !MILESTONE_CLOCK_STARTED;
+                        }
                     } else {
                         track.playing = false;
                     }
@@ -4988,6 +5274,21 @@ fn dispatch_control(
             }
             if retire_deliveries {
                 retire_track_deliveries(&mut state, key);
+            }
+            if let Some(hold) = state
+                .surfaces
+                .get_mut(&key.surface)
+                .and_then(|surface| surface.hold.as_mut())
+            {
+                if linked_play.is_some() {
+                    hold.playing_intent = true;
+                    // An explicit reposition wins over feedback from the old pause operation.
+                    if hold.held {
+                        hold.position = None;
+                    }
+                } else if linked_pause {
+                    hold.playing_intent = false;
+                }
             }
             advance_projection(&mut state);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
@@ -6313,6 +6614,19 @@ fn spawn_wait(
                                 "channel generation changed while waiting",
                             ))
                         }
+                        Some(_)
+                            if matches!(condition, 3..=6)
+                                && state
+                                    .surfaces
+                                    .get(&key.surface)
+                                    .and_then(|surface| surface.hold.as_ref())
+                                    .is_some_and(|hold| hold.held) =>
+                        {
+                            Some(WaitOutcome::Failed(
+                                messages::ERROR_NOT_VISIBLE,
+                                "timed surface is held",
+                            ))
+                        }
                         Some(track) => {
                             evaluate_wait(track, condition, condition_value).map(|observed| {
                                 match Envelope::new(
@@ -6381,7 +6695,7 @@ fn evaluate_wait(track: &TrackEntry, condition: u64, value: Option<u64>) -> Opti
             (position.presentation_id != 0 && position.presented_pts_us >= pts)
                 .then_some(position.presented_pts_us.max(0) as u64)
         }
-        5 => track.playing.then_some(1),
+        5 => (track.state.milestones & MILESTONE_CLOCK_STARTED != 0).then_some(1),
         6 => (track.state.milestones & MILESTONE_BUFFERED_ENDED != 0).then_some(1),
         7 => (track.state.milestones & MILESTONE_CHANNEL_ACCEPTED != 0).then_some(1),
         8 => (track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0).then_some(1),
@@ -6790,6 +7104,126 @@ fn track_ready_payload(
     payload
 }
 
+/// Retire the physical decoder identity on a visibility falling edge. A delayed PAUSE reply
+/// may confirm this retirement once, but cannot confirm a subsequent hide or a new producer PLAY.
+fn retire_held_decoder(state: &mut State, key: TrackKey) {
+    if !state
+        .surfaces
+        .get(&key.surface)
+        .is_some_and(|surface| surface.hold.is_some())
+    {
+        return;
+    }
+    let Some(track) = state.tracks.get_mut(&key) else {
+        return;
+    };
+    if track.configuration.mode != TrackMode::Timed {
+        return;
+    }
+    let Some(next) = track.decoder_reset_serial.checked_add(1) else {
+        let _ = track.state.lose();
+        if let Some(writer) = track.channel_writer.take() {
+            writer.close();
+        }
+        return;
+    };
+    track.hold_pause_decoder = Some(track.decoder_reset_serial);
+    track.decoder_reset_serial = next;
+}
+
+/// Hold is surface intent, independent of the producer's PAUSE. The control writer is bounded
+/// and asynchronous, so visibility transitions never wait on a hidden media connection.
+fn set_playback_hold(state: &mut State, key: SurfaceKey, held: bool, reason: u64) {
+    if !state.sessions.get(&key.session).is_some_and(|session| {
+        session
+            .accepted_profiles
+            .contains(registry::TIMED_MEDIA_SYNC)
+    }) {
+        return;
+    }
+    let Some(surface) = state.surfaces.get(&key) else {
+        return;
+    };
+    let old_reasons = surface.hold.as_ref().map_or(0, |hold| hold.reasons);
+    let cleared = if reason == vivid_protocol::timed::HOLD_NOT_VISIBLE {
+        reason | vivid_protocol::timed::HOLD_DETACHED
+    } else {
+        reason
+    };
+    let reasons = if held {
+        old_reasons | reason
+    } else {
+        old_reasons & !cleared
+    };
+    let held = reasons != 0;
+    if surface
+        .hold
+        .as_ref()
+        .is_some_and(|hold| hold.held == held && hold.reasons == reasons)
+        || (surface.hold.is_none() && !held)
+    {
+        return;
+    }
+    let Some(serial) = surface
+        .hold
+        .as_ref()
+        .map_or(Some(1), |hold| hold.serial.checked_add(1))
+    else {
+        if let Some(session) = state.sessions.get(&key.session) {
+            session.writer.close();
+        }
+        return;
+    };
+    let previous = surface.hold.as_ref().and_then(|hold| hold.position);
+    let clock = state
+        .tracks
+        .iter()
+        .filter(|(track, entry)| {
+            track.surface == key && entry.configuration.mode == TrackMode::Timed
+        })
+        .max_by_key(|(_, entry)| matches!(entry.configuration.kind, KindConfiguration::Audio(_)));
+    let observed = clock.and_then(|(track, entry)| {
+        entry
+            .outer_position
+            .and_then(|p| p.clock_pts_us)
+            .map(|pts_us| crate::HeldPosition {
+                track_id: track.track,
+                channel_generation: entry.state.channel_generation.get(),
+                epoch: entry.state.media_epoch,
+                pts_us,
+                estimated: true,
+            })
+    });
+    let position = if held {
+        observed.or(previous)
+    } else {
+        previous.or(observed)
+    };
+    let playing_intent = state
+        .tracks
+        .iter()
+        .any(|(track, entry)| track.surface == key && entry.playing);
+    let hold = crate::PlaybackHold {
+        context_id: key.context,
+        surface_id: key.surface,
+        serial,
+        held,
+        reasons,
+        playing_intent,
+        recovery_required: true,
+        position,
+    };
+    if let Ok(payload) = hold.payload()
+        && let Ok(body) = Envelope::new(0, payload).encode()
+        && let Some(session) = state.sessions.get(&key.session)
+    {
+        let _ = session
+            .writer
+            .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+    }
+    state.surfaces.get_mut(&key).unwrap().hold = Some(hold);
+}
+
 fn track_status_payload(
     key: TrackKey,
     track: &TrackEntry,
@@ -6870,8 +7304,12 @@ fn track_key_from_map(session: u64, map: &StrictMap<'_>) -> Result<TrackKey, Con
 }
 
 fn track_key_from_value(session: u64, value: &Value) -> Result<TrackKey, ControlError> {
-    let map = StrictMap::new("track identity", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        .map_err(|_| ControlError::bad("invalid track identity"))?;
+    let map = StrictMap::new(
+        "track identity",
+        value,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    )
+    .map_err(|_| ControlError::bad("invalid track identity"))?;
     track_key_from_map(session, &map)
 }
 
@@ -9068,8 +9506,11 @@ mod tests {
         for pane in [7, 8] {
             presenter.update_metrics(pane, 80, 24, (8, 16));
             let secret = presenter.issue_pane_capability(pane).unwrap();
-            let mut client =
-                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let mut config = producer(presenter.endpoint(), &secret);
+            config
+                .optional_profiles
+                .push(registry::TIMED_MEDIA_SYNC.into());
+            let mut client = crate::Session::connect(config).unwrap();
             let context = client.info().root_context_id;
             client
                 .create_surface(surface(context, 9), &RequestMetadata::default())
@@ -9077,17 +9518,29 @@ mod tests {
             let track = client
                 .create_track(video(context, 9, 11), &RequestMetadata::default())
                 .unwrap();
-            let snapshot = presenter.projection_snapshot(&HashSet::from([pane]));
-            let key = snapshot.sources[0].key;
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7, 8]));
+            let producer = snapshot
+                .surfaces
+                .iter()
+                .find(|surface| surface.pane == pane)
+                .unwrap()
+                .producer;
+            let projected = snapshot
+                .sources
+                .iter()
+                .find(|source| source.key.producer == producer)
+                .unwrap();
+            let key = projected.key;
             {
                 let mut state = lock(&presenter.state);
                 let entry = state.tracks.get_mut(&inner_track_key(key)).unwrap();
                 entry.outer_presented = true;
                 entry.last_pts_us = 9_000_000; // Admitted/delivered is not physically presented.
             }
-            owners.push((client, track, key, snapshot.sources[0].decoder_reset_serial));
+            owners.push((client, track, key, projected.decoder_reset_serial));
         }
         assert_ne!(owners[0].2, owners[1].2);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
         let position = super::super::BridgePositionSnapshot {
             decoder_reset_serial: owners[0].3,
             playing: false,
@@ -9153,6 +9606,95 @@ mod tests {
         let first = &state.tracks[&inner_track_key(owners[0].2)];
         assert!(evaluate_wait(first, 4, Some(2_000_000)).is_none());
         assert_eq!(evaluate_wait(first, 4, Some(1_000_000)), Some(1_000_000));
+        drop(state);
+
+        // Visibility holds the whole owning surface while a second producer with identical
+        // local IDs retains its clock observations and mutable scene authority.
+        presenter.projection_snapshot(&HashSet::from([8]));
+        let held = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(held.held);
+        assert!(held.position.unwrap().estimated);
+        let other = owners[1].0.query_track(&owners[1].1).unwrap();
+        assert!(other.playback_hold.is_none_or(|hold| !hold.held));
+        presenter.apply_outer_position(owners[0].2, position);
+        let confirmed = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(confirmed.serial > held.serial);
+        assert!(!confirmed.position.unwrap().estimated);
+        assert_eq!(confirmed.position.unwrap().pts_us, 1_000_000);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
+        let released = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(!released.held && released.recovery_required);
+        assert_eq!(released.position, confirmed.position);
+        assert!(released.serial > confirmed.serial);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .playback_hold
+                .unwrap()
+                .serial,
+            released.serial
+        );
+        // A second hide retires another decoder identity. Neither a duplicate completion of
+        // the first pause nor its delayed running observation may confirm the second hold.
+        presenter.projection_snapshot(&HashSet::from([8]));
+        let second_hold = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        presenter.apply_outer_position(owners[0].2, position);
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .playback_hold
+                .unwrap(),
+            second_hold
+        );
+        presenter.apply_outer_position(
+            owners[0].2,
+            super::super::BridgePositionSnapshot {
+                decoder_reset_serial: position.decoder_reset_serial + 1,
+                clock_pts_us: Some(1_080_000),
+                ..position
+            },
+        );
+        let second_confirmed = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(!second_confirmed.position.unwrap().estimated);
+        assert_eq!(second_confirmed.position.unwrap().pts_us, 1_080_000);
+        assert_eq!(
+            owners[1]
+                .0
+                .query_track(&owners[1].1)
+                .unwrap()
+                .last_presented_pts_us,
+            other.last_presented_pts_us
+        );
     }
 
     #[test]

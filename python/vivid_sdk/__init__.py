@@ -70,6 +70,7 @@ PROFILE_DESKTOP_SURFACE: str = _constant_text("PROFILE_DESKTOP_SURFACE")
 PROFILE_CANVAS_SURFACE: str = _constant_text("PROFILE_CANVAS_SURFACE")
 PROFILE_LIVE_MEDIA: str = _constant_text("PROFILE_LIVE_MEDIA")
 PROFILE_TIMED_MEDIA: str = _constant_text("PROFILE_TIMED_MEDIA")
+PROFILE_TIMED_MEDIA_SYNC: str = _constant_text("PROFILE_TIMED_MEDIA_SYNC")
 PROFILE_AUDIO_GAIN: str = _constant_text("PROFILE_AUDIO_GAIN")
 PROFILE_AUDIO_INPUT: str = _constant_text("PROFILE_AUDIO_INPUT")
 PROFILE_DESKTOP_INPUT: str = _constant_text("PROFILE_DESKTOP_INPUT")
@@ -190,6 +191,35 @@ MIC_PACKET_BYTES: int = _constant_number("MIC_PACKET_BYTES")
 
 
 BytesLike = Union[bytes, bytearray, memoryview]
+
+
+@dataclass(frozen=True)
+class HeldPosition:
+    track_id: int
+    channel_generation: int
+    epoch: int
+    pts_us: int
+    estimated: bool
+
+
+@dataclass(frozen=True)
+class PlaybackHold:
+    context_id: int
+    surface_id: int
+    serial: int
+    held: bool
+    reasons: int
+    playing_intent: bool
+    recovery_required: bool
+    position: Optional[HeldPosition]
+
+    @classmethod
+    def _from_native(cls, payload: Dict[int, Any]) -> PlaybackHold:
+        """Convert a hold already validated by the shared Rust wire codec."""
+        position = payload.get(7)
+        return cls(payload[0], payload[1], payload[2], payload[3], payload[4],
+                   payload[5], payload[6], None if position is None else HeldPosition(
+                       position[0], position[1], position[2], position[3], position[4]))
 
 
 @dataclass(frozen=True)
@@ -728,7 +758,7 @@ def connect(
             set(
                 optional_profiles
                 if optional_profiles is not None
-                else (PROFILE_LIVE_MEDIA, PROFILE_OBSERVABILITY, PROFILE_TIMED_MEDIA)
+                else (PROFILE_LIVE_MEDIA, PROFILE_OBSERVABILITY, PROFILE_TIMED_MEDIA_SYNC, PROFILE_TIMED_MEDIA)
             ).difference(required)
         )
     )
@@ -1153,7 +1183,13 @@ def probe_encoded_image(data: BytesLike) -> Tuple[int, int, int, int]:
 
 def take_event(session: Session) -> Optional[Dict[str, object]]:
     """The next session event, or `None` when the queue is empty."""
-    return _native.take_event(session)
+    return _typed_event(_native.take_event(session))
+
+
+def _typed_event(event: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if event is not None and event.get("kind") == "playback_hold":
+        event["hold"] = PlaybackHold._from_native(event["payload"])
+    return event
 
 
 def wait_event(session: Session, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US) -> Optional[Dict[str, object]]:
@@ -1162,7 +1198,7 @@ def wait_event(session: Session, *, timeout_us: int = MAX_TRACK_WAIT_TIMEOUT_US)
     Returns `None` both on timeout and once the final `connection_closed` event has been taken,
     which is what ends an event loop.
     """
-    return _native.wait_event(session, timeout_us=timeout_us)
+    return _typed_event(_native.wait_event(session, timeout_us=timeout_us))
 
 
 def abort(session: Session) -> None:
@@ -1175,7 +1211,10 @@ def query_surface(session: Session, surface: Surface) -> Dict[str, object]:
 
 
 def query_track(session: Session, track: Track) -> Dict[str, object]:
-    return _native.query_track(session, track)
+    status = _native.query_track(session, track)
+    if status.get("playback_hold") is not None:
+        status["playback_hold"] = PlaybackHold._from_native(status["playback_hold"])
+    return status
 
 
 def probe_track(
@@ -1202,9 +1241,11 @@ def play(
     start_pts_us: int = 0,
     minimum_buffer_us: int = 0,
     maximum_latency_us: int = 0,
+    synchronized: bool = False,
+    hold_serial: Optional[int] = None,
 ) -> None:
     """Start a timed track. Requires `timed-media-v1`."""
-    _native.play(session, track, start_pts_us, minimum_buffer_us, maximum_latency_us)
+    _native.play(session, track, start_pts_us, minimum_buffer_us, maximum_latency_us, synchronized, hold_serial)
 
 
 def pause(session: Session, track: Track) -> None:

@@ -120,6 +120,7 @@ pub use track::{
     Track, TrackQueryHandle, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied,
 };
 pub use vivid_protocol::audio_input::InputPacket;
+pub use vivid_protocol::timed::{HeldPosition, PlayOptions, PlaybackHold, StartPolicy};
 
 pub use vivid_protocol::messages::LaneClass;
 pub use vivid_protocol::wire::ConnectionKind;
@@ -334,6 +335,7 @@ mod tests {
             last_record_sequence: 14,
         };
         let mut status = TrackStatus {
+            playback_hold: None,
             context_id: 1,
             surface_id: 2,
             track_id: 3,

@@ -60,6 +60,7 @@ impl SessionInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
+    PlaybackHold(PlaybackHold),
     TargetChanged(PayloadMap),
     AnchorReady {
         context_id: u64,
@@ -119,6 +120,7 @@ pub(crate) struct Endpoints {
 }
 
 pub(crate) struct PendingControl {
+    pub(crate) last_inbound: Mutex<Instant>,
     pub(crate) requests: Mutex<HashMap<u64, mpsc::Sender<Result<Record, String>>>>,
     pub(crate) events: Mutex<VecDeque<SessionEvent>>,
     /// Signalled whenever the reader queues an event or records the connection ending, so a
@@ -716,16 +718,27 @@ impl Session {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_ready: Condvar::new(),
+            last_inbound: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         });
         let lifecycle = Arc::new(SessionLifecycle::new());
         let tracks = Arc::new(Mutex::new(HashMap::new()));
+        let next_request_id = Arc::new(AtomicU64::new(2));
         spawn_control_reader(
             reader,
             writer.clone(),
             pending.clone(),
             lifecycle.clone(),
             tracks.clone(),
+            info.accepted_profiles
+                .iter()
+                .any(|profile| profile == vivid_protocol::registry::TIMED_MEDIA_SYNC),
+        )?;
+        spawn_control_watchdog(
+            writer.clone(),
+            pending.clone(),
+            lifecycle.clone(),
+            next_request_id.clone(),
         )?;
         Ok(Self {
             control: ControlPlane::Live { writer, pending },
@@ -742,7 +755,7 @@ impl Session {
             anchor_key,
             info,
             next_id: AtomicU64::new(1),
-            next_request_id: Arc::new(AtomicU64::new(2)),
+            next_request_id,
             surfaces: HashMap::new(),
             tracks,
             closed: false,
@@ -1050,12 +1063,83 @@ impl Drop for Session {
     }
 }
 
+/// One outstanding probe at most. The monitor never waits on a socket writer, including a
+/// blackholed SSH control connection: shutdown interrupts that writer when liveness expires.
+fn spawn_control_watchdog(
+    writer: ConnectionWriter,
+    pending: Arc<PendingControl>,
+    lifecycle: Arc<SessionLifecycle>,
+    next_request_id: Arc<AtomicU64>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("vivid-control-liveness".into())
+        .spawn(move || {
+            let mut probe = None::<mpsc::Receiver<Result<Record, String>>>;
+            while !lifecycle.closed.load(Ordering::Acquire) {
+                let silence = match pending.last_inbound.lock() {
+                    Ok(at) => at.elapsed(),
+                    Err(_) => break,
+                };
+                if silence >= Duration::from_secs(15) {
+                    lifecycle.close(CloseCause::Lost, "Vivid control peer stopped responding");
+                    let _ = writer.shutdown();
+                    break;
+                }
+                if probe.as_ref().is_some_and(|reply| {
+                    !matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty))
+                }) {
+                    probe = None;
+                }
+                if silence >= Duration::from_secs(5) && probe.is_none() {
+                    let Ok(id) =
+                        next_request_id.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+                            id.checked_add(1)
+                        })
+                    else {
+                        lifecycle.close(CloseCause::Lost, "control request ID exhausted");
+                        let _ = writer.shutdown();
+                        break;
+                    };
+                    let (sender, reply) = mpsc::channel();
+                    if let Ok(mut requests) = pending.requests.lock() {
+                        requests.insert(id, sender);
+                    }
+                    probe = Some(reply);
+                    let probe_writer = writer.clone();
+                    let probe_lifecycle = lifecycle.clone();
+                    if thread::Builder::new()
+                        .name("vivid-control-probe".into())
+                        .spawn(move || {
+                            if let Err(error) = probe_writer.write_record(
+                                messages::PING,
+                                0,
+                                0,
+                                &messages::empty(id),
+                            ) {
+                                probe_lifecycle.close(CloseCause::Lost, &error.to_string());
+                                let _ = probe_writer.shutdown();
+                            }
+                        })
+                        .is_err()
+                    {
+                        lifecycle.close(CloseCause::Lost, "could not start control liveness probe");
+                        let _ = writer.shutdown();
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })?;
+    Ok(())
+}
+
 pub(crate) fn spawn_control_reader(
     mut reader: ConnectionReader,
     writer: ConnectionWriter,
     pending: Arc<PendingControl>,
     lifecycle: Arc<SessionLifecycle>,
     tracks: Arc<Mutex<TrackRegistry>>,
+    timed_sync: bool,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("vivid-control-reader".into())
@@ -1085,6 +1169,10 @@ pub(crate) fn spawn_control_reader(
                         return Err(invalid_data("unsupported required control record"));
                     }
                     let envelope = messages::decode_control(&record.body)?;
+                    if record.record_type == messages::PLAYBACK_HOLD && !timed_sync {
+                        return Err(invalid_data("PLAYBACK_HOLD requires timed-media-sync-v1"));
+                    }
+                    *lock(&pending.last_inbound, "last inbound control")? = Instant::now();
                     let fatal = if record.record_type == messages::ERROR {
                         messages::parse_error_reply(&record.body)?.fatal
                     } else {
@@ -1142,6 +1230,22 @@ pub(crate) fn spawn_control_reader(
                     }
                     let event =
                         session_event(record.record_type, record.object_id, envelope.payload)?;
+                    if let SessionEvent::PlaybackHold(hold) = &event {
+                        for ((context, surface, _), track) in
+                            lock(&tracks, "track registry")?.iter()
+                        {
+                            if *context == hold.context_id && *surface == hold.surface_id {
+                                let mut track = lock(track, "track")?;
+                                if track
+                                    .playback_hold
+                                    .as_ref()
+                                    .is_none_or(|old| old.serial < hold.serial)
+                                {
+                                    track.playback_hold = Some(hold.clone());
+                                }
+                            }
+                        }
+                    }
                     let mut events = lock(&pending.events, "control event queue")?;
                     if events.len() == MAX_CONTROL_EVENTS {
                         return Err(invalid_data("control event queue exceeded its bound"));
@@ -1288,6 +1392,7 @@ fn supported_control_record(kind: u16) -> bool {
             | FLUSH
             | DRAIN
             | PLAYBACK_STATE
+            | PLAYBACK_HOLD
             | SET_AUDIO_GAIN
             | CREATE_CONTEXT
             | CONTEXT_READY
@@ -1335,6 +1440,7 @@ mod audit_tests {
                     requests: Mutex::new(HashMap::from([(7, send)])),
                     events: Mutex::new(VecDeque::new()),
                     events_ready: Condvar::new(),
+                    last_inbound: Mutex::new(Instant::now()),
                     closed: AtomicBool::new(false),
                 }),
             };
@@ -1416,6 +1522,7 @@ mod audit_tests {
             requests: Mutex::new(HashMap::from([(7, send)])),
             events: Mutex::new(VecDeque::new()),
             events_ready: Condvar::new(),
+            last_inbound: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         });
         spawn_control_reader(
@@ -1424,10 +1531,57 @@ mod audit_tests {
             pending,
             Arc::new(SessionLifecycle::new()),
             Arc::new(Mutex::new(HashMap::new())),
+            false,
         )
         .unwrap();
         receive.recv_timeout(Duration::from_secs(1)).unwrap()
     }
+    #[test]
+    fn control_watchdog_distinguishes_media_waiting_from_control_silence() {
+        let pending = Arc::new(PendingControl {
+            requests: Mutex::new(HashMap::new()),
+            events: Mutex::new(VecDeque::new()),
+            events_ready: Condvar::new(),
+            last_inbound: Mutex::new(Instant::now() - Duration::from_secs(6)),
+            closed: AtomicBool::new(false),
+        });
+        let lifecycle = Arc::new(SessionLifecycle::new());
+        let writer = Connection::from_streams(
+            Box::new(io::empty()),
+            Box::new(io::sink()),
+            ConnectionKind::Control,
+        )
+        .unwrap()
+        .writer();
+        spawn_control_watchdog(
+            writer,
+            pending.clone(),
+            lifecycle.clone(),
+            Arc::new(AtomicU64::new(2)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pending.requests.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "control probe was not issued");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!lifecycle.closed.load(Ordering::Acquire));
+        // Valid inbound traffic keeps the control connection alive independently of media.
+        *pending.last_inbound.lock().unwrap() = Instant::now();
+        thread::sleep(Duration::from_millis(150));
+        assert!(!lifecycle.closed.load(Ordering::Acquire));
+        assert_eq!(pending.requests.lock().unwrap().len(), 1);
+        *pending.last_inbound.lock().unwrap() = Instant::now() - Duration::from_secs(16);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !lifecycle.closed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "silent control peer was not failed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A bounded wait is the primitive every binding's event loop is built on, so it has to do
     /// three things exactly: park until an event exists rather than spin, come back on its own
     /// when nothing arrives, and stop for good once the session is closed. A wait that returned
@@ -1439,6 +1593,7 @@ mod audit_tests {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_ready: Condvar::new(),
+            last_inbound: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         });
         let control = ControlPlane::Live {
@@ -1553,6 +1708,7 @@ mod audit_tests {
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_ready: Condvar::new(),
+            last_inbound: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         });
         spawn_control_reader(
@@ -1561,6 +1717,7 @@ mod audit_tests {
             pending.clone(),
             lifecycle.clone(),
             Arc::new(Mutex::new(HashMap::new())),
+            false,
         )
         .unwrap();
 

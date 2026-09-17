@@ -138,6 +138,7 @@ impl TrackChannel {
         track: Track,
         lifecycle: Arc<SessionLifecycle>,
         offline: bool,
+        timed_sync: bool,
     ) -> io::Result<Self> {
         let open_body = zeroize::Zeroizing::new(open_body);
         let snapshot = lock(&track.inner, "track")?.clone();
@@ -285,6 +286,7 @@ impl TrackChannel {
                 events.clone(),
                 input.clone(),
                 snapshot.media_sequence.clone(),
+                timed_sync,
             )?;
         }
         let handle_lifetime = Arc::new(ChannelHandleLifetime {
@@ -1198,6 +1200,7 @@ impl Session {
             track.clone(),
             self.lifecycle.clone(),
             matches!(&self.control, ControlPlane::Offline { .. }),
+            self.supports(vivid_protocol::registry::TIMED_MEDIA_SYNC),
         )
     }
 
@@ -1276,6 +1279,7 @@ pub(crate) fn spawn_channel_reader(
     events: Arc<ChannelEvents>,
     input: Arc<Mutex<VecDeque<(Instant, crate::InputPacket)>>>,
     input_sequence: Arc<Mutex<TrackMediaSequence>>,
+    timed_sync: bool,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(format!("vivid-track-reader-{}", configuration.track_id))
@@ -1367,8 +1371,24 @@ pub(crate) fn spawn_channel_reader(
                             flow.changed.notify_all();
                         }
                         messages::NEED_KEYFRAME => {
-                            validate_payload_keys("NEED_KEYFRAME", &payload, 0..=5, &[6])?;
-                            let minimum_epoch = required_u32(&payload, 4)?;
+                            let recovery = vivid_protocol::timed::NeedKeyframe::decode(
+                                &Value::Map(payload.clone()),
+                            )?;
+                            if recovery.reason == vivid_protocol::timed::PRESENTATION_RESUMED
+                                && !timed_sync
+                            {
+                                return Err(invalid_data(
+                                    "presentation recovery requires timed-media-sync-v1",
+                                ));
+                            }
+                            if recovery.reason == vivid_protocol::timed::PRESENTATION_RESUMED {
+                                // This asks for a correlated replacement transaction, not a
+                                // decoder repair in this channel. In particular a duplicate must
+                                // not poison a replacement generation that is already priming.
+                                push_channel_event(&events, ChannelEvent::NeedKeyframe(payload))?;
+                                continue;
+                            }
+                            let minimum_epoch = recovery.minimum_epoch;
                             let mut state = lock(&media, "channel media state")?;
                             state.recovery_revision =
                                 state.recovery_revision.checked_add(1).ok_or_else(|| {

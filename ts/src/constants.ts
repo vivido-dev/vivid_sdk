@@ -37,6 +37,7 @@ export const PROFILE_DESKTOP_SURFACE: string = textOf("PROFILE_DESKTOP_SURFACE")
 export const PROFILE_CANVAS_SURFACE: string = textOf("PROFILE_CANVAS_SURFACE");
 export const PROFILE_LIVE_MEDIA: string = textOf("PROFILE_LIVE_MEDIA");
 export const PROFILE_TIMED_MEDIA: string = textOf("PROFILE_TIMED_MEDIA");
+export const PROFILE_TIMED_MEDIA_SYNC: string = textOf("PROFILE_TIMED_MEDIA_SYNC");
 export const PROFILE_AUDIO_GAIN: string = textOf("PROFILE_AUDIO_GAIN");
 export const PROFILE_AUDIO_INPUT: string = textOf("PROFILE_AUDIO_INPUT");
 export const PROFILE_DESKTOP_INPUT: string = textOf("PROFILE_DESKTOP_INPUT");

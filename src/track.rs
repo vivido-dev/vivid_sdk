@@ -25,6 +25,7 @@ pub struct Track {
 
 #[derive(Clone)]
 pub(crate) struct TrackLocal {
+    pub(crate) playback_hold: Option<PlaybackHold>,
     pub(crate) configuration: TrackConfiguration,
     pub(crate) vector_limits: Option<vivid_protocol::vector::Limits>,
     pub(crate) revision: TrackRevision,
@@ -98,6 +99,12 @@ impl std::fmt::Debug for Track {
 }
 
 impl Track {
+    pub fn playback_hold(&self) -> Option<PlaybackHold> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.playback_hold.clone())
+    }
     pub fn context_id(&self) -> u64 {
         self.inner
             .lock()
@@ -171,6 +178,7 @@ pub struct TrackSupport {
 /// Authoritative state returned by `QUERY_TRACK`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackStatus {
+    pub playback_hold: Option<PlaybackHold>,
     pub context_id: u64,
     pub surface_id: u64,
     pub track_id: u64,
@@ -421,6 +429,7 @@ impl Session {
             ));
         }
         let inner = Arc::new(Mutex::new(TrackLocal {
+            playback_hold: None,
             configuration,
             vector_limits: self.info.vector_limits.clone(),
             revision: ready.revision,
@@ -444,6 +453,17 @@ impl Session {
     /// handle never reconciles mutable track state, so a late response cannot retire a new channel.
     /// Dropping/cancelling the owning session interrupts outstanding queries.
     pub fn track_query_handle(&self) -> Option<TrackQueryHandle> {
+        self.track_observation_handle(false)
+    }
+
+    /// A bounded gateway worker can freeze a clock and then observe its confirmed position.
+    /// The caller must keep these track IDs alive until completion and qualify the result by
+    /// its own projection operation. Session cancellation interrupts either request.
+    pub fn track_pause_query_handle(&self) -> Option<TrackQueryHandle> {
+        self.track_observation_handle(true)
+    }
+
+    fn track_observation_handle(&self, pause: bool) -> Option<TrackQueryHandle> {
         let crate::session::ControlPlane::Live { writer, pending } = &self.control else {
             return None;
         };
@@ -455,6 +475,38 @@ impl Session {
         let gain = self.supports(AUDIO_GAIN);
         Some(Arc::new(move |track| {
             let snapshot = lock(&track.inner, "track")?.clone();
+            if pause {
+                let request_id = ids
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |id| id.checked_add(1),
+                    )
+                    .map_err(|_| invalid_data("request ID space exhausted"))?;
+                let envelope = messages::Envelope::correlated(
+                    request_id,
+                    vec![
+                        (0, Value::Unsigned(snapshot.configuration.context_id)),
+                        (1, Value::Unsigned(snapshot.configuration.surface_id)),
+                        (2, Value::Unsigned(snapshot.configuration.track_id)),
+                    ],
+                )?;
+                let reply = control
+                    .request(
+                        request_id,
+                        messages::PAUSE,
+                        snapshot.configuration.track_id,
+                        &envelope.encode()?,
+                    )?
+                    .ok_or_else(|| invalid_data("missing PAUSE reply"))?;
+                if reply.record_type == messages::ERROR {
+                    return Err(presenter_error(&reply.body)?);
+                }
+                expect_record(&reply, messages::OK, snapshot.configuration.track_id)?;
+                if messages::decode_control(&reply.body)?.request_id != request_id {
+                    return Err(invalid_data("reply request ID does not match pause"));
+                }
+            }
             let request_id = ids
                 .fetch_update(
                     std::sync::atomic::Ordering::Relaxed,
@@ -505,6 +557,14 @@ impl Session {
         let status = parse_track_status(&snapshot, reply, self.supports(AUDIO_GAIN))?;
         let mut state = lock(&track.inner, "track")?;
         let generation_changed = status.channel_generation != state.channel_generation;
+        if let Some(hold) = &status.playback_hold
+            && state
+                .playback_hold
+                .as_ref()
+                .is_none_or(|old| old.serial < hold.serial)
+        {
+            state.playback_hold = Some(hold.clone());
+        }
         if generation_changed {
             let active_flow = state.active_flow.take();
             state.active_media = None;
@@ -643,10 +703,31 @@ impl Session {
         minimum_buffer_us: u64,
         maximum_latency_us: u64,
     ) -> io::Result<()> {
+        self.play_with(
+            track,
+            PlayOptions {
+                start_pts_us,
+                minimum_buffer_us,
+                maximum_latency_us,
+                start_policy: StartPolicy::AfterMinimumBuffer,
+                hold_serial: None,
+            },
+        )
+    }
+
+    pub fn play_with(&mut self, track: &Track, options: PlayOptions) -> io::Result<()> {
         if !self.supports(TIMED_MEDIA) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "timed-media-v1 was not accepted",
+            ));
+        }
+        if options.start_policy == StartPolicy::Synchronized
+            && !self.supports(vivid_protocol::registry::TIMED_MEDIA_SYNC)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "timed-media-sync-v1 was not accepted; update the presenter",
             ));
         }
         let state = lock(&track.inner, "track")?.clone();
@@ -657,19 +738,12 @@ impl Session {
         self.request_ok(
             messages::PLAY,
             state.configuration.track_id,
-            vec![
-                (0, Value::Unsigned(state.configuration.context_id)),
-                (1, Value::Unsigned(state.configuration.surface_id)),
-                (2, Value::Unsigned(state.configuration.track_id)),
-                (3, signed(start_pts_us)),
-                (4, Value::Unsigned(minimum_buffer_us)),
-                (5, Value::Unsigned(maximum_latency_us)),
-                (6, signed(1_i64 << 32)),
-                (7, Value::Unsigned(1)),
-                (8, Value::Unsigned(0)),
-                (9, Value::Unsigned(1)),
-                (10, Value::Unsigned(state.channel_generation.get())),
-            ],
+            options.payload(vivid_protocol::track::TrackAddress {
+                context_id: state.configuration.context_id,
+                surface_id: state.configuration.surface_id,
+                track_id: state.configuration.track_id,
+                channel_generation: state.channel_generation,
+            })?,
             &RequestMetadata::default(),
         )
     }
@@ -758,8 +832,19 @@ fn parse_track_status(
             snapshot.configuration.track_id,
         )?;
         let payload = decoded_payload(&record)?;
-        validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22, 23])?;
+        validate_payload_keys("TRACK_STATUS", &payload, 0..=20, &[21, 22, 23, 24])?;
         validate_track_tuple(&payload, &snapshot.configuration)?;
+        if let Some(value) = payload
+            .iter()
+            .find_map(|(key, value)| (*key == 24).then_some(value))
+        {
+            let hold = PlaybackHold::decode(value)?;
+            if hold.context_id != snapshot.configuration.context_id
+                || hold.surface_id != snapshot.configuration.surface_id
+            {
+                return Err(invalid_data("hold status has the wrong surface identity"));
+            }
+        }
         let kind = TrackKind::try_from(required_u64(&payload, 4)?).map_err(io::Error::other)?;
         let mode = TrackMode::try_from(required_u64(&payload, 5)?).map_err(io::Error::other)?;
         let lifecycle = required_u64(&payload, 6)?;
@@ -777,6 +862,11 @@ fn parse_track_status(
             ));
         }
         TrackStatus {
+            playback_hold: payload
+                .iter()
+                .find_map(|(key, value)| (*key == 24).then_some(value))
+                .map(PlaybackHold::decode)
+                .transpose()?,
             context_id: required_u64(&payload, 0)?,
             surface_id: required_u64(&payload, 1)?,
             track_id: required_u64(&payload, 2)?,
@@ -819,6 +909,7 @@ fn parse_track_status(
             };
         let flow = flow.unwrap_or_default();
         TrackStatus {
+            playback_hold: snapshot.playback_hold.clone(),
             context_id: snapshot.configuration.context_id,
             surface_id: snapshot.configuration.surface_id,
             track_id: snapshot.configuration.track_id,

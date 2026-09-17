@@ -308,6 +308,66 @@ pub struct SessionEventPayload {
     pub record_type: Option<f64>,
     pub diagnostic: Option<String>,
     pub payload: Option<PayloadPayload>,
+    pub hold: Option<PlaybackHoldPayload>,
+}
+
+#[napi(object)]
+pub struct HeldPositionPayload {
+    pub track_id: f64,
+    pub channel_generation: f64,
+    pub epoch: u32,
+    pub pts_us: f64,
+    pub estimated: bool,
+}
+
+#[napi(object)]
+pub struct PlaybackHoldPayload {
+    pub context_id: f64,
+    pub surface_id: f64,
+    pub serial: f64,
+    pub held: bool,
+    pub reasons: u32,
+    pub playing_intent: bool,
+    pub recovery_required: bool,
+    pub position: Option<HeldPositionPayload>,
+}
+
+fn playback_hold_payload(hold: &vivid_sdk::PlaybackHold) -> Result<PlaybackHoldPayload> {
+    let unsigned = |value: u64| -> Result<f64> {
+        if value > MAX_SAFE_INTEGER as u64 {
+            return Err(value_error(
+                "hold identity exceeds JavaScript's safe integer range",
+            ));
+        }
+        Ok(value as f64)
+    };
+    let position = hold
+        .position
+        .map(|position| -> Result<_> {
+            if position.pts_us.unsigned_abs() > MAX_SAFE_INTEGER as u64 {
+                return Err(value_error(
+                    "held PTS exceeds JavaScript's safe integer range",
+                ));
+            }
+            Ok(HeldPositionPayload {
+                track_id: unsigned(position.track_id)?,
+                channel_generation: unsigned(position.channel_generation)?,
+                epoch: position.epoch,
+                pts_us: position.pts_us as f64,
+                estimated: position.estimated,
+            })
+        })
+        .transpose()?;
+    Ok(PlaybackHoldPayload {
+        context_id: unsigned(hold.context_id)?,
+        surface_id: unsigned(hold.surface_id)?,
+        serial: unsigned(hold.serial)?,
+        held: hold.held,
+        reasons: hold.reasons as u32,
+        playing_intent: hold.playing_intent,
+        recovery_required: hold.recovery_required,
+        position,
+    })
 }
 
 /// A control payload, carried as scalar entries plus raw deterministic-CBOR bytes for everything
@@ -383,8 +443,15 @@ fn session_event(event: vivid_sdk::SessionEvent) -> Result<SessionEventPayload> 
         record_type: None,
         diagnostic: None,
         payload: None,
+        hold: None,
     };
     match event {
+        E::PlaybackHold(hold) => {
+            out.kind = "playbackHold".into();
+            out.hold = Some(playback_hold_payload(&hold)?);
+            out.object_id = Some(hold.surface_id as f64);
+            out.payload = Some(payload_payload(&hold.payload().map_err(io_error)?)?);
+        }
         E::TargetChanged(payload) => {
             out.kind = "targetChanged".into();
             out.payload = Some(payload_payload(&payload)?);
@@ -1696,7 +1763,7 @@ impl Session {
             let guard = locked(&inner, "session")?;
             let session = guard.as_ref().ok_or_else(closed_session)?;
             let status = session.query_track(&handle).map_err(io_error)?;
-            Ok(track_status_payload(&status))
+            track_status_payload(&status)
         })
         .await
     }
@@ -1774,9 +1841,14 @@ impl Session {
         start_pts_us: i64,
         minimum_buffer_us: f64,
         maximum_latency_us: f64,
+        synchronized: Option<bool>,
+        hold_serial: Option<f64>,
     ) -> Result<()> {
         let minimum_buffer_us = opt_u64(Some(minimum_buffer_us), "minimumBufferUs")?;
         let maximum_latency_us = opt_u64(Some(maximum_latency_us), "maximumLatencyUs")?;
+        let hold_serial = hold_serial
+            .map(|value| opt_u64(Some(value), "holdSerial"))
+            .transpose()?;
         let inner = Arc::clone(&self.inner);
         let handle = track.inner.clone();
         blocking(move || {
@@ -1784,7 +1856,20 @@ impl Session {
             guard
                 .as_mut()
                 .ok_or_else(closed_session)?
-                .play(&handle, start_pts_us, minimum_buffer_us, maximum_latency_us)
+                .play_with(
+                    &handle,
+                    vivid_sdk::PlayOptions {
+                        start_pts_us,
+                        minimum_buffer_us,
+                        maximum_latency_us,
+                        hold_serial,
+                        start_policy: if synchronized.unwrap_or(false) {
+                            vivid_sdk::StartPolicy::Synchronized
+                        } else {
+                            vivid_sdk::StartPolicy::AfterMinimumBuffer
+                        },
+                    },
+                )
                 .map_err(io_error)
         })
         .await
@@ -2021,8 +2106,13 @@ fn required_milestone_of(value: Option<f64>) -> Result<u64> {
     })
 }
 
-fn track_status_payload(status: &TrackStatus) -> TrackStatusPayload {
-    TrackStatusPayload {
+fn track_status_payload(status: &TrackStatus) -> Result<TrackStatusPayload> {
+    Ok(TrackStatusPayload {
+        playback_hold: status
+            .playback_hold
+            .as_ref()
+            .map(playback_hold_payload)
+            .transpose()?,
         context_id: status.context_id as f64,
         surface_id: status.surface_id as f64,
         track_id: status.track_id as f64,
@@ -2055,11 +2145,12 @@ fn track_status_payload(status: &TrackStatus) -> TrackStatusPayload {
             })
             .unwrap_or(0.0),
         terminal_loss_code: status.terminal_loss_code.map(|code| code as f64),
-    }
+    })
 }
 
 #[napi(object)]
 pub struct TrackStatusPayload {
+    pub playback_hold: Option<PlaybackHoldPayload>,
     pub context_id: f64,
     pub surface_id: f64,
     pub track_id: f64,
