@@ -14,10 +14,14 @@
 
 mod config;
 mod listener;
+pub(crate) mod overlay_host;
+mod overlay_relay;
 pub(crate) mod resource;
 mod service;
 mod socket;
 mod transport;
+mod vector_retention;
+pub use overlay_relay::{OverlayHostRequest, OverlayLayout};
 
 pub use config::*;
 pub use listener::{ConnectionCancel, PresenterListener, Transport};

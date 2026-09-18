@@ -1,5 +1,7 @@
 # vivid_sdk
 
+See [pane overlays](OVERLAYS.md) for Rust, Python, and TypeScript window APIs, Vello drawing, and current acceptance status.
+
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `vivid_sdk` is the full-duplex Rust SDK for Vivid Protocol 1.5. It serves both roles: the crate

@@ -200,7 +200,9 @@ impl Session {
         ensure_live_surface(&snapshot)?;
         let mut seen_slots = BTreeSet::new();
         for binding in bindings {
-            if !(1..=4).contains(&binding.slot) || !seen_slots.insert(binding.slot) {
+            let known = (1..=4).contains(&binding.slot)
+                || (binding.slot == crate::SLOT_VECTOR && self.supports(crate::VECTOR_SCENE));
+            if !known || !seen_slots.insert(binding.slot) {
                 return Err(invalid_input(
                     "ACTIVATE_TRACK slots must be known and unique",
                 ));

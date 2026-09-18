@@ -22,7 +22,9 @@ use vivid_protocol::lease::CleanupPolicy;
 use vivid_protocol::registry::{
     AUDIO_GAIN, AUDIO_INPUT, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT,
     DESKTOP_INPUT, DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA,
-    OBSERVABILITY, TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA, WEB_CARRIER,
+    OBSERVABILITY, OVERLAY_CLIPBOARD, OVERLAY_ENV, OVERLAY_INPUT, OVERLAY_PAINT, OVERLAY_POINTER,
+    OVERLAY_TEXT, OVERLAY_TEXT_LAYOUT, OVERLAY_TYPOGRAPHY, TERMINAL_CONTENT, TERMINAL_OVERLAY,
+    TERMINAL_SURFACE, TIMED_MEDIA, VECTOR_SCENE, WEB_CARRIER,
 };
 use vivid_protocol::scene::Fit;
 use vivid_protocol::surface::{
@@ -44,7 +46,7 @@ use crate::track::TrackWaitCondition;
 
 /// Surface slot assignments from §1 of the 1.5 media specification.
 ///
-/// Slot zero carries no playback and is the only slot an uplink audio track may declare. Slots 5
+/// Slot zero carries no playback and is the only slot an uplink audio track may declare. Slots 6
 /// through 31 are reserved; 32 and above are application-defined.
 pub const SLOT_NONE: u64 = 0;
 /// The `primary-video` slot. Video tracks only.
@@ -55,6 +57,8 @@ pub const SLOT_AUDIO: u64 = 2;
 pub const SLOT_RASTER: u64 = 3;
 /// The `poster` slot. Encoded image or raster.
 pub const SLOT_POSTER: u64 = 4;
+/// Portable vector-scene visual slot.
+pub const SLOT_VECTOR: u64 = 5;
 
 /// Track kind assignments from §1 of the 1.5 media specification.
 pub const TRACK_KIND_VIDEO: u64 = 1;
@@ -64,6 +68,8 @@ pub const TRACK_KIND_AUDIO: u64 = 2;
 pub const TRACK_KIND_RASTER: u64 = 3;
 /// Encoded-image track kind.
 pub const TRACK_KIND_IMAGE: u64 = 4;
+/// Portable vector-scene track kind.
+pub const TRACK_KIND_VECTOR: u64 = 5;
 
 /// Encoded-image encodings accepted by
 /// [`ImageConfiguration`](vivid_protocol::track::ImageConfiguration).
@@ -117,6 +123,10 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("PROFILE_CANVAS_SURFACE", Text(CANVAS_SURFACE)),
     ("PROFILE_LIVE_MEDIA", Text(LIVE_MEDIA)),
     ("PROFILE_TIMED_MEDIA", Text(TIMED_MEDIA)),
+    (
+        "PROFILE_TIMED_MEDIA_SYNC",
+        Text(vivid_protocol::registry::TIMED_MEDIA_SYNC),
+    ),
     ("PROFILE_AUDIO_GAIN", Text(AUDIO_GAIN)),
     ("PROFILE_AUDIO_INPUT", Text(AUDIO_INPUT)),
     ("PROFILE_DESKTOP_INPUT", Text(DESKTOP_INPUT)),
@@ -124,6 +134,16 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("PROFILE_FILE_DROP_PATH", Text(FILE_DROP_PATH)),
     ("PROFILE_OBSERVABILITY", Text(OBSERVABILITY)),
     ("PROFILE_WEB_CARRIER", Text(WEB_CARRIER)),
+    ("PROFILE_TERMINAL_OVERLAY", Text(TERMINAL_OVERLAY)),
+    ("PROFILE_VECTOR_SCENE", Text(VECTOR_SCENE)),
+    ("PROFILE_OVERLAY_INPUT", Text(OVERLAY_INPUT)),
+    ("PROFILE_OVERLAY_TEXT", Text(OVERLAY_TEXT)),
+    ("PROFILE_OVERLAY_TEXT_LAYOUT", Text(OVERLAY_TEXT_LAYOUT)),
+    ("PROFILE_OVERLAY_TYPOGRAPHY", Text(OVERLAY_TYPOGRAPHY)),
+    ("PROFILE_OVERLAY_PAINT", Text(OVERLAY_PAINT)),
+    ("PROFILE_OVERLAY_POINTER", Text(OVERLAY_POINTER)),
+    ("PROFILE_OVERLAY_CLIPBOARD", Text(OVERLAY_CLIPBOARD)),
+    ("PROFILE_OVERLAY_ENV", Text(OVERLAY_ENV)),
     // Surface semantic profiles.
     ("SURFACE_GENERIC", Text(GENERIC_CONTENT)),
     ("SURFACE_TERMINAL", Text(TERMINAL_CONTENT)),
@@ -185,6 +205,7 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("TRACK_KIND_AUDIO", Number(TRACK_KIND_AUDIO)),
     ("TRACK_KIND_RASTER", Number(TRACK_KIND_RASTER)),
     ("TRACK_KIND_IMAGE", Number(TRACK_KIND_IMAGE)),
+    ("TRACK_KIND_VECTOR", Number(TRACK_KIND_VECTOR)),
     ("LANE_CONTROL", Number(LaneClass::Control as u64)),
     ("LANE_INTERACTIVE", Number(LaneClass::Interactive as u64)),
     ("LANE_REALTIME", Number(LaneClass::Realtime as u64)),
@@ -194,6 +215,7 @@ static TABLE: &[(&str, ConstantValue)] = &[
     ("SLOT_AUDIO", Number(SLOT_AUDIO)),
     ("SLOT_RASTER", Number(SLOT_RASTER)),
     ("SLOT_POSTER", Number(SLOT_POSTER)),
+    ("SLOT_VECTOR", Number(SLOT_VECTOR)),
     // Scene node fit modes.
     ("FIT_FILL", Number(Fit::Fill as u64)),
     ("FIT_CONTAIN", Number(Fit::Contain as u64)),

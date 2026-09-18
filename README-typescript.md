@@ -1,5 +1,7 @@
 # vivid-sdk for TypeScript
 
+See [pane overlays](OVERLAYS.md) for interactive windows, submission receipts, and viewport events.
+
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `@vivido/vivid-sdk` is the TypeScript SDK for Vivid Protocol 1.5, for both roles. The current local build is tested with Node 22 and Bun 1.3.14;
@@ -204,6 +206,11 @@ Version 2.0 replaces the old subprocess wrapper. See
 [MIGRATING-node-1.5-to-2.0.md](MIGRATING-node-1.5-to-2.0.md).
 
 ## Current limits
+
+Pane overlays expose native asynchronous `OverlaySession` / `OverlayWindow` handles, retained
+images, typed Canvas builders, and asynchronous event iteration. Overlay revisions and hit IDs
+use `bigint`. See the [overlay API and validation guide](OVERLAYS.md#python-and-typescript).
+These APIs target direct Vivido connections; terminating SDK presenters reject the profiles.
 
 This is a source-build preview: npm platform prebuild packages and optional dependencies are not
 wired for distribution yet. Run `npm ci` and `npm run build:debug` in this checkout. The sibling

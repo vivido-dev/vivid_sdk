@@ -38,19 +38,20 @@ use vivid_protocol::track::{
     MILESTONE_CHANNEL_ACCEPTED, MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED,
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_OUTPUT_READY,
     MILESTONE_PRESENTED, RasterConfiguration, TrackConfiguration, TrackMode, TrackState,
-    VideoConfiguration,
+    VectorConfiguration, VideoConfiguration,
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use zeroize::Zeroizing;
 
 use super::config::{
-    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
-    BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, PaneMediaNodeStatus,
-    PaneMediaStatus, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
+    BridgeClipRect, BridgeNode, BridgeOverlayWindow, BridgePlayRequest, BridgeSource,
+    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
+    PaneMediaNodeStatus, PaneMediaStatus, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
 };
 use super::config::{
     DeliveryMetrics, MediaConfig, PaneId, PaneMediaSurfaceDescriptor, PresenterConfig, RelayMetrics,
 };
+use super::overlay_host::OverlayReply;
 use super::transport::{Reader, Writer};
 use crate::presenter::{KEYFRAME_REASON_TRANSPORT_LOSS, PresenterListener, Transport};
 
@@ -107,6 +108,7 @@ pub enum SourceDescriptor {
     Image(ImageConfiguration),
     Video(VideoConfiguration),
     Audio(AudioSourceConfig),
+    VectorScene(VectorConfiguration),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +120,7 @@ pub struct PlayRequest {
     pub late_policy: u64,
     pub loop_count: u64,
     pub start_policy: u64,
+    pub hold_serial: Option<u64>,
 }
 
 impl PlayRequest {
@@ -130,6 +133,7 @@ impl PlayRequest {
             late_policy: 1,
             loop_count: 0,
             start_policy: 1,
+            hold_serial: None,
         }
     }
 }
@@ -211,6 +215,22 @@ impl ProjectionSnapshot {
                 logical_height: surface.logical_height,
                 capture_policy: surface.capture_policy,
                 descriptor: bridge_semantic_descriptor(&surface.semantic_descriptor),
+                overlay_layouts: surface.overlay_layouts.clone(),
+                overlay_window: surface.overlay_window.map(|window| BridgeOverlayWindow {
+                    parent: window.parent,
+                    min_width: window.min_width,
+                    min_height: window.min_height,
+                    offset_x: 0,
+                    offset_y: 0,
+                    generation: window.generation,
+                    revision: window.revision,
+                    x: window.x,
+                    y: window.y,
+                    width: window.width,
+                    height: window.height,
+                    mode: window.mode,
+                    visible: window.visible,
+                }),
             })
             .collect();
         let sources = self
@@ -237,6 +257,7 @@ impl ProjectionSnapshot {
                     late_policy: source.play_request.late_policy,
                     loop_count: source.play_request.loop_count,
                     start_policy: source.play_request.start_policy,
+                    hold_serial: source.play_request.hold_serial,
                 },
                 eos_epoch: source.eos_epoch,
                 causation_id: source.causation_id,
@@ -349,18 +370,56 @@ fn bridge_source_kind(source: &SnapshotSource) -> BridgeSourceKind {
             max_access_unit_bytes: config.max_access_unit_bytes,
             codec_string: config.codec_string.clone(),
         },
+        SourceDescriptor::VectorScene(config) => BridgeSourceKind::VectorScene {
+            width: config.width,
+            height: config.height,
+            maximum_scene_bytes: config.maximum_scene_bytes,
+        },
     }
+}
+
+/// An overlay window's bounds, mode, visibility, generation and revision, present on a
+/// [`SnapshotSurface`] whose surface hosts a `vector-scene-v1` track. Geometry is rounded to
+/// logical pixels, matching every other geometry field this bridge model carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotOverlayWindow {
+    pub parent: Option<BridgeSurfaceKey>,
+    pub min_width: i64,
+    pub min_height: i64,
+    pub generation: u64,
+    pub revision: u64,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    /// `WindowMode` as its wire discriminant: 0 Floating, 1 Popup, 2 Modal.
+    pub mode: u64,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SnapshotSurface {
     pub producer: ProducerId,
+    /// The presentation principal this surface's session authenticated against. A scene node
+    /// carries its own pane, but an overlay window has no node: it is placed by its bounds, and
+    /// a relay needs the pane to know which rectangle those bounds are relative to.
+    pub pane: PaneId,
     pub context: u64,
     pub surface: u64,
     pub logical_width: u64,
     pub logical_height: u64,
     pub capture_policy: u64,
     pub semantic_descriptor: SemanticDescriptor,
+    pub overlay_window: Option<SnapshotOverlayWindow>,
+    pub overlay_layouts: Vec<super::OverlayLayout>,
+}
+
+fn window_mode_wire(mode: vivid_protocol::overlay::WindowMode) -> u64 {
+    match mode {
+        vivid_protocol::overlay::WindowMode::Floating => 0,
+        vivid_protocol::overlay::WindowMode::Popup => 1,
+        vivid_protocol::overlay::WindowMode::Modal => 2,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,10 +430,12 @@ pub struct SnapshotSource {
     pub live: bool,
     pub active: bool,
     pub audio_gain: Option<AudioGain>,
-    /// Retained immutable media body, currently used by encoded-image tracks.
+    /// Retained immutable image body or latest vector frame.
     pub retained: Option<Arc<[u8]>>,
     /// The fully composed latest raster, independent of the producer's delta chain.
     pub retained_raster: Option<RetainedRaster>,
+    /// Ordered assets, latest scene, and releases needed to rebuild an overlay track.
+    pub retained_vector: Vec<(u16, Arc<[u8]>)>,
     pub first_visible_presented: bool,
     pub playing: bool,
     pub play_request: PlayRequest,
@@ -492,6 +553,18 @@ pub struct MediaEvent {
     pub body: Vec<u8>,
 }
 
+/// Where a runtime sends the media records its tracks accept.
+enum MediaEventDelivery {
+    /// Hand each accepted record to the host, which retires every delivery with
+    /// [`VirtualVivid::complete_bridge_delivery`] or [`VirtualVivid::release_bridge_delivery`].
+    Push(mpsc::SyncSender<MediaEvent>),
+    /// The runtime owns a bounded queue that a [`VirtualVivid::wait_media_event`] caller drains.
+    Pull,
+    /// Terminate media at the runtime. Successful validation is immediately reusable flow, no
+    /// event is ever queued, and no delivery needs retirement.
+    Eventless,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayLeaseReady {
     pub context_id: u64,
@@ -585,6 +658,10 @@ struct SessionRuntime {
     lease: Option<(u64, u64)>,
     resume_key: Secret32,
     resume_generation: u64,
+    /// The interactive lane's writer, present once this session's overlay lane authenticates.
+    /// Unsolicited overlay records (window events, submission outcomes, viewport/environment
+    /// snapshots) are pushed here as soon as they are queued, rather than waiting for a request.
+    overlay_lane: Option<Arc<Writer>>,
 }
 
 // An exact authenticated transcript can recognize a lost-response retry after old keys
@@ -612,6 +689,7 @@ struct LeaseEntry {
 struct SurfaceEntry {
     state: SurfaceState,
     active_slots: HashMap<u64, u64>,
+    hold: Option<crate::PlaybackHold>,
 }
 
 struct TrackEntry {
@@ -619,12 +697,14 @@ struct TrackEntry {
     configuration: TrackConfiguration,
     state: TrackState,
     decoder_reset_serial: u64,
+    hold_pause_decoder: Option<u64>,
     flush_pending_channel_advance: bool,
     channel_advance_pending_flush: bool,
     audio_gain: AudioGain,
     channel_writer: Option<Arc<Writer>>,
     retained: Option<Arc<[u8]>>,
     retained_raster: Option<RetainedRaster>,
+    retained_vector: super::vector_retention::VectorRetention,
     playing: bool,
     play_request: PlayRequest,
     eos_epoch: Option<u32>,
@@ -729,6 +809,13 @@ struct State {
     play_commands: Vec<BridgeSourceKey>,
     connections: usize,
     delivery_metrics: DeliveryMetrics,
+    /// Overlay window/focus/revision bookkeeping, shared by every session this presenter accepts.
+    /// Only populated when `config.overlay` is set; otherwise no session ever negotiates the
+    /// profiles that would let anything reach it.
+    overlays: crate::presenter::overlay_host::Overlays,
+    overlay_relay: super::overlay_relay::OverlayRelay,
+    overlay_layouts: HashMap<SurfaceKey, Vec<super::OverlayLayout>>,
+    released_overlay_layouts: HashSet<(SurfaceKey, u64)>,
 }
 
 fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
@@ -763,6 +850,82 @@ pub struct VirtualVivid {
 }
 
 impl VirtualVivid {
+    pub fn pane_for_overlay_surface(&self, surface: BridgeSurfaceKey) -> Option<PaneId> {
+        let state = lock(&self.state);
+        state.surfaces.get(&SurfaceKey {
+            session: surface.producer,
+            context: surface.context,
+            surface: surface.surface,
+        })?;
+        state
+            .sessions
+            .get(&surface.producer)
+            .map(|session| session.pane)
+    }
+    pub fn relay_overlay_input(&self, surface: BridgeSurfaceKey, body: &[u8]) -> io::Result<bool> {
+        let envelope = messages::decode_control(body)?;
+        let input = vivid_protocol::overlay::wire::InputEvent::decode(
+            surface.surface,
+            &Value::Map(envelope.payload),
+        )?;
+        if input.address.context_id != surface.context {
+            return Err(invalid("overlay input owner mismatch"));
+        }
+        let mut state = lock(&self.state);
+        let changes_projection = matches!(
+            input.event,
+            vivid_protocol::overlay::Event::Geometry { .. }
+                | vivid_protocol::overlay::Event::Focus(_)
+        );
+        let accepted = state.overlays.relay_input(surface.producer, input);
+        if accepted && changes_projection {
+            advance_projection(&mut state);
+        }
+        flush_overlay_lane(&mut state, surface.producer);
+        Ok(accepted)
+    }
+
+    /// Route font measurement and retained-layout requests to the physical presenter.
+    pub fn enable_overlay_host_relay(&self) {
+        lock(&self.state).overlay_relay.enabled = true;
+    }
+
+    /// Only offer optional host services that the current physical presenter negotiated.
+    pub fn set_overlay_host_profiles(&self, profiles: &[String]) {
+        let mut state = lock(&self.state);
+        for profile in [
+            registry::OVERLAY_CLIPBOARD,
+            registry::OVERLAY_A11Y,
+            registry::OVERLAY_TYPOGRAPHY,
+        ] {
+            state
+                .config
+                .supported_profiles
+                .retain(|supported| supported != profile);
+            if profiles.iter().any(|supported| supported == profile) {
+                state.config.supported_profiles.push(profile.into());
+            }
+        }
+        state.config.supported_profiles.sort();
+    }
+
+    pub fn take_overlay_host_requests(&self) -> Vec<super::OverlayHostRequest> {
+        lock(&self.state).overlay_relay.queued.drain(..).collect()
+    }
+
+    pub fn complete_overlay_host_request(&self, id: u64, response: Result<Vec<u8>, String>) {
+        if let Some(sender) = lock(&self.state).overlay_relay.pending.get(&id) {
+            let response = response.and_then(|body| {
+                if body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
+                    Err("overlay host reply exceeds transport budget".into())
+                } else {
+                    Ok(body)
+                }
+            });
+            let _ = sender.try_send(response);
+        }
+    }
+
     /// Microphones are independent of viewport visibility and presentation-slot projection.
     pub fn microphone_requests(&self) -> Vec<super::MicrophoneRequest> {
         let state = lock(&self.state);
@@ -846,13 +1009,72 @@ impl VirtualVivid {
         Self::start_configured(listener, PresenterConfig::terminal(config), events)
     }
 
+    /// Start a runtime that terminates media locally.
+    ///
+    /// Accepted records never become bridge deliveries: successful validation is immediately
+    /// reusable flow, no [`MediaEvent`] is queued, and no delivery needs retirement. Focused
+    /// presenter and bridge tests use this to exercise media flow without hosting a consumer.
+    pub fn start_eventless<L: PresenterListener>(
+        listener: L,
+        config: MediaConfig,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(
+            listener,
+            PresenterConfig::terminal(config),
+            MediaEventDelivery::Eventless,
+        )
+    }
+
     pub fn start_configured<L: PresenterListener>(
         listener: L,
-        mut config: PresenterConfig,
+        config: PresenterConfig,
         events: Option<mpsc::SyncSender<MediaEvent>>,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(
+            listener,
+            config,
+            events.map_or(MediaEventDelivery::Pull, MediaEventDelivery::Push),
+        )
+    }
+
+    /// Start a configured presenter whose consumer terminates accepted media locally.
+    pub fn start_configured_eventless<L: PresenterListener>(
+        listener: L,
+        config: PresenterConfig,
+    ) -> io::Result<Self> {
+        Self::start_with_delivery(listener, config, MediaEventDelivery::Eventless)
+    }
+
+    fn start_with_delivery<L: PresenterListener>(
+        listener: L,
+        mut config: PresenterConfig,
+        delivery: MediaEventDelivery,
     ) -> io::Result<Self> {
         config.supported_profiles.sort();
         config.supported_profiles.dedup();
+        if !config.overlay
+            && config.supported_profiles.iter().any(|profile| {
+                matches!(
+                    profile.as_str(),
+                    registry::TERMINAL_OVERLAY
+                        | registry::VECTOR_SCENE
+                        | registry::OVERLAY_INPUT
+                        | registry::OVERLAY_TEXT
+                        | registry::OVERLAY_TEXT_LAYOUT
+                        | registry::OVERLAY_TYPOGRAPHY
+                        | registry::OVERLAY_PAINT
+                        | registry::OVERLAY_POINTER
+                        | registry::OVERLAY_ENV
+                        | registry::OVERLAY_A11Y
+                )
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this terminating presenter has no vector overlay renderer or pane input router",
+            ));
+        }
+
         if !config
             .supported_profiles
             .iter()
@@ -871,11 +1093,13 @@ impl VirtualVivid {
         // `wait_media_event` without supplying a Rust channel or a callback. The bound is what
         // keeps a stalled reader from growing retention without limit; overflow takes the same
         // recovery path as a busy push consumer.
-        let (media_events, events) = if let Some(caller) = events {
-            (Mutex::new(None), Some(caller))
-        } else {
-            let (sender, receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE_BOUND);
-            (Mutex::new(Some(receiver)), Some(sender))
+        let (media_events, events) = match delivery {
+            MediaEventDelivery::Push(caller) => (Mutex::new(None), Some(caller)),
+            MediaEventDelivery::Pull => {
+                let (sender, receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE_BOUND);
+                (Mutex::new(Some(receiver)), Some(sender))
+            }
+            MediaEventDelivery::Eventless => (Mutex::new(None), None),
         };
         registry::validate_profile_set(config.supported_profiles.iter().map(String::as_str))
             .map_err(io::Error::other)?;
@@ -916,6 +1140,10 @@ impl VirtualVivid {
             play_commands: Vec::new(),
             connections: 0,
             delivery_metrics: DeliveryMetrics::default(),
+            overlays: crate::presenter::overlay_host::Overlays::default(),
+            overlay_relay: Default::default(),
+            overlay_layouts: HashMap::new(),
+            released_overlay_layouts: HashSet::new(),
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -959,7 +1187,7 @@ impl VirtualVivid {
         let Some(receiver) = receiver.as_ref() else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "this runtime delivers media events through the channel given at startup",
+                "this runtime has no pull-mode media event queue",
             ));
         };
         match receiver.recv_timeout(timeout) {
@@ -1130,6 +1358,15 @@ impl VirtualVivid {
         };
         state.targets.insert(pane, target.clone());
         announce_target_change(&mut state, pane, &target, 0x1f);
+        // An overlay window lays out against the pane it sits in, so a resize moves its viewport.
+        if state.config.overlay
+            && let Some(viewport) = overlay_viewport(&metrics)
+        {
+            for session_id in overlay_sessions_for_pane(&state, pane) {
+                state.overlays.set_viewport(session_id, viewport);
+                flush_overlay_lane(&mut state, session_id);
+            }
+        }
     }
 
     /// Advances one desktop principal's target and announces the new descriptor to its live
@@ -1270,6 +1507,7 @@ impl VirtualVivid {
         if !state.config.target.accepts_anchors() {
             return;
         }
+        let mut changed = false;
         for session in state
             .sessions
             .values_mut()
@@ -1280,10 +1518,14 @@ impl VirtualVivid {
                 .values_mut()
                 .filter(|anchor| anchor.alternate == alternate)
             {
-                anchor.row = anchor.row.saturating_sub(lines);
+                let row = anchor.row.saturating_sub(lines);
+                changed |= row != anchor.row;
+                anchor.row = row;
             }
         }
-        advance_projection(&mut state);
+        if changed {
+            advance_projection(&mut state);
+        }
     }
 
     pub fn clear_anchors(&self, pane: PaneId, alternate: bool) {
@@ -1291,6 +1533,7 @@ impl VirtualVivid {
         if !state.config.target.accepts_anchors() {
             return;
         }
+        let mut changed = false;
         for session in state
             .sessions
             .values_mut()
@@ -1304,9 +1547,12 @@ impl VirtualVivid {
             for (context, anchor) in removed {
                 session.anchors.remove(&(context, anchor));
                 notify_anchor_gone(session, context, anchor);
+                changed = true;
             }
         }
-        advance_projection(&mut state);
+        if changed {
+            advance_projection(&mut state);
+        }
     }
 
     pub fn set_alternate_screen(&self, pane: PaneId, alternate: bool) {
@@ -1502,6 +1748,7 @@ impl VirtualVivid {
                 KindConfiguration::EncodedImage(_) => ("image", true),
                 KindConfiguration::Video(_) => ("video", true),
                 KindConfiguration::Audio(_) => ("audio", false),
+                KindConfiguration::VectorScene(_) => ("vector", false),
             };
             tracks.push(PaneTrackSummary {
                 source: bridge_track_key(*key),
@@ -1540,66 +1787,99 @@ impl VirtualVivid {
             .surfaces
             .iter()
             .filter(|(key, _)| sessions.contains(&key.session))
-            .map(|(key, surface)| SnapshotSurface {
-                producer: key.session,
-                context: key.context,
-                surface: key.surface,
-                logical_width: surface.state.definition.logical_width,
-                logical_height: surface.state.definition.logical_height,
-                capture_policy: surface.state.definition.policy,
-                semantic_descriptor: semantic_descriptor(&surface.state.definition.descriptor),
-            })
-            .collect::<Vec<_>>();
-        let sources = state
-            .tracks
-            .iter()
-            .filter(|(key, track)| {
-                sessions.contains(&key.surface.session)
-                    && track.configuration.direction != crate::TrackDirection::Uplink
-            })
-            .map(|(key, track)| SnapshotSource {
-                key: bridge_track_key(*key),
-                descriptor: source_descriptor(&state.tracks, *key, track),
-                decoder_reset_serial: track.decoder_reset_serial,
-                live: track.configuration.mode == TrackMode::Live,
-                active: state.surfaces.get(&key.surface).is_some_and(|surface| {
-                    surface
-                        .active_slots
-                        .values()
-                        .any(|track_id| *track_id == key.track)
-                }),
-                audio_gain: (matches!(track.configuration.kind, KindConfiguration::Audio(_))
-                    && state
+            .map(|(key, surface)| {
+                let overlay_window = super::overlay_host::owner(key.session)
+                    .context(key.context)
+                    .ok()
+                    .and_then(|context| context.surface(key.surface).ok())
+                    .and_then(|identity| state.overlays.window(identity))
+                    .map(|window| SnapshotOverlayWindow {
+                        parent: window.options.parent.map(|parent| BridgeSurfaceKey {
+                            producer: parent.context.session.session_id,
+                            context: parent.context.context_id,
+                            surface: parent.surface_id,
+                        }),
+                        min_width: window.options.min_width.get().round() as i64,
+                        min_height: window.options.min_height.get().round() as i64,
+                        generation: window.generation,
+                        revision: window.revision,
+                        x: window.options.bounds.origin.x.get().round() as i64,
+                        y: window.options.bounds.origin.y.get().round() as i64,
+                        width: window.options.bounds.width.get().round() as i64,
+                        height: window.options.bounds.height.get().round() as i64,
+                        mode: window_mode_wire(window.options.mode),
+                        visible: window.options.visible,
+                    });
+                SnapshotSurface {
+                    overlay_layouts: state.overlay_layouts.get(key).cloned().unwrap_or_default(),
+                    overlay_window,
+                    producer: key.session,
+                    pane: state
                         .sessions
-                        .get(&key.surface.session)
-                        .is_some_and(|session| {
-                            session.accepted_profiles.contains(registry::AUDIO_GAIN)
-                        }))
-                .then_some(track.audio_gain),
-                retained: track.retained.clone(),
-                retained_raster: track.retained_raster.clone(),
-                first_visible_presented: track.outer_presented,
-                playing: track.playing,
-                play_request: track.play_request,
-                eos_epoch: track.eos_epoch,
-                last_inner_record_sequence: track.last_record_sequence,
-                causation_id: track.causation_id,
-                capture_policy: state
-                    .surfaces
-                    .get(&key.surface)
-                    .map_or(0, |surface| surface.state.definition.policy),
-                semantic_descriptor: state
-                    .surfaces
-                    .get(&key.surface)
-                    .map(|surface| semantic_descriptor(&surface.state.definition.descriptor)),
-                raster_delta_operation_limit: match &track.configuration.kind {
-                    KindConfiguration::Raster(config) if config.delta_enabled => {
-                        Some(u32::from(config.maximum_delta_operations))
-                    }
-                    _ => None,
-                },
+                        .get(&key.session)
+                        .map_or(0, |session| session.pane),
+                    context: key.context,
+                    surface: key.surface,
+                    logical_width: surface.state.definition.logical_width,
+                    logical_height: surface.state.definition.logical_height,
+                    capture_policy: surface.state.definition.policy,
+                    semantic_descriptor: semantic_descriptor(&surface.state.definition.descriptor),
+                }
             })
             .collect::<Vec<_>>();
+        let sources =
+            state
+                .tracks
+                .iter()
+                .filter(|(key, track)| {
+                    sessions.contains(&key.surface.session)
+                        && !track.state.lost
+                        && track.configuration.direction != crate::TrackDirection::Uplink
+                })
+                .filter_map(|(key, track)| {
+                    Some(SnapshotSource {
+                        key: bridge_track_key(*key),
+                        descriptor: source_descriptor(&state.tracks, *key, track)?,
+                        decoder_reset_serial: track.decoder_reset_serial,
+                        live: track.configuration.mode == TrackMode::Live,
+                        active: state.surfaces.get(&key.surface).is_some_and(|surface| {
+                            surface
+                                .active_slots
+                                .values()
+                                .any(|track_id| *track_id == key.track)
+                        }),
+                        audio_gain: (matches!(
+                            track.configuration.kind,
+                            KindConfiguration::Audio(_)
+                        ) && state.sessions.get(&key.surface.session).is_some_and(
+                            |session| session.accepted_profiles.contains(registry::AUDIO_GAIN),
+                        ))
+                        .then_some(track.audio_gain),
+                        retained: track.retained.clone(),
+                        retained_raster: track.retained_raster.clone(),
+                        retained_vector: track.retained_vector.snapshot(),
+                        first_visible_presented: track.outer_presented,
+                        playing: track.playing,
+                        play_request: track.play_request,
+                        eos_epoch: track.eos_epoch,
+                        last_inner_record_sequence: track.last_record_sequence,
+                        causation_id: track.causation_id,
+                        capture_policy: state
+                            .surfaces
+                            .get(&key.surface)
+                            .map_or(0, |surface| surface.state.definition.policy),
+                        semantic_descriptor: state.surfaces.get(&key.surface).map(|surface| {
+                            semantic_descriptor(&surface.state.definition.descriptor)
+                        }),
+                        raster_delta_operation_limit: match &track.configuration.kind {
+                            KindConfiguration::Raster(config) if config.delta_enabled => {
+                                Some(u32::from(config.maximum_delta_operations))
+                            }
+                            _ => None,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
         let mut nodes = Vec::new();
         for (key, entry) in &state.nodes {
             if !sessions.contains(&key.session) {
@@ -1641,6 +1921,23 @@ impl VirtualVivid {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        let timed_surfaces = state
+            .tracks
+            .iter()
+            .filter(|(_, track)| track.configuration.mode == TrackMode::Timed)
+            .map(|(key, _)| key.surface)
+            .collect::<HashSet<_>>();
+        for surface in timed_surfaces {
+            let visible = projected_sources
+                .iter()
+                .any(|source| inner_track_key(*source).surface == surface);
+            set_playback_hold(
+                &mut state,
+                surface,
+                !visible,
+                vivid_protocol::timed::HOLD_NOT_VISIBLE,
+            );
+        }
         let projected_decoder_resets = sources
             .iter()
             .map(|source| (source.key, source.decoder_reset_serial))
@@ -1656,10 +1953,13 @@ impl VirtualVivid {
             .map(inner_track_key)
             .collect::<HashSet<_>>();
         for source in &hidden_sources {
+            retire_held_decoder(&mut state, inner_track_key(*source));
             let Some(track) = state.tracks.get_mut(&inner_track_key(*source)) else {
                 continue;
             };
-            if track.playing && matches!(track.configuration.kind, KindConfiguration::Video(_)) {
+            if track.configuration.mode == TrackMode::Timed
+                && matches!(track.configuration.kind, KindConfiguration::Video(_))
+            {
                 // A hidden tab removes its outer decoder just like a detached foreground client.
                 // Re-arm recovery before allowing the source into a later projection so no
                 // inter-frame packet can become the first input to the replacement decoder.
@@ -1764,10 +2064,30 @@ impl VirtualVivid {
 
     pub fn deactivate_bridge(&self) {
         let mut state = lock(&self.state);
+        let surfaces = state
+            .tracks
+            .iter()
+            .filter(|(_, track)| track.configuration.mode == TrackMode::Timed)
+            .map(|(key, _)| key.surface)
+            .collect::<HashSet<_>>();
+        for surface in surfaces {
+            set_playback_hold(
+                &mut state,
+                surface,
+                true,
+                vivid_protocol::timed::HOLD_DETACHED,
+            );
+        }
+        let retiring = state.projected_sources.iter().copied().collect::<Vec<_>>();
+        for source in retiring {
+            retire_held_decoder(&mut state, inner_track_key(source));
+        }
         state.projected_sources.clear();
         state.projected_decoder_resets.clear();
         for track in state.tracks.values_mut() {
-            if matches!(track.configuration.kind, KindConfiguration::Video(_)) && track.playing {
+            if matches!(track.configuration.kind, KindConfiguration::Video(_))
+                && track.configuration.mode == TrackMode::Timed
+            {
                 track.recovery_pending = true;
                 // A later foreground presenter owns a fresh decoder. Re-arm producer recovery for
                 // that handoff instead of damping its first NEED_KEYFRAME against the request
@@ -1898,6 +2218,10 @@ impl VirtualVivid {
     ) -> KeyframeRequestOutcome {
         let mut state = lock(&self.state);
         let key = inner_track_key(source);
+        let hold = state
+            .surfaces
+            .get(&key.surface)
+            .and_then(|surface| surface.hold.clone());
         let recovery_inflight = state
             .deliveries
             .values()
@@ -1925,7 +2249,28 @@ impl VirtualVivid {
                 .unwrap_or(0)
                 .max(track.state.media_epoch.saturating_add(1))
         };
-        if !send_need_keyframe(key, track, requested_epoch, reason) {
+        let delivered = if let Some(hold) = hold.filter(|hold| !hold.held && hold.recovery_required)
+        {
+            let mut payload = vivid_protocol::track::need_keyframe_payload(
+                track_address(key, track),
+                requested_epoch,
+                vivid_protocol::timed::PRESENTATION_RESUMED,
+            );
+            if let Some(position) = hold.position {
+                payload.push((7, signed(position.pts_us)));
+            }
+            payload.push((8, Value::Unsigned(hold.serial)));
+            Envelope::new(0, payload).encode().ok().is_some_and(|body| {
+                track.channel_writer.as_ref().is_some_and(|writer| {
+                    writer
+                        .write_record(messages::NEED_KEYFRAME, key.track, &body)
+                        .is_ok()
+                })
+            })
+        } else {
+            send_need_keyframe(key, track, requested_epoch, reason)
+        };
+        if !delivered {
             return KeyframeRequestOutcome::Ignored;
         }
         track.recovery_requested = true;
@@ -1953,19 +2298,170 @@ impl VirtualVivid {
         }
     }
 
+    pub fn reject_incompatible_playback(&self, source: SourceKey, decoder_reset_serial: u64) {
+        let mut state = lock(&self.state);
+        let key = inner_track_key(source);
+        let Some(track) = state.tracks.get_mut(&key) else {
+            return;
+        };
+        if track.decoder_reset_serial != decoder_reset_serial || track.state.lost {
+            return;
+        }
+        if track.state.lose().is_err() {
+            return;
+        }
+        if let Some(writer) = track.channel_writer.take() {
+            writer.close();
+        }
+        let revision = track.state.revision.get();
+        let body = Envelope::new(0, vec![
+            (0, Value::Unsigned(key.surface.context)), (1, Value::Unsigned(key.surface.surface)),
+            (2, Value::Unsigned(key.track)), (3, Value::Unsigned(messages::ERROR_UNSUPPORTED_PROFILE)),
+            (4, Value::Unsigned(revision)), (5, Value::Map(vec![])),
+            (6, Value::Text("downstream presenter does not support timed-media-sync-v1; synchronized playback cannot be downgraded".into())),
+        ]).encode();
+        if let Ok(body) = body
+            && let Some(session) = state.sessions.get(&key.surface.session)
+        {
+            let _ = session
+                .writer
+                .write_record(messages::TRACK_LOST, key.track, &body);
+        }
+        retire_track_deliveries(&mut state, key);
+        advance_projection(&mut state);
+    }
+
+    pub fn apply_downstream_hold(&self, source: SourceKey, observed: super::BridgeHoldSnapshot) {
+        let mut state = lock(&self.state);
+        let key = inner_track_key(source);
+        let Some(track) = state.tracks.get(&key) else {
+            return;
+        };
+        if track.decoder_reset_serial != observed.decoder_reset_serial {
+            return;
+        }
+        let position = observed.position_pts_us.map(|pts_us| crate::HeldPosition {
+            track_id: key.track,
+            channel_generation: track.state.channel_generation.get(),
+            epoch: track.state.media_epoch,
+            pts_us,
+            estimated: observed.estimated,
+        });
+        set_playback_hold(
+            &mut state,
+            key.surface,
+            observed.held,
+            vivid_protocol::timed::HOLD_DOWNSTREAM,
+        );
+        if let Some(position) = position
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key.surface)
+                .and_then(|surface| surface.hold.as_mut())
+            && hold.position != Some(position)
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.position = Some(position);
+            hold.serial = serial;
+            if let Ok(payload) = hold.payload()
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.surface.session)
+            {
+                let _ = session.writer.write_record(
+                    messages::PLAYBACK_HOLD,
+                    key.surface.surface,
+                    &body,
+                );
+            }
+        }
+    }
+
     pub fn apply_outer_position(&self, source: SourceKey, position: super::BridgePositionSnapshot) {
         let mut state = lock(&self.state);
+        let held = state
+            .surfaces
+            .get(&inner_track_key(source).surface)
+            .and_then(|surface| surface.hold.as_ref())
+            .is_some_and(|hold| hold.held);
         let Some(track) = state.tracks.get_mut(&inner_track_key(source)) else {
             return;
         };
-        if position.decoder_reset_serial != track.decoder_reset_serial
+        let frozen_reply = held
+            && position.state == 3
+            && track.hold_pause_decoder == Some(position.decoder_reset_serial);
+        if (!frozen_reply && position.decoder_reset_serial != track.decoder_reset_serial)
             || position.playing != track.playing
             || position.start_pts_us != track.play_request.start_pts_us
             || position.state > 5
         {
             return;
         }
+        if frozen_reply {
+            track.hold_pause_decoder = None;
+        }
         track.outer_position = Some(position);
+        if position.state == 2 {
+            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+        }
+        let clock_generation = track.state.channel_generation.get();
+        let clock_epoch = track.state.media_epoch;
+        let resume_serial = track.play_request.hold_serial;
+        let key = inner_track_key(source).surface;
+        if position.state == 2
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key)
+                .and_then(|surface| surface.hold.as_mut())
+            && !hold.held
+            && hold.recovery_required
+            && resume_serial == Some(hold.serial)
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.serial = serial;
+            hold.recovery_required = false;
+            hold.position = position.clock_pts_us.map(|pts_us| crate::HeldPosition {
+                track_id: source.track,
+                channel_generation: clock_generation,
+                epoch: clock_epoch,
+                pts_us,
+                estimated: false,
+            });
+            if let Ok(payload) = hold.payload()
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.session)
+            {
+                let _ = session
+                    .writer
+                    .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+            }
+        }
+        if frozen_reply
+            && let Some(pts_us) = position.clock_pts_us
+            && let Some(hold) = state
+                .surfaces
+                .get_mut(&key)
+                .and_then(|surface| surface.hold.as_mut())
+            && hold.held
+            && let Some(serial) = hold.serial.checked_add(1)
+        {
+            hold.serial = serial;
+            hold.position = Some(crate::HeldPosition {
+                track_id: source.track,
+                channel_generation: clock_generation,
+                epoch: clock_epoch,
+                pts_us,
+                estimated: false,
+            });
+            let payload = hold.payload();
+            if let Ok(payload) = payload
+                && let Ok(body) = Envelope::new(0, payload).encode()
+                && let Some(session) = state.sessions.get(&key.session)
+            {
+                let _ = session
+                    .writer
+                    .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+            }
+        }
     }
 
     pub fn apply_outer_playback(
@@ -1981,7 +2477,7 @@ impl VirtualVivid {
             if track.decoder_reset_serial != decoder_reset_serial {
                 return;
             }
-            if state_value >= 2 {
+            if state_value == 2 {
                 track.state.milestones |= MILESTONE_CLOCK_STARTED;
             }
             if eos_state >= 1 {
@@ -2402,22 +2898,26 @@ fn handle_connection(
         ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, state, changed),
         ConnectionKind::Track => handle_track(&mut reader, state, changed),
         ConnectionKind::Lane => {
-            let writer = reader.writer();
-            let first = reader.read_record(ConnectionKind::Lane)?;
-            let request = messages::decode_control(&first.body)
-                .map(|envelope| envelope.request_id)
-                .unwrap_or(0);
-            writer.write_record(
-                messages::ERROR,
-                first.object_id,
-                &protocol_error(
-                    request,
-                    messages::ERROR_UNSUPPORTED_PROFILE,
-                    true,
-                    "this presenter does not serve Vivid lane connections",
-                )?,
-            )?;
-            Ok(())
+            if lock(state).config.overlay {
+                handle_lane(&mut reader, state)
+            } else {
+                let writer = reader.writer();
+                let first = reader.read_record(ConnectionKind::Lane)?;
+                let request = messages::decode_control(&first.body)
+                    .map(|envelope| envelope.request_id)
+                    .unwrap_or(0);
+                writer.write_record(
+                    messages::ERROR,
+                    first.object_id,
+                    &protocol_error(
+                        request,
+                        messages::ERROR_UNSUPPORTED_PROFILE,
+                        true,
+                        "this presenter does not serve Vivid lane connections",
+                    )?,
+                )?;
+                Ok(())
+            }
         }
         ConnectionKind::FileTransfer => {
             let writer = reader.writer();
@@ -2435,6 +2935,202 @@ fn handle_connection(
             Ok(())
         }
     }
+}
+
+/// Serves the overlay interactive lane: one independently authenticated connection per session,
+/// carrying renewal, pointer capture requests, and every unsolicited overlay record the session is
+/// owed. A stalled or malformed bulk track must never delay this connection, so it shares nothing
+/// with `handle_track` but the session lookup.
+fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()> {
+    let writer = reader.writer();
+    let first = reader.read_record(ConnectionKind::Lane)?;
+    if first.record_type != messages::LANE_OPEN {
+        return Err(invalid("lane connection did not open a lane"));
+    }
+    let envelope = messages::decode_control(&first.body)?;
+    let request_id = envelope.request_id;
+    let open = messages::LaneOpen::decode(&first.body)?;
+    let session_id = open.session_id;
+    {
+        let mut state = lock(shared);
+        let Some(session) = state.sessions.get(&session_id) else {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_NOT_FOUND,
+                "session does not exist",
+            ));
+        };
+        if session.closed {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_NOT_FOUND,
+                "session is no longer live",
+            ));
+        }
+        if !session.accepted_profiles.contains(registry::OVERLAY_INPUT) {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_UNSUPPORTED_PROFILE,
+                "overlay-input-v1 was not negotiated",
+            ));
+        }
+        let expected = auth::lane_tag(
+            session.channel_key.expose(),
+            session_id,
+            messages::LaneClass::Interactive as u32,
+            open.lane_generation,
+            &open.client_nonce,
+        );
+        if !auth::verify_tag(&expected, &open.authentication_tag) {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_AUTH_FAILED,
+                "lane authentication failed",
+            ));
+        }
+        let accepted_body = Envelope::new(
+            request_id,
+            vec![
+                (0, Value::Unsigned(session_id)),
+                (1, Value::Unsigned(messages::LaneClass::Interactive as u64)),
+                (2, Value::Unsigned(open.lane_generation)),
+                (
+                    3,
+                    Value::Unsigned(u64::from(vivid_protocol::LANE_MAX_RECORD_BODY)),
+                ),
+            ],
+        )
+        .encode()?;
+        writer.write_record(messages::LANE_ACCEPTED, 0, &accepted_body)?;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("checked above")
+            .overlay_lane = Some(writer.clone());
+        // The spec requires an initial viewport and environment snapshot right after lane
+        // authentication, not on the next unrelated change.
+        state.overlays.open_lane(session_id);
+        flush_overlay_lane(&mut state, session_id);
+    }
+    // Refuse inbound records larger than the allowance just granted. Without this the lane would
+    // accept whatever the connection preface negotiated, which is the bulk ceiling.
+    reader.set_maximum(vivid_protocol::LANE_MAX_RECORD_BODY)?;
+    reader.clear_read_deadline()?;
+    loop {
+        let record = match reader.read_record(ConnectionKind::Lane) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        };
+        let envelope = messages::decode_control(&record.body)?;
+        let mut state = lock(shared);
+        // A session end or a newer lane superseding this one both retire it without error: the
+        // producer's own transport close or replacement lane already explains why.
+        let Some(session) = state.sessions.get(&session_id) else {
+            break;
+        };
+        if session.closed
+            || !session
+                .overlay_lane
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &writer))
+        {
+            break;
+        }
+        let mut outcome: OverlayReply = match record.record_type {
+            messages::OVERLAY_INPUT_RENEW => {
+                state
+                    .overlays
+                    .renew(session_id, record.object_id, &envelope.payload)
+            }
+            messages::OVERLAY_INPUT_CAPTURE => {
+                state
+                    .overlays
+                    .capture(session_id, record.object_id, &envelope.payload)
+            }
+            _ => Err("record is not carried on the overlay interactive lane"),
+        };
+        if outcome.is_ok()
+            && state.overlay_relay.enabled
+            && record.record_type == messages::OVERLAY_INPUT_CAPTURE
+        {
+            let capture = vivid_protocol::overlay::wire::Capture::decode(
+                record.object_id,
+                &Value::Map(envelope.payload.clone()),
+            )?;
+            if state.overlay_relay.pending.len() >= 64 {
+                outcome = Err("overlay host request capacity exhausted");
+            } else {
+                let id = state
+                    .overlay_relay
+                    .next_id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("host request ID exhausted"))?;
+                state.overlay_relay.next_id = id;
+                let (sender, receiver) = mpsc::sync_channel(1);
+                state.overlay_relay.pending.insert(id, sender);
+                state
+                    .overlay_relay
+                    .queued
+                    .push_back(super::OverlayHostRequest {
+                        id,
+                        surface: BridgeSurfaceKey {
+                            producer: session_id,
+                            context: capture.address.context_id,
+                            surface: capture.address.surface_id,
+                        },
+                        record_type: record.record_type,
+                        body: record.body.clone(),
+                        layout_ids: Vec::new(),
+                    });
+                let wakeup = state.media_wakeup.clone();
+                drop(state);
+                if let Some(wakeup) = wakeup {
+                    wakeup();
+                }
+                let response = receiver.recv_timeout(Duration::from_secs(2));
+                state = lock(shared);
+                state.overlay_relay.pending.remove(&id);
+                state
+                    .overlay_relay
+                    .queued
+                    .retain(|request| request.id != id);
+                if !matches!(response, Ok(Ok(_))) {
+                    outcome = Err("outer pointer capture failed");
+                }
+            }
+        }
+        let (reply_type, body) = match outcome {
+            Ok((reply, fields)) => (reply, Envelope::new(envelope.request_id, fields).encode()?),
+            Err(reason) => (
+                messages::ERROR,
+                protocol_error(
+                    envelope.request_id,
+                    messages::ERROR_BAD_STATE,
+                    false,
+                    reason,
+                )?,
+            ),
+        };
+        drop(state);
+        writer.write_record(reply_type, record.object_id, &body)?;
+        let mut state = lock(shared);
+        flush_overlay_lane(&mut state, session_id);
+    }
+    let mut state = lock(shared);
+    if let Some(session) = state.sessions.get_mut(&session_id)
+        && session
+            .overlay_lane
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &writer))
+    {
+        session.overlay_lane = None;
+    }
+    Ok(())
 }
 
 fn handle_control(
@@ -3001,6 +3697,15 @@ fn establish_session(
         resume_generation,
         extensions: vec![],
     };
+    if welcome
+        .accepted_profiles
+        .iter()
+        .any(|profile| profile == registry::VECTOR_SCENE)
+    {
+        welcome
+            .extensions
+            .push((15, state.overlays.limits().to_value()));
+    }
     welcome.confirm(&prk)?;
     let candidate_welcome = welcome.encode(request_id)?;
     let fingerprint = profile_fingerprint(target_profile, &welcome.accepted_profiles);
@@ -3122,8 +3827,23 @@ fn establish_session(
             lease: lease_key,
             resume_key: Secret32::new(*keys.resume_key()),
             resume_generation,
+            overlay_lane: None,
         },
     );
+    // Seed this session's viewport from the pane it authenticated against, so its first window
+    // query or action has geometry to answer with. The lane's initial snapshot delivers it; a
+    // later resize is pushed by `update_metrics`.
+    if state.config.overlay
+        && decided
+            .accepted_profiles
+            .iter()
+            .any(|profile| profile == registry::VECTOR_SCENE)
+        && let Some(viewport) = state.metrics.get(&pane).and_then(overlay_viewport)
+    {
+        state
+            .overlays
+            .install_session_viewport(session_id, viewport);
+    }
     if let Some(key) = lease_key
         && let Some(lease) = state.leases.get_mut(&key)
     {
@@ -3230,6 +3950,171 @@ fn recorrelate_cached_reply(body: &[u8], request_id: u64) -> io::Result<Vec<u8>>
     envelope.encode().map_err(io::Error::other)
 }
 
+/// Every live, `vector-scene-v1`-negotiated session belonging to `pane`. A pane ordinarily has
+/// exactly one, but nothing here assumes that: two producers can authenticate against the same
+/// pane, and each must be reachable independently.
+fn overlay_sessions_for_pane(state: &State, pane: PaneId) -> Vec<u64> {
+    state
+        .sessions
+        .iter()
+        .filter(|(_, session)| {
+            session.pane == pane
+                && !session.closed
+                && session.accepted_profiles.contains(registry::VECTOR_SCENE)
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The logical-pixel rectangle a pane's overlay windows lay out against.
+///
+/// It is derived from the pane's own cell grid rather than set separately: the two would drift,
+/// and an overlay window laid out against a stale viewport is placed wrong. `update_metrics`
+/// already computes the pixel extent, so there is exactly one source of truth.
+fn overlay_viewport(metrics: &Metrics) -> Option<vivid_protocol::overlay::wire::Viewport> {
+    Some(vivid_protocol::overlay::wire::Viewport {
+        width: vivid_protocol::vector::Scalar::new(f64::from(metrics.viewport_width)).ok()?,
+        height: vivid_protocol::vector::Scalar::new(f64::from(metrics.viewport_height)).ok()?,
+        scale_numerator: 1,
+        scale_denominator: 1,
+    })
+}
+
+impl VirtualVivid {
+    /// Reports the host environment (appearance, font defaults, motion preference) a pane's
+    /// overlay windows should match, and pushes the change to every negotiated session.
+    pub fn set_overlay_environment(
+        &self,
+        pane: PaneId,
+        environment: vivid_protocol::overlay::wire::Environment,
+    ) {
+        let mut state = lock(&self.state);
+        state.overlays.set_environment(environment);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        flush_overlay_lanes(&mut state, &sessions);
+    }
+
+    /// Delivers a pointer event in viewport logical pixels to a pane's overlay windows. `button`
+    /// is `(button, pressed)`. Returns whether any session's overlay consumed it.
+    pub fn overlay_pointer(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state
+            .overlays
+            .pointer(&sessions, position, button, modifiers, None);
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a pressure sample, as a device that has one reports.
+    pub fn overlay_pressure(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        pressure: f64,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let pressure = vivid_protocol::vector::Scalar::new(pressure).map_err(io::Error::other)?;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state
+            .overlays
+            .pointer(&sessions, position, None, 0, Some(pressure));
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a wheel delta in viewport logical pixels to a pane's overlay windows.
+    pub fn overlay_wheel(
+        &self,
+        pane: PaneId,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        modifiers: u32,
+    ) -> io::Result<bool> {
+        let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
+        let scroll = vivid_protocol::overlay::Scroll {
+            dx: vivid_protocol::vector::Scalar::new(dx).map_err(io::Error::other)?,
+            dy: vivid_protocol::vector::Scalar::new(dy).map_err(io::Error::other)?,
+            // A terminal reports wheel detents, not pixel-precise motion; the caller has already
+            // converted them to logical pixels, which is exactly what `precise` being false means.
+            precise: false,
+            phase: vivid_protocol::overlay::ScrollPhase::Changed,
+        };
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.wheel(&sessions, position, scroll, modifiers);
+        flush_overlay_lanes(&mut state, &sessions);
+        Ok(consumed)
+    }
+
+    /// Delivers a physical key transition to a pane's overlay windows. `usage` is a USB HID
+    /// keyboard-page usage. Escape dismissal is the host's policy, keyed off the usage.
+    pub fn overlay_key(&self, pane: PaneId, usage: u32, down: bool, modifiers: u32) -> bool {
+        self.overlay_key_event(pane, usage, down, false, modifiers)
+    }
+
+    pub fn overlay_has_focus(&self, pane: PaneId) -> bool {
+        let state = lock(&self.state);
+        state
+            .overlays
+            .focus_belongs_to(&overlay_sessions_for_pane(&state, pane))
+    }
+
+    pub fn overlay_key_event(
+        &self,
+        pane: PaneId,
+        usage: u32,
+        down: bool,
+        repeat: bool,
+        modifiers: u32,
+    ) -> bool {
+        let event = vivid_protocol::overlay::Event::Key {
+            physical: usage,
+            down,
+            repeat,
+            modifiers,
+        };
+        let escape = usage == 0x29;
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.keyboard(&sessions, event, escape);
+        flush_overlay_lanes(&mut state, &sessions);
+        consumed
+    }
+
+    /// Delivers committed text to a pane's overlay windows, as a platform text-input path would
+    /// after a key or an IME commit.
+    pub fn overlay_text(&self, pane: PaneId, text: &str) -> bool {
+        let event = vivid_protocol::overlay::Event::Text(text.to_owned());
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        let consumed = state.overlays.keyboard(&sessions, event, false);
+        flush_overlay_lanes(&mut state, &sessions);
+        consumed
+    }
+
+    /// Gains or loses native pane focus, which cancels gestures and held input state in every
+    /// overlay window of the pane.
+    pub fn set_overlay_pane_focus(&self, pane: PaneId, focused: bool) {
+        let mut state = lock(&self.state);
+        let sessions = overlay_sessions_for_pane(&state, pane);
+        state.overlays.set_pane_focus(&sessions, focused);
+        flush_overlay_lanes(&mut state, &sessions);
+    }
+}
+
 fn dispatch_control(
     shared: &Arc<Mutex<State>>,
     session_id: u64,
@@ -3250,6 +4135,289 @@ fn dispatch_control(
         return Err(ControlError::missing("session does not exist"));
     }
     admit_session_post_hello(&mut state, session_id);
+    if state.overlay_relay.enabled
+        && matches!(
+            record.record_type,
+            messages::MEASURE_OVERLAY_TEXT_BATCH
+                | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
+                | messages::SET_OVERLAY_EDITOR
+                | messages::SET_OVERLAY_CLIPBOARD
+                | messages::SET_OVERLAY_SEMANTICS
+        )
+    {
+        use vivid_protocol::overlay::wire::text::styled::{MeasureBatch, ReleaseLayouts};
+        if record.body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
+            return Err(ControlError::bad(
+                "overlay host request exceeds transport budget",
+            ));
+        }
+        let profile = match record.record_type {
+            messages::SET_OVERLAY_EDITOR => registry::OVERLAY_TEXT,
+            messages::SET_OVERLAY_CLIPBOARD => registry::OVERLAY_CLIPBOARD,
+            messages::SET_OVERLAY_SEMANTICS => registry::OVERLAY_A11Y,
+            _ => registry::OVERLAY_TEXT_LAYOUT,
+        };
+        if !state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.accepted_profiles.contains(profile))
+        {
+            return Err(ControlError::state(
+                "overlay host profile was not negotiated",
+            ));
+        }
+        let address = match record.record_type {
+            messages::MEASURE_OVERLAY_TEXT_BATCH => {
+                MeasureBatch::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text measurement request"))?
+                    .address
+            }
+            messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
+                ReleaseLayouts::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text layout release"))?
+                    .address
+            }
+            messages::SET_OVERLAY_EDITOR => {
+                state
+                    .overlays
+                    .set_editor_geometry(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::text::EditorGeometry::decode(
+                    record.object_id,
+                    &value,
+                )
+                .map_err(|_| ControlError::bad("invalid editor geometry"))?
+                .address
+            }
+            messages::SET_OVERLAY_CLIPBOARD => {
+                state
+                    .overlays
+                    .set_clipboard(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::Clipboard::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid clipboard request"))?
+                    .address
+            }
+            messages::SET_OVERLAY_SEMANTICS => {
+                state
+                    .overlays
+                    .set_semantics(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::SetSemantics::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid semantics"))?
+                    .address
+            }
+            _ => unreachable!(),
+        };
+        let key = SurfaceKey {
+            session: session_id,
+            context: address.context_id,
+            surface: address.surface_id,
+        };
+        if !state
+            .surfaces
+            .get(&key)
+            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+        {
+            return Err(ControlError::missing("overlay surface is absent or stale"));
+        }
+        if state.overlay_relay.pending.len() >= 64 {
+            return Err(ControlError::state(
+                "overlay host request capacity exhausted",
+            ));
+        }
+        let measurement = (record.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH)
+            .then(|| MeasureBatch::decode(record.object_id, &value))
+            .transpose()
+            .map_err(|_| ControlError::bad("invalid text measurement request"))?;
+        if measurement.as_ref().is_some_and(|query| {
+            query
+                .texts
+                .iter()
+                .any(|text| text.typography != Default::default())
+        }) && !state.sessions.get(&session_id).is_some_and(|session| {
+            session
+                .accepted_profiles
+                .contains(registry::OVERLAY_TYPOGRAPHY)
+        }) {
+            return Err(ControlError::state(
+                "overlay typography profile was not negotiated",
+            ));
+        }
+        let mut retained_layouts = Vec::new();
+        if let Some(query) = measurement.as_ref().filter(|query| query.retain) {
+            let current = state.overlay_layouts.get(&key);
+            let reserved_count: usize = state
+                .overlay_relay
+                .reservations
+                .values()
+                .filter(|(surface, _, _)| {
+                    surface.producer == session_id
+                        && surface.context == key.context
+                        && surface.surface == key.surface
+                })
+                .map(|(_, count, _)| count)
+                .sum();
+            if current.map_or(0, Vec::len) + reserved_count + query.texts.len() > 256 {
+                return Err(ControlError::state(
+                    "retained overlay layout limit exceeded",
+                ));
+            }
+            let mut bytes = state
+                .overlay_layouts
+                .values()
+                .flatten()
+                .map(|layout| layout.body.len())
+                .sum::<usize>()
+                + state
+                    .overlay_relay
+                    .reservations
+                    .values()
+                    .map(|(_, _, bytes)| bytes)
+                    .sum::<usize>();
+            for text in &query.texts {
+                let single = MeasureBatch {
+                    address,
+                    texts: vec![text.clone()],
+                    retain: true,
+                };
+                let body = Envelope::new(
+                    1,
+                    single
+                        .payload()
+                        .map_err(|_| ControlError::bad("invalid text"))?,
+                )
+                .encode()
+                .map_err(|_| ControlError::bad("invalid text"))?;
+                bytes = bytes
+                    .checked_add(body.len())
+                    .ok_or_else(|| ControlError::state("layout budget overflow"))?;
+                if bytes > super::overlay_relay::MAX_RETAINED_LAYOUT_BYTES {
+                    return Err(ControlError::state("retained layout byte limit exceeded"));
+                }
+                state.overlay_relay.next_layout = state
+                    .overlay_relay
+                    .next_layout
+                    .checked_add(1)
+                    .ok_or_else(|| ControlError::state("layout ID exhausted"))?;
+                retained_layouts.push(super::OverlayLayout {
+                    id: state.overlay_relay.next_layout,
+                    body,
+                });
+            }
+        }
+        let id = state
+            .overlay_relay
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| ControlError::state("overlay host request ID exhausted"))?;
+        state.overlay_relay.next_id = id;
+        state.overlay_relay.reservations.insert(
+            id,
+            (
+                BridgeSurfaceKey {
+                    producer: session_id,
+                    context: key.context,
+                    surface: key.surface,
+                },
+                retained_layouts.len(),
+                retained_layouts
+                    .iter()
+                    .map(|layout| layout.body.len())
+                    .sum(),
+            ),
+        );
+        let (sender, receiver) = mpsc::sync_channel(1);
+        state.overlay_relay.pending.insert(id, sender);
+        state
+            .overlay_relay
+            .queued
+            .push_back(super::OverlayHostRequest {
+                id,
+                surface: BridgeSurfaceKey {
+                    producer: session_id,
+                    context: address.context_id,
+                    surface: address.surface_id,
+                },
+                record_type: record.record_type,
+                body: record.body.clone(),
+                layout_ids: retained_layouts.iter().map(|layout| layout.id).collect(),
+            });
+        let wakeup = state.media_wakeup.clone();
+        drop(state);
+        if let Some(wakeup) = wakeup {
+            wakeup();
+        }
+        // This is the connection worker, never the session actor or the global state lock.
+        let response = receiver.recv_timeout(Duration::from_secs(10));
+        let mut state = lock(shared);
+        state.overlay_relay.pending.remove(&id);
+        state.overlay_relay.reservations.remove(&id);
+        state
+            .overlay_relay
+            .queued
+            .retain(|request| request.id != id);
+        let body = response
+            .map_err(|_| ControlError::state("overlay host request timed out"))?
+            .map_err(|_| ControlError::state("outer overlay host refused request"))?;
+        if !state
+            .surfaces
+            .get(&key)
+            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+        {
+            return Err(ControlError::missing(
+                "overlay surface disappeared during host request",
+            ));
+        }
+        let response = messages::decode_control(&body)
+            .map_err(|_| ControlError::bad("invalid outer overlay reply"))?;
+        if let Some(query) = measurement {
+            let answer = vivid_protocol::overlay::wire::text::styled::BatchMeasured::decode(
+                address,
+                &Value::Map(response.payload.clone()),
+            )
+            .map_err(|_| ControlError::bad("invalid outer measurement"))?;
+            if answer.layouts.len() != query.texts.len() {
+                return Err(ControlError::bad("outer measurement count mismatch"));
+            }
+            for (index, ((id, metrics), text)) in
+                answer.layouts.iter().zip(&query.texts).enumerate()
+            {
+                if *id != retained_layouts.get(index).map_or(0, |layout| layout.id) {
+                    return Err(ControlError::bad("outer layout identity mismatch"));
+                }
+                metrics
+                    .validate_text(&text.text())
+                    .map_err(|_| ControlError::bad("invalid outer text geometry"))?;
+            }
+            state
+                .overlay_layouts
+                .entry(key)
+                .or_default()
+                .extend(retained_layouts);
+            advance_projection(&mut state);
+        } else if record.record_type == messages::RELEASE_OVERLAY_TEXT_LAYOUTS {
+            let release = ReleaseLayouts::decode(record.object_id, &value)
+                .map_err(|_| ControlError::bad("invalid layout release"))?;
+            state
+                .released_overlay_layouts
+                .extend(release.ids.into_iter().map(|id| (key, id)));
+            prune_overlay_layouts(&mut state, key);
+            advance_projection(&mut state);
+        }
+        let kind = if record.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH {
+            messages::OVERLAY_TEXT_BATCH_MEASURED
+        } else {
+            messages::OK
+        };
+        return Ok(Some((
+            kind,
+            record.object_id,
+            Envelope::new(request_id, response.payload)
+                .encode()
+                .map_err(|_| ControlError::bad("invalid outer overlay reply"))?,
+        )));
+    }
     let projection_revision_before = state.projection_revision;
     let mutation_cache = if is_idempotent_mutation(record.record_type) {
         envelope.idempotency_key.map(|key| {
@@ -3302,6 +4470,7 @@ fn dispatch_control(
                 SurfaceEntry {
                     state: surface,
                     active_slots: HashMap::new(),
+                    hold: None,
                 },
             );
             advance_projection(&mut state);
@@ -3394,7 +4563,12 @@ fn dispatch_control(
                     || state
                         .sessions
                         .get(&session_id)
-                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)));
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)))
+                && (!matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    || state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::VECTOR_SCENE)));
             (
                 messages::TRACK_SUPPORT,
                 0,
@@ -3441,6 +4615,11 @@ fn dispatch_control(
                         .sessions
                         .get(&session_id)
                         .is_some_and(|s| s.accepted_profiles.contains(registry::AUDIO_INPUT)))
+                || (matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    && !state
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|s| s.accepted_profiles.contains(registry::VECTOR_SCENE)))
             {
                 return Err(ControlError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
@@ -3454,6 +4633,7 @@ fn dispatch_control(
             if state.tracks.contains_key(&key) {
                 return Err(ControlError::state("track identity is already live"));
             }
+            let is_vector_scene = matches!(configuration.kind, KindConfiguration::VectorScene(_));
             if state.tracks.len() >= state.config.media.max_sources {
                 return Err(ControlError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -3469,12 +4649,14 @@ fn dispatch_control(
                     configuration,
                     state: track_state,
                     decoder_reset_serial: 1,
+                    hold_pause_decoder: None,
                     flush_pending_channel_advance: false,
                     channel_advance_pending_flush: false,
                     audio_gain: AudioGain::UNITY,
                     channel_writer: None,
                     retained: None,
                     retained_raster: None,
+                    retained_vector: Default::default(),
                     playing: false,
                     play_request: PlayRequest::baseline(),
                     eos_epoch: None,
@@ -3492,6 +4674,14 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                 },
             );
+            if is_vector_scene {
+                state.overlays.note_track(
+                    session_id,
+                    key.track,
+                    key.surface.context,
+                    key.surface.surface,
+                );
+            }
             advance_projection(&mut state);
             (
                 messages::TRACK_READY,
@@ -3515,11 +4705,24 @@ fn dispatch_control(
                 .tracks
                 .get(&key)
                 .ok_or_else(|| ControlError::missing("track does not exist"))?;
+            let mut payload = track_status_payload(key, track, gain_supported);
+            if let Some(hold) = state
+                .surfaces
+                .get(&key.surface)
+                .and_then(|surface| surface.hold.as_ref())
+            {
+                payload.push((
+                    24,
+                    Value::Map(
+                        hold.payload()
+                            .map_err(|_| ControlError::state("invalid hold state"))?,
+                    ),
+                ));
+            }
             (
                 messages::TRACK_STATUS,
                 record.object_id,
-                Envelope::new(request_id, track_status_payload(key, track, gain_supported))
-                    .encode(),
+                Envelope::new(request_id, payload).encode(),
             )
         }
         messages::ADVANCE_CHANNEL => {
@@ -3549,6 +4752,7 @@ fn dispatch_control(
                     track.channel_advance_pending_flush = true;
                 }
                 track.channel_writer = None;
+                track.hold_pause_decoder = None;
                 track.eos_epoch = None;
                 track.outer_position = None;
                 track.microphone.take();
@@ -3862,6 +5066,18 @@ fn dispatch_control(
                     message: "track wait generation is stale",
                 });
             }
+            if matches!(condition, 3..=6)
+                && state
+                    .surfaces
+                    .get(&key.surface)
+                    .and_then(|surface| surface.hold.as_ref())
+                    .is_some_and(|hold| hold.held)
+            {
+                return Err(ControlError {
+                    code: messages::ERROR_NOT_VISIBLE,
+                    message: "timed surface is held",
+                });
+            }
             if let Some(observed) = evaluate_wait(track, condition, condition_value) {
                 (
                     messages::WAIT_SATISFIED,
@@ -3908,6 +5124,22 @@ fn dispatch_control(
         }
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
             let key = track_key_from_value(session_id, &value)?;
+            if record.record_type == messages::PLAY {
+                let requested = value.map_value(11).and_then(Value::as_u64);
+                let current = state
+                    .surfaces
+                    .get(&key.surface)
+                    .and_then(|surface| surface.hold.as_ref())
+                    .map(|hold| hold.serial);
+                if requested.is_some() && requested != current {
+                    return Err(ControlError::state("PLAY names a stale hold transition"));
+                }
+            }
+            let sync_supported = state.sessions.get(&session_id).is_some_and(|session| {
+                session
+                    .accepted_profiles
+                    .contains(registry::TIMED_MEDIA_SYNC)
+            });
             let mut linked_play = None;
             let mut linked_pause = false;
             let mut retire_deliveries = false;
@@ -3917,8 +5149,9 @@ fn dispatch_control(
                 .ok_or_else(|| ControlError::missing("track does not exist"))?;
             match record.record_type {
                 messages::PLAY => {
-                    let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-                        .map_err(|_| ControlError::bad("invalid PLAY"))?;
+                    let map =
+                        StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+                            .map_err(|_| ControlError::bad("invalid PLAY"))?;
                     let request = PlayRequest {
                         start_pts_us: map
                             .required(3)
@@ -3935,9 +5168,18 @@ fn dispatch_control(
                         late_policy: required_u64(&map, 7)?,
                         loop_count: required_u64(&map, 8)?,
                         start_policy: required_u64(&map, 9)?,
+                        hold_serial: map
+                            .optional_u64(11)
+                            .map_err(|_| ControlError::bad("invalid hold serial"))?,
                     };
                     if request.minimum_buffer_us > request.maximum_latency_us
                         || request.rate_32_32 != 1_i64 << 32
+                        || request.late_policy != 1
+                        || request.loop_count != 0
+                        || !(request.start_policy == 1
+                            || (sync_supported && request.start_policy == 2))
+                        || request.hold_serial == Some(0)
+                        || (request.hold_serial.is_some() && request.start_policy != 2)
                         || required_u64(&map, 10)? != track.state.channel_generation.get()
                     {
                         return Err(ControlError::state("PLAY policy or generation is invalid"));
@@ -3945,7 +5187,12 @@ fn dispatch_control(
                     track.outer_position = None;
                     track.playing = true;
                     track.play_request = request;
-                    track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                    track.hold_pause_decoder = None;
+                    if request.start_policy == 1 {
+                        track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                    } else {
+                        track.state.milestones &= !MILESTONE_CLOCK_STARTED;
+                    }
                     linked_play = Some(request);
                     #[cfg(any(test, feature = "testing"))]
                     state.play_commands.push(bridge_track_key(key));
@@ -3967,6 +5214,7 @@ fn dispatch_control(
                     track.state.last_media_id = 0;
                     track.eos_epoch = None;
                     track.outer_position = None;
+                    track.hold_pause_decoder = None;
                     track.state.milestones &= !(MILESTONE_EOS_ACCEPTED
                         | MILESTONE_BUFFERED_ENDED
                         | MILESTONE_OUTPUT_READY
@@ -4014,7 +5262,11 @@ fn dispatch_control(
                     if let Some(request) = linked_play {
                         track.playing = true;
                         track.play_request = request;
-                        track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                        if request.start_policy == 1 {
+                            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                        } else {
+                            track.state.milestones &= !MILESTONE_CLOCK_STARTED;
+                        }
                     } else {
                         track.playing = false;
                     }
@@ -4023,8 +5275,113 @@ fn dispatch_control(
             if retire_deliveries {
                 retire_track_deliveries(&mut state, key);
             }
+            if let Some(hold) = state
+                .surfaces
+                .get_mut(&key.surface)
+                .and_then(|surface| surface.hold.as_mut())
+            {
+                if linked_play.is_some() {
+                    hold.playing_intent = true;
+                    // An explicit reposition wins over feedback from the old pause operation.
+                    if hold.held {
+                        hold.position = None;
+                    }
+                } else if linked_pause {
+                    hold.playing_intent = false;
+                }
+            }
             advance_projection(&mut state);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
+        }
+        messages::SET_OVERLAY_WINDOW if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_window(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            flush_overlay_lane(&mut state, session_id);
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::OVERLAY_ACTION if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .action(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            flush_overlay_lane(&mut state, session_id);
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::QUERY_OVERLAY if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .status(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_CLIPBOARD if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_clipboard(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_SEMANTICS if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_semantics(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::SET_OVERLAY_EDITOR if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .set_editor_geometry(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::MEASURE_OVERLAY_TEXT_BATCH if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .measure_text_batch(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
+        }
+        messages::RELEASE_OVERLAY_TEXT_LAYOUTS if state.config.overlay => {
+            let (reply_type, fields) = state
+                .overlays
+                .release_text_layouts(session_id, record.object_id, &envelope.payload)
+                .map_err(ControlError::state)?;
+            (
+                reply_type,
+                record.object_id,
+                Envelope::new(request_id, fields).encode(),
+            )
         }
         _ if record.flags & RECORD_OPTIONAL != 0 => return Ok(None),
         _ => {
@@ -4196,6 +5553,7 @@ fn handle_track(
         track: open.track_id,
     };
     let generation = ChannelGeneration::new(open.channel_generation);
+    let is_vector_scene;
     {
         let mut state = lock(shared);
         let session = state
@@ -4339,9 +5697,14 @@ fn handle_track(
             )
             .encode()?,
         )?;
+        is_vector_scene = matches!(track.configuration.kind, KindConfiguration::VectorScene(_));
     }
     reader.clear_read_deadline()?;
-    let result = track_loop(reader, shared, changed, key, generation);
+    let result = if is_vector_scene {
+        vector_track_loop(reader, shared, changed, key, generation)
+    } else {
+        track_loop(reader, shared, changed, key, generation)
+    };
     let mut state = lock(shared);
     let mut changed_payload = None;
     let gain_supported = state
@@ -4758,8 +6121,201 @@ fn track_loop(
     }
 }
 
+/// Validate overlay records and deliver them through the same bounded, acknowledged bridge
+/// path as other media. Only an eventless presenter can return credit at local acceptance.
+fn vector_track_loop(
+    reader: &mut Reader,
+    shared: &Arc<Mutex<State>>,
+    changed: &Arc<Condvar>,
+    key: TrackKey,
+    generation: ChannelGeneration,
+) -> io::Result<()> {
+    loop {
+        let record = match reader.read_record(ConnectionKind::Track) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if record.object_id != key.track {
+            return Err(invalid("track record object ID is not the accepted track"));
+        }
+        if record.record_type == messages::CHANNEL_EOS {
+            // An overlay window's vector track has no timed EOS concept; a producer that stops
+            // updating a window simply lets it be a static, still-valid final scene.
+            return Ok(());
+        }
+        let length = u32::try_from(record.body.len())
+            .map_err(|_| invalid("vector record body exceeds u32"))?;
+        let mut state = lock(shared);
+        let Some(track) = state.tracks.get_mut(&key) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "track disappeared"));
+        };
+        if track.state.channel_generation != generation {
+            return Ok(());
+        }
+        // Charge the record against the grant this channel was given before doing anything with
+        // it: a producer that overran its window broke the channel's contract.
+        if track.state.flow.admit(length).is_err() {
+            return Err(invalid("vector record exceeded its channel flow grant"));
+        }
+        let retained_bytes = state
+            .tracks
+            .values()
+            .map(|track| track.retained_vector.bytes())
+            .sum::<u64>();
+        if record.record_type != messages::VECTOR_ASSET_RELEASE
+            && u64::from(length)
+                > state
+                    .config
+                    .media
+                    .aggregate_retained_bytes
+                    .saturating_sub(retained_bytes)
+        {
+            return Err(invalid("aggregate retained vector budget exceeded"));
+        }
+        if record.record_type == messages::VECTOR_FRAME && state.overlay_relay.enabled {
+            let frame =
+                vivid_protocol::vector::Frame::decode(&record.body).map_err(io::Error::other)?;
+            for command in frame.canvas.commands() {
+                if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command
+                    && (state
+                        .released_overlay_layouts
+                        .contains(&(key.surface, *layout))
+                        || !state
+                            .overlay_layouts
+                            .get(&key.surface)
+                            .is_some_and(|layouts| {
+                                layouts.iter().any(|candidate| candidate.id == *layout)
+                            }))
+                {
+                    return Err(invalid(
+                        "vector scene references an absent or foreign layout",
+                    ));
+                }
+            }
+        }
+        state
+            .tracks
+            .get_mut(&key)
+            .ok_or_else(|| invalid("vector track disappeared"))?
+            .retained_vector
+            .accept(record.record_type, &record.body)?;
+        let accepted = state.overlays.media_record(
+            key.surface.session,
+            record.record_type,
+            key.track,
+            &record.body,
+        );
+        if accepted
+            && let Some(track) = state.tracks.get_mut(&key)
+            && record.record_type == messages::VECTOR_FRAME
+        {
+            // A published display list is all the readiness an overlay window has: there is
+            // no decoder to initialize and no picture to wait for. The producer holds its
+            // first `ACTIVATE_TRACK` behind this milestone, so the window would never reach
+            // its slot without it.
+            track.state.milestones |= MILESTONE_OUTPUT_READY;
+            track.retained = track.retained_vector.frame();
+        }
+        flush_overlay_lane(&mut state, key.surface.session);
+        if !accepted {
+            return Err(invalid("vector track record was refused"));
+        }
+        if record.record_type == messages::VECTOR_FRAME {
+            prune_overlay_layouts(&mut state, key.surface);
+        }
+        let wakeup = state.media_wakeup.clone();
+        if let Some(events) = state.events.clone() {
+            state.next_delivery = state
+                .next_delivery
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("delivery ID exhausted"))?;
+            let delivery_id = state.next_delivery;
+            state.deliveries.insert(
+                delivery_id,
+                PendingDelivery {
+                    track: key,
+                    bytes: u64::from(length),
+                    random_access: false,
+                },
+            );
+            let mut event = MediaEvent {
+                delivery_id,
+                source: bridge_track_key(key),
+                record_type: record.record_type,
+                recovered_keyframe: None,
+                body: record.body,
+            };
+            loop {
+                match events.try_send(event) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        state.deliveries.remove(&delivery_id);
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "bridge media consumer closed",
+                        ));
+                    }
+                    Err(mpsc::TrySendError::Full(pending)) => event = pending,
+                }
+                // Keep this channel's one admitted packet; release the global lock while
+                // another owner drains. No success credit or unbounded spill queue is needed.
+                state = changed
+                    .wait_timeout(state, Duration::from_millis(50))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+                if !state
+                    .tracks
+                    .get(&key)
+                    .is_some_and(|track| track.state.channel_generation == generation)
+                    || !state.deliveries.contains_key(&delivery_id)
+                {
+                    state.deliveries.remove(&delivery_id);
+                    return Ok(());
+                }
+            }
+        } else if let Some(track) = state.tracks.get_mut(&key) {
+            grant_rolling_flow(key, track);
+        }
+        advance_projection(&mut state);
+        drop(state);
+        changed.notify_all();
+        if let Some(wakeup) = wakeup {
+            wakeup();
+        }
+    }
+}
+
 fn has_retained_media(track: &TrackEntry) -> bool {
     track.retained.is_some() || track.retained_raster.is_some()
+}
+
+fn prune_overlay_layouts(state: &mut State, surface: SurfaceKey) {
+    let mut referenced = HashSet::new();
+    for (key, track) in &state.tracks {
+        if key.surface == surface
+            && matches!(track.configuration.kind, KindConfiguration::VectorScene(_))
+            && let Some(body) = &track.retained
+            && let Ok(frame) = vivid_protocol::vector::Frame::decode(body)
+        {
+            for command in frame.canvas.commands() {
+                if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command {
+                    referenced.insert(*layout);
+                }
+            }
+        }
+    }
+    if let Some(layouts) = state.overlay_layouts.get_mut(&surface) {
+        layouts.retain(|layout| {
+            !state
+                .released_overlay_layouts
+                .contains(&(surface, layout.id))
+                || referenced.contains(&layout.id)
+        });
+    }
+    state
+        .released_overlay_layouts
+        .retain(|(key, id)| *key != surface || referenced.contains(id));
 }
 
 /// Terminate an inner raster delta chain into one owner-scoped latest framebuffer.
@@ -5058,6 +6614,19 @@ fn spawn_wait(
                                 "channel generation changed while waiting",
                             ))
                         }
+                        Some(_)
+                            if matches!(condition, 3..=6)
+                                && state
+                                    .surfaces
+                                    .get(&key.surface)
+                                    .and_then(|surface| surface.hold.as_ref())
+                                    .is_some_and(|hold| hold.held) =>
+                        {
+                            Some(WaitOutcome::Failed(
+                                messages::ERROR_NOT_VISIBLE,
+                                "timed surface is held",
+                            ))
+                        }
                         Some(track) => {
                             evaluate_wait(track, condition, condition_value).map(|observed| {
                                 match Envelope::new(
@@ -5126,7 +6695,7 @@ fn evaluate_wait(track: &TrackEntry, condition: u64, value: Option<u64>) -> Opti
             (position.presentation_id != 0 && position.presented_pts_us >= pts)
                 .then_some(position.presented_pts_us.max(0) as u64)
         }
-        5 => track.playing.then_some(1),
+        5 => (track.state.milestones & MILESTONE_CLOCK_STARTED != 0).then_some(1),
         6 => (track.state.milestones & MILESTONE_BUFFERED_ENDED != 0).then_some(1),
         7 => (track.state.milestones & MILESTONE_CHANNEL_ACCEPTED != 0).then_some(1),
         8 => (track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0).then_some(1),
@@ -5391,8 +6960,9 @@ fn source_descriptor(
     tracks: &HashMap<TrackKey, TrackEntry>,
     key: TrackKey,
     track: &TrackEntry,
-) -> SourceDescriptor {
-    match &track.configuration.kind {
+) -> Option<SourceDescriptor> {
+    Some(match &track.configuration.kind {
+        KindConfiguration::VectorScene(config) => SourceDescriptor::VectorScene(config.clone()),
         KindConfiguration::Raster(config) => SourceDescriptor::Raster(config.clone()),
         KindConfiguration::EncodedImage(config) => SourceDescriptor::Image(config.clone()),
         KindConfiguration::Video(config) => SourceDescriptor::Video(config.clone()),
@@ -5416,7 +6986,7 @@ fn source_descriptor(
                 codec_string: config.codec_string.clone(),
             })
         }
-    }
+    })
 }
 
 fn semantic_descriptor(descriptor: &SurfaceDescriptor) -> SemanticDescriptor {
@@ -5433,7 +7003,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
     if configuration.direction == crate::TrackDirection::Uplink {
         return vivid_protocol::audio_input::supports(configuration);
     }
-    (1..=4).contains(&configuration.slot)
+    (1..=5).contains(&configuration.slot)
         && match &configuration.kind {
             KindConfiguration::Video(video) => {
                 media::is_portable_packetization(&video.codec, &video.packetization)
@@ -5447,6 +7017,9 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             )
             .is_ok(),
             KindConfiguration::Raster(_) | KindConfiguration::EncodedImage(_) => true,
+            // Structurally supported; whether this session negotiated `vector-scene-v1` at all is
+            // checked at the CREATE_TRACK/PROBE_TRACK_CONFIG call sites, which have the session.
+            KindConfiguration::VectorScene(_) => true,
         }
 }
 
@@ -5531,6 +7104,126 @@ fn track_ready_payload(
     payload
 }
 
+/// Retire the physical decoder identity on a visibility falling edge. A delayed PAUSE reply
+/// may confirm this retirement once, but cannot confirm a subsequent hide or a new producer PLAY.
+fn retire_held_decoder(state: &mut State, key: TrackKey) {
+    if !state
+        .surfaces
+        .get(&key.surface)
+        .is_some_and(|surface| surface.hold.is_some())
+    {
+        return;
+    }
+    let Some(track) = state.tracks.get_mut(&key) else {
+        return;
+    };
+    if track.configuration.mode != TrackMode::Timed {
+        return;
+    }
+    let Some(next) = track.decoder_reset_serial.checked_add(1) else {
+        let _ = track.state.lose();
+        if let Some(writer) = track.channel_writer.take() {
+            writer.close();
+        }
+        return;
+    };
+    track.hold_pause_decoder = Some(track.decoder_reset_serial);
+    track.decoder_reset_serial = next;
+}
+
+/// Hold is surface intent, independent of the producer's PAUSE. The control writer is bounded
+/// and asynchronous, so visibility transitions never wait on a hidden media connection.
+fn set_playback_hold(state: &mut State, key: SurfaceKey, held: bool, reason: u64) {
+    if !state.sessions.get(&key.session).is_some_and(|session| {
+        session
+            .accepted_profiles
+            .contains(registry::TIMED_MEDIA_SYNC)
+    }) {
+        return;
+    }
+    let Some(surface) = state.surfaces.get(&key) else {
+        return;
+    };
+    let old_reasons = surface.hold.as_ref().map_or(0, |hold| hold.reasons);
+    let cleared = if reason == vivid_protocol::timed::HOLD_NOT_VISIBLE {
+        reason | vivid_protocol::timed::HOLD_DETACHED
+    } else {
+        reason
+    };
+    let reasons = if held {
+        old_reasons | reason
+    } else {
+        old_reasons & !cleared
+    };
+    let held = reasons != 0;
+    if surface
+        .hold
+        .as_ref()
+        .is_some_and(|hold| hold.held == held && hold.reasons == reasons)
+        || (surface.hold.is_none() && !held)
+    {
+        return;
+    }
+    let Some(serial) = surface
+        .hold
+        .as_ref()
+        .map_or(Some(1), |hold| hold.serial.checked_add(1))
+    else {
+        if let Some(session) = state.sessions.get(&key.session) {
+            session.writer.close();
+        }
+        return;
+    };
+    let previous = surface.hold.as_ref().and_then(|hold| hold.position);
+    let clock = state
+        .tracks
+        .iter()
+        .filter(|(track, entry)| {
+            track.surface == key && entry.configuration.mode == TrackMode::Timed
+        })
+        .max_by_key(|(_, entry)| matches!(entry.configuration.kind, KindConfiguration::Audio(_)));
+    let observed = clock.and_then(|(track, entry)| {
+        entry
+            .outer_position
+            .and_then(|p| p.clock_pts_us)
+            .map(|pts_us| crate::HeldPosition {
+                track_id: track.track,
+                channel_generation: entry.state.channel_generation.get(),
+                epoch: entry.state.media_epoch,
+                pts_us,
+                estimated: true,
+            })
+    });
+    let position = if held {
+        observed.or(previous)
+    } else {
+        previous.or(observed)
+    };
+    let playing_intent = state
+        .tracks
+        .iter()
+        .any(|(track, entry)| track.surface == key && entry.playing);
+    let hold = crate::PlaybackHold {
+        context_id: key.context,
+        surface_id: key.surface,
+        serial,
+        held,
+        reasons,
+        playing_intent,
+        recovery_required: true,
+        position,
+    };
+    if let Ok(payload) = hold.payload()
+        && let Ok(body) = Envelope::new(0, payload).encode()
+        && let Some(session) = state.sessions.get(&key.session)
+    {
+        let _ = session
+            .writer
+            .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
+    }
+    state.surfaces.get_mut(&key).unwrap().hold = Some(hold);
+}
+
 fn track_status_payload(
     key: TrackKey,
     track: &TrackEntry,
@@ -5611,8 +7304,12 @@ fn track_key_from_map(session: u64, map: &StrictMap<'_>) -> Result<TrackKey, Con
 }
 
 fn track_key_from_value(session: u64, value: &Value) -> Result<TrackKey, ControlError> {
-    let map = StrictMap::new("track identity", value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        .map_err(|_| ControlError::bad("invalid track identity"))?;
+    let map = StrictMap::new(
+        "track identity",
+        value,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    )
+    .map_err(|_| ControlError::bad("invalid track identity"))?;
     track_key_from_map(session, &map)
 }
 
@@ -5680,6 +7377,10 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
 }
 
 fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
+    state.overlay_layouts.remove(&surface);
+    state
+        .released_overlay_layouts
+        .retain(|(key, _)| *key != surface);
     let tracks = state
         .tracks
         .keys()
@@ -5696,10 +7397,51 @@ fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
     });
 }
 
+/// Write every overlay lane record queued for one session, in arrival order. A session whose lane
+/// has not authenticated yet simply keeps its queue; the initial snapshot [`Overlays::open_lane`]
+/// queues on lane authentication drains it once the writer exists.
+fn flush_overlay_lane(state: &mut State, session_id: u64) {
+    let Some(writer) = state
+        .sessions
+        .get(&session_id)
+        .and_then(|session| session.overlay_lane.clone())
+    else {
+        return;
+    };
+    for record in state.overlays.take_pending(session_id) {
+        let Ok(body) = Envelope::new(0, record.payload).encode() else {
+            continue;
+        };
+        if writer
+            .write_record(record.record_type, record.object_id, &body)
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Write every overlay lane record queued for each of these sessions.
+fn flush_overlay_lanes(state: &mut State, sessions: &[u64]) {
+    for session_id in sessions {
+        flush_overlay_lane(state, *session_id);
+    }
+}
+
 fn cleanup_session(state: &mut State, session: u64) {
+    state
+        .overlay_layouts
+        .retain(|key, _| key.session != session);
+    state
+        .released_overlay_layouts
+        .retain(|(key, _)| key.session != session);
     if let Some(runtime) = state.sessions.remove(&session) {
         runtime.writer.close();
+        if let Some(lane) = runtime.overlay_lane {
+            lane.close();
+        }
     }
+    state.overlays.remove_session(session);
     let surfaces = state
         .surfaces
         .keys()
@@ -6182,6 +7924,7 @@ fn kind_name(kind: &KindConfiguration) -> &'static str {
     match kind {
         KindConfiguration::Video(_) => "video",
         KindConfiguration::Audio(_) => "audio",
+        KindConfiguration::VectorScene(_) => "vector",
         KindConfiguration::Raster(_) => "raster",
         KindConfiguration::EncodedImage(_) => "image",
     }
@@ -6298,6 +8041,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminating_presenter_cannot_advertise_unimplemented_overlay_profiles() {
+        use crate::presenter::SocketListener;
+        for profile in [
+            registry::VECTOR_SCENE,
+            registry::TERMINAL_OVERLAY,
+            registry::OVERLAY_INPUT,
+            registry::OVERLAY_TEXT,
+            registry::OVERLAY_TEXT_LAYOUT,
+            registry::OVERLAY_TYPOGRAPHY,
+            registry::OVERLAY_PAINT,
+            registry::OVERLAY_POINTER,
+            registry::OVERLAY_ENV,
+            registry::OVERLAY_A11Y,
+        ] {
+            let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
+            let mut config = PresenterConfig::terminal(MediaConfig::default());
+            config.supported_profiles.push(profile.to_owned());
+            let error = VirtualVivid::start_configured(listener, config, None)
+                .err()
+                .expect("must reject unsupported renderer");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        }
+    }
+
     #[cfg(windows)]
     struct TestSocketListener {
         inner: std::net::TcpListener,
@@ -6368,6 +8136,24 @@ mod tests {
             optional_profiles: vec![crate::AUDIO_GAIN.into()],
             ..ProducerConfig::default()
         }
+    }
+
+    #[test]
+    fn anchorless_terminal_motion_does_not_advance_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        let revision = presenter.revision();
+
+        for _ in 0..1_000 {
+            presenter.scroll_anchors(7, 1, false);
+            presenter.clear_anchors(7, false);
+        }
+
+        assert_eq!(presenter.revision(), revision);
     }
 
     fn surface(context_id: u64, surface_id: u64) -> SurfaceDefinition {
@@ -7720,8 +9506,11 @@ mod tests {
         for pane in [7, 8] {
             presenter.update_metrics(pane, 80, 24, (8, 16));
             let secret = presenter.issue_pane_capability(pane).unwrap();
-            let mut client =
-                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let mut config = producer(presenter.endpoint(), &secret);
+            config
+                .optional_profiles
+                .push(registry::TIMED_MEDIA_SYNC.into());
+            let mut client = crate::Session::connect(config).unwrap();
             let context = client.info().root_context_id;
             client
                 .create_surface(surface(context, 9), &RequestMetadata::default())
@@ -7729,17 +9518,29 @@ mod tests {
             let track = client
                 .create_track(video(context, 9, 11), &RequestMetadata::default())
                 .unwrap();
-            let snapshot = presenter.projection_snapshot(&HashSet::from([pane]));
-            let key = snapshot.sources[0].key;
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7, 8]));
+            let producer = snapshot
+                .surfaces
+                .iter()
+                .find(|surface| surface.pane == pane)
+                .unwrap()
+                .producer;
+            let projected = snapshot
+                .sources
+                .iter()
+                .find(|source| source.key.producer == producer)
+                .unwrap();
+            let key = projected.key;
             {
                 let mut state = lock(&presenter.state);
                 let entry = state.tracks.get_mut(&inner_track_key(key)).unwrap();
                 entry.outer_presented = true;
                 entry.last_pts_us = 9_000_000; // Admitted/delivered is not physically presented.
             }
-            owners.push((client, track, key, snapshot.sources[0].decoder_reset_serial));
+            owners.push((client, track, key, projected.decoder_reset_serial));
         }
         assert_ne!(owners[0].2, owners[1].2);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
         let position = super::super::BridgePositionSnapshot {
             decoder_reset_serial: owners[0].3,
             playing: false,
@@ -7805,6 +9606,95 @@ mod tests {
         let first = &state.tracks[&inner_track_key(owners[0].2)];
         assert!(evaluate_wait(first, 4, Some(2_000_000)).is_none());
         assert_eq!(evaluate_wait(first, 4, Some(1_000_000)), Some(1_000_000));
+        drop(state);
+
+        // Visibility holds the whole owning surface while a second producer with identical
+        // local IDs retains its clock observations and mutable scene authority.
+        presenter.projection_snapshot(&HashSet::from([8]));
+        let held = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(held.held);
+        assert!(held.position.unwrap().estimated);
+        let other = owners[1].0.query_track(&owners[1].1).unwrap();
+        assert!(other.playback_hold.is_none_or(|hold| !hold.held));
+        presenter.apply_outer_position(owners[0].2, position);
+        let confirmed = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(confirmed.serial > held.serial);
+        assert!(!confirmed.position.unwrap().estimated);
+        assert_eq!(confirmed.position.unwrap().pts_us, 1_000_000);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
+        let released = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(!released.held && released.recovery_required);
+        assert_eq!(released.position, confirmed.position);
+        assert!(released.serial > confirmed.serial);
+        presenter.projection_snapshot(&HashSet::from([7, 8]));
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .playback_hold
+                .unwrap()
+                .serial,
+            released.serial
+        );
+        // A second hide retires another decoder identity. Neither a duplicate completion of
+        // the first pause nor its delayed running observation may confirm the second hold.
+        presenter.projection_snapshot(&HashSet::from([8]));
+        let second_hold = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        presenter.apply_outer_position(owners[0].2, position);
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .playback_hold
+                .unwrap(),
+            second_hold
+        );
+        presenter.apply_outer_position(
+            owners[0].2,
+            super::super::BridgePositionSnapshot {
+                decoder_reset_serial: position.decoder_reset_serial + 1,
+                clock_pts_us: Some(1_080_000),
+                ..position
+            },
+        );
+        let second_confirmed = owners[0]
+            .0
+            .query_track(&owners[0].1)
+            .unwrap()
+            .playback_hold
+            .unwrap();
+        assert!(!second_confirmed.position.unwrap().estimated);
+        assert_eq!(second_confirmed.position.unwrap().pts_us, 1_080_000);
+        assert_eq!(
+            owners[1]
+                .0
+                .query_track(&owners[1].1)
+                .unwrap()
+                .last_presented_pts_us,
+            other.last_presented_pts_us
+        );
     }
 
     #[test]

@@ -2,11 +2,12 @@ import { strict as assert } from "node:assert";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { inspect } from "node:util";
 
 import { PaneSession, connect, lease, presenter } from "../../dist/index.js";
 
-const SOURCE = new URL("../../ts/src/", import.meta.url).pathname;
+const SOURCE = fileURLToPath(new URL("../../ts/src/", import.meta.url));
 
 test("no source file carries capability material into a log or a URL", () => {
   // The rule the repository states for every product: capability material stays out of logs,

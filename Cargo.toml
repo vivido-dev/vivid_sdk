@@ -36,8 +36,10 @@ native-media = ["vivid_protocol/native"]
 presenter = ["dep:log", "dep:serde", "dep:sha2"]
 # An in-process Vivid 1.5 presenter fake for producer tests, plus the presenter test-support API
 # gateway consumers drive from their own suites. Off by default: it is only compiled into crates
-# that ask for it, and it never affects a production build of the SDK.
-testing = []
+# that ask for it, and it never affects a production build of the SDK. Requires `presenter`: its
+# overlay window/focus/revision bookkeeping is shared with the real terminating presenter, so a
+# producer-side regression against this fake and against a live host agree on the same state.
+testing = ["presenter"]
 
 [dependencies]
 crossterm = "0.29"
@@ -91,3 +93,11 @@ path = "examples/rust/05_replace_track.rs"
 name = "sdk_06_presenter_roundtrip"
 path = "examples/rust/06_presenter_roundtrip.rs"
 required-features = ["presenter"]
+
+[[example]]
+name = "sdk_07_overlay_window"
+path = "examples/rust/07_overlay_window.rs"
+
+[[example]]
+name = "sdk_08_overlay_paths"
+path = "examples/rust/08_overlay_paths.rs"

@@ -33,6 +33,7 @@ mod lease;
 mod media_info;
 mod offline;
 mod orch;
+pub mod overlay;
 mod pane;
 mod pipeline;
 mod resume;
@@ -79,8 +80,8 @@ pub use config::{
 };
 pub use constants::{
     ConstantValue, IMAGE_ENCODING_JPEG, IMAGE_ENCODING_PNG, SLOT_AUDIO, SLOT_NONE, SLOT_POSTER,
-    SLOT_PRIMARY_VIDEO, SLOT_RASTER, TRACK_KIND_AUDIO, TRACK_KIND_IMAGE, TRACK_KIND_RASTER,
-    TRACK_KIND_VIDEO, constant_table,
+    SLOT_PRIMARY_VIDEO, SLOT_RASTER, SLOT_VECTOR, TRACK_KIND_AUDIO, TRACK_KIND_IMAGE,
+    TRACK_KIND_RASTER, TRACK_KIND_VECTOR, TRACK_KIND_VIDEO, constant_table,
 };
 pub use controller::{
     ActivationSecret, BridgeAdmin, Carrier, DEFAULT_ACTIVATION_TIMEOUT_US, DirectBrowserAdmin,
@@ -96,10 +97,12 @@ pub use file_drop::{
 pub use guard::{ActiveGrant, DesktopPreconditions, InputBindingGuard, InputQueue};
 pub use input::{
     InputBindingStatus, InputGrantTermination, InputLane, InputLaneEvent, InputLeaseRenewal,
+    OverlayInputLane, OverlayLaneEvent, OverlaySubmission,
 };
 pub use lease::{ContextReady, SessionLeaseReady};
 pub use media_info::probe_encoded_image;
 pub use orch::{DeskMutation, DesktopSurface, SurfaceBuilder, SurfaceSlots, TrackBuilder};
+pub use overlay::{OverlaySession, OverlayWindow, OverlayWindowOptions};
 pub use pane::{PaneImageOptions, PaneSession};
 pub use pipeline::{
     AudioPacketData, BoundedQueue, EncodedPacket, LatestFrame, MINIMUM_TARGET_BITS_PER_SECOND,
@@ -117,6 +120,7 @@ pub use track::{
     Track, TrackQueryHandle, TrackStatus, TrackSupport, TrackWaitCondition, TrackWaitSatisfied,
 };
 pub use vivid_protocol::audio_input::InputPacket;
+pub use vivid_protocol::timed::{HeldPosition, PlayOptions, PlaybackHold, StartPolicy};
 
 pub use vivid_protocol::messages::LaneClass;
 pub use vivid_protocol::wire::ConnectionKind;
@@ -143,7 +147,9 @@ pub use vivid_protocol::messages::ErrorDetail;
 pub use vivid_protocol::registry::{
     AUDIO_GAIN, CANVAS_CONTENT, CANVAS_SURFACE, CORE_CONTROL, DESKTOP_CONTENT, DESKTOP_INPUT,
     DESKTOP_SURFACE, FILE_DROP, FILE_DROP_PATH, GENERIC_CONTENT, LIVE_MEDIA, OBSERVABILITY,
-    TERMINAL_CONTENT, TERMINAL_SURFACE, TIMED_MEDIA,
+    OVERLAY_A11Y, OVERLAY_CLIPBOARD, OVERLAY_ENV, OVERLAY_INPUT, OVERLAY_PAINT, OVERLAY_POINTER,
+    OVERLAY_TEXT, OVERLAY_TEXT_LAYOUT, OVERLAY_TYPOGRAPHY, TERMINAL_CONTENT, TERMINAL_OVERLAY,
+    TERMINAL_SURFACE, TIMED_MEDIA, VECTOR_SCENE,
 };
 pub use vivid_protocol::revision::FileTransferGeneration;
 pub use vivid_protocol::scene::{Fit, SceneNode};
@@ -159,7 +165,7 @@ pub use vivid_protocol::track::{
     MILESTONE_DECODER_INITIALIZED, MILESTONE_EOS_ACCEPTED, MILESTONE_FIRST_MEDIA,
     MILESTONE_KNOWN_MASK, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_RANDOM_ACCESS,
     MILESTONE_TRACK_LOST, RasterConfiguration, TrackConfiguration, TrackDirection, TrackMode,
-    VideoConfiguration,
+    VectorConfiguration, VideoConfiguration,
 };
 
 const MAX_CONTROL_EVENTS: usize = 1024;
@@ -329,6 +335,7 @@ mod tests {
             last_record_sequence: 14,
         };
         let mut status = TrackStatus {
+            playback_hold: None,
             context_id: 1,
             surface_id: 2,
             track_id: 3,
@@ -757,6 +764,7 @@ mod tests {
     #[test]
     fn input_and_track_queue_pressure_fail_closed_without_dropping_transitions() {
         let pending = PendingInput {
+            overlay_receipts: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::from([InputLaneEvent::Input {
                 record_type: messages::KEY_INPUT,

@@ -1,0 +1,936 @@
+//! A real `OverlaySession` driven end to end against the headless overlay presenter.
+//!
+//! Nothing here needs a GPU or a terminal. That is the point: a producer-side overlay toolkit has
+//! to be testable in ordinary CI, and until this existed the only way to exercise one was a live
+//! Vivido with a Vello adapter.
+
+#![cfg(feature = "testing")]
+
+use std::time::Duration;
+
+use vivid_sdk::overlay::{
+    Brush, Canvas, Cap, Color, ColorSpace, Command, Corners, CursorShape, Extend, GradientStop,
+    HitRole, Join, Path, Point, PresentationOutcome, Rect, Scalar, Shadow, StrokeStyle, WindowMode,
+    buttons,
+};
+use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+use vivid_sdk::{OverlayLaneEvent, OverlaySession, OverlayWindowOptions, ProducerConfig};
+
+fn session(presenter: &TestPresenter) -> OverlaySession {
+    let config = ProducerConfig {
+        endpoint_control: Some(presenter.endpoint().to_owned()),
+        authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+        producer_name: "overlay-headless-test".into(),
+        ..ProducerConfig::default()
+    };
+    OverlaySession::connect(config).expect("overlay session")
+}
+
+fn panel() -> (Canvas, Path) {
+    let bounds = Rect::new(0., 0., 320., 180.).unwrap();
+    let path = Path::rounded_rectangle(bounds, 12.).unwrap();
+    let mut canvas = Canvas::new();
+    canvas
+        .fill(path.clone(), Brush::Solid(Color(0x203050ff)))
+        .unwrap();
+    canvas
+        .push(Command::Hit {
+            id: 7,
+            path: path.clone(),
+            role: HitRole::Input,
+            cursor: Some(CursorShape::Pointer),
+        })
+        .unwrap();
+    (canvas, path)
+}
+
+#[test]
+fn a_producer_presents_a_scene_and_the_presenter_keeps_the_exact_display_list() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .expect("overlay window");
+
+    let (canvas, _) = panel();
+    let receipt = window.submit(canvas.clone()).expect("submission");
+    assert_eq!(
+        receipt.wait(Duration::from_secs(5)).expect("receipt"),
+        Some(PresentationOutcome::Presented)
+    );
+
+    let scenes = presenter.overlay_scenes();
+    assert_eq!(scenes.len(), 1);
+    // The presenter keeps the list the producer built, not a re-encoding of it.
+    assert_eq!(scenes[0].canvas, canvas);
+    assert_eq!(scenes[0].revision, receipt.revision());
+
+    window.close().unwrap();
+    overlays.close().unwrap();
+}
+
+#[test]
+fn replacing_a_scene_supersedes_the_receipt_it_replaced() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 100., 100.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    let first = window.submit(panel().0).unwrap();
+    assert_eq!(
+        first.wait(Duration::from_secs(5)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+
+    let mut second_canvas = Canvas::new();
+    second_canvas
+        .fill(
+            Path::rectangle(Rect::new(0., 0., 50., 50.).unwrap()).unwrap(),
+            Brush::Solid(Color(0xff0000ff)),
+        )
+        .unwrap();
+    let second = window.submit(second_canvas).unwrap();
+    assert_eq!(
+        second.wait(Duration::from_secs(5)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    // The earlier receipt resolves exactly once, and as superseded rather than presented.
+    assert_eq!(
+        first.wait(Duration::ZERO).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    assert!(second.revision() > first.revision());
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn pointer_input_reaches_the_region_the_display_list_declared() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // Viewport coordinates: the window sits at (40, 40), so this lands 10 logical pixels inside.
+    assert!(presenter.overlay_pointer(50., 50., None, 0).unwrap());
+    assert!(
+        presenter
+            .overlay_pointer(50., 50., Some((buttons::PRIMARY, true)), 0)
+            .unwrap()
+    );
+
+    let mut regions = Vec::new();
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Input(input) = event
+            && let vivid_sdk::overlay::Event::Pointer {
+                position,
+                region,
+                button,
+                ..
+            } = input.event
+        {
+            assert!(overlays.event_targets(&input, &window).unwrap());
+            // Positions arrive window-local, not viewport-relative.
+            assert_eq!((position.x.get(), position.y.get()), (10., 10.));
+            regions.push((region, button));
+            if button.is_some() {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        regions,
+        vec![(7, None), (7, Some((buttons::PRIMARY, true)))]
+    );
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_viewport_change_reaches_the_producer_with_its_own_revision() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let _window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    presenter.set_overlay_viewport(1024., 768., 2).unwrap();
+    let mut seen = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Viewport(update) = event {
+            seen = Some(update);
+            if seen
+                .as_ref()
+                .is_some_and(|u| u.viewport.width.get() == 1024.)
+            {
+                break;
+            }
+        }
+    }
+    let update = seen.expect("viewport snapshot");
+    assert_eq!(update.viewport.width.get(), 1024.);
+    assert_eq!(update.viewport.height.get(), 768.);
+    assert_eq!(update.viewport.scale_numerator, 2);
+    assert!(update.revision > 0);
+
+    overlays.close().unwrap();
+}
+
+/// A session that carries the overlay bundle but deliberately not the paint profile.
+fn session_without_paint(presenter: &TestPresenter) -> OverlaySession {
+    let mut config = ProducerConfig {
+        endpoint_control: Some(presenter.endpoint().to_owned()),
+        authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+        producer_name: "overlay-headless-no-paint".into(),
+        ..ProducerConfig::default()
+    };
+    config.target_profile = vivid_sdk::TERMINAL_SURFACE.into();
+    config.required_profiles.extend([
+        vivid_sdk::CORE_CONTROL.into(),
+        vivid_sdk::LIVE_MEDIA.into(),
+        vivid_sdk::TERMINAL_SURFACE.into(),
+        vivid_sdk::TERMINAL_OVERLAY.into(),
+        vivid_sdk::VECTOR_SCENE.into(),
+        vivid_sdk::OVERLAY_INPUT.into(),
+    ]);
+    config.required_profiles.sort();
+    config.required_profiles.dedup();
+    // A profile cannot be both required and optional, and the default config offers some of the
+    // same ones; the required list is the point of this session.
+    config
+        .optional_profiles
+        .retain(|profile| !config.required_profiles.contains(profile));
+    OverlaySession::from_session(vivid_sdk::Session::connect(config).expect("session"))
+        .expect("overlay session")
+}
+
+#[test]
+fn paint_commands_round_trip_and_carry_their_style_to_the_host() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 200., 120.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let path = Path::rectangle(Rect::new(0., 0., 200., 120.).unwrap()).unwrap();
+    let stops = vec![
+        GradientStop {
+            offset: 0,
+            color: Color(0xff0000ff),
+        },
+        GradientStop {
+            offset: u16::MAX,
+            color: Color(0x0000ffff),
+        },
+    ];
+
+    let mut canvas = Canvas::new();
+    canvas
+        .shadow(Shadow {
+            rect: Rect::new(10., 10., 100., 60.).unwrap(),
+            radii: Corners::new([4., 8., 12., 16.]).unwrap(),
+            color: Color(0x00000055),
+            offset: Point::new(0., 6.).unwrap(),
+            blur: Scalar::new(18.).unwrap(),
+            spread: Scalar::new(-2.).unwrap(),
+            inset: false,
+        })
+        .unwrap();
+    canvas
+        .fill(
+            path.clone(),
+            Brush::Linear {
+                start: Point::new(0., 0.).unwrap(),
+                end: Point::new(200., 0.).unwrap(),
+                stops,
+                color_space: ColorSpace::Oklab,
+            },
+        )
+        .unwrap();
+    canvas
+        .fill(
+            Path::rounded_rectangle_corners(
+                Rect::new(0., 0., 80., 40.).unwrap(),
+                Corners::new([2., 6., 10., 14.]).unwrap(),
+            )
+            .unwrap(),
+            Brush::Image {
+                asset: 1,
+                transform: None,
+                extend: Extend::Repeat,
+            },
+        )
+        .unwrap();
+    canvas
+        .stroke_styled(
+            path,
+            Brush::Solid(Color(0xffffffff)),
+            StrokeStyle {
+                width: Scalar::new(2.5).unwrap(),
+                cap: Cap::Round,
+                join: Join::Bevel,
+                miter_limit: Scalar::new(6.).unwrap(),
+                dashes: vec![Scalar::new(4.).unwrap(), Scalar::new(2.).unwrap()],
+                dash_offset: Scalar::new(1.5).unwrap(),
+            },
+        )
+        .unwrap();
+    canvas.validate().unwrap();
+
+    let receipt = window.submit(canvas.clone()).unwrap();
+    assert_eq!(
+        receipt.wait(Duration::from_secs(5)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    // The presenter keeps the list byte-for-byte, so every paint field survived the codec.
+    assert_eq!(presenter.overlay_scenes()[0].canvas, canvas);
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn paint_commands_are_refused_locally_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let path = Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap();
+
+    // A plain scene still submits: only the paint forms are gated.
+    let mut plain = Canvas::new();
+    plain
+        .fill(path.clone(), Brush::Solid(Color(0x203050ff)))
+        .unwrap();
+    window
+        .submit(plain)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // Each paint form fails before anything is sent, so the producer gets a local diagnosis
+    // instead of a channel failure on the host.
+    let mut shadowed = Canvas::new();
+    shadowed
+        .shadow(Shadow {
+            rect: Rect::new(0., 0., 10., 10.).unwrap(),
+            radii: Corners::uniform(2.).unwrap(),
+            color: Color(0x000000ff),
+            offset: Point::new(0., 2.).unwrap(),
+            blur: Scalar::new(4.).unwrap(),
+            spread: Scalar::ZERO,
+            inset: false,
+        })
+        .unwrap();
+    // The diagnosis names the missing profile, so a producer can act on it.
+    let error = window.submit(shadowed).unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-paint-v1"),
+        "unexpected diagnosis: {error}"
+    );
+
+    let mut dashed = Canvas::new();
+    dashed
+        .stroke_styled(
+            path.clone(),
+            Brush::Solid(Color(0xffffffff)),
+            StrokeStyle::new(1.).unwrap(),
+        )
+        .unwrap();
+    assert!(window.submit(dashed).is_err());
+
+    let mut imaged = Canvas::new();
+    imaged
+        .fill(
+            path.clone(),
+            Brush::Image {
+                asset: 1,
+                transform: None,
+                extend: Extend::Pad,
+            },
+        )
+        .unwrap();
+    assert!(window.submit(imaged).is_err());
+
+    let mut oklab = Canvas::new();
+    oklab
+        .fill(
+            path,
+            Brush::Linear {
+                start: Point::new(0., 0.).unwrap(),
+                end: Point::new(10., 0.).unwrap(),
+                stops: vec![
+                    GradientStop {
+                        offset: 0,
+                        color: Color(0xff0000ff),
+                    },
+                    GradientStop {
+                        offset: u16::MAX,
+                        color: Color(0x0000ffff),
+                    },
+                ],
+                color_space: ColorSpace::Oklab,
+            },
+        )
+        .unwrap();
+    assert!(window.submit(oklab).is_err());
+
+    // An sRGB gradient is not a paint form, so it still submits on the same session.
+    let mut srgb = Canvas::new();
+    srgb.fill(
+        Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+        Brush::Linear {
+            start: Point::new(0., 0.).unwrap(),
+            end: Point::new(64., 0.).unwrap(),
+            stops: vec![
+                GradientStop {
+                    offset: 0,
+                    color: Color(0xff0000ff),
+                },
+                GradientStop {
+                    offset: u16::MAX,
+                    color: Color(0x0000ffff),
+                },
+            ],
+            color_space: ColorSpace::Srgb,
+        },
+    )
+    .unwrap();
+    window.submit(srgb).unwrap();
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_region_cursor_and_hover_transitions_reach_the_producer() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // The presenter resolves the same cursor the region declared, through the same hit test.
+    assert_eq!(presenter.overlay_cursor(), None);
+    presenter.overlay_pointer(50., 50., None, 0).unwrap();
+    assert_eq!(presenter.overlay_cursor(), Some(CursorShape::Pointer));
+    // Leaving the region drops it again.
+    presenter.overlay_pointer(500., 500., None, 0).unwrap();
+    assert_eq!(presenter.overlay_cursor(), None);
+
+    // Three presses in the same place are one sequence, exactly as a host counts them.
+    for _ in 0..3 {
+        presenter
+            .overlay_pointer(50., 50., Some((buttons::PRIMARY, true)), 0)
+            .unwrap();
+        presenter
+            .overlay_pointer(50., 50., Some((buttons::PRIMARY, false)), 0)
+            .unwrap();
+    }
+
+    let mut hover = Vec::new();
+    let mut clicks = Vec::new();
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Input(input) = event {
+            match input.event {
+                vivid_sdk::overlay::Event::Hover { region, entered } => {
+                    hover.push((region, entered));
+                }
+                vivid_sdk::overlay::Event::Pointer { clicks: n, .. } if n > 0 => clicks.push(n),
+                _ => {}
+            }
+        }
+        if clicks.len() == 3 {
+            break;
+        }
+    }
+    // Enter, leave when the pointer went to empty space, then enter again on the press back in.
+    assert_eq!(hover, vec![(7, true), (7, false), (7, true)]);
+    assert_eq!(clicks, vec![1, 2, 3]);
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_region_cursor_is_refused_locally_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let mut canvas = Canvas::new();
+    canvas
+        .push(Command::Hit {
+            id: 1,
+            path: Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            role: HitRole::Input,
+            cursor: Some(CursorShape::Text),
+        })
+        .unwrap();
+    let error = window.submit(canvas).unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-pointer-v1"),
+        "unexpected diagnosis: {error}"
+    );
+
+    // A region with no cursor is not a pointer form, so it still submits on the same session.
+    let mut plain = Canvas::new();
+    plain
+        .push(Command::Hit {
+            id: 1,
+            path: Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            role: HitRole::Input,
+            cursor: None,
+        })
+        .unwrap();
+    window.submit(plain).unwrap();
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_clipboard_write_round_trips_and_is_refused_without_a_gesture() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(40., 40., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // No gesture has happened in this window, so the host refuses and nothing is written.
+    let error = window.set_clipboard("hijacked").unwrap_err();
+    assert!(
+        error.to_string().contains("clipboard"),
+        "unexpected diagnosis: {error}"
+    );
+    assert!(presenter.overlay_clipboard().is_empty());
+
+    // A user action in the window is what authorizes the write.
+    window.request_focus().unwrap();
+    presenter
+        .overlay_pointer(50., 50., Some((buttons::PRIMARY, true)), 0)
+        .unwrap();
+    window.set_clipboard("copied from the panel").unwrap();
+    assert_eq!(presenter.overlay_clipboard(), vec!["copied from the panel"]);
+
+    // The same text over the ceiling is refused before anything is sent, so the producer gets a
+    // local diagnosis rather than a failed request.
+    let oversized = "x".repeat(64 * 1024 + 1);
+    assert!(window.set_clipboard(&oversized).is_err());
+    assert_eq!(presenter.overlay_clipboard().len(), 1);
+
+    // And an empty write is refused too, because clearing a clipboard the user did not ask to
+    // clear is the interference this profile exists to prevent.
+    assert!(window.set_clipboard("").is_err());
+    assert_eq!(presenter.overlay_clipboard().len(), 1);
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_clipboard_write_is_refused_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    presenter
+        .overlay_pointer(10., 10., Some((buttons::PRIMARY, true)), 0)
+        .unwrap();
+    let error = window.set_clipboard("text").unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-clipboard-v1"),
+        "unexpected diagnosis: {error}"
+    );
+    overlays.close().unwrap();
+}
+
+#[test]
+fn the_host_environment_reaches_the_producer() {
+    use vivid_sdk::overlay::Scalar;
+    use vivid_sdk::overlay::{Appearance, Environment};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let _window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    // The presenter names the defaults a producer should adopt.
+    presenter.set_overlay_environment(Environment {
+        font_family: "Iosevka Term".to_owned(),
+        font_size: Scalar::new(13.5).unwrap(),
+        appearance: Appearance::Dark,
+        // A host that cannot read the preference reports absence rather than asserting one.
+        reduced_motion: None,
+        refresh_interval_us: Some(16_667),
+    });
+
+    let mut seen = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Environment(update) = event {
+            seen = Some(update);
+            if seen
+                .as_ref()
+                .is_some_and(|u| !u.environment.font_family.is_empty())
+            {
+                break;
+            }
+        }
+    }
+    let update = seen.expect("environment snapshot");
+    assert_eq!(update.environment.font_family, "Iosevka Term");
+    assert_eq!(update.environment.font_size.get(), 13.5);
+    assert_eq!(update.environment.appearance, Appearance::Dark);
+    assert_eq!(update.environment.reduced_motion, None);
+    assert_eq!(update.environment.refresh_interval_us, Some(16_667));
+    assert!(update.revision > 0);
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn an_environment_snapshot_precedes_the_first_viewport_and_carries_a_revision() {
+    // A producer that adopts the host's font must be able to do it before it draws anything, so
+    // the environment arrives on the lane a producer already has open.
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let mut environment_revision = 0;
+    let mut viewport_revision = 0;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        match event {
+            OverlayLaneEvent::Environment(update) => environment_revision = update.revision,
+            OverlayLaneEvent::Viewport(update) => viewport_revision = update.revision,
+            OverlayLaneEvent::ConnectionLost { diagnostic } => {
+                panic!("lane lost before an initial snapshot: {diagnostic}")
+            }
+            _ => {}
+        }
+        if environment_revision > 0 && viewport_revision > 0 {
+            break;
+        }
+    }
+    assert!(environment_revision > 0, "no environment snapshot arrived");
+    assert!(viewport_revision > 0, "no viewport snapshot arrived");
+
+    // A change bumps the environment revision without touching the viewport's.
+    presenter.set_overlay_environment(vivid_sdk::overlay::Environment {
+        appearance: vivid_sdk::overlay::Appearance::Dark,
+        ..presenter.overlay_environment()
+    });
+    let mut bumped = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Environment(update) = event {
+            bumped = Some(update);
+            break;
+        }
+    }
+    let bumped = bumped.expect("revised environment snapshot");
+    assert!(bumped.revision > environment_revision);
+    assert_eq!(
+        bumped.environment.appearance,
+        vivid_sdk::overlay::Appearance::Dark
+    );
+    assert_eq!(
+        presenter.overlay_environment().appearance,
+        vivid_sdk::overlay::Appearance::Dark
+    );
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_semantic_tree_reaches_the_host_and_an_action_comes_back() {
+    use vivid_sdk::overlay::{AccessibleAction, SemanticNode, SemanticRole, Semantics};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 200., 100.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let receipt = window.submit(panel().0).unwrap();
+    receipt.wait(Duration::from_secs(5)).unwrap();
+
+    let mut spin = SemanticNode {
+        id: 7,
+        role: SemanticRole::SpinButton,
+        bounds: Rect::new(10., 10., 60., 20.).unwrap(),
+        label: "Count".to_owned(),
+        numeric: Some([
+            Scalar::new(5.).unwrap(),
+            Scalar::new(0.).unwrap(),
+            Scalar::new(10.).unwrap(),
+        ]),
+        level: None,
+        set: None,
+        toggled: None,
+        disabled: false,
+        actions: vec![AccessibleAction::Increment, AccessibleAction::Decrement],
+        children: Vec::new(),
+    };
+    spin.set = None;
+    let semantics = Semantics {
+        scene_revision: receipt.revision(),
+        nodes: vec![
+            SemanticNode {
+                id: 1,
+                role: SemanticRole::Application,
+                bounds: Rect::new(0., 0., 200., 100.).unwrap(),
+                label: "Panel".to_owned(),
+                numeric: None,
+                level: None,
+                set: None,
+                toggled: None,
+                disabled: false,
+                actions: Vec::new(),
+                children: vec![1],
+            },
+            spin,
+        ],
+    };
+    window.set_semantics(&semantics).unwrap();
+    assert_eq!(presenter.overlay_semantics(), Some(semantics));
+
+    // Assistive technology invoking a node reaches the producer as its own event.
+    assert!(
+        presenter
+            .overlay_accessibility_action(7, AccessibleAction::Increment)
+            .unwrap()
+    );
+    let mut seen = None;
+    while let Some(event) = overlays.wait_event(Duration::from_millis(500)).unwrap() {
+        if let OverlayLaneEvent::Accessibility { node, action, .. } = event {
+            seen = Some((node, action));
+            break;
+        }
+    }
+    assert_eq!(seen, Some((7, AccessibleAction::Increment)));
+
+    // A node the live tree does not name is refused rather than sent: an adapter that asks about
+    // one is holding a tree the host no longer describes anything with.
+    assert!(
+        !presenter
+            .overlay_accessibility_action(8, AccessibleAction::Click)
+            .unwrap()
+    );
+
+    // A tree that described the scene just replaced describes nothing. The publish travels on
+    // the bulk channel, so the receipt is what says it landed.
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(presenter.overlay_semantics(), None);
+
+    // An action naming a node the live tree no longer describes is refused rather than sent: the
+    // asker is holding a tree the host has already retired.
+    assert!(
+        !presenter
+            .overlay_accessibility_action(7, AccessibleAction::Click)
+            .unwrap()
+    );
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_stale_semantic_tree_is_refused() {
+    use vivid_sdk::overlay::{SemanticNode, SemanticRole, Semantics};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+
+    // Nothing has been published, so no revision is current.
+    let error = window
+        .set_semantics(&Semantics {
+            scene_revision: 1,
+            nodes: vec![SemanticNode {
+                id: 1,
+                role: SemanticRole::Group,
+                bounds: Rect::new(0., 0., 10., 10.).unwrap(),
+                label: String::new(),
+                numeric: None,
+                level: None,
+                set: None,
+                toggled: None,
+                disabled: false,
+                actions: Vec::new(),
+                children: Vec::new(),
+            }],
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("published scene"),
+        "unexpected diagnosis: {error}"
+    );
+    assert_eq!(presenter.overlay_semantics(), None);
+
+    overlays.close().unwrap();
+}
+
+/// One node at `id`, describing a scene at `scene_revision`, with the app's own identity in it.
+fn describing(scene_revision: u64, id: u64) -> vivid_sdk::overlay::Semantics {
+    use vivid_sdk::overlay::{SemanticNode, SemanticRole, Semantics};
+
+    Semantics {
+        scene_revision,
+        nodes: vec![SemanticNode {
+            id,
+            role: SemanticRole::Group,
+            bounds: Rect::new(0., 0., 100., 100.).unwrap(),
+            label: format!("owner {id}"),
+            numeric: None,
+            level: None,
+            set: None,
+            toggled: None,
+            disabled: false,
+            actions: Vec::new(),
+            children: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn a_semantic_tree_is_refused_when_the_profile_was_not_negotiated() {
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session_without_paint(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 64., 64.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    // A plain scene, since this session deliberately did not negotiate the pointer profile
+    // either.
+    let mut plain = Canvas::new();
+    plain
+        .fill(
+            Path::rectangle(Rect::new(0., 0., 64., 64.).unwrap()).unwrap(),
+            Brush::Solid(Color(0x203050ff)),
+        )
+        .unwrap();
+    window
+        .submit(plain)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    // Refused before anything is sent, so the producer gets a local diagnosis rather than a
+    // channel failure, and the host is never asked to describe a window to assistive technology.
+    let error = window.set_semantics(&describing(1, 1)).unwrap_err();
+    assert!(
+        error.to_string().contains("overlay-a11y-v1"),
+        "unexpected diagnosis: {error}"
+    );
+    assert!(presenter.overlay_semantics().is_none());
+
+    overlays.close().unwrap();
+}
+
+#[test]
+fn a_retained_text_layout_round_trips_and_releases() {
+    use vivid_protocol::overlay::wire::text::styled::{StyledText, TextStyle};
+
+    let presenter = TestPresenter::start(80, 24).unwrap();
+    let overlays = session(&presenter);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 320., 180.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    window
+        .submit(panel().0)
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+
+    let mut styled = StyledText::new("Retained", TextStyle::default());
+    styled.wrap = false;
+    let layout = window.layout_text(&styled).unwrap();
+
+    // The host measured it, and keeps it as long as the handle is held.
+    assert!(layout.measurement().width.get() > 0.);
+    assert!(layout.measurement().height.get() > 0.);
+
+    // A retained layout is what a scene draws through, so painting it must be accepted.
+    let mut canvas = Canvas::new();
+    window
+        .draw_text_layout(
+            &mut canvas,
+            &layout,
+            vivid_sdk::overlay::Point::new(4., 4.).unwrap(),
+        )
+        .unwrap();
+
+    // Releasing it is what makes a later use an error rather than a stale scene.
+    window.release_text_layout(&layout).unwrap();
+    assert!(window.release_text_layout(&layout).is_err());
+    assert!(
+        window
+            .draw_text_layout(
+                &mut canvas,
+                &layout,
+                vivid_sdk::overlay::Point::new(4., 4.).unwrap()
+            )
+            .is_err()
+    );
+
+    overlays.close().unwrap();
+}

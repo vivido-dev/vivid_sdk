@@ -22,6 +22,15 @@ pub(crate) fn session_event(
     payload: PayloadMap,
 ) -> io::Result<SessionEvent> {
     Ok(match record_type {
+        messages::PLAYBACK_HOLD => {
+            let hold = PlaybackHold::decode(&Value::Map(payload))?;
+            if hold.surface_id != object_id {
+                return Err(invalid_data(
+                    "PLAYBACK_HOLD surface does not match object ID",
+                ));
+            }
+            SessionEvent::PlaybackHold(hold)
+        }
         messages::TARGET_CHANGED => SessionEvent::TargetChanged(payload),
         messages::ANCHOR_READY => SessionEvent::AnchorReady {
             context_id: optional_u64(&payload, 0)
@@ -75,6 +84,17 @@ pub(crate) fn session_info(welcome: &messages::Welcome) -> SessionInfo {
         establishment_state: welcome.establishment_state,
         resume_generation: welcome.resume_generation,
         resource_contract: welcome.resource_contract.clone(),
+        vector_limits: welcome
+            .extensions
+            .iter()
+            .find(|(key, _)| {
+                *key == 15
+                    && welcome
+                        .accepted_profiles
+                        .iter()
+                        .any(|profile| profile == crate::VECTOR_SCENE)
+            })
+            .and_then(|(_, value)| vivid_protocol::vector::Limits::from_value(value).ok()),
     }
 }
 

@@ -37,6 +37,7 @@ export const PROFILE_DESKTOP_SURFACE: string = textOf("PROFILE_DESKTOP_SURFACE")
 export const PROFILE_CANVAS_SURFACE: string = textOf("PROFILE_CANVAS_SURFACE");
 export const PROFILE_LIVE_MEDIA: string = textOf("PROFILE_LIVE_MEDIA");
 export const PROFILE_TIMED_MEDIA: string = textOf("PROFILE_TIMED_MEDIA");
+export const PROFILE_TIMED_MEDIA_SYNC: string = textOf("PROFILE_TIMED_MEDIA_SYNC");
 export const PROFILE_AUDIO_GAIN: string = textOf("PROFILE_AUDIO_GAIN");
 export const PROFILE_AUDIO_INPUT: string = textOf("PROFILE_AUDIO_INPUT");
 export const PROFILE_DESKTOP_INPUT: string = textOf("PROFILE_DESKTOP_INPUT");
@@ -44,6 +45,16 @@ export const PROFILE_FILE_DROP: string = textOf("PROFILE_FILE_DROP");
 export const PROFILE_FILE_DROP_PATH: string = textOf("PROFILE_FILE_DROP_PATH");
 export const PROFILE_OBSERVABILITY: string = textOf("PROFILE_OBSERVABILITY");
 export const PROFILE_WEB_CARRIER: string = textOf("PROFILE_WEB_CARRIER");
+export const PROFILE_TERMINAL_OVERLAY: string = textOf("PROFILE_TERMINAL_OVERLAY");
+export const PROFILE_VECTOR_SCENE: string = textOf("PROFILE_VECTOR_SCENE");
+export const PROFILE_OVERLAY_INPUT: string = textOf("PROFILE_OVERLAY_INPUT");
+export const PROFILE_OVERLAY_TEXT: string = textOf("PROFILE_OVERLAY_TEXT");
+export const PROFILE_OVERLAY_TEXT_LAYOUT: string = textOf("PROFILE_OVERLAY_TEXT_LAYOUT");
+export const PROFILE_OVERLAY_TYPOGRAPHY: string = textOf("PROFILE_OVERLAY_TYPOGRAPHY");
+export const PROFILE_OVERLAY_PAINT: string = textOf("PROFILE_OVERLAY_PAINT");
+export const PROFILE_OVERLAY_POINTER: string = textOf("PROFILE_OVERLAY_POINTER");
+export const PROFILE_OVERLAY_CLIPBOARD: string = textOf("PROFILE_OVERLAY_CLIPBOARD");
+export const PROFILE_OVERLAY_ENV: string = textOf("PROFILE_OVERLAY_ENV");
 
 // -- Surface semantic profiles ---------------------------------------------
 export const SURFACE_GENERIC: string = textOf("SURFACE_GENERIC");
@@ -83,6 +94,7 @@ export const TRACK_KIND_VIDEO: number = numberOf("TRACK_KIND_VIDEO");
 export const TRACK_KIND_AUDIO: number = numberOf("TRACK_KIND_AUDIO");
 export const TRACK_KIND_RASTER: number = numberOf("TRACK_KIND_RASTER");
 export const TRACK_KIND_IMAGE: number = numberOf("TRACK_KIND_IMAGE");
+export const TRACK_KIND_VECTOR: number = numberOf("TRACK_KIND_VECTOR");
 export const LANE_CONTROL: number = numberOf("LANE_CONTROL");
 export const LANE_INTERACTIVE: number = numberOf("LANE_INTERACTIVE");
 export const LANE_REALTIME: number = numberOf("LANE_REALTIME");
@@ -92,6 +104,7 @@ export const SLOT_PRIMARY_VIDEO: number = numberOf("SLOT_PRIMARY_VIDEO");
 export const SLOT_AUDIO: number = numberOf("SLOT_AUDIO");
 export const SLOT_RASTER: number = numberOf("SLOT_RASTER");
 export const SLOT_POSTER: number = numberOf("SLOT_POSTER");
+export const SLOT_VECTOR: number = numberOf("SLOT_VECTOR");
 
 // -- Scene node fit --------------------------------------------------------
 export const FIT_FILL: number = numberOf("FIT_FILL");

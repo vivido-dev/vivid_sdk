@@ -26,6 +26,7 @@
     "build": "napi build --release --manifest-path node-bindings/Cargo.toml --output-dir node-bindings --no-js && tsc -p ts",
     "build:debug": "napi build --manifest-path node-bindings/Cargo.toml --output-dir node-bindings --no-js && tsc -p ts",
     "typecheck": "tsc -p ts --noEmit",
+    "typecheck:overlay-consumer": "tsc --noEmit --strict --target ES2023 --module NodeNext --skipLibCheck bindings/tests/overlay_consumer.ts",
     "test": "node --test ts/tests/*.test.mjs",
     "test:bun": "bun test ts/tests",
     "test:conformance": "node --test conformance/compare.test.mjs && node conformance/compare.mjs",

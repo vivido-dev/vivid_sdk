@@ -487,3 +487,6 @@ async def advance_channel(session: Session, track: Track, reason: int) -> TrackC
 
 async def display_image(path: Union[str, Path], **options: Any) -> Any:
     return await _run(_display_image, path, **options)
+
+
+from .overlay_async import OverlaySession as OverlaySession, OverlayWindow as OverlayWindow

@@ -4,7 +4,7 @@
 //! cumulative flow window, the sustained-rate bucket, and the media sequence discipline that
 //! survives a channel advance.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use std::{io, thread};
@@ -63,6 +63,9 @@ pub(crate) struct ChannelMediaState {
     pub(crate) recovery_revision: u64,
     pub(crate) image_sent: bool,
     pub(crate) eos: bool,
+    vector_assets: BTreeMap<u64, u64>,
+    vector_asset_bytes: u64,
+    last_vector_asset_id: u64,
 }
 
 pub(crate) struct ChannelRateState {
@@ -135,6 +138,7 @@ impl TrackChannel {
         track: Track,
         lifecycle: Arc<SessionLifecycle>,
         offline: bool,
+        timed_sync: bool,
     ) -> io::Result<Self> {
         let open_body = zeroize::Zeroizing::new(open_body);
         let snapshot = lock(&track.inner, "track")?.clone();
@@ -245,6 +249,9 @@ impl TrackChannel {
             recovery_revision: 0,
             image_sent: false,
             eos: false,
+            vector_assets: BTreeMap::new(),
+            vector_asset_bytes: 0,
+            last_vector_asset_id: 0,
         }));
         {
             let mut state = lock(&track.inner, "track")?;
@@ -279,6 +286,7 @@ impl TrackChannel {
                 events.clone(),
                 input.clone(),
                 snapshot.media_sequence.clone(),
+                timed_sync,
             )?;
         }
         let handle_lifetime = Arc::new(ChannelHandleLifetime {
@@ -768,6 +776,138 @@ impl TrackChannel {
         Ok(sequence)
     }
 
+    /// Submit a complete portable vector scene on this authenticated bulk channel.
+    /// Scene revisions are strictly increasing across channel generations, like raster frame IDs.
+    pub fn send_vector(&self, frame: &vivid_protocol::vector::Frame) -> io::Result<u64> {
+        let limits = lock(&self.track.inner, "track")?
+            .vector_limits
+            .clone()
+            .ok_or_else(|| invalid_input("vector-scene-v1 was not accepted"))?;
+        frame
+            .canvas
+            .validate_with_limits(&limits)
+            .map_err(|e| invalid_input(e.to_string()))?;
+        let configuration = self.track.configuration()?;
+        let KindConfiguration::VectorScene(vector) = configuration.kind else {
+            return Err(invalid_input("VECTOR_FRAME requires a vector-scene track"));
+        };
+        let body = frame.encode().map_err(|e| invalid_input(e.to_string()))?;
+        if body.len() as u64 > u64::from(lock(&self.track.inner, "track")?.maximum_record_body) {
+            return Err(invalid_input(
+                "vector frame exceeds the granted record limit",
+            ));
+        }
+        if body.len().saturating_sub(12) > vector.maximum_scene_bytes as usize {
+            return Err(invalid_input(
+                "vector scene exceeds immutable track configuration",
+            ));
+        }
+        self.send_media(
+            messages::VECTOR_FRAME,
+            frame.revision,
+            frame.epoch,
+            true,
+            &body,
+        )
+    }
+
+    /// Upload one immutable RGBA image retained within this channel generation.
+    /// The presenter enforces negotiated per-image and retained-resource limits before admission.
+    pub fn send_vector_asset(&self, asset: &vivid_protocol::vector::ImageAsset) -> io::Result<u64> {
+        self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
+        let configuration = self.track.configuration()?;
+        if !matches!(configuration.kind, KindConfiguration::VectorScene(_)) {
+            return Err(invalid_input("VECTOR_ASSET requires a vector-scene track"));
+        }
+        let limits = lock(&self.track.inner, "track")?
+            .vector_limits
+            .clone()
+            .ok_or_else(|| invalid_input("vector-scene-v1 was not accepted"))?;
+        asset.validate().map_err(|e| invalid_input(e.to_string()))?;
+        let asset_bytes =
+            u64::try_from(asset.rgba.len()).map_err(|_| invalid_input("asset size exceeds u64"))?;
+        let body_bytes = asset_bytes
+            .checked_add(16)
+            .ok_or_else(|| invalid_input("asset body overflows u64"))?;
+        if body_bytes > u64::from(configuration.maximum_record_body)
+            || body_bytes > u64::from(lock(&self.track.inner, "track")?.maximum_record_body)
+        {
+            return Err(invalid_input(
+                "vector asset exceeds the granted record limit",
+            ));
+        }
+        {
+            let media = lock(&self.media, "channel media state")?;
+            if media.eos {
+                return Err(invalid_input("assets cannot follow CHANNEL_EOS"));
+            }
+            if asset.id <= media.last_vector_asset_id {
+                return Err(invalid_input(
+                    "retained asset IDs must increase in this channel generation",
+                ));
+            }
+            if asset_bytes > limits.values()[7]
+                || media.vector_assets.len() as u64 >= limits.values()[8]
+                || media
+                    .vector_asset_bytes
+                    .checked_add(asset_bytes)
+                    .is_none_or(|bytes| bytes > limits.values()[9])
+            {
+                return Err(invalid_input(
+                    "retained asset exceeds negotiated resource limits",
+                ));
+            }
+        }
+        let body = asset.encode().map_err(|e| invalid_input(e.to_string()))?;
+        let body_length =
+            u32::try_from(body.len()).map_err(|_| invalid_input("asset body exceeds u32"))?;
+        let sequence = self.write_charged_record(
+            messages::VECTOR_ASSET,
+            configuration.track_id,
+            body_length,
+            &body,
+        )?;
+        // Assets are ordered before EOS, but do not consume a scene revision or satisfy readiness.
+        let mut media = lock(&self.media, "channel media state")?;
+        media.last_sequence = sequence;
+        media.vector_assets.insert(asset.id, asset_bytes);
+        media.vector_asset_bytes += asset_bytes;
+        media.last_vector_asset_id = asset.id;
+        Ok(sequence)
+    }
+
+    /// Remove an asset from future scene lookup. Already submitted scenes retain their images.
+    pub fn release_vector_asset(&self, id: u64) -> io::Result<u64> {
+        self.lifecycle.ensure_active()?;
+        let _send_order = lock(&self.send_order, "channel send order")?;
+        let configuration = self.track.configuration()?;
+        let bytes = {
+            let media = lock(&self.media, "channel media state")?;
+            if media.eos {
+                return Err(invalid_input("asset release cannot follow CHANNEL_EOS"));
+            }
+            *media
+                .vector_assets
+                .get(&id)
+                .ok_or_else(|| invalid_input("retained asset is absent"))?
+        };
+        let body = vivid_protocol::vector::AssetRelease { id }
+            .encode()
+            .map_err(|e| invalid_input(e.0))?;
+        let sequence = self.write_charged_record(
+            messages::VECTOR_ASSET_RELEASE,
+            configuration.track_id,
+            8,
+            &body,
+        )?;
+        let mut media = lock(&self.media, "channel media state")?;
+        media.last_sequence = sequence;
+        media.vector_assets.remove(&id);
+        media.vector_asset_bytes -= bytes;
+        Ok(sequence)
+    }
+
     pub fn eos(&self) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
@@ -839,6 +979,19 @@ impl TrackChannel {
             let media_state = lock(&self.media, "channel media state")?;
             if media_state.eos {
                 return Err(invalid_input("media cannot follow CHANNEL_EOS"));
+            }
+            if record_type == messages::VECTOR_FRAME {
+                let frame =
+                    vivid_protocol::vector::Frame::decode(body).map_err(|e| invalid_input(e.0))?;
+                for command in frame.canvas.commands() {
+                    if let vivid_protocol::vector::Command::Image { asset, .. } = command
+                        && !media_state.vector_assets.contains_key(asset)
+                    {
+                        return Err(invalid_input(
+                            "scene references an absent or released image",
+                        ));
+                    }
+                }
             }
             if media_state.needs_recovery && !recovery_unit {
                 return Err(invalid_input(
@@ -1047,6 +1200,7 @@ impl Session {
             track.clone(),
             self.lifecycle.clone(),
             matches!(&self.control, ControlPlane::Offline { .. }),
+            self.supports(vivid_protocol::registry::TIMED_MEDIA_SYNC),
         )
     }
 
@@ -1125,6 +1279,7 @@ pub(crate) fn spawn_channel_reader(
     events: Arc<ChannelEvents>,
     input: Arc<Mutex<VecDeque<(Instant, crate::InputPacket)>>>,
     input_sequence: Arc<Mutex<TrackMediaSequence>>,
+    timed_sync: bool,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name(format!("vivid-track-reader-{}", configuration.track_id))
@@ -1216,8 +1371,24 @@ pub(crate) fn spawn_channel_reader(
                             flow.changed.notify_all();
                         }
                         messages::NEED_KEYFRAME => {
-                            validate_payload_keys("NEED_KEYFRAME", &payload, 0..=5, &[6])?;
-                            let minimum_epoch = required_u32(&payload, 4)?;
+                            let recovery = vivid_protocol::timed::NeedKeyframe::decode(
+                                &Value::Map(payload.clone()),
+                            )?;
+                            if recovery.reason == vivid_protocol::timed::PRESENTATION_RESUMED
+                                && !timed_sync
+                            {
+                                return Err(invalid_data(
+                                    "presentation recovery requires timed-media-sync-v1",
+                                ));
+                            }
+                            if recovery.reason == vivid_protocol::timed::PRESENTATION_RESUMED {
+                                // This asks for a correlated replacement transaction, not a
+                                // decoder repair in this channel. In particular a duplicate must
+                                // not poison a replacement generation that is already priming.
+                                push_channel_event(&events, ChannelEvent::NeedKeyframe(payload))?;
+                                continue;
+                            }
+                            let minimum_epoch = recovery.minimum_epoch;
                             let mut state = lock(&media, "channel media state")?;
                             state.recovery_revision =
                                 state.recovery_revision.checked_add(1).ok_or_else(|| {
@@ -1226,8 +1397,14 @@ pub(crate) fn spawn_channel_reader(
                             state.needs_recovery = true;
                             state.minimum_recovery_epoch =
                                 state.minimum_recovery_epoch.max(minimum_epoch);
-                            drop(state);
+                            // Publish the event before exposing `needs_recovery` to a sender. If
+                            // the media lock were released first, an interframe could observe the
+                            // new requirement, fail locally, and still find no event to explain
+                            // how to recover. Keeping the lock across the bounded event enqueue
+                            // makes the state transition and its recovery instruction observable
+                            // in one order.
                             push_channel_event(&events, ChannelEvent::NeedKeyframe(payload))?;
+                            drop(state);
                         }
                         messages::NEED_FULL_FRAME => {
                             validate_exact_payload_keys("NEED_FULL_FRAME", &payload, 0..=4)?;
@@ -1237,8 +1414,8 @@ pub(crate) fn spawn_channel_reader(
                                     invalid_data("channel recovery revision exhausted")
                                 })?;
                             state.needs_recovery = true;
-                            drop(state);
                             push_channel_event(&events, ChannelEvent::NeedFullFrame(payload))?;
+                            drop(state);
                         }
                         _ if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 => {}
                         _ => {
@@ -1297,6 +1474,159 @@ mod tests {
         CoordinateModel, ProducerConfig, RequestMetadata, Session, SurfaceDefinition,
         SurfaceDescriptor, SurfaceRole,
     };
+
+    fn vector_channel() -> (Session, super::TrackChannel) {
+        let mut config = ProducerConfig::offline();
+        config.required_profiles.push(crate::VECTOR_SCENE.into());
+        config.required_profiles.sort();
+        let mut session = Session::connect(config).unwrap();
+        let definition = crate::SurfaceBuilder::new(&session, 1, 1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let surface = session
+            .create_surface(definition, &RequestMetadata::default())
+            .unwrap();
+        let mut configuration = crate::TrackBuilder::new(
+            &surface,
+            crate::SLOT_RASTER,
+            TrackMode::Live,
+            LaneClass::Bulk,
+        )
+        .raster(1, 1)
+        .unwrap()
+        .build(&session.info().resource_contract, 2)
+        .unwrap();
+        configuration.slot = crate::SLOT_VECTOR;
+        configuration.maximum_record_body = 1024;
+        configuration.maximum_inflight_body_bytes = 8192;
+        configuration.maximum_encoded_bits_per_second = 1_000_000;
+        configuration.kind = KindConfiguration::VectorScene(crate::VectorConfiguration {
+            width: 1,
+            height: 1,
+            maximum_scene_bytes: 512,
+        });
+        let track = session
+            .create_track(configuration, &RequestMetadata::default())
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        (session, channel)
+    }
+
+    #[test]
+    fn vector_assets_do_not_consume_scene_ids_and_eos_orders_both_record_kinds() {
+        let (_session, channel) = vector_channel();
+        let asset = vivid_protocol::vector::ImageAsset {
+            id: 7,
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        };
+        channel.send_vector_asset(&asset).unwrap();
+        assert!(channel.media.lock().unwrap().needs_recovery);
+        assert_eq!(channel.track_sequence.lock().unwrap().last_id, 0);
+        assert!(channel.send_vector_asset(&asset).is_err());
+        let frame = vivid_protocol::vector::Frame {
+            epoch: 1,
+            revision: 3,
+            canvas: vivid_protocol::vector::Canvas::new(),
+        };
+        channel.send_vector(&frame).unwrap();
+        assert!(!channel.media.lock().unwrap().needs_recovery);
+        assert!(channel.send_vector(&frame).is_err());
+        let second = vivid_protocol::vector::ImageAsset {
+            id: 8,
+            ..asset.clone()
+        };
+        let asset_sequence = channel.send_vector_asset(&second).unwrap();
+        assert_eq!(channel.media.lock().unwrap().last_sequence, asset_sequence);
+        assert_eq!(channel.track_sequence.lock().unwrap().last_id, 3);
+        let release_sequence = channel.release_vector_asset(7).unwrap();
+        assert!(release_sequence > asset_sequence);
+        assert_eq!(channel.media.lock().unwrap().vector_asset_bytes, 4);
+        assert!(channel.release_vector_asset(7).is_err());
+        assert!(channel.send_vector_asset(&asset).is_err());
+        assert_eq!(channel.track_sequence.lock().unwrap().last_id, 3);
+        assert!(channel.eos().unwrap() > release_sequence);
+        assert!(channel.release_vector_asset(8).is_err());
+        assert!(
+            channel
+                .send_vector_asset(&vivid_protocol::vector::ImageAsset { id: 9, ..asset })
+                .is_err()
+        );
+        assert!(
+            channel
+                .send_vector(&vivid_protocol::vector::Frame {
+                    revision: 4,
+                    ..frame
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vector_asset_budgets_are_shared_by_channel_clones_and_isolated_between_sessions() {
+        let (_a, first) = vector_channel();
+        let (_b, second) = vector_channel();
+        let mut limits = *vivid_protocol::vector::Limits::default().values();
+        limits[7] = 4;
+        limits[8] = 1;
+        limits[9] = 4;
+        first.track.inner.lock().unwrap().vector_limits =
+            Some(vivid_protocol::vector::Limits::new(limits).unwrap());
+        let asset = vivid_protocol::vector::ImageAsset {
+            id: 1,
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        };
+        first.send_vector_asset(&asset).unwrap();
+        assert!(
+            first
+                .clone()
+                .send_vector_asset(&vivid_protocol::vector::ImageAsset {
+                    id: 2,
+                    ..asset.clone()
+                })
+                .is_err()
+        );
+        second.send_vector_asset(&asset).unwrap();
+        first.close().unwrap();
+        second
+            .send_vector_asset(&vivid_protocol::vector::ImageAsset { id: 2, ..asset })
+            .unwrap();
+        assert_eq!(second.media.lock().unwrap().vector_asset_bytes, 8);
+    }
+
+    #[test]
+    fn oversized_vector_records_do_not_consume_credit_or_scene_revisions() {
+        let (_session, channel) = vector_channel();
+        channel.track.inner.lock().unwrap().maximum_record_body = 16;
+        let before = channel.flow.state.lock().unwrap().flow;
+        let asset = vivid_protocol::vector::ImageAsset {
+            id: 1,
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        };
+        assert!(channel.send_vector_asset(&asset).is_err());
+        let mut canvas = vivid_protocol::vector::Canvas::new();
+        canvas
+            .push(vivid_protocol::vector::Command::Opacity(u16::MAX))
+            .unwrap();
+        assert!(
+            channel
+                .send_vector(&vivid_protocol::vector::Frame {
+                    epoch: 1,
+                    revision: 1,
+                    canvas
+                })
+                .is_err()
+        );
+        assert_eq!(channel.flow.state.lock().unwrap().flow, before);
+        assert_eq!(channel.track_sequence.lock().unwrap().last_id, 0);
+        assert!(channel.media.lock().unwrap().vector_assets.is_empty());
+    }
 
     struct BlockingWriter {
         armed: Arc<AtomicBool>,

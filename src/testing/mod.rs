@@ -6,10 +6,12 @@
 //! private fake agrees with.
 
 pub mod admin;
+pub mod overlay;
 pub mod presenter;
 pub mod script;
 
 pub use admin::FakeAdmin;
+pub use overlay::{PresentedScene, RetainedAsset};
 pub use presenter::{
     DestroyObservation, Observed, ObservedBinding, ROOT_SECRET_HEX, TargetKind, TestPresenter,
     TrackChannelLog,

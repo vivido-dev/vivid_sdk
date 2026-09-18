@@ -28,3 +28,4 @@ node-bindings/*.node
 node-bindings/index.d.ts
 dist/
 node_modules/
+bun.lock
