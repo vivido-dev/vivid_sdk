@@ -4214,10 +4214,10 @@ fn dispatch_control(
             context: address.context_id,
             surface: address.surface_id,
         };
-        if !state
+        if state
             .surfaces
             .get(&key)
-            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+            .is_none_or(|surface| surface.state.generation.get() != address.generation)
         {
             return Err(ControlError::missing("overlay surface is absent or stale"));
         }
@@ -4360,10 +4360,10 @@ fn dispatch_control(
         let body = response
             .map_err(|_| ControlError::state("overlay host request timed out"))?
             .map_err(|_| ControlError::state("outer overlay host refused request"))?;
-        if !state
+        if state
             .surfaces
             .get(&key)
-            .is_some_and(|surface| surface.state.generation.get() == address.generation)
+            .is_none_or(|surface| surface.state.generation.get() != address.generation)
         {
             return Err(ControlError::missing(
                 "overlay surface disappeared during host request",
@@ -6264,10 +6264,10 @@ fn vector_track_loop(
                     .wait_timeout(state, Duration::from_millis(50))
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .0;
-                if !state
+                if state
                     .tracks
                     .get(&key)
-                    .is_some_and(|track| track.state.channel_generation == generation)
+                    .is_none_or(|track| track.state.channel_generation != generation)
                     || !state.deliveries.contains_key(&delivery_id)
                 {
                     state.deliveries.remove(&delivery_id);
@@ -7107,10 +7107,10 @@ fn track_ready_payload(
 /// Retire the physical decoder identity on a visibility falling edge. A delayed PAUSE reply
 /// may confirm this retirement once, but cannot confirm a subsequent hide or a new producer PLAY.
 fn retire_held_decoder(state: &mut State, key: TrackKey) {
-    if !state
+    if state
         .surfaces
         .get(&key.surface)
-        .is_some_and(|surface| surface.hold.is_some())
+        .is_none_or(|surface| surface.hold.is_none())
     {
         return;
     }

@@ -385,17 +385,15 @@ impl Overlays {
             self.last_gesture = Some((id, std::time::Instant::now()));
         }
         match input.event {
-            Event::Geometry { bounds, .. } => {
-                if window.options.bounds != bounds {
-                    let mut options = window.options.clone();
-                    options.bounds = bounds;
-                    if self
-                        .windows
-                        .update(id, input.address.generation, window.revision, options)
-                        .is_err()
-                    {
-                        return false;
-                    }
+            Event::Geometry { bounds, .. } if window.options.bounds != bounds => {
+                let mut options = window.options.clone();
+                options.bounds = bounds;
+                if self
+                    .windows
+                    .update(id, input.address.generation, window.revision, options)
+                    .is_err()
+                {
+                    return false;
                 }
             }
             Event::Focus(true) => {
