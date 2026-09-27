@@ -524,9 +524,9 @@ environment and `npm run build:debug`. Run `python -m pytest python-tests/test_o
 `npm run typecheck:overlay-consumer`. The mypy platform override includes the package's Unix
 automation annotations; it does not run Unix-only automation tests on Windows.
 
-For the native Vivido socket/GPU integration test, build both bindings first, set
-`VIVID_OVERLAY_TEST_PYTHON` to that environment's Python executable and
-`VIVID_OVERLAY_TEST_NODE` to the Node executable, then run from `vivido/`:
+For the native Vivido socket/GPU integration test, build both bindings first. The test runs the
+SDK's `.venv` Python and the `node` on `PATH`; set `VIVID_OVERLAY_TEST_PYTHON` or
+`VIVID_OVERLAY_TEST_NODE` to use other executables. Run from `vivido/`:
 
 ```sh
 cargo test --lib native_overlay_python_and_typescript_bindings -- --ignored --nocapture
