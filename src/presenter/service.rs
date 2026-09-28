@@ -5298,6 +5298,9 @@ fn dispatch_control(
                 .overlays
                 .set_window(session_id, record.object_id, &envelope.payload)
                 .map_err(ControlError::state)?;
+            // A relay places the window from the projection, and a text request can name the
+            // window before any scene does; an unchanged revision would publish neither.
+            advance_projection(&mut state);
             flush_overlay_lane(&mut state, session_id);
             (
                 reply_type,
@@ -5310,6 +5313,8 @@ fn dispatch_control(
                 .overlays
                 .action(session_id, record.object_id, &envelope.payload)
                 .map_err(ControlError::state)?;
+            // Closing, centering, and focusing change what a relay projects, as input does.
+            advance_projection(&mut state);
             flush_overlay_lane(&mut state, session_id);
             (
                 reply_type,

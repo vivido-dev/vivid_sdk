@@ -189,6 +189,54 @@ fn a_pane_presenter_hosts_an_overlay_window_end_to_end() {
     );
 }
 
+/// A relay republishes the projection only when its revision advances, so a window change the
+/// revision does not count never reaches the physical host. Placing a window must count: a
+/// toolkit measures its text against the window before it has drawn anything, and the physical
+/// host refuses to measure for a window it was never told about — inside vvmux that was
+/// "overlay window is absent" on a UI's first layout pass.
+#[test]
+fn placing_moving_or_focusing_a_window_advances_the_projection_a_relay_publishes() {
+    const PANE: u64 = 3;
+
+    let (presenter, endpoint) = presenter();
+    presenter.update_metrics(PANE, 80, 24, CELL);
+    let secret = presenter.issue_pane_capability(PANE).expect("capability");
+    let overlays = connect(&endpoint, &secret, "window-projection");
+    let panes = HashSet::from([PANE]);
+    let window = overlays
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(12., 20., 240., 120.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .expect("overlay window");
+    let snapshot = presenter.projection_snapshot(&panes);
+    assert_eq!(
+        overlay_surfaces(&snapshot),
+        1,
+        "the window is projected before any scene"
+    );
+
+    let placed = presenter.revision();
+    window
+        .set_bounds(Rect::new(40., 50., 240., 120.).unwrap())
+        .expect("move");
+    let moved = presenter.revision();
+    assert!(moved > placed, "a moved window republishes the projection");
+    let projected = presenter
+        .projection_snapshot(&panes)
+        .surfaces
+        .into_iter()
+        .find_map(|surface| surface.overlay_window)
+        .expect("window geometry");
+    assert_eq!((projected.x, projected.y), (40, 50));
+
+    window.request_focus().expect("focus");
+    assert!(
+        presenter.revision() > moved,
+        "a window action republishes the projection"
+    );
+}
+
 /// A declarative toolkit measures every string it is about to draw before it can decide where
 /// anything goes, so this service is not an enhancement — it is what makes such a program run at
 /// all. A presenter that negotiates the overlay bundle without it accepts the connection and then
