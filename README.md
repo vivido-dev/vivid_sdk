@@ -1,8 +1,8 @@
 # vivid_sdk
 
-See [pane overlays](OVERLAYS.md) for Rust, Python, and TypeScript window APIs, Vello drawing, and current acceptance status.
+See [pane overlays](docs/OVERLAYS.md) for Rust, Python, TypeScript, and Lua window APIs, Vello drawing, and current acceptance status.
 
-See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
+See the [progressive examples](examples/README.md) for eight runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `vivid_sdk` is the full-duplex Rust SDK for Vivid Protocol 1.5. It serves both roles: the crate
 root is the producer, and [`presenter`](src/presenter/) — behind the off-by-default `presenter`
@@ -13,12 +13,13 @@ things alike: a presenter's `SceneNode` is its own projection of a node, not the
 
 ## Bindings
 
-Two language bindings are built on this crate, each carrying both roles in one artifact:
+Three language bindings are built on this crate, each carrying both roles in one artifact:
 
 | Package | README | Target |
 |---|---|---|
 | `vivid-sdk` (PyPI) | [README-python.md](README-python.md) | Python 3.9+, via a PyO3 extension |
 | `@vivido/vivid-sdk` (npm) | [README-typescript.md](README-typescript.md) | Node 20+, via a napi-rs addon |
+| `vivid-sdk` (LuaRocks) | [README-lua.md](README-lua.md) | LuaJIT and Lua 5.1-5.5, via an mlua module loaded with `require` |
 
 They marshal; they do not decide. Constants, resource claims, and image container parsing come from
 this crate, so a binding cannot disagree with the SDK about a wire value — and
@@ -29,8 +30,9 @@ independent fixture expectations:
 npm run test:conformance
 ```
 
-Add values to `constants.rs` and explicit names to both host packages. Export-coverage tests
-check that public declarations match the table; values are never copied into host modules.
+Add values to `constants.rs` and explicit names to every host package — for Lua, the
+`lua/types/vivid_sdk.lua` definitions. Export-coverage tests check that public declarations match
+the table; values are never copied into host modules.
 Full API parity and per-platform binding distribution remain in progress.
 
 `SocketListener` binds the endpoint spellings a producer already understands — `unix:/absolute/path`

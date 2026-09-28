@@ -25,6 +25,8 @@ target
 __pycache__/
 *.py[cod]
 node-bindings/*.node
+# The Lua module lua/build.sh stages; *.so above covers the Unix spellings.
+lua/vivid_sdk.dll
 node-bindings/index.d.ts
 dist/
 node_modules/

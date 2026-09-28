@@ -1,25 +1,28 @@
 # Cross-language conformance
 
-Build the Python extension and Node addon, then run from the SDK directory:
+Build the Python extension, the Node addon, and the Lua module (`lua/build.sh`), then run from the
+SDK directory:
 
 ```sh
 npm run test:conformance
 ```
 
-The runner executes Rust, Python, and TypeScript scenarios against real loopback presenters.
+The runner executes Rust, Python, TypeScript, and Lua scenarios against real loopback presenters.
 `VIVID_CONFORMANCE_PYTHON=/absolute/path/to/python` selects an existing Python environment;
-otherwise the runner uses `uv run python`.
+otherwise the runner uses `uv run python`. `VIVID_CONFORMANCE_LUA` selects the Lua interpreter,
+which must match the Lua the staged module was built for; otherwise the runner uses `luajit`.
 
 Reports cover public constant exports, an exact four-color raster capture, and rejection of zero
 and oversized raster widths. Submodule-export tests additionally check lease/file-drop/microphone
 constants. Rust/protocol tests remain the authority for cases not included here.
 
-Differential comparison catches drift between languages. It cannot detect a bug all three share.
+Differential comparison catches drift between languages. It cannot detect a bug they all share.
 Independent assertions therefore check the exact fixture pixels, capture shape, invalid-geometry
 results, and the protocol microphone packet shape: 20 ms of 48 kHz mono s16LE is 1920 bytes.
 
-Add scenarios in `examples/conformance.rs`, `conformance/scenario.py`, and
-`conformance/scenario.mjs`, plus independent expectations in `validateReport`. Keep waits bounded
+Add scenarios in `examples/rust/conformance.rs`, `conformance/scenario.py`,
+`conformance/scenario.mjs`, and `conformance/scenario.lua`, plus independent expectations in
+`validateReport`. Keep waits bounded
 and close handles in teardown. This suite does not establish full API parity, live terminal-pane
 integration, or distribution compatibility.
 

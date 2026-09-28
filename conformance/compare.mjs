@@ -7,11 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
 
 /** Run one producer command and return its parsed report. */
-function report(label, command, args) {
+function report(label, command, args, env = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     encoding: "utf8",
-    env: process.env,
+    env: { ...process.env, ...env },
     timeout: 120_000,
   });
   if (result.status !== 0) {
@@ -22,7 +22,7 @@ function report(label, command, args) {
   return { label, parsed };
 }
 
-/** Agreement alone cannot detect a bug shared by all three implementations. */
+/** Agreement alone cannot detect a bug shared by every implementation. */
 export function validateReport(report) {
   assert.equal(report.raster.retained, true);
   assert.equal(report.raster.layers, 1);
@@ -51,6 +51,9 @@ function main() {
     report("python", process.env.VIVID_CONFORMANCE_PYTHON ?? "uv",
       process.env.VIVID_CONFORMANCE_PYTHON ? ["conformance/scenario.py"] : ["run", "python", "conformance/scenario.py"]),
     report("typescript", process.execPath, ["conformance/scenario.mjs"]),
+    // `lua/build.sh` stages the module there, for whichever Lua it was built for.
+    report("lua", process.env.VIVID_CONFORMANCE_LUA ?? "luajit", ["conformance/scenario.lua"],
+      { LUA_CPATH: `lua/?.${process.platform === "win32" ? "dll" : "so"};;` }),
   ];
   compareReports(reports);
   for (const other of reports.slice(1)) console.log(`ok    ${other.label} matches rust`);

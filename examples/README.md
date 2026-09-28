@@ -1,19 +1,19 @@
 # Progressive Vivid SDK examples
 
 Eight runnable examples in each language use the current `dev` SDK and Vivid Protocol 1.5.
-They use the public Rust, Python, and native TypeScript APIs. Start with the pane helpers,
-then learn the explicit surface/track lifecycle and the terminating presenter.
+They use the public Rust, Python, native TypeScript, and native Lua APIs. Start with the pane
+helpers, then learn the explicit surface/track lifecycle and the terminating presenter.
 
-| Level | Topic | Rust | Python | TypeScript |
-|---|---|---|---|---|
-| Basic | Show a PNG/JPEG | [01](rust/01_show_image.rs) | [01](python/01_show_image.py) | [01](typescript/01_show_image.ts) |
-| Basic | Generate four RGBA pixels | [02](rust/02_generated_raster.rs) | [02](python/02_generated_raster.py) | [02](typescript/02_generated_raster.ts) |
-| Intermediate | Session, surface, track, placement, activation | [03](rust/03_surface_and_track.rs) | [03](python/03_surface_and_track.py) | [03](typescript/03_surface_and_track.ts) |
-| Intermediate | Finite raster animation | [04](rust/04_raster_animation.rs) | [04](python/04_raster_animation.py) | [04](typescript/04_raster_animation.ts) |
-| Advanced | Replace a track on the same surface | [05](rust/05_replace_track.rs) | [05](python/05_replace_track.py) | [05](typescript/05_replace_track.ts) |
-| Advanced | Producer/presenter round trip | [06](rust/06_presenter_roundtrip.rs) | [06](python/06_presenter_roundtrip.py) | [06](typescript/06_presenter_roundtrip.ts) |
-| Advanced | Interactive vector overlay window | [07](rust/07_overlay_window.rs) | [07](python/07_overlay_window.py) | [07](typescript/07_overlay_window.ts) |
-| Advanced | Freeform paths: curves, even-odd holes, dashes | [08](rust/08_overlay_paths.rs) | [08](python/08_overlay_paths.py) | [08](typescript/08_overlay_paths.ts) |
+| Level | Topic | Rust | Python | TypeScript | Lua |
+|---|---|---|---|---|---|
+| Basic | Show a PNG/JPEG | [01](rust/01_show_image.rs) | [01](python/01_show_image.py) | [01](typescript/01_show_image.ts) | [01](lua/01_show_image.lua) |
+| Basic | Generate four RGBA pixels | [02](rust/02_generated_raster.rs) | [02](python/02_generated_raster.py) | [02](typescript/02_generated_raster.ts) | [02](lua/02_generated_raster.lua) |
+| Intermediate | Session, surface, track, placement, activation | [03](rust/03_surface_and_track.rs) | [03](python/03_surface_and_track.py) | [03](typescript/03_surface_and_track.ts) | [03](lua/03_surface_and_track.lua) |
+| Intermediate | Finite raster animation | [04](rust/04_raster_animation.rs) | [04](python/04_raster_animation.py) | [04](typescript/04_raster_animation.ts) | [04](lua/04_raster_animation.lua) |
+| Advanced | Replace a track on the same surface | [05](rust/05_replace_track.rs) | [05](python/05_replace_track.py) | [05](typescript/05_replace_track.ts) | [05](lua/05_replace_track.lua) |
+| Advanced | Producer/presenter round trip | [06](rust/06_presenter_roundtrip.rs) | [06](python/06_presenter_roundtrip.py) | [06](typescript/06_presenter_roundtrip.ts) | [06](lua/06_presenter_roundtrip.lua) |
+| Advanced | Interactive vector overlay window | [07](rust/07_overlay_window.rs) | [07](python/07_overlay_window.py) | [07](typescript/07_overlay_window.ts) | [07](lua/07_overlay_window.lua) |
+| Advanced | Freeform paths: curves, even-odd holes, dashes | [08](rust/08_overlay_paths.rs) | [08](python/08_overlay_paths.py) | [08](typescript/08_overlay_paths.ts) | [08](lua/08_overlay_paths.lua) |
 
 ## Setup
 
@@ -44,6 +44,15 @@ npm ci
 npm run build:debug
 npm run build:examples
 ```
+
+Lua source build (LuaJIT by default; `--lua lua54` and the rest for another Lua):
+
+```sh
+lua/build.sh
+export LUA_CPATH="lua/?.so;;"
+```
+
+The Lua examples load the module with a plain `require("vivid_sdk")` from `package.cpath`.
 
 The TypeScript examples import the local package by its public name, `@vivido/vivid-sdk`.
 Compilation writes JavaScript into `target/examples-typescript/`; no global TS runner is needed.
@@ -76,6 +85,17 @@ python examples/python/08_overlay_paths.py
 ```
 
 ```sh
+luajit examples/lua/01_show_image.lua image.png
+luajit examples/lua/02_generated_raster.lua
+luajit examples/lua/03_surface_and_track.lua
+luajit examples/lua/04_raster_animation.lua
+luajit examples/lua/05_replace_track.lua
+luajit examples/lua/06_presenter_roundtrip.lua
+luajit examples/lua/07_overlay_window.lua
+luajit examples/lua/08_overlay_paths.lua
+```
+
+```sh
 node target/examples-typescript/01_show_image.js image.png
 node target/examples-typescript/02_generated_raster.js
 node target/examples-typescript/03_surface_and_track.js
@@ -96,6 +116,7 @@ For Cargo, application arguments follow `--`:
 cargo run --example sdk_03_surface_and_track -- --duration 2
 python examples/python/03_surface_and_track.py --duration 2
 node target/examples-typescript/03_surface_and_track.js --duration 2
+luajit examples/lua/03_surface_and_track.lua --duration 2
 ```
 
 Example 04 sends 90 frames over roughly three seconds and exits. Example 05 first shows the
@@ -112,7 +133,8 @@ green, blue, white pixel bytes. A timeout or mismatch fails the process.
   top-left 16 Ã— 8 terminal cells. This explicit example uses grid placement rather than an anchor.
 - **04:** one sequential sender rotates the four pixels, with monotonically increasing frame IDs
   and pacing below the track's default rate. Every send is awaited in Python/TypeScript; blocked
-  flow cannot accumulate an unbounded queue. EOS follows the final frame on the same channel.
+  flow cannot accumulate an unbounded queue; Lua's sends block the same way, paced with
+  `vivid.sleep`. EOS follows the final frame on the same channel.
 - **05:** a replacement is created and primed while the old track remains active. Readiness precedes
   slot activation; only then is the old track destroyed. The surface, node, and logical 2 Ã— 2
   coordinate system remain unchanged when the encoded raster resolution becomes 4 Ã— 4.
@@ -126,15 +148,15 @@ green, blue, white pixel bytes. A timeout or mismatch fails the process.
   `--duration`.
 - **08:** freeform paths, which 07 does not reach: the four segment kinds, caps and joins, a dash
   pattern, and the even-odd rule. A path is built rather than described, so the same geometry is
-  written the same way in all three languages - and the builder reports the first coordinate the
+  written the same way in every language - and the builder reports the first coordinate the
   wire cannot carry rather than panicking part way through an expression. The ring is the one to
   watch: its hole is a hole to the host's hit testing too, because the host hit tests the fill
   rule it draws by.
 
-Rust and Python placement take signed **32.32 fixed-point cells** (`16 << 32`); TypeScript takes
-ordinary cell numbers (`16`). Producer track waits take **microseconds** in Rust/Python and
-**milliseconds** in TypeScript. Presenter waits take Rust `Duration`, Python **seconds**, and
-TypeScript **milliseconds**.
+Rust and Python placement take signed **32.32 fixed-point cells** (`16 << 32`); TypeScript and Lua
+take ordinary cell numbers (`16`). Producer track waits take **microseconds** in Rust/Python,
+**milliseconds** in TypeScript, and **seconds** in Lua. Presenter waits take Rust `Duration`,
+Python **seconds**, TypeScript **milliseconds**, and Lua **seconds**.
 
 The explicit examples delete their node and surface before closing. Current presenters may retain
 an anchored poster on clean GOODBYE, so simply closing an arbitrary session is not equivalent to
@@ -142,7 +164,7 @@ removing its presentation. The pre-existing [Python image command](python/vivid_
 uses that poster behavior; its old `python examples/vivid_image.py IMAGE` path remains available.
 
 No lease/resume, desktop injection, microphone, or encoded-video parity is claimed here.
-TypeScript fixture IDs stay within its safe integer range.
+TypeScript and LuaJIT fixture IDs stay within their exact integer ranges.
 
 ## Verification
 
@@ -156,8 +178,11 @@ python -m pytest
 npm run typecheck
 npm run typecheck:examples
 npm test
+cargo fmt --manifest-path lua-bindings/Cargo.toml --all --check
+cargo clippy --manifest-path lua-bindings/Cargo.toml --all-targets -- -D warnings
+lua/build.sh && LUA_CPATH="lua/?.so;;" luajit lua-tests/run.lua
 ```
 
-Run all three 06 commands above for bounded live-socket verification. To verify visible placement,
+Run all four 06 commands above for bounded live-socket verification. To verify visible placement,
 animation, replacement, and removal, run 01â€“05 inside a real pane; a successful headless presenter
 round trip does not establish that the terminal compositor rendered the examples.

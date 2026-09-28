@@ -1,8 +1,8 @@
 name: conformance
 
-# The point of this job is that it needs all three toolchains at once. Every binding runs the
-# same scenarios, with independent fixture expectations as well as differential comparison.
-# Agreement alone cannot detect a bug shared by all three languages.
+# The point of this job is that it needs every toolchain at once. Every binding runs the same
+# scenarios, with independent fixture expectations as well as differential comparison.
+# Agreement alone cannot detect a bug shared by every language.
 
 on:
   push:
@@ -37,8 +37,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - run: sudo apt-get update && sudo apt-get install -y luajit
 
       - run: uv run --with maturin maturin develop --release
       - run: npm ci
       - run: npm run build
+      - run: lua/build.sh --release
       - run: npm run test:conformance

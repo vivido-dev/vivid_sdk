@@ -1,0 +1,55 @@
+name: lua
+
+on:
+  push:
+    branches: [dev, master, sdk-language-bindings]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # A module is built for exactly one Lua, so each Lua is its own build: LuaJIT (what Neovim and
+    # most embedders carry), the 5.1 ABI it shares, and 5.4 with 64-bit integers and `<close>`.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: luajit
+            interpreter: luajit
+          - feature: lua51
+            interpreter: lua5.1
+          - feature: lua54
+            interpreter: lua5.4
+    defaults:
+      run:
+        working-directory: vivid_sdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: vivid_sdk
+      # These branches are coupled until the protocol prerequisite is merged/released.
+      - uses: actions/checkout@v4
+        with:
+          repository: vivido-dev/vivid_protocol
+          ref: e8ae56565c7064e7263c4993d3979f67038912e1
+          path: vivid_protocol
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vivid_sdk/lua-bindings -> target
+          key: ${{ matrix.feature }}
+      - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.interpreter }}
+
+      # lua-bindings is its own Cargo workspace; the SDK root's `--workspace` never builds it.
+      - run: cargo fmt --manifest-path lua-bindings/Cargo.toml --all --check
+      - run: >-
+          cargo clippy --manifest-path lua-bindings/Cargo.toml --all-targets
+          --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - run: lua/build.sh --lua ${{ matrix.feature }}
+      # The automation tests use python3's standard library for their fake servers.
+      - run: ${{ matrix.interpreter }} lua-tests/run.lua
+        env:
+          LUA_CPATH: lua/?.so;;

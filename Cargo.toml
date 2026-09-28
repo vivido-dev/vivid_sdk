@@ -9,8 +9,8 @@ description = "Reusable full-duplex Vivid Protocol 1.5 producer and presenter SD
 readme = "README.md"
 repository = "https://github.com/vivido-dev/vivid_sdk"
 
-# The Python and Node bindings have their own release channels (PyPI/npm). Keep them and their
-# tooling out of the Rust crate.
+# The Python, Node, and Lua bindings have their own release channels (PyPI/npm/LuaRocks). Keep
+# them and their tooling out of the Rust crate.
 exclude = [
   "python",
   "python-bindings",
@@ -25,6 +25,11 @@ exclude = [
   "README-python.md",
   "README-typescript.md",
   ".pytest_cache",
+  "lua",
+  "lua-bindings",
+  "lua-tests",
+  "README-lua.md",
+  "*.rockspec",
 ]
 
 [features]

@@ -1,0 +1,47 @@
+[package]
+name = "vivid-sdk-lua"
+version = "1.5.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Native Lua module for the vivid_sdk Lua package"
+repository = "https://github.com/vivido-dev/vivid_sdk"
+publish = false
+
+# Its own workspace, deliberately. A build targets exactly one Lua, and mlua's version features are
+# mutually exclusive, so `cargo --workspace --all-features` at the SDK root would enable every Lua
+# at once. Build this crate with `--manifest-path lua-bindings/Cargo.toml`, or through the rockspec.
+[workspace]
+
+[lib]
+# The file Lua loads is named for the module, `vivid_sdk.so`; the build script (`lua/build.sh`) and
+# the rockspec copy this library to that name. The entry points are named in `src/lib.rs`.
+name = "vivid_sdk_lua"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+# Exactly one Lua per build. LuaJIT is the default because it is the Lua that Neovim and most
+# embedders carry; LuaRocks builds pass `--no-default-features` and the feature for the Lua it
+# targets.
+[features]
+default = ["luajit"]
+lua51 = ["mlua/lua51"]
+lua52 = ["mlua/lua52"]
+lua53 = ["mlua/lua53"]
+lua54 = ["mlua/lua54"]
+lua55 = ["mlua/lua55"]
+luajit = ["mlua/luajit"]
+
+[dependencies]
+getrandom = "0.4"
+libc = "0.2"
+# `module`: the host process provides Lua, so nothing is linked and `require` loads the library.
+mlua = { version = "0.12.1", features = ["module", "serialize"] }
+serde_json = "1"
+sha2 = "0.11"
+vivid_protocol = { version = "1.5", path = "../../vivid_protocol" }
+# The module carries both roles: one artifact, a producer and a presenter — the same choice the
+# Python wheel and the Node addon make.
+vivid_sdk = { version = "1.5", path = "..", features = ["presenter"] }
+zeroize = "1.9"

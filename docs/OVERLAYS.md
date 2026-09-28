@@ -1,6 +1,6 @@
 # Pane overlays
 
-Rust, Python, and TypeScript expose `OverlaySession`, `OverlayWindow`, and window options.
+Rust, Python, TypeScript, and Lua expose `OverlaySession`, `OverlayWindow`, and window options.
 Direct Vivido connections have window-control, vector-channel, cached Vello rendering, and
 interactive-lane integration. This is a development preview: the complete cross-language overlay
 and GPUI-inspired UI plan has not passed live pane acceptance.
@@ -185,8 +185,51 @@ are also `bigint`. Receipt waits remain independent of event iteration.
 
 Colors are straight-alpha sRGB `0xRRGGBBAA`; opacity and gradient offsets are in `[0, 1]`.
 Geometry uses logical pixels. Hit roles are `input`, `drag`, `resize`, and `transparent`;
-resize edge bits are left=1, right=2, top=4, bottom=8. Save/restore delimit transforms and clips.
+resize edge bits are left=1, top=2, right=4, bottom=8. Save/restore delimit transforms and clips.
 Text supports host font family, weight, italic, color, and optional maximum width.
+
+## Lua
+
+Lua reaches the same Rust handles through the native module, with methods on userdata and
+configuration as tables. `vivid.overlay.connect(options)` negotiates the profile bundle with the
+normal connection options; `vivid.overlay.from_session(session)` adopts a session that already
+did. Every call blocks the calling Lua state.
+
+```lua
+local vivid = require("vivid_sdk")
+local overlay = vivid.overlay
+local Brush, Canvas, Path, rect = overlay.Brush, overlay.Canvas, overlay.Path, overlay.rect
+
+local session = overlay.connect()
+local window = session:create_window({ bounds = rect(40, 40, 320, 180), mode = "floating" })
+local path = Path.rounded_rectangle(rect(0, 0, 320, 180), 12)
+window:present(Canvas.new():fill(path, Brush.solid(0x203050FF)):hit(1, path))
+window:center()
+for event in session:events() do
+  if event.kind == "dismissed" or event.kind == "connection-lost" then break end
+  if event.kind == "pointer" and event:targets(window) and event.down then break end
+end
+window:close()
+session:close()
+```
+
+Rectangles and points are plain tables — `{ x =, y =, width =, height = }` and `{ x =, y = }` —
+and `overlay.rect(x, y, w, h)` and `overlay.point(x, y)` build them. Paths come from
+`Path.new({ even_odd = true })` or the shape constructors and extend with `move_to`, `line_to`,
+`quad_to`, `cubic_to`, and `close`, chained; like Rust's builder, a coordinate the wire cannot
+carry is remembered and reported when the path is used. A shape path can be extended too. Brushes
+are validated when made: `Brush.solid`, `Brush.linear(start, finish, stops, space)`,
+`Brush.radial(center, radius, stops, space)`, and `Brush.image(image, transform, extend)`, which
+takes the retained image itself rather than its ID. `canvas:stroke(path, brush, width)` is a plain
+stroke that needs no paint profile; `canvas:stroke_styled(path, brush, style)` carries caps,
+joins, and dashes under `overlay-paint-v1`. Styled text and semantic trees are tables.
+
+Events are tables named by `kind`, the same strings the other languages use (`"pointer"`,
+`"connection-lost"`, `"submission-outcome"`), each with `event:targets(window)`. Text offsets —
+measurement ranges, `truncated_at`, and IME selections — are UTF-8 byte offsets, which is how Lua
+indexes a string: `text:sub(first + 1, last)`. `raise` is not a keyword in Lua, so windows have
+`window:raise()`. Revisions and application hit IDs are Lua integers: exact to 2^53 on LuaJIT,
+5.1, and 5.2, and to 2^63 - 1 on 5.3 and later.
 
 ## Paint commands
 
@@ -368,9 +411,9 @@ with the same Parley/font-fallback implementation used to paint Canvas text.
 - TypeScript: `await window.measureText(text, size, { family, weight, italic, maxWidth })`.
 
 Results contain logical-pixel width, height, line geometry, and visual-order cluster geometry.
-Geometry includes text ranges, bounds, baselines, and cluster direction. Rust ranges use UTF-8
-byte offsets; Python uses character indexes; TypeScript uses UTF-16 indexes. Measurement starts
-at `(0, 0)` independently of Canvas text origin and color. These are measurement snapshots,
+Geometry includes text ranges, bounds, baselines, and cluster direction. Rust ranges use UTF-8 byte
+offsets, as does Lua; Python uses character indexes; TypeScript uses UTF-16 indexes. Measurement
+starts at `(0, 0)` independently of Canvas text origin and color. These are measurement snapshots,
 not retained layout handles: use matching text/style when painting. For guaranteed
 measurement/painting consistency, use the retained layout service below.
 
@@ -487,7 +530,7 @@ layout = window.layout_text(paragraph)
 cut = layout.measurement.truncated_at  # None when the complete text fits.
 ```
 
-Rust returns `TextMeasurement.truncated_at` in UTF-8 bytes; Python returns character indexes;
+Rust and Lua return `truncated_at` in UTF-8 bytes; Python returns character indexes;
 TypeScript exposes optional `truncatedAt` in UTF-16 units. All cluster ranges refer to the
 original text. The inserted marker has an empty range at the cutoff and positive visible geometry;
 it is not part of the application's editable string. The retained layout paints the exact fitted
@@ -499,18 +542,21 @@ uses bounded waits and ends after connection loss or explicit session close. Typ
 pointer, wheel, physical key, committed text, IME, focus, geometry, dismissal, cancellation,
 and viewport changes (`ViewportEvent` / `kind: "viewport"`, with `revision` and `viewport`).
 Python provides event dataclasses; TypeScript provides a discriminated union on `kind`.
-IME selections use Python character indexes or JavaScript UTF-16 indexes into the preedit string.
+Lua provides tables named by `kind`, with the same strings.
+IME selections use Python character indexes, JavaScript UTF-16 indexes, or Lua UTF-8 byte offsets
+into the preedit string.
 TypeScript scene revisions and application hit IDs are `bigint` throughout. Window, session,
 and asset wire identities stay opaque. Closing sessions invalidates their remaining windows.
 
 Physical keys, pointer buttons, and modifier masks are protocol values, never a host's platform
-encoding, and they match `desktop-surface-v1`'s assignments. Rust re-exports
-`overlay::{keys, buttons, modifiers}`; Python exposes `overlay.Key`, `overlay.MouseButton`, and
-`overlay.Modifiers`; TypeScript exports `overlay.Key`, `overlay.MouseButton`, and
-`overlay.Modifiers`. A physical key is a USB HID keyboard-page usage in `0x04..=0xe7`, with zero
-for a key the page does not name. Buttons are primary, auxiliary, secondary, back, forward, then
-`5..=31`. Modifiers are shift, control, alt, super, caps lock, and num lock; every other bit is
-reserved and an event that sets one is rejected rather than dispatched.
+encoding, and they match `desktop-surface-v1`'s assignments. Rust re-exports `overlay::{keys,
+buttons, modifiers}`; Python exposes `overlay.Key`, `overlay.MouseButton`, and `overlay.Modifiers`;
+TypeScript exports `overlay.Key`, `overlay.MouseButton`, and `overlay.Modifiers`; Lua has
+`vivid.overlay.Key`, `vivid.overlay.MouseButton`, and `vivid.overlay.Modifiers`, read from the
+protocol crate. A physical key is a USB HID keyboard-page usage in `0x04..=0xe7`, with zero for a
+key the page does not name. Buttons are primary, auxiliary, secondary, back, forward, then `5..=31`.
+Modifiers are shift, control, alt, super, caps lock, and num lock; every other bit is reserved and
+an event that sets one is rejected rather than dispatched.
 
 Wheel events add `precise` (true for trackpads, false for detented wheels whose detents the host
 has already converted to logical pixels) and `phase` (`"none"`, `"began"`, `"changed"`, `"ended"`,
@@ -522,19 +568,23 @@ Build from the SDK directory with `python -m maturin develop` in the configured 
 environment and `npm run build:debug`. Run `python -m pytest python-tests/test_overlay.py`,
 `python -m mypy --platform linux`, `npm test`, `npm run typecheck`, and
 `npm run typecheck:overlay-consumer`. The mypy platform override includes the package's Unix
-automation annotations; it does not run Unix-only automation tests on Windows.
+automation annotations; it does not run Unix-only automation tests on Windows. For Lua, run
+`lua/build.sh` and `LUA_CPATH="lua/?.so;;" luajit lua-tests/run.lua`.
 
-For the native Vivido socket/GPU integration test, build both bindings first. The test runs the
-SDK's `.venv` Python and the `node` on `PATH`; set `VIVID_OVERLAY_TEST_PYTHON` or
-`VIVID_OVERLAY_TEST_NODE` to use other executables. Run from `vivido/`:
+For the native Vivido socket/GPU integration test, build all three bindings first. The test runs
+the SDK's `.venv` Python, the `node` on `PATH`, and `luajit` with the module `lua/build.sh`
+staged; set `VIVID_OVERLAY_TEST_PYTHON`, `VIVID_OVERLAY_TEST_NODE`, or `VIVID_OVERLAY_TEST_LUA`
+to use other executables (a Lua interpreter must match the Lua the module was built for). Run
+from `vivido/`:
 
 ```sh
-cargo test --lib native_overlay_python_and_typescript_bindings -- --ignored --nocapture
+cargo test --lib native_overlay_language_bindings -- --ignored --nocapture
 ```
 
-The harness starts Python blocking, Python asyncio, and TypeScript producers against isolated
+The harness starts Python blocking, Python asyncio, TypeScript, and Lua producers against isolated
 authenticated host sessions. It verifies exact four-color Vello readback, window controls,
-retained assets, typed pointer input with an ID above 2^53, IME offset conversion, capture,
+retained assets, typed pointer input with an ID above 2^53 (below it for LuaJIT, whose numbers
+are doubles), IME offset conversion, capture,
 child popups, per-submission outcomes, track replacement/reconciliation, independent asset
 release, unsolicited viewport changes, host text measurement, focused-editor geometry, styled
 measurement batches, retained layout colors, replacement-track reuse, release, and cleanup.

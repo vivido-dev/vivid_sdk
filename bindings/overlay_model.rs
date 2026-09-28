@@ -1,4 +1,4 @@
-//! Shared conversion helpers for the Python and Node overlay bindings. No language callbacks.
+//! Shared conversion helpers for the Python, Node, and Lua overlay bindings. No language callbacks.
 use std::io;
 use vivid_protocol::overlay::{AccessibleAction, SemanticNode, SemanticRole, Semantics, Toggled};
 use vivid_protocol::vector::*;
