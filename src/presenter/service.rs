@@ -1610,7 +1610,7 @@ impl VirtualVivid {
 
     #[allow(dead_code)]
     pub fn projection_snapshot(&self, panes: &HashSet<PaneId>) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, &HashMap::new(), true)
+        self.projection_snapshot_inner(panes, &HashMap::new(), Some(true))
     }
 
     pub fn projection_snapshot_with_viewports(
@@ -1618,7 +1618,7 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
     ) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, viewport_offsets, true)
+        self.projection_snapshot_inner(panes, viewport_offsets, Some(true))
     }
 
     /// Build a projection without exposing newly visible timed sources to their workers.
@@ -1768,14 +1768,24 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
     ) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, viewport_offsets, false)
+        self.projection_snapshot_inner(panes, viewport_offsets, Some(false))
+    }
+
+    /// Read scene and retained content without changing playback visibility or ingress flow.
+    /// Additional visual subscribers must not become authorities for the timed projection.
+    pub fn inspect_projection_snapshot_with_viewports(
+        &self,
+        panes: &HashSet<PaneId>,
+        viewport_offsets: &HashMap<PaneId, usize>,
+    ) -> ProjectionSnapshot {
+        self.projection_snapshot_inner(panes, viewport_offsets, None)
     }
 
     fn projection_snapshot_inner(
         &self,
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
-        activate_immediately: bool,
+        activation: Option<bool>,
     ) -> ProjectionSnapshot {
         let mut state = lock(&self.state);
         let sessions = state
@@ -1917,6 +1927,16 @@ impl VirtualVivid {
             .keys()
             .map(|key| (key.session, key.node))
             .collect::<Vec<_>>();
+        let Some(activate_immediately) = activation else {
+            return ProjectionSnapshot {
+                revision: state.projection_revision,
+                surfaces,
+                sources,
+                nodes,
+                live_nodes,
+                videos_needing_keyframes: Vec::new(),
+            };
+        };
         let projected_sources = sources
             .iter()
             .map(|source| source.key)
@@ -6556,7 +6576,9 @@ fn validate_media_record(
                     config.height,
                     u32::from(config.maximum_delta_operations),
                 )?;
-                Ok((frame.epoch, frame.frame_id, false, frame.pts_us, false))
+                // The composed retained canvas changed just as it does for a full frame.
+                // Snapshot subscribers must observe that revision even though this is a delta.
+                Ok((frame.epoch, frame.frame_id, false, frame.pts_us, true))
             }
         }
         (KindConfiguration::EncodedImage(config), messages::IMAGE_DATA) => {
@@ -9626,6 +9648,31 @@ mod tests {
         assert!(held.position.unwrap().estimated);
         let other = owners[1].0.query_track(&owners[1].1).unwrap();
         assert!(other.playback_hold.is_none_or(|hold| !hold.held));
+        // A retained-content subscriber may inspect either owner's scene without releasing the
+        // hidden owner's hold or removing the visible owner's active projection.
+        let projection_before = lock(&presenter.state).projected_sources.clone();
+        let observed = presenter
+            .inspect_projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::new());
+        assert_eq!(observed.sources.len(), 1);
+        assert_eq!(lock(&presenter.state).projected_sources, projection_before);
+        assert_eq!(
+            owners[0]
+                .0
+                .query_track(&owners[0].1)
+                .unwrap()
+                .playback_hold
+                .unwrap()
+                .serial,
+            held.serial
+        );
+        assert!(
+            owners[1]
+                .0
+                .query_track(&owners[1].1)
+                .unwrap()
+                .playback_hold
+                .is_none_or(|hold| !hold.held)
+        );
         presenter.apply_outer_position(owners[0].2, position);
         let confirmed = owners[0]
             .0
