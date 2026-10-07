@@ -173,7 +173,9 @@ channel.eos()?;
 
 Native discovery uses `VIVID_ENDPOINT_CONTROL`, `VIVID_ENDPOINT_INTERACTIVE`,
 `VIVID_ENDPOINT_REALTIME`, `VIVID_ENDPOINT_BULK`, and `VIVID_ROOT_SECRET`. Missing lane endpoints
-select the protocol-defined fallback endpoint value while remaining separate connections.
+select the protocol-defined fallback endpoint value while remaining separate connections. The
+variables are read as one target's set: a config that names `endpoint_control` takes its other
+lanes only from the config, never from an ambient environment that may describe another presenter.
 
 Secret-bearing configuration deliberately implements neither `Debug` nor `Display`. Dropping a
 session is an unclean transport loss so a resumable lease may suspend. Call `Session::close()` to

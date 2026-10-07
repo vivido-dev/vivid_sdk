@@ -577,17 +577,27 @@ impl Session {
                 vivid_protocol::discovery::ENDPOINT_CONTROL,
             )?)
         };
-        let interactive = optional_endpoint(
+        // Discovery variables describe one target as a set. An explicit control endpoint names a
+        // different target than the ambient environment may, so its unset lanes take the protocol
+        // fallback instead of an ambient lane that belongs to someone else's presenter.
+        let lane = |explicit: Option<&str>, variable| {
+            if config.endpoint_control.is_some() {
+                explicit.map(Endpoint::parse).transpose()
+            } else {
+                optional_endpoint(explicit, variable)
+            }
+        };
+        let interactive = lane(
             config.endpoint_interactive.as_deref(),
             vivid_protocol::discovery::ENDPOINT_INTERACTIVE,
         )?
         .or_else(|| control_endpoint.clone());
-        let bulk = optional_endpoint(
+        let bulk = lane(
             config.endpoint_bulk.as_deref(),
             vivid_protocol::discovery::ENDPOINT_BULK,
         )?
         .or_else(|| control_endpoint.clone());
-        let realtime = optional_endpoint(
+        let realtime = lane(
             config.endpoint_realtime.as_deref(),
             vivid_protocol::discovery::ENDPOINT_REALTIME,
         )?
