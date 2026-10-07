@@ -291,7 +291,7 @@ impl Writer {
             .clamp(1024 * 1024, MAX_QUEUED_BYTES);
         if self
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(size).filter(|next| *next <= byte_budget)
             })
             .is_err()

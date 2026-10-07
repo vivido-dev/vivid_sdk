@@ -477,7 +477,7 @@ impl Session {
             let snapshot = lock(&track.inner, "track")?.clone();
             if pause {
                 let request_id = ids
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
                         |id| id.checked_add(1),
@@ -508,7 +508,7 @@ impl Session {
                 }
             }
             let request_id = ids
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |id| id.checked_add(1),

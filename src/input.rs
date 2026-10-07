@@ -136,7 +136,7 @@ impl InputLane {
         }
         let request_id = self
             .next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| invalid_data("interactive request ID space exhausted"))?;
@@ -875,7 +875,7 @@ impl OverlayInputLane {
         let id = self
             .inner
             .next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| invalid_data("interactive request ID space exhausted"))?;
         let body = Envelope::correlated(id, payload)?.encode()?;
         if self.inner.offline {

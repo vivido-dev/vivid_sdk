@@ -124,7 +124,7 @@ impl AudioInputSender {
             state.rate.charge(1).map_err(io::Error::other)?;
         }
         let id = NEXT_PACKET
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| invalid_data("microphone media identity exhausted"))?;
         let body = InputPacket {
             epoch: 1,

@@ -873,7 +873,7 @@ impl Session {
 
     pub fn allocate_id(&self) -> io::Result<u64> {
         self.next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| invalid_data("SDK object ID space exhausted"))
@@ -1030,7 +1030,7 @@ impl Session {
 
     pub(crate) fn next_request(&self) -> io::Result<u64> {
         self.next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| invalid_data("request ID space exhausted"))
@@ -1092,7 +1092,7 @@ fn spawn_control_watchdog(
                 }
                 if silence >= Duration::from_secs(5) && probe.is_none() {
                     let Ok(id) =
-                        next_request_id.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+                        next_request_id.try_update(Ordering::AcqRel, Ordering::Acquire, |id| {
                             id.checked_add(1)
                         })
                     else {

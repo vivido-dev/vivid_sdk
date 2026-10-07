@@ -60,7 +60,7 @@ impl Session {
                 return Err(invalid_input("outer overlay host profile is unavailable"));
             }
             let id = ids
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |id| id.checked_add(1),
