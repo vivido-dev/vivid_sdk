@@ -533,7 +533,7 @@ impl OverlayWindow {
                 ));
             }
             // Reject before copying the caller's pixels into owned transport storage.
-            let record_limit = state.track.configuration()?.maximum_record_body as usize;
+            let record_limit = state.track.shared_configuration()?.maximum_record_body as usize;
             if rgba
                 .len()
                 .checked_add(16)

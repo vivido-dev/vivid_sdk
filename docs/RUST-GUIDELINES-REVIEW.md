@@ -6,7 +6,9 @@ change the public API: `Debug` on every public type, with redacted output for ty
 secrets; presenter items re-exported by name instead of by glob; the polling in `wait_for_rate`
 and in the microphone write watchdog; and lint `allow`s converted to `expect`s with reasons. A
 follow-up raised `rust-version` to 1.95, because the crate already used `Atomic*::try_update`,
-which became stable in that release. The open findings follow, most important first. Guideline IDs such as `M-STRONG-TYPES` name the rule
+which became stable in that release. A later change fixed the performance and resilience findings
+that did not need an API change: the send path, track waits, and microphone packet numbering. The
+open findings follow, most important first. Guideline IDs such as `M-STRONG-TYPES` name the rule
 each one comes from.
 
 The application guidelines do not apply to this crate. It is a library, it uses no
@@ -47,38 +49,22 @@ public constructors on the builder itself. The guideline wants `SessionLease::bu
 
 ## Performance
 
-**Per-frame clones on the send path (M-HOTPATH, M-MEM-REUSE).** `send_raster` and
-`send_raster_adaptive` call `Track::configuration()`, which clones the whole `TrackConfiguration`
-for every frame. `raster_delta_body` clones the entire `TrackLocal` under the track lock,
-including the `effective_claims` map, only to read the raster configuration and the delta limit.
-Every frame also allocates a new body `Vec`, and `send_raster_adaptive` can encode a frame twice.
-Possible fixes:
+`benches/send.rs` measures one send of each media kind against an offline session, reporting time,
+allocations, and allocated bytes per send (`cargo bench --bench send`). The send path no longer
+clones the track configuration or the track state per record, and writes raw raster frames, video
+packets, and audio packets as a prefix followed by the caller's bytes, so they allocate nothing.
+Track waits park on a condition variable that every mutation they read wakes, with a 100 ms recheck
+only as a backstop.
 
-- Read only the fields needed under the lock.
-- Keep the immutable configuration in an `Arc`.
-- Add a send API that takes a reusable body buffer.
+**Remaining send allocations (M-MEM-REUSE).** Compressed full frames and every delta frame still
+allocate a body, and `send_raster_delta_adaptive` builds both the raw and the compressed delta to
+compare their sizes. Removing these needs a send API that takes a reusable body buffer, which is an
+addition to the public API.
 
-**No benchmarks (M-HOTPATH).** There is no `benches/`. Add a small benchmark of raster and video
-sends against an offline session before changing the send path, so the change can be measured.
-
-**Remaining polling loops (M-THROUGHPUT).**
-
-- `accept_loop` in `presenter/service.rs` sleeps 10 ms whenever `accept` returns `WouldBlock`. The
-  `PresenterListener::accept` contract is non-blocking, so this loop is how shutdown gets noticed.
-  Removing the polling needs a way to wake the listener, which changes a trait that products
-  implement.
-- `spawn_wait` polls every 2 ms while a track wait is pending. Moving it onto the presenter's
-  `changed` condvar first requires checking that every change to state `evaluate_wait` reads also
-  notifies: milestones, `outer_presented`, `outer_position`, `last_media_id`, `lost`, holds, wait
-  cancellation, channel generation, and track removal. Some of these already notify, but not all.
-  One missed notify would turn into a wait that stalls until its timeout.
-
-## Resilience
-
-**Process-wide packet counter (M-AVOID-STATICS).** `NEXT_PACKET` in `audio_input.rs` numbers
-microphone packets for every sender and presenter in the process. A counter per
-`AudioInputSender` would scope packet IDs to their owner. That matches the repository's rule on
-owner identity and makes tests deterministic.
+**Remaining polling loop (M-THROUGHPUT).** `accept_loop` in `presenter/service.rs` sleeps 10 ms
+whenever `accept` returns `WouldBlock`. The `PresenterListener::accept` contract is non-blocking, so
+this loop is how shutdown gets noticed. Removing the polling needs a way to wake the listener, which
+changes a trait that products implement.
 
 ## Documentation
 

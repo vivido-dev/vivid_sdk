@@ -61,6 +61,12 @@ const MAX_LEASES: usize = 64;
 const MAX_WAITS: usize = 64;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_WAIT_US: u64 = 24 * 60 * 60 * 1_000_000;
+/// Longest a parked track wait goes without re-evaluating its condition.
+///
+/// Waits are woken by `State::wake_waits`, so this is not how they normally complete. It only
+/// bounds the delay that a mutation which forgets to wake them would add. Shorter values spend idle
+/// wake-ups on every pending wait; longer ones make such a bug look like a stalled wait.
+const WAIT_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_FLOW_RECORDS: u64 = 1;
 // Start with one record so a newly projected video observes recovery promptly, then expand after
 // the first completed delivery. Keeping the startup grant forever turns linked audio into a
@@ -816,6 +822,23 @@ struct State {
     overlay_relay: super::overlay_relay::OverlayRelay,
     overlay_layouts: HashMap<SurfaceKey, Vec<super::OverlayLayout>>,
     released_overlay_layouts: HashSet<(SurfaceKey, u64)>,
+    /// Wakes parked track waits. Paired only with this state's own mutex.
+    wait_changed: Arc<Condvar>,
+    /// Track waits currently parked on `wait_changed`.
+    parked_waits: usize,
+}
+
+impl State {
+    /// Wake every parked track wait so it re-evaluates its condition.
+    ///
+    /// Call this while still holding the state lock after any mutation that can satisfy or fail a
+    /// wait: a track revision, milestone, outer presentation or position, last media ID, or loss;
+    /// a channel generation change; a surface hold; a wait cancellation; or a track removal.
+    fn wake_waits(&self) {
+        if self.parked_waits != 0 {
+            self.wait_changed.notify_all();
+        }
+    }
 }
 
 fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
@@ -1152,6 +1175,8 @@ impl VirtualVivid {
             overlay_relay: Default::default(),
             overlay_layouts: HashMap::new(),
             released_overlay_layouts: HashSet::new(),
+            wait_changed: Arc::new(Condvar::new()),
+            parked_waits: 0,
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2190,6 +2215,7 @@ impl VirtualVivid {
                 }
             }
         }
+        state.wake_waits();
         let wakeup = recovery_completed
             .then(|| {
                 advance_projection(&mut state);
@@ -2234,6 +2260,7 @@ impl VirtualVivid {
         if let Some(track) = state.tracks.get_mut(&inner_track_key(source)) {
             track.outer_presented = true;
             track.state.milestones |= MILESTONE_PRESENTED;
+            state.wake_waits();
         }
     }
 
@@ -2356,6 +2383,7 @@ impl VirtualVivid {
         }
         retire_track_deliveries(&mut state, key);
         advance_projection(&mut state);
+        state.wake_waits();
     }
 
     pub fn apply_downstream_hold(&self, source: SourceKey, observed: super::BridgeHoldSnapshot) {
@@ -2434,6 +2462,7 @@ impl VirtualVivid {
         let clock_epoch = track.state.media_epoch;
         let resume_serial = track.play_request.hold_serial;
         let key = inner_track_key(source).surface;
+        state.wake_waits();
         if position.state == 2
             && let Some(hold) = state
                 .surfaces
@@ -2513,6 +2542,7 @@ impl VirtualVivid {
             if eos_state >= 2 {
                 track.state.milestones |= MILESTONE_BUFFERED_ENDED;
             }
+            state.wake_waits();
         }
     }
 
@@ -3178,6 +3208,7 @@ fn handle_control(
             .map_err(|error| with_context(error, "establishing root session"))?;
     drop(hello);
     drop(body);
+    let wait_changed = lock(shared).wait_changed.clone();
     let mut clean = false;
     let mut terminal_error = None;
     let run_result = (|| -> io::Result<()> {
@@ -3193,7 +3224,13 @@ fn handle_control(
                     break;
                 }
             };
-            match dispatch_control(shared, session_id, &record) {
+            let dispatched = dispatch_control(shared, session_id, &record);
+            // Control records advance revisions and generations, start clocks, cancel waits, and
+            // destroy tracks. Waking every parked wait after each one is cheaper and safer than
+            // tracking which of the many control mutations a wait reads. The mutation is already
+            // visible under the state lock, so notifying after releasing it loses no wakeup.
+            wait_changed.notify_all();
+            match dispatched {
                 Ok(Some((record_type, object_id, body))) => {
                     writer.write_record(record_type, object_id, &body)?;
                 }
@@ -5589,6 +5626,7 @@ fn microphone_channel(
             track.microphone.take();
             track.channel_writer = None;
             let _ = track.state.detach();
+            state.wake_waits();
         }
         advance_projection(&mut state);
         state.media_wakeup.clone()
@@ -5694,6 +5732,7 @@ fn handle_track(
             track.state.revision = track.state.revision.advance()?;
             track.channel_writer = Some(writer.clone());
             let revision = track.state.revision.get();
+            state.wake_waits();
             drop(state);
             writer.write_record(
                 messages::CHANNEL_ACCEPTED,
@@ -5752,6 +5791,7 @@ fn handle_track(
             .encode()?,
         )?;
         is_vector_scene = matches!(track.configuration.kind, KindConfiguration::VectorScene(_));
+        state.wake_waits();
     }
     reader.clear_read_deadline()?;
     let result = if is_vector_scene {
@@ -5784,6 +5824,7 @@ fn handle_track(
         changed_payload = Envelope::new(0, track_status_payload(key, track, gain_supported))
             .encode()
             .ok();
+        state.wake_waits();
     }
     let control = state
         .sessions
@@ -5863,6 +5904,7 @@ fn track_loop(
             track.state.milestones |= MILESTONE_EOS_ACCEPTED;
             track.last_record_sequence = record.sequence;
             advance_projection(&mut state);
+            state.wake_waits();
             continue;
         }
 
@@ -5930,6 +5972,7 @@ fn track_loop(
             track.state.milestones |= MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
             track.last_record_sequence = record.sequence;
             track.last_pts_us = pts;
+            state.wake_waits();
             changed.notify_all();
         }
         loop {
@@ -6061,6 +6104,7 @@ fn track_loop(
             }
             update_retained_media(key, track, &record)?;
         }
+        state.wake_waits();
         if recovering_keyframe && recovery_gates_audio {
             let linked_audio = state
                 .tracks
@@ -6120,6 +6164,7 @@ fn track_loop(
             );
             send_flow_update(key, track);
             advance_projection(&mut state);
+            state.wake_waits();
             drop(state);
             changed.notify_all();
             continue;
@@ -6270,6 +6315,7 @@ fn vector_track_loop(
             // its slot without it.
             track.state.milestones |= MILESTONE_OUTPUT_READY;
             track.retained = track.retained_vector.frame();
+            state.wake_waits();
         }
         flush_overlay_lane(&mut state, key.surface.session);
         if !accepted {
@@ -6647,89 +6693,97 @@ fn spawn_wait(
         enum WaitOutcome {
             Satisfied(Vec<u8>),
             Failed(u64, &'static str),
+            TimedOut,
         }
         let deadline = Instant::now() + Duration::from_micros(timeout_us);
-        loop {
-            let outcome = {
-                let mut state = lock(&shared);
-                let cancelled = state
-                    .sessions
-                    .get_mut(&session_id)
-                    .is_some_and(|session| session.cancelled_waits.remove(&request_id));
-                if cancelled {
-                    Some(WaitOutcome::Failed(
-                        messages::ERROR_CANCELLED,
-                        "track wait was cancelled",
-                    ))
-                } else {
-                    match state.tracks.get(&key) {
-                        None => Some(WaitOutcome::Failed(
-                            messages::ERROR_NOT_FOUND,
-                            "track was destroyed while waiting",
-                        )),
-                        Some(track) if track.state.channel_generation.get() != generation => {
-                            Some(WaitOutcome::Failed(
-                                messages::ERROR_STALE_CHANNEL_GENERATION,
-                                "channel generation changed while waiting",
-                            ))
-                        }
-                        Some(_)
-                            if matches!(condition, 3..=6)
-                                && state
-                                    .surfaces
-                                    .get(&key.surface)
-                                    .and_then(|surface| surface.hold.as_ref())
-                                    .is_some_and(|hold| hold.held) =>
-                        {
-                            Some(WaitOutcome::Failed(
-                                messages::ERROR_NOT_VISIBLE,
-                                "timed surface is held",
-                            ))
-                        }
-                        Some(track) => {
-                            evaluate_wait(track, condition, condition_value).map(|observed| {
-                                match Envelope::new(
-                                    request_id,
-                                    wait_payload(key, track, condition, observed),
-                                )
-                                .encode()
-                                {
-                                    Ok(body) => WaitOutcome::Satisfied(body),
-                                    Err(_) => WaitOutcome::Failed(
-                                        messages::ERROR_BAD_MESSAGE,
-                                        "wait reply encoding failed",
-                                    ),
-                                }
-                            })
-                        }
+        let mut state = lock(&shared);
+        let wait_changed = state.wait_changed.clone();
+        let outcome = loop {
+            let cancelled = state
+                .sessions
+                .get_mut(&session_id)
+                .is_some_and(|session| session.cancelled_waits.remove(&request_id));
+            let outcome = if cancelled {
+                Some(WaitOutcome::Failed(
+                    messages::ERROR_CANCELLED,
+                    "track wait was cancelled",
+                ))
+            } else {
+                match state.tracks.get(&key) {
+                    None => Some(WaitOutcome::Failed(
+                        messages::ERROR_NOT_FOUND,
+                        "track was destroyed while waiting",
+                    )),
+                    Some(track) if track.state.channel_generation.get() != generation => {
+                        Some(WaitOutcome::Failed(
+                            messages::ERROR_STALE_CHANNEL_GENERATION,
+                            "channel generation changed while waiting",
+                        ))
+                    }
+                    Some(_)
+                        if matches!(condition, 3..=6)
+                            && state
+                                .surfaces
+                                .get(&key.surface)
+                                .and_then(|surface| surface.hold.as_ref())
+                                .is_some_and(|hold| hold.held) =>
+                    {
+                        Some(WaitOutcome::Failed(
+                            messages::ERROR_NOT_VISIBLE,
+                            "timed surface is held",
+                        ))
+                    }
+                    Some(track) => {
+                        evaluate_wait(track, condition, condition_value).map(|observed| {
+                            match Envelope::new(
+                                request_id,
+                                wait_payload(key, track, condition, observed),
+                            )
+                            .encode()
+                            {
+                                Ok(body) => WaitOutcome::Satisfied(body),
+                                Err(_) => WaitOutcome::Failed(
+                                    messages::ERROR_BAD_MESSAGE,
+                                    "wait reply encoding failed",
+                                ),
+                            }
+                        })
                     }
                 }
             };
             if let Some(outcome) = outcome {
-                match outcome {
-                    WaitOutcome::Satisfied(body) => {
-                        let _ = writer.write_record(messages::WAIT_SATISFIED, object_id, &body);
-                    }
-                    WaitOutcome::Failed(code, diagnostic) => {
-                        if let Ok(body) = protocol_error(request_id, code, false, diagnostic) {
-                            let _ = writer.write_record(messages::ERROR, object_id, &body);
-                        }
-                    }
-                }
-                break;
+                break outcome;
             }
-            if Instant::now() >= deadline {
-                if let Ok(body) = protocol_error(
-                    request_id,
-                    messages::ERROR_TIMEOUT,
-                    false,
-                    "track wait timed out",
-                ) {
-                    let _ = writer.write_record(messages::ERROR, object_id, &body);
-                }
-                break;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break WaitOutcome::TimedOut;
             }
-            thread::sleep(Duration::from_millis(2));
+            // Park until a mutation calls `State::wake_waits`. Counting parked waits under the
+            // lock lets every mutation skip the notify when nothing waits.
+            state.parked_waits = state.parked_waits.saturating_add(1);
+            state = wait_changed
+                .wait_timeout(state, remaining.min(WAIT_RECHECK_INTERVAL))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+            state.parked_waits = state.parked_waits.saturating_sub(1);
+        };
+        drop(state);
+        let reply = match outcome {
+            WaitOutcome::Satisfied(body) => Ok((messages::WAIT_SATISFIED, body)),
+            WaitOutcome::Failed(code, diagnostic) => {
+                protocol_error(request_id, code, false, diagnostic)
+                    .map(|body| (messages::ERROR, body))
+            }
+            WaitOutcome::TimedOut => protocol_error(
+                request_id,
+                messages::ERROR_TIMEOUT,
+                false,
+                "track wait timed out",
+            )
+            .map(|body| (messages::ERROR, body)),
+        };
+        if let Ok((record_type, body)) = reply {
+            let _ = writer.write_record(record_type, object_id, &body);
         }
         if let Some(session) = lock(&shared).sessions.get_mut(&session_id) {
             session.pending_waits = session.pending_waits.saturating_sub(1);
@@ -7184,6 +7238,7 @@ fn retire_held_decoder(state: &mut State, key: TrackKey) {
         if let Some(writer) = track.channel_writer.take() {
             writer.close();
         }
+        state.wake_waits();
         return;
     };
     track.hold_pause_decoder = Some(track.decoder_reset_serial);
@@ -7281,6 +7336,7 @@ fn set_playback_hold(state: &mut State, key: SurfaceKey, held: bool, reason: u64
             .write_record(messages::PLAYBACK_HOLD, key.surface, &body);
     }
     state.surfaces.get_mut(&key).unwrap().hold = Some(hold);
+    state.wake_waits();
 }
 
 fn track_status_payload(
@@ -7419,6 +7475,7 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
         .tracks
         .remove(&key)
         .expect("track existence checked above");
+    state.wake_waits();
     if let Some(surface) = state.surfaces.get_mut(&key.surface) {
         let slots = surface.active_slots.len();
         surface
@@ -7522,6 +7579,7 @@ fn cleanup_session(state: &mut State, session: u64) {
     state
         .projected_sources
         .retain(|source| source.producer != session);
+    state.wake_waits();
 }
 
 fn suspend_session(
@@ -7584,6 +7642,7 @@ fn suspend_session(
         }
         let _ = track.state.detach();
     }
+    state.wake_waits();
     state
         .deliveries
         .retain(|_, delivery| delivery.track.surface.session != session_id);
@@ -9953,6 +10012,66 @@ mod tests {
         ));
         audio_writer.join().unwrap();
         video_writer.join().unwrap();
+        client.close().unwrap();
+    }
+
+    /// A parked track wait completes on the mutation that satisfies it, not on its periodic
+    /// recheck. The outer playback report is a presenter API call rather than a control record, so
+    /// only an explicit wake from that call can complete the wait promptly.
+    #[test]
+    fn a_parked_track_wait_wakes_on_the_mutation_that_satisfies_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start_eventless(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client = crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let track = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let source = BridgeSourceKey {
+            producer: client.info().session_id,
+            context,
+            surface: 9,
+            track: 11,
+        };
+        let decoder_reset_serial =
+            lock(&presenter.state).tracks[&inner_track_key(source)].decoder_reset_serial;
+
+        thread::scope(|scope| {
+            let wait = scope.spawn(|| {
+                client.wait_track(
+                    &track,
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_BUFFERED_ENDED),
+                    5_000_000,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while lock(&presenter.state).parked_waits == 0 {
+                assert!(Instant::now() < deadline, "the track wait never parked");
+                thread::yield_now();
+            }
+            let satisfied_at = Instant::now();
+            presenter.apply_outer_playback(source, decoder_reset_serial, 0, 2);
+            let satisfied = wait.join().unwrap().unwrap();
+            assert!(
+                satisfied_at.elapsed() < WAIT_RECHECK_INTERVAL / 2,
+                "the wait completed on its recheck interval instead of on the wake"
+            );
+            assert_ne!(
+                satisfied.observed_value.unwrap() & MILESTONE_BUFFERED_ENDED,
+                0
+            );
+        });
+        assert_eq!(lock(&presenter.state).parked_waits, 0);
         client.close().unwrap();
     }
 

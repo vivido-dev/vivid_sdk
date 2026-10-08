@@ -26,7 +26,8 @@ pub struct Track {
 #[derive(Clone)]
 pub(crate) struct TrackLocal {
     pub(crate) playback_hold: Option<PlaybackHold>,
-    pub(crate) configuration: TrackConfiguration,
+    /// Shared so that the send path can read it per record without cloning it.
+    pub(crate) configuration: Arc<TrackConfiguration>,
     pub(crate) vector_limits: Option<vivid_protocol::vector::Limits>,
     pub(crate) revision: TrackRevision,
     pub(crate) channel_generation: ChannelGeneration,
@@ -142,7 +143,12 @@ impl Track {
     }
 
     pub fn configuration(&self) -> io::Result<TrackConfiguration> {
-        Ok(lock(&self.inner, "track")?.configuration.clone())
+        Ok(TrackConfiguration::clone(&*self.shared_configuration()?))
+    }
+
+    /// The immutable configuration without copying it, for per-record send paths.
+    pub(crate) fn shared_configuration(&self) -> io::Result<Arc<TrackConfiguration>> {
+        Ok(Arc::clone(&lock(&self.inner, "track")?.configuration))
     }
 
     pub fn effective_claims(&self) -> io::Result<PayloadMap> {
@@ -430,7 +436,7 @@ impl Session {
         }
         let inner = Arc::new(Mutex::new(TrackLocal {
             playback_hold: None,
-            configuration,
+            configuration: Arc::new(configuration),
             vector_limits: self.info.vector_limits.clone(),
             revision: ready.revision,
             channel_generation: ready.generation,

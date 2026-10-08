@@ -14,7 +14,7 @@ use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_protocol::messages::{ChannelOpen, Envelope, TrackKind};
 use vivid_protocol::resource::{ChannelFlow, ResourceError, TokenBucket};
 use vivid_protocol::revision::{ChannelGeneration, TrackRevision};
-use vivid_protocol::track::{KindConfiguration, TrackConfiguration};
+use vivid_protocol::track::{KindConfiguration, RasterConfiguration, TrackConfiguration};
 use vivid_protocol::wire::{Connection, ConnectionReader, ConnectionWriter};
 use vivid_protocol::{media, messages};
 
@@ -279,7 +279,7 @@ impl TrackChannel {
         if let Some(reader) = reader {
             spawn_channel_reader(
                 reader,
-                snapshot.configuration.clone(),
+                TrackConfiguration::clone(&snapshot.configuration),
                 snapshot.channel_generation,
                 flow.clone(),
                 media.clone(),
@@ -338,7 +338,7 @@ impl TrackChannel {
 
     /// Grant the initial bounded receive window, or replenish capacity after consumption.
     pub fn grant_audio_input(&self) -> io::Result<()> {
-        let configuration = self.track.configuration()?;
+        let configuration = self.track.shared_configuration()?;
         if configuration.direction != TrackDirection::Uplink {
             return Err(invalid_input("audio input credit requires an uplink track"));
         }
@@ -517,21 +517,15 @@ impl TrackChannel {
         if self.track.kind() != TrackKind::Video {
             return Err(invalid_input("VIDEO_PACKET requires a video track"));
         }
-        let body = media::video_packet_body(VideoPacket {
-            epoch: packet.epoch,
-            packet_id: packet.packet_id,
-            pts_us: packet.pts_us,
-            dts_us: packet.dts_us,
-            duration_us: packet.duration_us,
-            key: packet.key,
-            data: packet.data,
-        })?;
+        // The prefix validates the packet; its payload reaches the transport without a copy.
+        let prefix = media::video_packet_prefix(&packet)?;
         self.send_media(
             messages::VIDEO_PACKET,
             packet.packet_id,
             packet.epoch,
             packet.key,
-            &body,
+            &[&prefix, packet.data],
+            None,
         )
     }
 
@@ -539,22 +533,14 @@ impl TrackChannel {
         if self.track.kind() != TrackKind::Audio {
             return Err(invalid_input("AUDIO_PACKET requires an audio track"));
         }
-        let body = media::audio_packet_body(AudioPacket {
-            epoch: packet.epoch,
-            packet_id: packet.packet_id,
-            pts_us: packet.pts_us,
-            dts_us: packet.dts_us,
-            duration_us: packet.duration_us,
-            trim_start_samples: packet.trim_start_samples,
-            trim_end_samples: packet.trim_end_samples,
-            data: packet.data,
-        })?;
+        let prefix = media::audio_packet_prefix(&packet)?;
         self.send_media(
             messages::AUDIO_PACKET,
             packet.packet_id,
             packet.epoch,
             true,
-            &body,
+            &[&prefix, packet.data],
+            None,
         )
     }
 
@@ -565,11 +551,14 @@ impl TrackChannel {
         rgba: &[u8],
         compress: bool,
     ) -> io::Result<u64> {
-        let configuration = self.track.configuration()?;
-        let KindConfiguration::Raster(raster) = configuration.kind else {
+        let configuration = self.track.shared_configuration()?;
+        let KindConfiguration::Raster(raster) = &configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
-        if compress && !raster.zstd_enabled {
+        if !compress {
+            return self.send_raw_raster(epoch, frame_id, raster, rgba);
+        }
+        if !raster.zstd_enabled {
             return Err(invalid_input(
                 "track configuration did not permit zstd raster frames",
             ));
@@ -580,9 +569,43 @@ impl TrackChannel {
             raster.width,
             raster.height,
             rgba,
-            compress,
+            true,
         )?;
-        self.send_media(messages::RASTER_FRAME, frame_id, epoch, true, &body)
+        self.send_media(
+            messages::RASTER_FRAME,
+            frame_id,
+            epoch,
+            true,
+            &[&body],
+            None,
+        )
+    }
+
+    /// Send a full uncompressed frame as its prefix followed by the caller's pixels.
+    ///
+    /// The pixels are written straight from `rgba`, so a raw frame never copies the framebuffer.
+    fn send_raw_raster(
+        &self,
+        epoch: u32,
+        frame_id: u64,
+        raster: &RasterConfiguration,
+        rgba: &[u8],
+    ) -> io::Result<u64> {
+        let prefix = media::raster_full_frame_prefix(
+            epoch,
+            frame_id,
+            raster.width,
+            raster.height,
+            rgba.len(),
+        )?;
+        self.send_media(
+            messages::RASTER_FRAME,
+            frame_id,
+            epoch,
+            true,
+            &[&prefix, rgba],
+            None,
+        )
     }
 
     /// Send a full raster frame using zstd only when the negotiated track permits it and the
@@ -592,8 +615,8 @@ impl TrackChannel {
     /// the raw framebuffer size. An incompressible zstd frame can be slightly larger than that
     /// claim, while a raw fallback is always admissible.
     pub fn send_raster_adaptive(&self, epoch: u32, frame_id: u64, rgba: &[u8]) -> io::Result<u64> {
-        let configuration = self.track.configuration()?;
-        let KindConfiguration::Raster(raster) = configuration.kind else {
+        let configuration = self.track.shared_configuration()?;
+        let KindConfiguration::Raster(raster) = &configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
         if raster.zstd_enabled {
@@ -611,10 +634,18 @@ impl TrackChannel {
             )
             .map_err(|_| invalid_input("raw raster body exceeds address space"))?;
             if compressed.len() < raw_length {
-                return self.send_media(messages::RASTER_FRAME, frame_id, epoch, true, &compressed);
+                return self.send_media(
+                    messages::RASTER_FRAME,
+                    frame_id,
+                    epoch,
+                    true,
+                    &[&compressed],
+                    None,
+                );
             }
         }
-        self.send_raster(epoch, frame_id, rgba, false)
+        // Falling back costs only the prefix: the raw pixels are never re-encoded or copied.
+        self.send_raw_raster(epoch, frame_id, raster, rgba)
     }
 
     #[expect(
@@ -640,7 +671,14 @@ impl TrackChannel {
             operations,
             compress,
         )?;
-        self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
+        self.send_media(
+            messages::RASTER_FRAME,
+            frame_id,
+            epoch,
+            false,
+            &[&body],
+            None,
+        )
     }
 
     /// Send a raster delta using zstd only when every negotiated constraint permits it and the
@@ -663,8 +701,8 @@ impl TrackChannel {
             operations,
             false,
         )?;
-        let configuration = self.track.configuration()?;
-        let KindConfiguration::Raster(raster) = configuration.kind else {
+        let configuration = self.track.shared_configuration()?;
+        let KindConfiguration::Raster(raster) = &configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
         let body = if raster.zstd_enabled {
@@ -685,7 +723,14 @@ impl TrackChannel {
         } else {
             raw
         };
-        self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
+        self.send_media(
+            messages::RASTER_FRAME,
+            frame_id,
+            epoch,
+            false,
+            &[&body],
+            None,
+        )
     }
 
     #[expect(
@@ -702,8 +747,15 @@ impl TrackChannel {
         operations: &[RasterDeltaOperation<'_>],
         compress: bool,
     ) -> io::Result<Vec<u8>> {
-        let state = lock(&self.track.inner, "track")?.clone();
-        let KindConfiguration::Raster(raster) = state.configuration.kind else {
+        // Read only the two fields this needs; the track state also holds the claim map.
+        let (configuration, delta_operation_limit) = {
+            let state = lock(&self.track.inner, "track")?;
+            (
+                Arc::clone(&state.configuration),
+                state.delta_operation_limit,
+            )
+        };
+        let KindConfiguration::Raster(raster) = &configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
         if compress && !raster.zstd_enabled {
@@ -711,7 +763,7 @@ impl TrackChannel {
                 "track configuration did not permit zstd raster frames",
             ));
         }
-        if !raster.delta_enabled || state.delta_operation_limit == 0 {
+        if !raster.delta_enabled || delta_operation_limit == 0 {
             return Err(invalid_input(
                 "track configuration did not permit raster deltas",
             ));
@@ -734,7 +786,7 @@ impl TrackChannel {
             duration_us,
             raster.width,
             raster.height,
-            state.delta_operation_limit,
+            delta_operation_limit,
             operations,
             compress,
         )
@@ -743,8 +795,8 @@ impl TrackChannel {
     pub fn send_image(&self, encoded: &[u8]) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
-        let configuration = self.track.configuration()?;
-        let KindConfiguration::EncodedImage(image) = configuration.kind else {
+        let configuration = self.track.shared_configuration()?;
+        let KindConfiguration::EncodedImage(image) = &configuration.kind else {
             return Err(invalid_input("IMAGE_DATA requires an encoded-image track"));
         };
         if encoded.len() != image.encoded_length as usize {
@@ -764,14 +816,8 @@ impl TrackChannel {
             }
             state.recovery_revision
         };
-        let body_length =
-            u32::try_from(encoded.len()).map_err(|_| invalid_input("image body exceeds u32"))?;
-        let sequence = self.write_charged_record(
-            messages::IMAGE_DATA,
-            configuration.track_id,
-            body_length,
-            encoded,
-        )?;
+        let sequence =
+            self.write_charged_record(messages::IMAGE_DATA, configuration.track_id, &[encoded])?;
         let mut state = lock(&self.media, "channel media state")?;
         state.last_sequence = sequence;
         if state.recovery_revision == recovery_revision {
@@ -792,8 +838,8 @@ impl TrackChannel {
             .canvas
             .validate_with_limits(&limits)
             .map_err(|e| invalid_input(e.to_string()))?;
-        let configuration = self.track.configuration()?;
-        let KindConfiguration::VectorScene(vector) = configuration.kind else {
+        let configuration = self.track.shared_configuration()?;
+        let KindConfiguration::VectorScene(vector) = &configuration.kind else {
             return Err(invalid_input("VECTOR_FRAME requires a vector-scene track"));
         };
         let body = frame.encode().map_err(|e| invalid_input(e.to_string()))?;
@@ -812,7 +858,8 @@ impl TrackChannel {
             frame.revision,
             frame.epoch,
             true,
-            &body,
+            &[&body],
+            Some(frame),
         )
     }
 
@@ -821,7 +868,7 @@ impl TrackChannel {
     pub fn send_vector_asset(&self, asset: &vivid_protocol::vector::ImageAsset) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
-        let configuration = self.track.configuration()?;
+        let configuration = self.track.shared_configuration()?;
         if !matches!(configuration.kind, KindConfiguration::VectorScene(_)) {
             return Err(invalid_input("VECTOR_ASSET requires a vector-scene track"));
         }
@@ -865,14 +912,8 @@ impl TrackChannel {
             }
         }
         let body = asset.encode().map_err(|e| invalid_input(e.to_string()))?;
-        let body_length =
-            u32::try_from(body.len()).map_err(|_| invalid_input("asset body exceeds u32"))?;
-        let sequence = self.write_charged_record(
-            messages::VECTOR_ASSET,
-            configuration.track_id,
-            body_length,
-            &body,
-        )?;
+        let sequence =
+            self.write_charged_record(messages::VECTOR_ASSET, configuration.track_id, &[&body])?;
         // Assets are ordered before EOS, but do not consume a scene revision or satisfy readiness.
         let mut media = lock(&self.media, "channel media state")?;
         media.last_sequence = sequence;
@@ -886,7 +927,7 @@ impl TrackChannel {
     pub fn release_vector_asset(&self, id: u64) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
-        let configuration = self.track.configuration()?;
+        let configuration = self.track.shared_configuration()?;
         let bytes = {
             let media = lock(&self.media, "channel media state")?;
             if media.eos {
@@ -903,8 +944,7 @@ impl TrackChannel {
         let sequence = self.write_charged_record(
             messages::VECTOR_ASSET_RELEASE,
             configuration.track_id,
-            8,
-            &body,
+            &[&body],
         )?;
         let mut media = lock(&self.media, "channel media state")?;
         media.last_sequence = sequence;
@@ -916,7 +956,7 @@ impl TrackChannel {
     pub fn eos(&self) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
-        let configuration = self.track.configuration()?;
+        let configuration = self.track.shared_configuration()?;
         if configuration.direction == TrackDirection::Uplink {
             return Err(invalid_input("only the presenter may send uplink EOS"));
         }
@@ -964,19 +1004,22 @@ impl TrackChannel {
         self.writer.shutdown()
     }
 
+    /// Send one media record whose body is the concatenation of `body`.
+    ///
+    /// `scene` is the frame a `VECTOR_FRAME` body encodes. Its image references are checked
+    /// against the retained assets under the same send order that releases them.
     pub(crate) fn send_media(
         &self,
         record_type: u16,
         media_id: u64,
         epoch: u32,
         recovery_unit: bool,
-        body: &[u8],
+        body: &[&[u8]],
+        scene: Option<&vivid_protocol::vector::Frame>,
     ) -> io::Result<u64> {
         self.lifecycle.ensure_active()?;
         let _send_order = lock(&self.send_order, "channel send order")?;
-        let body_length =
-            u32::try_from(body.len()).map_err(|_| invalid_input("media body exceeds u32"))?;
-        let configuration = self.track.configuration()?;
+        let configuration = self.track.shared_configuration()?;
         let recovery_revision = {
             if configuration.direction == TrackDirection::Uplink {
                 return Err(invalid_input("only the presenter may send uplink media"));
@@ -985,9 +1028,7 @@ impl TrackChannel {
             if media_state.eos {
                 return Err(invalid_input("media cannot follow CHANNEL_EOS"));
             }
-            if record_type == messages::VECTOR_FRAME {
-                let frame =
-                    vivid_protocol::vector::Frame::decode(body).map_err(|e| invalid_input(e.0))?;
+            if let Some(frame) = scene {
                 for command in frame.canvas.commands() {
                     if let vivid_protocol::vector::Command::Image { asset, .. } = command
                         && !media_state.vector_assets.contains_key(asset)
@@ -1020,8 +1061,7 @@ impl TrackChannel {
         // the observer the producer needs in order to issue that PLAY and unblock its own write.
         let mut next_sequence = *lock(&self.track_sequence, "track media sequence")?;
         next_sequence.accept(media_id, epoch)?;
-        let sequence =
-            self.write_charged_record(record_type, configuration.track_id, body_length, body)?;
+        let sequence = self.write_charged_record(record_type, configuration.track_id, body)?;
         {
             // Merge rather than overwrite: a control reply may have reconciled the presenter's
             // view while this record was in transport, and both are monotone progress.
@@ -1039,13 +1079,22 @@ impl TrackChannel {
         Ok(sequence)
     }
 
+    /// Charge rate and flow for one record whose body is the concatenation of `body`, then write
+    /// it without joining the parts.
     pub(crate) fn write_charged_record(
         &self,
         record_type: u16,
         object_id: u64,
-        body_length: u32,
-        body: &[u8],
+        body: &[&[u8]],
     ) -> io::Result<u64> {
+        let body_length = body
+            .iter()
+            .try_fold(0_u32, |length, part| {
+                u32::try_from(part.len())
+                    .ok()
+                    .and_then(|part| length.checked_add(part))
+            })
+            .ok_or_else(|| invalid_input("record body exceeds u32"))?;
         let rate_started = Instant::now();
         self.wait_for_rate(body_length)?;
         let rate_limited = rate_started.elapsed();
@@ -1074,7 +1123,9 @@ impl TrackChannel {
                     state.flow = admitted;
                     drop(state);
                     let transport_started = Instant::now();
-                    let result = self.writer.write_record(record_type, 0, object_id, body);
+                    let result = self
+                        .writer
+                        .write_record_parts(record_type, 0, object_id, body);
                     if result.is_ok() {
                         self.record_send_pressure(SendPressure {
                             rate_limited,

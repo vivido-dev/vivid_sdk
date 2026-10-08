@@ -1,6 +1,6 @@
 [package]
 name = "vivid_sdk"
-version = "1.5.10"
+version = "1.5.11"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.95"
@@ -62,6 +62,13 @@ tempfile = "3"
 # The conformance example prints JSON that a cross-language runner reads; nothing in the crate
 # itself depends on serde.
 serde_json = "1"
+
+# A std-only send-path benchmark: `cargo bench --bench send`. The adaptive raster scenarios need
+# zstd.
+[[bench]]
+name = "send"
+harness = false
+required-features = ["native-media"]
 
 [[example]]
 name = "conformance"
