@@ -11,11 +11,11 @@ use vivid_protocol::file_drop::{
     MaximumFileData, QueryFileDrop,
 };
 use vivid_protocol::messages;
+use vivid_protocol::registry::record as records;
 use vivid_protocol::revision::{
     FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration,
 };
 use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionReader, ConnectionWriter};
-use vivid_protocol::{auth, registry::record as records};
 
 use crate::*;
 
@@ -509,24 +509,7 @@ impl Session {
         }
         let mut nonce = [0; file_drop::FILE_TRANSFER_NONCE_BYTES];
         random_bytes(&mut nonce)?;
-        let tag = auth::file_transfer_tag(
-            self.channel_key.expose(),
-            self.info.session_id,
-            request.context_id,
-            request.surface_id,
-            request.producer_epoch.get(),
-            request.grant_generation.get(),
-            request.surface_generation.get(),
-            request.drop_id,
-            request.transfer_id,
-            request.transfer_generation.get(),
-            request.resume_offset,
-            request.maximum_record_body,
-            request.maximum_body_bytes,
-            request.maximum_records,
-            &nonce,
-        );
-        let open = FileTransferOpen {
+        let mut open = FileTransferOpen {
             session_id: self.info.session_id,
             context_id: request.context_id,
             surface_id: request.surface_id,
@@ -541,8 +524,9 @@ impl Session {
             maximum_body_bytes: request.maximum_body_bytes,
             maximum_records: request.maximum_records,
             client_nonce: nonce,
-            authentication_tag: tag,
+            authentication_tag: [0; file_drop::FILE_TRANSFER_TAG_BYTES],
         };
+        open.sign(self.channel_key.expose());
         let mut connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
                 &directory.join(format!(

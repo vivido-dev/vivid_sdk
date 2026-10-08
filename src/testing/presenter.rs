@@ -1376,18 +1376,7 @@ fn serve_track_channel(
     }
     let open = messages::ChannelOpen::decode(open_record.object_id, &open_record.body)
         .map_err(io::Error::other)?;
-    let expected = auth::channel_tag(
-        channel_key.expose(),
-        open.session_id,
-        open.context_id,
-        open.surface_id,
-        open.track_id,
-        open.channel_generation,
-        open.track_kind as u32,
-        open.lane as u32,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected, &open.authentication_tag) {
+    if !open.verify(channel_key.expose()) {
         return Err(io::Error::other("CHANNEL_OPEN authentication tag failed"));
     }
 

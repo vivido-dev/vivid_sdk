@@ -859,10 +859,8 @@ impl OverlayWindow {
 // The presenter component is a producer-local namespace marker, never transmitted. The host
 // substitutes its authenticated owner; parent handles are additionally checked by Arc identity.
 fn owner(session: &Session) -> SessionIdentity {
-    SessionIdentity {
-        presenter: PresenterInstanceId([0; 16]),
-        session_id: session.info().session_id,
-    }
+    SessionIdentity::new(PresenterInstanceId([0; 16]), session.info().session_id)
+        .expect("WELCOME decoding rejects a zero session ID")
 }
 fn closed() -> io::Error {
     io::Error::new(

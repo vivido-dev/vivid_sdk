@@ -1812,9 +1812,9 @@ impl VirtualVivid {
                     .and_then(|identity| state.overlays.window(identity))
                     .map(|window| SnapshotOverlayWindow {
                         parent: window.options.parent.map(|parent| BridgeSurfaceKey {
-                            producer: parent.context.session.session_id,
-                            context: parent.context.context_id,
-                            surface: parent.surface_id,
+                            producer: parent.context().session().session_id(),
+                            context: parent.context().context_id(),
+                            surface: parent.surface_id(),
                         }),
                         min_width: window.options.min_width.get().round() as i64,
                         min_height: window.options.min_height.get().round() as i64,
@@ -3678,7 +3678,7 @@ fn establish_session(
     let identity = SessionIdentity::new(state.presenter, session_id).map_err(io::Error::other)?;
     let root_context = match leased_context {
         Some(context) => context,
-        None => identity.context(1).map_err(io::Error::other)?.context_id,
+        None => identity.context(1).map_err(io::Error::other)?.context_id(),
     };
     let mut server_nonce = [0_u8; auth::NONCE_BYTES];
     let mut session_tag = [0_u8; messages::SESSION_TAG_BYTES];
@@ -5631,18 +5631,7 @@ fn handle_track(
                 "session is no longer live",
             ));
         }
-        let expected = auth::channel_tag(
-            session.channel_key.expose(),
-            open.session_id,
-            open.context_id,
-            open.surface_id,
-            open.track_id,
-            open.channel_generation,
-            open.track_kind as u32,
-            open.lane as u32,
-            &open.client_nonce,
-        );
-        if !auth::verify_tag(&expected, &open.authentication_tag) {
+        if !open.verify(session.channel_key.expose()) {
             writer.write_record(
                 messages::ERROR,
                 open.track_id,

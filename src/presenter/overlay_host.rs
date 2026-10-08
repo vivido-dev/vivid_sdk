@@ -178,11 +178,14 @@ fn measurement_of(text: &StyledText) -> TextMeasurement {
 
 /// The producer names its own session with a placeholder presenter instance, so the presenter
 /// side must derive the identical identity or every window would key to a different owner.
+///
+/// # Panics
+///
+/// Panics on a zero `session_id`; the presenter allocates session IDs from 1 and resume decoding
+/// rejects zero, so every live session ID is nonzero.
 pub(crate) fn owner(session_id: u64) -> SessionIdentity {
-    SessionIdentity {
-        presenter: PresenterInstanceId([0; 16]),
-        session_id,
-    }
+    SessionIdentity::new(PresenterInstanceId([0; 16]), session_id)
+        .expect("live presenter session IDs are nonzero")
 }
 
 impl Overlays {
@@ -347,7 +350,7 @@ impl Overlays {
             let object_id = input.address.surface_id;
             if let Ok(payload) = input.payload() {
                 self.queue_for(
-                    owner.session_id,
+                    owner.session_id(),
                     LaneRecord {
                         record_type: messages::OVERLAY_INPUT_EVENT,
                         object_id,
@@ -795,8 +798,8 @@ impl Overlays {
         }
         let event = vivid_protocol::overlay::wire::InputEvent {
             address: vivid_protocol::overlay::wire::WindowAddress {
-                context_id: window.context.context_id,
-                surface_id: window.surface_id,
+                context_id: window.context().context_id(),
+                surface_id: window.surface_id(),
                 generation: current.generation,
             },
             scene_revision: self
@@ -809,10 +812,10 @@ impl Overlays {
             return false;
         };
         self.queue_for(
-            window.context.session.session_id,
+            window.context().session().session_id(),
             LaneRecord {
                 record_type: messages::OVERLAY_INPUT_EVENT,
-                object_id: window.surface_id,
+                object_id: window.surface_id(),
                 payload,
             },
         );
@@ -973,8 +976,8 @@ impl Overlays {
         let result = SubmissionOutcome {
             submission: Submission {
                 address: WindowAddress {
-                    context_id: window.context.context_id,
-                    surface_id: window.surface_id,
+                    context_id: window.context().context_id(),
+                    surface_id: window.surface_id(),
                     generation: state.generation,
                 },
                 track_id,
@@ -986,10 +989,10 @@ impl Overlays {
         };
         if let Ok(payload) = result.payload() {
             self.queue_for(
-                window.context.session.session_id,
+                window.context().session().session_id(),
                 LaneRecord {
                     record_type: messages::OVERLAY_SUBMISSION_OUTCOME,
-                    object_id: window.surface_id,
+                    object_id: window.surface_id(),
                     payload,
                 },
             );
@@ -1044,18 +1047,18 @@ impl Overlays {
         self.windows.revoke_owner(owner);
         self.tracks.retain(|(session, _), _| *session != session_id);
         self.displayed
-            .retain(|id, _| id.context.session.session_id != session_id);
+            .retain(|id, _| id.context().session().session_id() != session_id);
         self.accepted
-            .retain(|id, _| id.context.session.session_id != session_id);
+            .retain(|id, _| id.context().session().session_id() != session_id);
         self.assets
             .retain(|(session, _, _), _| *session != session_id);
         self.highest_asset
             .retain(|(session, _), _| *session != session_id);
         self.semantics
-            .retain(|id, _| id.context.session.session_id != session_id);
+            .retain(|id, _| id.context().session().session_id() != session_id);
         if self
             .last_gesture
-            .is_some_and(|(id, _)| id.context.session.session_id == session_id)
+            .is_some_and(|(id, _)| id.context().session().session_id() == session_id)
         {
             self.last_gesture = None;
         }
@@ -1112,7 +1115,7 @@ impl Overlays {
     fn scenes_of(&self, sessions: &[u64]) -> Vec<PresentedScene> {
         self.displayed
             .values()
-            .filter(|scene| sessions.contains(&scene.window.context.session.session_id))
+            .filter(|scene| sessions.contains(&scene.window.context().session().session_id()))
             .cloned()
             .collect()
     }
@@ -1129,7 +1132,7 @@ impl Overlays {
     pub(crate) fn focus_belongs_to(&self, sessions: &[u64]) -> bool {
         self.windows
             .focus()
-            .is_some_and(|id| sessions.contains(&id.context.session.session_id))
+            .is_some_and(|id| sessions.contains(&id.context().session().session_id()))
     }
 
     /// Deliver a pointer event through the same hit test a real host performs, against the
@@ -1219,7 +1222,7 @@ impl Overlays {
         } else {
             self.windows.focus()
         };
-        if !moved.is_some_and(|id| sessions.contains(&id.context.session.session_id)) {
+        if !moved.is_some_and(|id| sessions.contains(&id.context().session().session_id())) {
             return;
         }
         self.windows.set_pane_focus(focused);

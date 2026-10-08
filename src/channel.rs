@@ -16,7 +16,7 @@ use vivid_protocol::resource::{ChannelFlow, ResourceError, TokenBucket};
 use vivid_protocol::revision::{ChannelGeneration, TrackRevision};
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration};
 use vivid_protocol::wire::{Connection, ConnectionReader, ConnectionWriter};
-use vivid_protocol::{auth, media, messages};
+use vivid_protocol::{media, messages};
 
 use crate::*;
 
@@ -1172,18 +1172,7 @@ impl Session {
         };
         let mut nonce = [0; 16];
         random_bytes(&mut nonce)?;
-        let tag = auth::channel_tag(
-            self.channel_key.expose(),
-            self.info.session_id,
-            state.configuration.context_id,
-            state.configuration.surface_id,
-            state.configuration.track_id,
-            state.channel_generation.get(),
-            state.configuration.kind.kind() as u32,
-            state.configuration.lane as u32,
-            &nonce,
-        );
-        let open = ChannelOpen {
+        let mut open = ChannelOpen {
             session_id: self.info.session_id,
             context_id: state.configuration.context_id,
             surface_id: state.configuration.surface_id,
@@ -1192,8 +1181,9 @@ impl Session {
             track_kind: state.configuration.kind.kind(),
             lane: state.configuration.lane,
             client_nonce: nonce,
-            authentication_tag: tag,
+            authentication_tag: [0; 16],
         };
+        open.sign(self.channel_key.expose());
         let open_body = messages::encode_payload(1, open.payload())?;
         let connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
