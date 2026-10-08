@@ -18,7 +18,7 @@ SDK rather than a reimplementation: constants, resource claims, and image contai
 come from Rust, so it cannot disagree with the Rust, Python, or TypeScript packages about a wire
 value, and the [conformance check](conformance/README.md) compares it with them.
 
-LuaJIT, Lua 5.1, 5.2, 5.3, 5.4, and 5.5 are supported, one per build. Rust 1.88+ is required.
+LuaJIT, Lua 5.1, 5.2, 5.3, 5.4, and 5.5 are supported, one per build. Rust 1.95+ is required.
 
 ## Building
 

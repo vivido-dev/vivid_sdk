@@ -19,7 +19,7 @@ helpers, then learn the explicit surface/track lifecycle and the terminating pre
 
 Run every command below from the SDK directory, `vivid_sdk/`. This repository uses a sibling
 `../vivid_protocol` checkout; use the protocol revision required by the SDK's current `dev`.
-Rust requires 1.88 or newer. Python requires 3.9 or newer. Use Node 22.20+ for the native
+Rust requires 1.95 or newer. Python requires 3.9 or newer. Use Node 22.20+ for the native
 TypeScript build tools; these examples do not require Bun or browser support.
 
 Examples 01â€“05, 07 and 08 run **inside a Vivid-enabled Vivido pane**, inheriting `VIVID_ENDPOINT_CONTROL`,

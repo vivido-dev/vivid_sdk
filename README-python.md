@@ -5,7 +5,7 @@ See [pane overlays](OVERLAYS.md) for interactive windows, submission receipts, a
 See the [progressive examples](examples/README.md) for six runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
 `vivid-sdk` is the typed Python SDK for Vivid Protocol 1.5, for both roles. Python 3.9+ and Rust
-1.88+ are required.
+1.95+ are required.
 
 The module namespace produces media; `vivid_sdk.presenter` accepts it. One wheel carries both, so a
 Python program can be either end of a session — or, as the tests do, both at once.

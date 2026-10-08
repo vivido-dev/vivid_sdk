@@ -2,7 +2,7 @@
 name = "vivid-sdk-node"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "Apache-2.0"
 description = "Private napi-rs extension for the @vivido/vivid-sdk TypeScript package"
 repository = "https://github.com/vivido-dev/vivid_sdk"

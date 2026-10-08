@@ -1199,14 +1199,14 @@ fn build_surface_config(
     if let Some(policy) = optional(config, "policy")? {
         builder = builder.policy(policy);
     }
-    if let Some(parameters) = config.get_item("desktop_parameters")? {
-        if !parameters.is_none() {
-            let parameters = parameters
-                .cast::<PyDict>()
-                .map_err(|_| PyValueError::new_err("desktop_parameters must be a dict"))?;
-            let encoded = parse_desktop_parameters(Some(parameters.clone().into_any()))?;
-            builder = builder.profile_parameters(encoded);
-        }
+    if let Some(parameters) = config.get_item("desktop_parameters")?
+        && !parameters.is_none()
+    {
+        let parameters = parameters
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("desktop_parameters must be a dict"))?;
+        let encoded = parse_desktop_parameters(Some(parameters.clone().into_any()))?;
+        builder = builder.profile_parameters(encoded);
     }
     let definition = builder.build().map_err(io_error)?;
     let dict = PyDict::new(py);
@@ -2528,10 +2528,10 @@ fn contract_to_array(contract: &ResourceContract) -> Vec<u64> {
     let mut values = vec![0_u64; RESOURCE_COUNT];
     if let Value::Map(entries) = contract.to_value() {
         for (key, value) in entries {
-            if let (Ok(index), Some(number)) = (usize::try_from(key), value.as_u64()) {
-                if index < RESOURCE_COUNT {
-                    values[index] = number;
-                }
+            if let (Ok(index), Some(number)) = (usize::try_from(key), value.as_u64())
+                && index < RESOURCE_COUNT
+            {
+                values[index] = number;
             }
         }
     }
