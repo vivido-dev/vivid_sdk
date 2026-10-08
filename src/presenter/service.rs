@@ -80,6 +80,7 @@ pub enum KeyframeRequestOutcome {
     Ignored,
 }
 
+#[derive(Debug)]
 pub struct OuterMediaProjection<'a> {
     pub compatibility_revision: u64,
     pub apply_sequence: u64,
@@ -440,7 +441,6 @@ pub struct SnapshotSource {
     pub playing: bool,
     pub play_request: PlayRequest,
     pub eos_epoch: Option<u32>,
-    #[allow(dead_code)]
     pub last_inner_record_sequence: u64,
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     pub capture_policy: u64,
@@ -849,6 +849,15 @@ pub struct VirtualVivid {
     media_events: Mutex<Option<mpsc::Receiver<MediaEvent>>>,
 }
 
+impl std::fmt::Debug for VirtualVivid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VirtualVivid")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VirtualVivid {
     pub fn pane_for_overlay_surface(&self, surface: BridgeSurfaceKey) -> Option<PaneId> {
         let state = lock(&self.state);
@@ -996,7 +1005,6 @@ impl VirtualVivid {
         advance_projection(&mut state);
     }
 
-    #[allow(dead_code)]
     pub fn start<L: PresenterListener>(listener: L, config: MediaConfig) -> io::Result<Self> {
         Self::start_configured(listener, PresenterConfig::terminal(config), None)
     }
@@ -1608,7 +1616,6 @@ impl VirtualVivid {
         std::mem::take(&mut lock(&self.state).play_commands)
     }
 
-    #[allow(dead_code)]
     pub fn projection_snapshot(&self, panes: &HashSet<PaneId>) -> ProjectionSnapshot {
         self.projection_snapshot_inner(panes, &HashMap::new(), Some(true))
     }
@@ -5466,6 +5473,30 @@ impl Drop for MicrophoneEndpoint {
     }
 }
 
+/// Write progress the microphone relay publishes to its deadline watchdog.
+#[derive(Default)]
+struct RelayProgress {
+    writing_since: Option<Instant>,
+    finished: bool,
+}
+
+/// The relay's side of [`RelayProgress`]. Dropping it, by return or panic, ends the watchdog.
+struct RelayWatch(Arc<(Mutex<RelayProgress>, Condvar)>);
+
+impl RelayWatch {
+    fn writing(&self, since: Option<Instant>) {
+        lock(&self.0.0).writing_since = since;
+        self.0.1.notify_all();
+    }
+}
+
+impl Drop for RelayWatch {
+    fn drop(&mut self) {
+        lock(&self.0.0).finished = true;
+        self.0.1.notify_all();
+    }
+}
+
 fn microphone_channel(
     reader: &mut Reader,
     shared: &Arc<Mutex<State>>,
@@ -5485,42 +5516,51 @@ fn microphone_channel(
     let cancel = reader.cancel();
     let worker_cancel = cancel.clone();
     let worker_sender = sender.clone();
-    let writing_since = Arc::new(Mutex::new(None::<Instant>));
-    let worker_writing = writing_since.clone();
-    let finished = Arc::new(AtomicBool::new(false));
-    let watchdog_finished = finished.clone();
+    let progress = Arc::new((Mutex::new(RelayProgress::default()), Condvar::new()));
+    // Created before either spawn, so a relay that never starts still ends the watchdog.
+    let relay_watch = RelayWatch(progress.clone());
     let watchdog_cancel = cancel.clone();
     thread::Builder::new()
         .name("vivid-microphone-deadline".into())
         .spawn(move || {
-            while !watchdog_finished.load(Ordering::Acquire)
-                && Arc::strong_count(&watchdog_finished) > 1
-            {
-                if lock(&writing_since).is_some_and(|at| at.elapsed() > Duration::from_millis(200))
-                {
-                    watchdog_cancel.cancel();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
+            let (state, changed) = &*progress;
+            let mut current = lock(state);
+            while !current.finished {
+                current = match current.writing_since {
+                    None => changed
+                        .wait(current)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    Some(at) => {
+                        let Some(remaining) = Duration::from_millis(200).checked_sub(at.elapsed())
+                        else {
+                            watchdog_cancel.cancel();
+                            break;
+                        };
+                        changed
+                            .wait_timeout(current, remaining)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0
+                    }
+                };
             }
         })?;
     thread::Builder::new()
         .name("vivid-microphone-relay".into())
         .spawn(move || {
+            let watch = relay_watch;
             while let Ok(Some((at, packet))) = rx.recv() {
                 if at.elapsed() <= Duration::from_millis(200) {
-                    *lock(&worker_writing) = Some(Instant::now());
+                    watch.writing(Some(Instant::now()));
                     let result = worker_sender.try_send(&packet);
-                    *lock(&worker_writing) = None;
+                    watch.writing(None);
                     if result.is_err() {
                         break;
                     }
                 }
             }
-            *lock(&worker_writing) = Some(Instant::now());
+            watch.writing(Some(Instant::now()));
             let _ = worker_sender.eos();
             worker_cancel.cancel();
-            finished.store(true, Ordering::Release);
         })?;
     let wake = {
         let mut state = lock(shared);
@@ -6598,7 +6638,10 @@ fn validate_media_record(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "moves the track-wait request fields into the wait thread"
+)]
 fn spawn_wait(
     shared: Arc<Mutex<State>>,
     writer: Arc<Writer>,
@@ -8087,8 +8130,7 @@ mod tests {
             let mut config = PresenterConfig::terminal(MediaConfig::default());
             config.supported_profiles.push(profile.to_owned());
             let error = VirtualVivid::start_configured(listener, config, None)
-                .err()
-                .expect("must reject unsupported renderer");
+                .expect_err("must reject unsupported renderer");
             assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         }
     }

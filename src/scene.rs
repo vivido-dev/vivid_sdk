@@ -303,7 +303,10 @@ impl Session {
     }
 
     /// Create a terminal grid node using signed 32.32 cell coordinates.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public signature; grouping the geometry into a type would break callers"
+    )]
     pub fn place_terminal_surface(
         &mut self,
         surface: &Surface,

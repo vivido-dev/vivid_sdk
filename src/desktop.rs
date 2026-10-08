@@ -30,6 +30,7 @@ fn wait_output_ready(session: &mut Session, track: &Track) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct DesktopSession {
     session: Session,
     surface: DesktopSurface,

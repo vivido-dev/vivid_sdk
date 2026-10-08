@@ -23,10 +23,24 @@ mod transport;
 mod vector_retention;
 pub use overlay_relay::{OverlayHostRequest, OverlayLayout};
 
-pub use config::*;
+pub use config::{
+    BridgeClipRect, BridgeHoldSnapshot, BridgeKeyframeRequest, BridgeMetrics, BridgeNode,
+    BridgeOverlayWindow, BridgePlayRequest, BridgePositionSnapshot, BridgeSource,
+    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
+    DeliveryMetrics, DisplayMetrics, IpcMetrics, MediaConfig, MicrophoneRequest, PaneId,
+    PaneMediaNodeStatus, PaneMediaStatus, PaneMediaSurfaceDescriptor, PaneMediaSurfaceStatus,
+    PaneMediaTrackStatus, PresentationTarget, PresenterConfig, RelayMetrics, TerminalTarget,
+};
 pub use listener::{ConnectionCancel, PresenterListener, Transport};
 pub use resource::{Binding, MediaResourceDescription, ResourceError, TrackFacts};
-pub use service::*;
+pub use service::{
+    AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
+    KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, PaneCapture,
+    PaneMediaSummary, PaneTrackSummary, PlayRequest, ProducerId, ProjectionSnapshot,
+    RetainedRaster, SceneNode, SceneNodeConfig, SemanticDescriptor, SkipReason, SkippedSource,
+    SnapshotOverlayWindow, SnapshotSource, SnapshotSurface, SourceDescriptor, SourceKey,
+    VirtualVivid,
+};
 pub use socket::SocketListener;
 pub use transport::{Reader, Writer};
 

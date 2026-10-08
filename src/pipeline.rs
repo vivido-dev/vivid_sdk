@@ -18,6 +18,15 @@ pub struct LatestFrame<T> {
     changed: Condvar,
     dropped: AtomicU64,
 }
+
+impl<T> std::fmt::Debug for LatestFrame<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LatestFrame")
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
 impl<T> LatestFrame<T> {
     pub fn new() -> Self {
         Self {
@@ -66,6 +75,15 @@ pub struct BoundedQueue<T> {
     not_full: Condvar,
     capacity: usize,
 }
+
+impl<T> std::fmt::Debug for BoundedQueue<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedQueue")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
 struct BoundedInner<T> {
     items: VecDeque<T>,
     dropped: u64,
@@ -111,7 +129,10 @@ impl<T> BoundedQueue<T> {
         self.not_empty.notify_one();
         Ok(())
     }
-    #[allow(clippy::result_unit_err)]
+    #[expect(
+        clippy::result_unit_err,
+        reason = "public signature; `Err(())` only means closed and drained"
+    )]
     pub fn pop(&self) -> Result<T, ()> {
         let mut g = self.inner.lock().expect("bounded queue");
         loop {
@@ -180,7 +201,7 @@ pub struct AudioPacketData {
 ///
 /// Clones share the channel, the packet-ID counter, and the media epoch, so handing a clone to a
 /// media worker continues the exact sequence — exactly one sender per channel generation may send.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TrackSender {
     channel: TrackChannel,
     detached: Arc<AtomicBool>,
@@ -608,6 +629,22 @@ pub struct VideoRateControl {
     configured_bits_per_second: u64,
     target_bits_per_second: AtomicU64,
     inner: Mutex<RateWindow>,
+}
+
+impl std::fmt::Debug for VideoRateControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VideoRateControl")
+            .field(
+                "configured_bits_per_second",
+                &self.configured_bits_per_second,
+            )
+            .field(
+                "target_bits_per_second",
+                &self.target_bits_per_second.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 struct RateWindow {

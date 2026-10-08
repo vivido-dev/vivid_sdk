@@ -11,6 +11,15 @@ pub struct Transport {
     pub(crate) deadline: Arc<Mutex<Option<Instant>>>,
 }
 
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Transport")
+            .field("cancel", &self.cancel)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Product-provided accepted-connection listener used by the inner presenter.
 pub trait PresenterListener: Send + 'static {
     fn endpoint(&self) -> String;
@@ -84,6 +93,15 @@ impl Read for DeadlineReader {
 #[derive(Clone)]
 pub struct ConnectionCancel {
     inner: Arc<CancelInner>,
+}
+
+impl std::fmt::Debug for ConnectionCancel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionCancel")
+            .field("cancelled", &self.inner.cancelled.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 struct CancelInner {

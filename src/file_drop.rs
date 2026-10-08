@@ -44,7 +44,10 @@ impl FileDropBindingGuard {
         self.grant
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public signature carries the file-drop binding fields; grouping them would break callers"
+    )]
     pub fn enable(
         &mut self,
         context_id: u64,

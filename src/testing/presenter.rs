@@ -185,6 +185,15 @@ pub struct TestPresenter {
     join: Option<JoinHandle<io::Result<()>>>,
 }
 
+impl std::fmt::Debug for TestPresenter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestPresenter")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TestPresenter {
     /// Start a presenter with the given terminal grid.
     ///

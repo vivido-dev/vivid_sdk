@@ -44,6 +44,7 @@ enum GuardState {
 }
 
 /// The producer-side input-binding lifecycle manager.
+#[derive(Debug)]
 pub struct InputBindingGuard {
     epoch: u64,
     state: GuardState,
@@ -304,6 +305,7 @@ impl Default for InputBindingGuard {
     }
 }
 
+#[derive(Debug)]
 pub struct InputQueue {
     inner: BoundedQueue<InputEvent>,
 }
@@ -316,7 +318,10 @@ impl InputQueue {
     pub fn push(&self, event: InputEvent) -> Result<(), InputEvent> {
         self.inner.push_nonblocking(event)
     }
-    #[allow(clippy::result_unit_err)]
+    #[expect(
+        clippy::result_unit_err,
+        reason = "public signature; `Err(())` only means closed and drained"
+    )]
     pub fn pop(&self) -> Result<InputEvent, ()> {
         self.inner.pop()
     }

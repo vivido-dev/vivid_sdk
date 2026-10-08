@@ -167,6 +167,15 @@ pub struct LeaseHandle {
     grant: Option<LeaseGrant>,
 }
 
+impl std::fmt::Debug for LeaseHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeaseHandle")
+            .field("grant", &self.grant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LeaseHandle {
     /// The endpoints a worker connects to.
     pub fn endpoints(&self) -> Option<&LaneEndpoints> {
@@ -335,6 +344,15 @@ pub struct VividoAdmin {
     // for lease authority, and revocation must serialize with issuance.
     session: Mutex<Session>,
     endpoints: LaneEndpoints,
+}
+
+impl std::fmt::Debug for VividoAdmin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VividoAdmin")
+            .field("endpoints", &self.endpoints)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VividoAdmin {
@@ -511,6 +529,7 @@ pub fn worker_context(
 /// length-prefixed CBOR protocol. Unix sockets are intentionally unavailable on
 /// non-Unix controller hosts until the gateway admin protocol gains a portable
 /// local transport.
+#[derive(Debug)]
 pub struct BridgeAdmin {
     socket: String,
 }
@@ -784,6 +803,7 @@ impl PresenterAdmin for BridgeAdmin {
 /// Vvbridge reveals only owner-protected lane endpoints for the public route ID. This controller
 /// then establishes an ordinary root-authenticated Vivid session directly with vvweb; vvbridge
 /// never receives the root secret and cannot issue a new authenticated lease on its own.
+#[derive(Debug)]
 pub struct DirectBrowserAdmin {
     inner: VividoAdmin,
 }

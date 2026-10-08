@@ -617,7 +617,10 @@ impl TrackChannel {
         self.send_raster(epoch, frame_id, rgba, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public signature carries the RASTER_FRAME delta fields; grouping them would break callers"
+    )]
     pub fn send_raster_delta(
         &self,
         epoch: u32,
@@ -642,7 +645,6 @@ impl TrackChannel {
 
     /// Send a raster delta using zstd only when every negotiated constraint permits it and the
     /// resulting body is smaller than the raw delta.
-    #[allow(clippy::too_many_arguments)]
     pub fn send_raster_delta_adaptive(
         &self,
         epoch: u32,
@@ -686,7 +688,10 @@ impl TrackChannel {
         self.send_media(messages::RASTER_FRAME, frame_id, epoch, false, &body)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shares the RASTER_FRAME delta fields of its public callers"
+    )]
     fn raster_delta_body(
         &self,
         epoch: u32,
@@ -1102,32 +1107,49 @@ impl TrackChannel {
         let Some(rate) = &self.rate else {
             return Ok(());
         };
+        let body_length = u64::from(body_length);
+        // Sleep on the flow condvar for exactly the token deficit. Channel close and session
+        // close both notify it, so a closing channel still wakes the sender immediately.
+        let mut flow = lock(&self.flow.state, "channel flow state")?;
         loop {
             self.lifecycle.ensure_active()?;
-            if lock(&self.flow.state, "channel flow state")?.closed {
+            if flow.closed {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "track channel is closed",
                 ));
             }
-            let mut state = lock(rate, "channel rate state")?;
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(state.updated_at);
-            state.updated_at = now;
-            state
-                .body_bytes
-                .replenish(elapsed)
-                .map_err(io::Error::other)?;
-            state.records.replenish(elapsed).map_err(io::Error::other)?;
-            let mut body_bytes = state.body_bytes.clone();
-            let mut records = state.records.clone();
-            if body_bytes.charge(u64::from(body_length)).is_ok() && records.charge(1).is_ok() {
-                state.body_bytes = body_bytes;
-                state.records = records;
-                return Ok(());
-            }
-            drop(state);
-            thread::sleep(Duration::from_millis(1));
+            let wait = {
+                let mut state = lock(rate, "channel rate state")?;
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(state.updated_at);
+                state.updated_at = now;
+                state
+                    .body_bytes
+                    .replenish(elapsed)
+                    .map_err(io::Error::other)?;
+                state.records.replenish(elapsed).map_err(io::Error::other)?;
+                let wait = state
+                    .body_bytes
+                    .time_until(body_length)
+                    .map_err(io::Error::other)?
+                    .max(state.records.time_until(1).map_err(io::Error::other)?);
+                let Some(wait) = wait else {
+                    state
+                        .body_bytes
+                        .charge(body_length)
+                        .map_err(io::Error::other)?;
+                    state.records.charge(1).map_err(io::Error::other)?;
+                    return Ok(());
+                };
+                wait
+            };
+            flow = self
+                .flow
+                .changed
+                .wait_timeout(flow, wait)
+                .map_err(|_| io::Error::other("channel flow lock is poisoned"))?
+                .0;
         }
     }
 }
@@ -1269,7 +1291,10 @@ impl Session {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "moves each shared channel handle into the reader thread"
+)]
 pub(crate) fn spawn_channel_reader(
     mut reader: ConnectionReader,
     configuration: TrackConfiguration,
@@ -1460,11 +1485,12 @@ pub(crate) fn close_track_flow(flow: Option<&Weak<FlowSync>>, message: &str) {
 mod tests {
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use vivid_protocol::messages::LaneClass;
+    use vivid_protocol::resource::TokenBucket;
     use vivid_protocol::track::{
         KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
     };
@@ -1511,6 +1537,49 @@ mod tests {
             .unwrap();
         let channel = session.open_track_channel(&track).unwrap();
         (session, channel)
+    }
+
+    /// Give an offline channel a record bucket that is already empty, so the next send must wait.
+    fn drain_record_rate(channel: &mut super::TrackChannel, records_per_second: u64) {
+        let mut records = TokenBucket::new(records_per_second, 1);
+        records.charge(records_per_second).unwrap();
+        channel.rate = Some(Arc::new(Mutex::new(super::ChannelRateState {
+            body_bytes: TokenBucket::new(1 << 20, 1024),
+            records,
+            updated_at: Instant::now(),
+        })));
+    }
+
+    #[test]
+    fn rate_wait_sleeps_for_the_token_deficit() {
+        let (_session, mut channel) = vector_channel();
+        drain_record_rate(&mut channel, 50);
+        let started = Instant::now();
+        channel.wait_for_rate(1).unwrap();
+        let waited = started.elapsed();
+        // One record at 50 per second is owed 20 ms after the bucket empties.
+        assert!(
+            waited >= Duration::from_millis(15),
+            "waited only {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    }
+
+    #[test]
+    fn closing_the_channel_wakes_a_sender_waiting_for_rate() {
+        let (_session, mut channel) = vector_channel();
+        // At one record per second the deficit alone would hold the sender for a full second.
+        drain_record_rate(&mut channel, 1);
+        let flow = Arc::downgrade(&channel.flow);
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            super::close_track_flow(Some(&flow), "closed by test");
+        });
+        let started = Instant::now();
+        let error = channel.wait_for_rate(1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        closer.join().unwrap();
     }
 
     #[test]

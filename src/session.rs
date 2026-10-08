@@ -402,13 +402,25 @@ impl std::fmt::Debug for Session {
 }
 
 /// One bounded establishment attempt. Retains identical authenticated HELLO bytes across
-/// transport failures; never reuse it for a fresh logical attempt. Contains secrets, no Debug.
+/// transport failures; never reuse it for a fresh logical attempt. `Debug` omits the prepared
+/// HELLO and keys.
 pub struct EstablishmentAttempt {
     config: ProducerConfig,
     prepared: Option<(Hello, Secret32, zeroize::Zeroizing<Vec<u8>>)>,
     deadline: std::time::Instant,
     carrier_key: Option<Secret32>,
     tried: bool,
+}
+
+impl std::fmt::Debug for EstablishmentAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EstablishmentAttempt")
+            .field("config", &self.config)
+            .field("deadline", &self.deadline)
+            .field("tried", &self.tried)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EstablishmentAttempt {

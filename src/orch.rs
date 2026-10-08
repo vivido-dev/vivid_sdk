@@ -90,6 +90,7 @@ impl DeskMutation {
 /// answer is almost always "the session's root context" and "the next allocated id". Leaving that
 /// to each binding is how the Python package ended up owning the defaults; they belong here, where
 /// every language gets the same ones.
+#[derive(Debug)]
 pub struct SurfaceBuilder {
     definition: SurfaceDefinition,
 }
@@ -199,6 +200,7 @@ impl SurfaceBuilder {
     }
 }
 
+#[derive(Debug)]
 pub struct TrackBuilder {
     context_id: u64,
     surface_id: u64,
@@ -523,6 +525,7 @@ fn check(c: &ResourceContract, r: Resource, claim: u64, name: &str) -> io::Resul
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct SurfaceSlots {
     surface: Surface,
     bindings: Vec<SlotBinding>,

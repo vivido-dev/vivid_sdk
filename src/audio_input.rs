@@ -36,6 +36,15 @@ pub struct AudioInputSender {
     write: Arc<WriteRecord>,
 }
 
+impl std::fmt::Debug for AudioInputSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AudioInputSender")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AudioInputSender {
     pub fn new(
         config: &TrackConfiguration,

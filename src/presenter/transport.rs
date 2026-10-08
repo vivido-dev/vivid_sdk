@@ -25,6 +25,17 @@ pub struct Reader {
     first_record: bool,
 }
 
+impl std::fmt::Debug for Reader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Reader")
+            .field("negotiated_maximum", &self.negotiated_maximum)
+            .field("maximum", &self.maximum)
+            .field("sequence", &self.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Reader {
     pub fn new(mut stream: Transport) -> io::Result<(Self, Preface, [u8; PREFACE_SIZE])> {
         let cancel = stream.cancel();
@@ -157,6 +168,16 @@ pub struct Writer {
     closed: Arc<AtomicBool>,
     cancel: ConnectionCancel,
     bytes: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Writer")
+            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("queued_bytes", &self.bytes.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 const MAX_QUEUED_RECORDS: usize = 64;
 const MAX_QUEUED_BYTES: usize = HARD_MAX_RECORD_BODY as usize + HEADER_SIZE;

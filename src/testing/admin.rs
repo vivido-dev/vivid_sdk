@@ -30,6 +30,16 @@ pub struct FakeAdmin {
     carrier: Carrier,
 }
 
+impl std::fmt::Debug for FakeAdmin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FakeAdmin")
+            .field("endpoints", &self.endpoints)
+            .field("carrier", &self.carrier)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FakeAdmin {
     /// A fake admin that presents the given profiles over a native carrier.
     pub fn new(profiles: Vec<String>, endpoints: LaneEndpoints) -> Self {

@@ -108,7 +108,7 @@ impl From<messages::ErrorReply> for PresenterError {
 
 /// Authentication material for a new or resumed 1.5 session.
 ///
-/// This type intentionally implements neither `Debug` nor `Display`.
+/// `Debug` shows only the variant and its numeric identity; there is no `Display`.
 pub enum ProducerAuthentication {
     /// Read `VIVID_ROOT_SECRET` at connect time.
     RootFromEnvironment,
@@ -130,6 +130,39 @@ pub enum ProducerAuthentication {
         attempt_id: [u8; auth::ATTEMPT_ID_BYTES],
         prior_resume_key: Secret32,
     },
+}
+
+impl std::fmt::Debug for ProducerAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only the variant and its numeric identity are shown. Secrets, attempt IDs, and proofs
+        // are capability material and never reach a diagnostic.
+        match self {
+            Self::RootFromEnvironment => formatter.write_str("RootFromEnvironment"),
+            Self::Root { .. } => formatter.debug_struct("Root").finish_non_exhaustive(),
+            Self::LeaseActivation {
+                context_id,
+                lease_id,
+                ..
+            } => formatter
+                .debug_struct("LeaseActivation")
+                .field("context_id", context_id)
+                .field("lease_id", lease_id)
+                .finish_non_exhaustive(),
+            Self::Resume {
+                context_id,
+                lease_id,
+                session_id,
+                resume_generation,
+                ..
+            } => formatter
+                .debug_struct("Resume")
+                .field("context_id", context_id)
+                .field("lease_id", lease_id)
+                .field("session_id", session_id)
+                .field("resume_generation", resume_generation)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Opens one fresh Vivid transport for the requested 1.5 connection kind.
@@ -196,7 +229,8 @@ impl ProducerAuthentication {
     }
 }
 
-/// Connection and negotiation policy. Secret-bearing fields are deliberately non-debuggable.
+/// Connection and negotiation policy. `Debug` redacts the authentication material.
+#[derive(Debug)]
 pub struct ProducerConfig {
     pub endpoint_control: Option<String>,
     pub endpoint_interactive: Option<String>,

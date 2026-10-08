@@ -228,7 +228,10 @@ impl PaneSession {
         clear.and(close)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "takes the per-kind track limits its callers resolve"
+    )]
     fn present<F>(
         &mut self,
         width: u32,

@@ -115,6 +115,7 @@ impl RetainedImage {
     }
 }
 
+#[derive(Debug)]
 pub struct OverlayWindowStatus {
     pub bounds: Rect,
     pub viewport: Viewport,
