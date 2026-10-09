@@ -20,3 +20,7 @@ vivid_protocol = { version = "1.5", path = "../../vivid_protocol" }
 # The wheel carries both roles: one artifact, a producer and a presenter.
 vivid_sdk = { version = "1.5", path = "..", features = ["presenter"] }
 zeroize = "1.9"
+
+[build-dependencies]
+# Must track the pyo3 version above so the emitted link args stay in sync.
+pyo3-build-config = "0.29"
