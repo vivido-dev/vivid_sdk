@@ -128,6 +128,8 @@ impl LuaPath {
                     p.y.get(),
                 ),
                 Segment::Close => builder.close(),
+                // A segment kind this build cannot read is left out rather than misdrawn.
+                _ => builder,
             };
         }
         Self { builder }
@@ -276,6 +278,7 @@ impl LuaUserData for LuaBrush {
                     Brush::Linear { .. } => "linear",
                     Brush::Radial { .. } => "radial",
                     Brush::Image { .. } => "image",
+                    _ => "unknown",
                 }
             ))
         });

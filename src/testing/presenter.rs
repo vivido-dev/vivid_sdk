@@ -719,7 +719,7 @@ impl Read for HandshakeReader<'_> {
 fn read_preface(stream: &mut TcpStream) -> io::Result<Preface> {
     let mut bytes = [0_u8; PREFACE_SIZE];
     stream.read_exact(&mut bytes)?;
-    Preface::decode(bytes)
+    Ok(Preface::decode(bytes)?)
 }
 
 /// Everything one serving thread owns. A struct rather than eight arguments, because the lane and
@@ -1348,10 +1348,9 @@ fn accept_secondary_connections(
                     shutdown,
                 ));
             }
-            vivid_protocol::wire::ConnectionKind::Control
-            | vivid_protocol::wire::ConnectionKind::FileTransfer => {
-                // The test presenter advertises neither a second control leg nor file-drop-v1.
-            }
+            // The test presenter advertises neither a second control leg nor file-drop-v1, and
+            // serves no connection kind it does not know.
+            _ => {}
         }
     }
     // A producer may leave secondary channels open when the control session ends. Wake every

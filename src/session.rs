@@ -594,7 +594,9 @@ impl Session {
         // fallback instead of an ambient lane that belongs to someone else's presenter.
         let lane = |explicit: Option<&str>, variable| {
             if config.endpoint_control.is_some() {
-                explicit.map(Endpoint::parse).transpose()
+                explicit
+                    .map(|value| Endpoint::parse(value).map_err(io::Error::from))
+                    .transpose()
             } else {
                 optional_endpoint(explicit, variable)
             }

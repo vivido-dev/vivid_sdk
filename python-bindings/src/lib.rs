@@ -1058,6 +1058,8 @@ fn build_track_config(
                 image.cache_lookup = value;
             }
         }
+        // A kind with no caller-stated codec details keeps what the builder chose.
+        _ => {}
     }
 
     let dict = PyDict::new(py);
@@ -1149,6 +1151,9 @@ fn build_track_config(
             dict.set_item("encoded_length", image.encoded_length)?;
             dict.set_item("sha256", image.sha256.map(|value| PyBytes::new(py, &value)))?;
             dict.set_item("cache_lookup", image.cache_lookup)?;
+        }
+        _ => {
+            dict.set_item("kind", "unknown")?;
         }
     }
     Ok(dict.unbind())
@@ -1266,7 +1271,13 @@ fn session_event_to_pydict(py: Python<'_>, event: SessionEvent) -> PyResult<Boun
             dict.set_item("kind", "playback_hold")?;
             dict.set_item(
                 "payload",
-                payload_to_pydict(py, &hold.payload().map_err(io_error)?)?,
+                payload_to_pydict(
+                    py,
+                    &hold
+                        .payload()
+                        .map_err(std::io::Error::from)
+                        .map_err(io_error)?,
+                )?,
             )?;
         }
         SessionEvent::TargetChanged(payload) => {
@@ -1423,7 +1434,13 @@ fn track_status_to_pydict(py: Python<'_>, status: &TrackStatus) -> PyResult<Py<P
     if let Some(hold) = &status.playback_hold {
         dict.set_item(
             "playback_hold",
-            payload_to_pydict(py, &hold.payload().map_err(io_error)?)?,
+            payload_to_pydict(
+                py,
+                &hold
+                    .payload()
+                    .map_err(std::io::Error::from)
+                    .map_err(io_error)?,
+            )?,
         )?;
     } else {
         dict.set_item("playback_hold", PyNone::get(py))?;
@@ -3400,6 +3417,7 @@ fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Raster => "raster",
         TrackKind::EncodedImage => "image",
         TrackKind::VectorScene => "vector",
+        _ => "unknown",
     }
 }
 

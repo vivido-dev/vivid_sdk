@@ -40,7 +40,8 @@ pub(crate) fn hello_lease_identity(hello: &Hello) -> Option<(u64, u64)> {
             lease_id,
             ..
         } => Some((*context_id, *lease_id)),
-        HelloAuthentication::Root { .. } => None,
+        // Root authentication, and any kind this build does not know, carry no lease.
+        _ => None,
     }
 }
 

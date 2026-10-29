@@ -450,7 +450,9 @@ fn session_event(event: vivid_sdk::SessionEvent) -> Result<SessionEventPayload> 
             out.kind = "playbackHold".into();
             out.hold = Some(playback_hold_payload(&hold)?);
             out.object_id = Some(hold.surface_id as f64);
-            out.payload = Some(payload_payload(&hold.payload().map_err(io_error)?)?);
+            out.payload = Some(payload_payload(
+                &hold.payload().map_err(io::Error::from).map_err(io_error)?,
+            )?);
         }
         E::TargetChanged(payload) => {
             out.kind = "targetChanged".into();
@@ -1328,6 +1330,8 @@ fn track_configuration(
                 image.encoded_length = unsigned::<u32>(Some(value), "encoded_length")?;
             }
         }
+        // A kind with no caller-stated codec details keeps what the builder chose.
+        _ => {}
     }
     Ok(configuration)
 }
@@ -1377,6 +1381,7 @@ fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Raster => "raster",
         TrackKind::EncodedImage => "image",
         TrackKind::VectorScene => "vector",
+        _ => "unknown",
     }
 }
 

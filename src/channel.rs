@@ -790,6 +790,7 @@ impl TrackChannel {
             operations,
             compress,
         )
+        .map_err(io::Error::from)
     }
 
     pub fn send_image(&self, encoded: &[u8]) -> io::Result<u64> {
@@ -940,7 +941,7 @@ impl TrackChannel {
         };
         let body = vivid_protocol::vector::AssetRelease { id }
             .encode()
-            .map_err(|e| invalid_input(e.0))?;
+            .map_err(|e| invalid_input(e.reason()))?;
         let sequence = self.write_charged_record(
             messages::VECTOR_ASSET_RELEASE,
             configuration.track_id,

@@ -35,7 +35,8 @@ impl VectorRetention {
     }
 
     pub fn accept(&mut self, kind: u16, body: &[u8]) -> io::Result<()> {
-        let invalid = |e: vector::InvalidScene| io::Error::new(io::ErrorKind::InvalidData, e.0);
+        let invalid =
+            |e: vector::InvalidScene| io::Error::new(io::ErrorKind::InvalidData, e.reason());
         match kind {
             messages::VECTOR_ASSET => {
                 let asset = ImageAsset::decode(body).map_err(invalid)?;

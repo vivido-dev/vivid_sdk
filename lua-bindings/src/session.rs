@@ -677,6 +677,7 @@ pub fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Raster => "raster",
         TrackKind::EncodedImage => "image",
         TrackKind::VectorScene => "vector",
+        _ => "unknown",
     }
 }
 
@@ -1446,6 +1447,8 @@ pub fn track_configuration(
             }
         }
         KindConfiguration::EncodedImage(_) => {}
+        // A kind with no caller-stated codec details keeps what the builder chose.
+        _ => {}
     }
     Ok(configuration)
 }
@@ -1548,6 +1551,9 @@ fn track_configuration_table(lua: &Lua, configuration: &TrackConfiguration) -> L
                     .transpose()?,
             )?;
             table.set("cache_lookup", image.cache_lookup)?;
+        }
+        _ => {
+            table.set("kind", "unknown")?;
         }
     }
     Ok(table)
@@ -1681,7 +1687,8 @@ pub fn session_event(lua: &Lua, event: SessionEvent) -> LuaResult<LuaTable> {
         SessionEvent::PlaybackHold(hold) => {
             table.set("kind", "playback_hold")?;
             table.set("hold", playback_hold(lua, &hold)?)?;
-            table.set("payload", payload_to_lua(lua, &hold.payload().lua()?)?)?;
+            let payload = hold.payload().map_err(std::io::Error::from).lua()?;
+            table.set("payload", payload_to_lua(lua, &payload)?)?;
         }
         SessionEvent::TargetChanged(payload) => {
             table.set("kind", "target_changed")?;

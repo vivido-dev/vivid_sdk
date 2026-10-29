@@ -350,7 +350,7 @@ impl Session {
             context_id,
             anchor_id,
         )
-        .map_err(|message| invalid_input(message.to_owned()))
+        .map_err(io::Error::from)
     }
 
     pub fn conpty_anchor_marker(&self, context_id: u64, anchor_id: u64) -> io::Result<String> {
@@ -360,7 +360,7 @@ impl Session {
             context_id,
             anchor_id,
         )
-        .map_err(|message| invalid_input(message.to_owned()))
+        .map_err(io::Error::from)
     }
 
     pub fn query_anchor(&self, context_id: u64, anchor_id: u64) -> io::Result<AnchorStatus> {

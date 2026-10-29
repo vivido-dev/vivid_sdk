@@ -256,6 +256,8 @@ fn flatten(path: &Path) -> io::Result<Vec<Vec<f64>>> {
                 c.y.get(),
             ],
             Segment::Close => vec![4.],
+            // A segment kind this build cannot read is left out rather than misdrawn.
+            _ => Vec::new(),
         })
         .collect())
 }
@@ -629,6 +631,7 @@ fn accessible_action_name(action: vivid_sdk::overlay::AccessibleAction) -> &'sta
         Action::Decrement => "decrement",
         Action::Expand => "expand",
         Action::Collapse => "collapse",
+        _ => "unknown",
     }
 }
 
@@ -641,6 +644,8 @@ fn scroll_phase(phase: vivid_sdk::overlay::ScrollPhase) -> u8 {
         ScrollPhase::Changed => 2,
         ScrollPhase::Ended => 3,
         ScrollPhase::Cancelled => 4,
+        // A phase this build does not know is reported as no phase.
+        _ => 0,
     }
 }
 
@@ -809,11 +814,15 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
                 DismissReason::Closed => "closed",
                 DismissReason::OwnerLost => "owner-lost",
                 DismissReason::ParentClosed => "parent-closed",
+                _ => "unknown",
             }
             .into();
         }
         Event::Cancel => {
             data.kind = "cancel";
+        }
+        _ => {
+            data.kind = "unknown";
         }
     }
     data

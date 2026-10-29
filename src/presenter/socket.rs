@@ -67,23 +67,28 @@ impl SocketListener {
             });
         }
 
-        match Endpoint::parse(endpoint)? {
-            #[cfg(unix)]
-            Endpoint::Unix(path) => {
-                let listener = UnixListener::bind(&path)?;
-                owner_only(&path)?;
-                let resolved = format!("unix:{}", path.display());
-                Ok(Self {
-                    kind: Bound::Unix { listener, path },
-                    endpoint: resolved,
-                })
-            }
-            #[cfg(not(unix))]
-            Endpoint::Unix(_) => Err(io::Error::new(
+        let endpoint = Endpoint::parse(endpoint)?;
+        let path = endpoint
+            .as_unix()
+            .expect("every endpoint without the tcp: prefix is a Unix path");
+        #[cfg(unix)]
+        {
+            let path = path.to_path_buf();
+            let listener = UnixListener::bind(&path)?;
+            owner_only(&path)?;
+            let resolved = format!("unix:{}", path.display());
+            Ok(Self {
+                kind: Bound::Unix { listener, path },
+                endpoint: resolved,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Unix endpoints are not available on this platform",
-            )),
-            Endpoint::Tcp(_) => unreachable!("the tcp: prefix is handled above"),
+            ))
         }
     }
 }

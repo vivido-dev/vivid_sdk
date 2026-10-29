@@ -6,8 +6,6 @@
 use std::{env, io};
 
 #[cfg(unix)]
-use std::path::PathBuf;
-
 use vivid_protocol::resource::{Resource, ResourceContract};
 use vivid_protocol::wire::Endpoint;
 
@@ -21,7 +19,7 @@ pub(crate) fn endpoint(explicit: Option<&str>, variable: &str) -> io::Result<End
                 format!("required Vivid discovery variable {variable} is absent"),
             )
         })?;
-    Endpoint::parse(&value)
+    Ok(Endpoint::parse(&value)?)
 }
 
 pub(crate) fn optional_endpoint(
@@ -31,18 +29,18 @@ pub(crate) fn optional_endpoint(
     explicit
         .map(ToOwned::to_owned)
         .or_else(|| env::var(variable).ok())
-        .map(|value| Endpoint::parse(&value))
+        .map(|value| Endpoint::parse(&value).map_err(io::Error::from))
         .transpose()
 }
 
 pub(crate) fn offline_endpoint() -> io::Result<Endpoint> {
     #[cfg(unix)]
     {
-        Ok(Endpoint::Unix(PathBuf::from("/dev/null")))
+        Ok(Endpoint::unix("/dev/null")?)
     }
     #[cfg(not(unix))]
     {
-        Endpoint::parse("tcp:127.0.0.1:1")
+        Ok(Endpoint::parse("tcp:127.0.0.1:1")?)
     }
 }
 

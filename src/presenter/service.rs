@@ -421,14 +421,6 @@ pub struct SnapshotSurface {
     pub overlay_layouts: Vec<super::OverlayLayout>,
 }
 
-fn window_mode_wire(mode: vivid_protocol::overlay::WindowMode) -> u64 {
-    match mode {
-        vivid_protocol::overlay::WindowMode::Floating => 0,
-        vivid_protocol::overlay::WindowMode::Popup => 1,
-        vivid_protocol::overlay::WindowMode::Modal => 2,
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SnapshotSource {
     pub key: SourceKey,
@@ -1279,6 +1271,8 @@ impl VirtualVivid {
             CleanupPolicy::SuspendOnUncleanLoss => definition
                 .requested_disconnect_grace_us
                 .min(MAX_DISCONNECT_GRACE_US),
+            // A policy this build does not know keeps no grace: clean up immediately.
+            _ => 0,
         };
         let mut state = lock(&self.state);
         if !definition
@@ -1781,6 +1775,7 @@ impl VirtualVivid {
                 KindConfiguration::Video(_) => ("video", true),
                 KindConfiguration::Audio(_) => ("audio", false),
                 KindConfiguration::VectorScene(_) => ("vector", false),
+                _ => continue,
             };
             tracks.push(PaneTrackSummary {
                 source: bridge_track_key(*key),
@@ -1849,7 +1844,7 @@ impl VirtualVivid {
                         y: window.options.bounds.origin.y.get().round() as i64,
                         width: window.options.bounds.width.get().round() as i64,
                         height: window.options.bounds.height.get().round() as i64,
-                        mode: window_mode_wire(window.options.mode),
+                        mode: window.options.mode.wire_value(),
                         visible: window.options.visible,
                     });
                 SnapshotSurface {
@@ -2991,6 +2986,10 @@ fn handle_connection(
             )?;
             Ok(())
         }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported Vivid connection kind",
+        )),
     }
 }
 
@@ -3345,7 +3344,8 @@ fn retry_establishment(
             attempt_id,
             ..
         } => ((*context_id, *lease_id), *attempt_id),
-        HelloAuthentication::Root { .. } => return None,
+        // Root authentication, and any kind this build does not know, have no lease to retry.
+        _ => return None,
     };
     let lease = state.leases.get_mut(&key)?;
     let retry = lease.retry.as_ref()?;
@@ -3383,7 +3383,7 @@ fn retry_establishment(
             [0; 32],
             Vec::new(),
         ),
-        HelloAuthentication::Root { .. } => unreachable!(),
+        _ => unreachable!("only lease authentication reaches establishment retry"),
     };
     Some((|| {
         let AttemptDecision::ExactReplay { welcome, .. } = decision.map_err(|_| {
@@ -3599,6 +3599,14 @@ fn establish_session(
                 session_id: *session_id,
                 generation: *resume_generation,
             }
+        }
+        _ => {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_AUTH_FAILED,
+                "authentication kind is not supported",
+            ));
         }
     };
     let (
@@ -6598,6 +6606,7 @@ fn apply_retained_raster_operation(
                 }
             }
         }
+        _ => return Err(invalid("unsupported raster delta operation")),
     }
     Ok(())
 }
@@ -7099,6 +7108,7 @@ fn source_descriptor(
                 codec_string: config.codec_string.clone(),
             })
         }
+        _ => return None,
     })
 }
 
@@ -7133,6 +7143,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             // Structurally supported; whether this session negotiated `vector-scene-v1` at all is
             // checked at the CREATE_TRACK/PROBE_TRACK_CONFIG call sites, which have the session.
             KindConfiguration::VectorScene(_) => true,
+            _ => false,
         }
 }
 
@@ -8045,6 +8056,7 @@ fn kind_name(kind: &KindConfiguration) -> &'static str {
         KindConfiguration::VectorScene(_) => "vector",
         KindConfiguration::Raster(_) => "raster",
         KindConfiguration::EncodedImage(_) => "image",
+        _ => "unknown",
     }
 }
 

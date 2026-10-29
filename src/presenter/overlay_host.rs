@@ -1255,7 +1255,8 @@ fn hit(canvas: &Canvas, point: Point) -> Option<vivid_protocol::vector::HitRegio
                 Segment::Move(a) | Segment::Line(a) => std::slice::from_ref(a),
                 Segment::Quad(a, b) => &[*a, *b],
                 Segment::Cubic(a, b, c) => &[*a, *b, *c],
-                Segment::Close => &[],
+                // A segment kind this build cannot read contributes no bounds.
+                _ => &[],
             };
             for p in points {
                 left = left.min(p.x.get());
