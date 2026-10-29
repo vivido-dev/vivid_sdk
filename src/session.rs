@@ -709,8 +709,10 @@ impl Session {
         }
         let prk = auth::extract_handshake_prk(
             session_secret,
-            &hello.client_nonce,
-            &welcome.server_nonce,
+            &vivid_protocol::auth::HandshakeNonces {
+                client: hello.client_nonce,
+                server: welcome.server_nonce,
+            },
             &carrier_binding_key,
         );
         let unconfirmed = zeroize::Zeroizing::new(welcome.unconfirmed_payload()?);
@@ -730,9 +732,9 @@ impl Session {
             welcome.resume_generation,
             &welcome.session_tag,
         );
-        let channel_key = Secret32::new(*keys.channel_key());
-        let resume_key =
-            (auth_kind != messages::AUTHENTICATION_ROOT).then(|| Secret32::new(*keys.resume_key()));
+        let channel_key = Secret32::new(*keys.channel_key().expose());
+        let resume_key = (auth_kind != messages::AUTHENTICATION_ROOT)
+            .then(|| Secret32::new(*keys.resume_key().expose()));
         let lease_identity = hello_lease_identity(hello);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         connection.set_receive_body_limit(config.maximum_control_body)?;
@@ -823,15 +825,17 @@ impl Session {
         let server_nonce = [0x33; auth::NONCE_BYTES];
         let prk = auth::extract_handshake_prk(
             &offline_secret,
-            &client_nonce,
-            &server_nonce,
+            &vivid_protocol::auth::HandshakeNonces {
+                client: client_nonce,
+                server: server_nonce,
+            },
             &CARRIER_BINDING_NONE,
         );
         let session_tag = [0x44; messages::SESSION_TAG_BYTES];
         let (keys, anchor_key) =
             auth::derive_session_keys(&prk, OFFLINE_SESSION_ID, 0, &session_tag);
-        let channel_key = Secret32::new(*keys.channel_key());
-        let resume_key = resumable.then(|| Secret32::new(*keys.resume_key()));
+        let channel_key = Secret32::new(*keys.channel_key().expose());
+        let resume_key = resumable.then(|| Secret32::new(*keys.resume_key().expose()));
         let resource_contract = offline_contract();
         let info = SessionInfo {
             session_id: OFFLINE_SESSION_ID,
@@ -1352,7 +1356,7 @@ pub(crate) fn apply_track_lost(
 
 // Assigned control records understood by the SDK; unknown OPTIONAL bodies are opaque.
 fn supported_control_record(kind: u16) -> bool {
-    use vivid_protocol::registry::record::*;
+    use vivid_protocol::messages::*;
     matches!(
         kind,
         HELLO

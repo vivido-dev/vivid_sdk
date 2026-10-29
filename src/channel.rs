@@ -564,11 +564,13 @@ impl TrackChannel {
             ));
         }
         let body = media::raster_frame_body_with_compression(
-            epoch,
-            frame_id,
-            raster.width,
-            raster.height,
-            rgba,
+            &vivid_protocol::media::RasterFrame {
+                epoch,
+                frame_id,
+                width: raster.width,
+                height: raster.height,
+                rgba,
+            },
             true,
         )?;
         self.send_media(
@@ -591,13 +593,13 @@ impl TrackChannel {
         raster: &RasterConfiguration,
         rgba: &[u8],
     ) -> io::Result<u64> {
-        let prefix = media::raster_full_frame_prefix(
+        let prefix = media::raster_full_frame_prefix(&media::RasterFrame {
             epoch,
             frame_id,
-            raster.width,
-            raster.height,
-            rgba.len(),
-        )?;
+            width: raster.width,
+            height: raster.height,
+            rgba,
+        })?;
         self.send_media(
             messages::RASTER_FRAME,
             frame_id,
@@ -621,11 +623,13 @@ impl TrackChannel {
         };
         if raster.zstd_enabled {
             let compressed = media::raster_frame_body_with_compression(
-                epoch,
-                frame_id,
-                raster.width,
-                raster.height,
-                rgba,
+                &vivid_protocol::media::RasterFrame {
+                    epoch,
+                    frame_id,
+                    width: raster.width,
+                    height: raster.height,
+                    rgba,
+                },
                 true,
             )?;
             let raw_length = usize::try_from(
@@ -779,15 +783,17 @@ impl TrackChannel {
             ));
         }
         media::raster_delta_frame_body(
-            epoch,
-            frame_id,
-            base_frame_id,
-            pts_us,
-            duration_us,
-            raster.width,
-            raster.height,
+            &vivid_protocol::media::RasterDeltaFrame {
+                epoch,
+                frame_id,
+                base_frame_id,
+                pts_us,
+                duration_us,
+                width: raster.width,
+                height: raster.height,
+                operations,
+            },
             delta_operation_limit,
-            operations,
             compress,
         )
         .map_err(io::Error::from)
@@ -1235,7 +1241,9 @@ impl Session {
             client_nonce: nonce,
             authentication_tag: [0; 16],
         };
-        open.sign(self.channel_key.expose());
+        open.sign(&vivid_protocol::auth::ChannelKey::new(
+            *self.channel_key.expose(),
+        ));
         let open_body = messages::encode_payload(1, open.payload())?;
         let connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(

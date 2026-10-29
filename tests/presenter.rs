@@ -292,7 +292,7 @@ fn a_dropped_reply_leaves_the_request_serviced_and_unanswered() {
     // has already done the work, so a producer that retries must not cause it to be done twice.
     let script = Script::new();
     script.arm(Fault::DropReply {
-        record_type: vivid_protocol::registry::record::SURFACE_READY,
+        record_type: vivid_protocol::messages::SURFACE_READY,
         times: 1,
     });
     let presenter = TestPresenter::start_with(
@@ -320,7 +320,7 @@ fn a_dropped_reply_leaves_the_request_serviced_and_unanswered() {
         presenter
             .observed()
             .iter()
-            .any(|record| record.record_type == vivid_protocol::registry::record::CREATE_SURFACE),
+            .any(|record| record.record_type == vivid_protocol::messages::CREATE_SURFACE),
         "the request was serviced even though its reply was dropped"
     );
 }
@@ -329,7 +329,7 @@ fn a_dropped_reply_leaves_the_request_serviced_and_unanswered() {
 fn a_delayed_reply_still_arrives() {
     let script = Script::new();
     script.delay(
-        vivid_protocol::registry::record::SURFACE_READY,
+        vivid_protocol::messages::SURFACE_READY,
         Duration::from_millis(150),
     );
     let presenter = TestPresenter::start_with(

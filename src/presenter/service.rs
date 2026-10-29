@@ -60,7 +60,6 @@ const MAX_SESSIONS: usize = 16;
 const MAX_LEASES: usize = 64;
 const MAX_WAITS: usize = 64;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
-const MAX_WAIT_US: u64 = 24 * 60 * 60 * 1_000_000;
 /// Longest a parked track wait goes without re-evaluating its condition.
 ///
 /// Waits are woken by `State::wake_waits`, so this is not how they normally complete. It only
@@ -3033,14 +3032,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
                 "overlay-input-v1 was not negotiated",
             ));
         }
-        let expected = auth::lane_tag(
-            session.channel_key.expose(),
-            session_id,
-            messages::LaneClass::Interactive as u32,
-            open.lane_generation,
-            &open.client_nonce,
-        );
-        if !auth::verify_tag(&expected, &open.authentication_tag) {
+        if !open.verify(&auth::ChannelKey::new(*session.channel_key.expose())) {
             return Err(send_fatal(
                 &writer,
                 request_id,
@@ -3362,26 +3354,32 @@ fn retry_establishment(
     }
     let maximum = retry.maximum;
     let decision = match &hello.authentication {
-        HelloAuthentication::LeaseActivation { .. } => lease.machine.begin_activation(
-            attempt_id,
-            hello.client_nonce,
-            body,
-            retry.profile_fingerprint,
-            session_id,
-            [0; 32],
-            Vec::new(),
-        ),
+        HelloAuthentication::LeaseActivation { .. } => {
+            lease
+                .machine
+                .begin_activation(vivid_protocol::lease::EstablishmentAttempt {
+                    attempt_id,
+                    client_nonce: hello.client_nonce,
+                    hello_bytes: body,
+                    profile_fingerprint: retry.profile_fingerprint,
+                    session_id,
+                    server_nonce: [0; 32],
+                    welcome: Vec::new(),
+                })
+        }
         HelloAuthentication::Resume {
             resume_generation, ..
         } => lease.machine.begin_resume(
             ResumeGeneration::new(*resume_generation),
-            attempt_id,
-            hello.client_nonce,
-            body,
-            retry.profile_fingerprint,
-            session_id,
-            [0; 32],
-            Vec::new(),
+            vivid_protocol::lease::EstablishmentAttempt {
+                attempt_id,
+                client_nonce: hello.client_nonce,
+                hello_bytes: body,
+                profile_fingerprint: retry.profile_fingerprint,
+                session_id,
+                server_nonce: [0; 32],
+                welcome: Vec::new(),
+            },
         ),
         _ => unreachable!("only lease authentication reaches establishment retry"),
     };
@@ -3545,7 +3543,7 @@ fn establish_session(
             session_id,
             resume_generation,
             attempt_id,
-            proof,
+            ..
         } => {
             let key = (*context_id, *lease_id);
             let Some(lease) = state.leases.get(&key) else {
@@ -3575,16 +3573,7 @@ fn establish_session(
                     "lease resume failed",
                 ));
             };
-            let expected = auth::resume_hello_proof(
-                prior.expose(),
-                preface,
-                *lease_id,
-                *session_id,
-                *resume_generation,
-                attempt_id,
-                &hello.authless_payload()?,
-            );
-            if !auth::verify_proof(&expected, proof) {
+            if !hello.verify_resume(&auth::ResumeKey::new(*prior.expose()), preface)? {
                 return Err(send_fatal(
                     &writer,
                     request_id,
@@ -3738,7 +3727,14 @@ fn establish_session(
         Principal::Resume { generation, .. } => generation.saturating_add(1),
         _ => 0,
     };
-    let prk = auth::extract_handshake_prk(secret, &hello.client_nonce, &server_nonce, &[0; 32]);
+    let prk = auth::extract_handshake_prk(
+        secret,
+        &vivid_protocol::auth::HandshakeNonces {
+            client: hello.client_nonce,
+            server: server_nonce,
+        },
+        &[0; 32],
+    );
     let maximum = hello
         .maximum_control_body
         .min(vivid_protocol::CONTROL_MAX_RECORD_BODY);
@@ -3792,15 +3788,15 @@ fn establish_session(
                 .ok_or_else(|| io::Error::other("lease disappeared during activation"))?;
             let decision = lease
                 .machine
-                .begin_activation(
-                    *attempt_id,
-                    hello.client_nonce,
-                    hello_body,
-                    fingerprint,
+                .begin_activation(vivid_protocol::lease::EstablishmentAttempt {
+                    attempt_id: *attempt_id,
+                    client_nonce: hello.client_nonce,
+                    hello_bytes: hello_body,
+                    profile_fingerprint: fingerprint,
                     session_id,
                     server_nonce,
-                    candidate_welcome,
-                )
+                    welcome: candidate_welcome,
+                })
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::PermissionDenied, "lease activation failed")
                 })?;
@@ -3831,13 +3827,15 @@ fn establish_session(
                 .machine
                 .begin_resume(
                     ResumeGeneration::new(*generation),
-                    *attempt_id,
-                    hello.client_nonce,
-                    hello_body,
-                    fingerprint,
-                    session_id,
-                    server_nonce,
-                    candidate_welcome,
+                    vivid_protocol::lease::EstablishmentAttempt {
+                        attempt_id: *attempt_id,
+                        client_nonce: hello.client_nonce,
+                        hello_bytes: hello_body,
+                        profile_fingerprint: fingerprint,
+                        session_id,
+                        server_nonce,
+                        welcome: candidate_welcome,
+                    },
                 )
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::PermissionDenied, "lease resume failed")
@@ -3860,7 +3858,14 @@ fn establish_session(
     let (_, decided) = Welcome::decode(&decided_welcome).map_err(io::Error::other)?;
     let session_tag = decided.session_tag;
     let accepted_profiles = decided.accepted_profiles.iter().cloned().collect();
-    let prk = auth::extract_handshake_prk(secret, &hello.client_nonce, &decided_nonce, &[0; 32]);
+    let prk = auth::extract_handshake_prk(
+        secret,
+        &vivid_protocol::auth::HandshakeNonces {
+            client: hello.client_nonce,
+            server: decided_nonce,
+        },
+        &[0; 32],
+    );
     let (keys, anchor_key) =
         auth::derive_session_keys(&prk, session_id, resume_generation, &session_tag);
     let (scene_revision, target_generation) = state
@@ -3885,7 +3890,7 @@ fn establish_session(
             closed: false,
             accepted_profiles,
             session_tag,
-            channel_key: Secret32::new(*keys.channel_key()),
+            channel_key: Secret32::new(*keys.channel_key().expose()),
             anchor_key,
             writer: writer.clone(),
             root_context,
@@ -3897,7 +3902,7 @@ fn establish_session(
             cancelled_waits: HashSet::new(),
             pending_waits: 0,
             lease: lease_key,
-            resume_key: Secret32::new(*keys.resume_key()),
+            resume_key: Secret32::new(*keys.resume_key().expose()),
             resume_generation,
             overlay_lane: None,
         },
@@ -4798,10 +4803,15 @@ fn dispatch_control(
             )
         }
         messages::ADVANCE_CHANNEL => {
-            let map = StrictMap::new("ADVANCE_CHANNEL", &value, &[0, 1, 2, 3, 4, 5])
+            let advance = vivid_protocol::track::AdvanceChannel::decode(&value)
                 .map_err(|_| ControlError::bad("invalid channel advance"))?;
-            let key = track_key_from_map(session_id, &map)?;
-            let reason = required_u64(&map, 5)?;
+            let key = track_key(
+                session_id,
+                advance.context_id,
+                advance.surface_id,
+                advance.track_id,
+            );
+            let reason = advance.reason;
             let (generation, revision) = {
                 let track = state
                     .tracks
@@ -4809,10 +4819,7 @@ fn dispatch_control(
                     .ok_or_else(|| ControlError::missing("track does not exist"))?;
                 track
                     .state
-                    .advance_channel(
-                        ChannelGeneration::new(required_u64(&map, 3)?),
-                        ChannelGeneration::new(required_u64(&map, 4)?),
-                    )
+                    .advance_channel(advance.current_generation, advance.next_generation)
                     .map_err(|_| ControlError::state("channel advance is stale"))?;
                 if track.flush_pending_channel_advance {
                     track.flush_pending_channel_advance = false;
@@ -4876,11 +4883,15 @@ fn dispatch_control(
                     message: "audio-gain-v1 was not negotiated",
                 });
             }
-            let map = StrictMap::new("SET_AUDIO_GAIN", &value, &[0, 1, 2, 3])
-                .map_err(|_| ControlError::bad("invalid audio gain"))?;
-            let key = track_key_from_map(session_id, &map)?;
-            let gain = AudioGain::new(required_u64(&map, 3)?)
-                .ok_or_else(|| ControlError::bad("audio gain exceeds 200 percent"))?;
+            let request = vivid_protocol::track::SetAudioGain::decode(&value)
+                .map_err(|_| ControlError::bad("invalid audio gain or gain above 200 percent"))?;
+            let key = track_key(
+                session_id,
+                request.context_id,
+                request.surface_id,
+                request.track_id,
+            );
+            let gain = request.gain;
             let track = state
                 .tracks
                 .get_mut(&key)
@@ -4898,21 +4909,18 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         }
         messages::ACTIVATE_TRACK => {
-            let map = StrictMap::new("ACTIVATE_TRACK", &value, &[0, 1, 2, 3])
+            let activation = vivid_protocol::track::ActivateTrack::decode(&value)
                 .map_err(|_| ControlError::bad("invalid activation"))?;
-            let surface_key = surface_key_from_map(session_id, &map)?;
-            let expected_revision = SurfaceRevision::new(required_u64(&map, 3)?);
-            let bindings = map
-                .required(2)
-                .map_err(|_| ControlError::bad("missing bindings"))?
-                .as_array()
-                .ok_or_else(|| ControlError::bad("bindings are not an array"))?;
+            let surface_key = SurfaceKey {
+                session: session_id,
+                context: activation.context_id,
+                surface: activation.surface_id,
+            };
+            let expected_revision = activation.expected_surface_revision;
             let mut active = HashMap::new();
-            for value in bindings {
-                let binding = StrictMap::new("slot binding", value, &[0, 1, 2, 3])
-                    .map_err(|_| ControlError::bad("invalid slot binding"))?;
-                let slot = required_u64(&binding, 0)?;
-                let track_id = required_u64(&binding, 1)?;
+            for binding in &activation.bindings {
+                let slot = binding.slot;
+                let track_id = binding.track_id;
                 if track_id == 0 {
                     continue;
                 }
@@ -4925,8 +4933,8 @@ fn dispatch_control(
                     .ok_or_else(|| ControlError::missing("activation track is absent"))?;
                 if track.configuration.direction == crate::TrackDirection::Uplink
                     || track.configuration.slot != slot
-                    || track.state.channel_generation.get() != required_u64(&binding, 2)?
-                    || track.state.milestones & required_u64(&binding, 3)? == 0
+                    || track.state.channel_generation != binding.channel_generation
+                    || track.state.milestones & binding.required_milestone == 0
                 {
                     return Err(ControlError::state(
                         "activation generation or milestone is not ready",
@@ -4971,11 +4979,11 @@ fn dispatch_control(
             )
         }
         messages::BEGIN_TXN => {
-            let map = StrictMap::new("BEGIN_TXN", &value, &[0, 1])
+            let begin = vivid_protocol::scene::BeginTxn::decode(&value)
                 .map_err(|_| ControlError::bad("invalid transaction"))?;
-            let context = required_u64(&map, 0)?;
+            let context = begin.context_id;
             require_root_context(&state, session_id, context)?;
-            let transaction = required_u64(&map, 1)?;
+            let transaction = begin.transaction_id;
             if state
                 .transactions
                 .insert((session_id, context, transaction), Vec::new())
@@ -5007,10 +5015,10 @@ fn dispatch_control(
             let transaction = envelope
                 .transaction_id
                 .ok_or_else(|| ControlError::bad("node deletion omits transaction"))?;
-            let map = StrictMap::new("DELETE_NODE", &value, &[0, 1])
+            let delete = vivid_protocol::scene::DeleteNode::decode(&value)
                 .map_err(|_| ControlError::bad("invalid node deletion"))?;
-            let context = required_u64(&map, 0)?;
-            let node = required_u64(&map, 1)?;
+            let context = delete.context_id;
+            let node = delete.node_id;
             let pending = state
                 .transactions
                 .get_mut(&(session_id, context, transaction))
@@ -5092,10 +5100,10 @@ fn dispatch_control(
             )
         }
         messages::QUERY_ANCHOR => {
-            let map = StrictMap::new("QUERY_ANCHOR", &value, &[0, 1])
+            let query = vivid_protocol::anchor::QueryAnchor::decode(&value)
                 .map_err(|_| ControlError::bad("invalid anchor query"))?;
-            let context = required_u64(&map, 0)?;
-            let anchor = required_u64(&map, 1)?;
+            let context = query.context_id;
+            let anchor = query.anchor_id;
             let session = state.sessions.get(&session_id).unwrap();
             let position = session.anchors.get(&(context, anchor));
             let mut payload = vec![
@@ -5116,18 +5124,13 @@ fn dispatch_control(
             )
         }
         messages::WAIT_TRACK => {
-            let map = StrictMap::new("WAIT_TRACK", &value, &[0, 1, 2, 3, 4, 5, 6])
+            let wait = vivid_protocol::track::WaitTrack::decode(&value)
                 .map_err(|_| ControlError::bad("invalid track wait"))?;
-            let key = track_key_from_map(session_id, &map)?;
-            let condition = required_u64(&map, 3)?;
-            let condition_value = map
-                .optional_u64(4)
-                .map_err(|_| ControlError::bad("invalid wait value"))?;
-            let timeout = required_u64(&map, 5)?;
-            let generation = required_u64(&map, 6)?;
-            if timeout == 0 || timeout > MAX_WAIT_US {
-                return Err(ControlError::bad("invalid wait timeout"));
-            }
+            let key = track_key(session_id, wait.context_id, wait.surface_id, wait.track_id);
+            let condition = wait.condition;
+            let condition_value = wait.condition_value;
+            let timeout = wait.timeout_us;
+            let generation = wait.channel_generation.get();
             let track = state
                 .tracks
                 .get(&key)
@@ -5184,14 +5187,14 @@ fn dispatch_control(
             }
         }
         messages::CANCEL_WAIT => {
-            let map = StrictMap::new("CANCEL_WAIT", &value, &[0])
+            let cancel = vivid_protocol::messages::CancelWait::decode(&value)
                 .map_err(|_| ControlError::bad("invalid wait cancellation"))?;
             state
                 .sessions
                 .get_mut(&session_id)
                 .unwrap()
                 .cancelled_waits
-                .insert(required_u64(&map, 0)?);
+                .insert(cancel.request_id);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         }
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
@@ -5275,10 +5278,9 @@ fn dispatch_control(
                     linked_pause = true;
                 }
                 messages::FLUSH => {
-                    let map = StrictMap::new("FLUSH", &value, &[0, 1, 2, 3])
-                        .map_err(|_| ControlError::bad("invalid FLUSH"))?;
-                    let epoch = u32::try_from(required_u64(&map, 3)?)
-                        .map_err(|_| ControlError::bad("invalid FLUSH epoch"))?;
+                    let epoch = vivid_protocol::track::Flush::decode(&value)
+                        .map_err(|_| ControlError::bad("invalid FLUSH"))?
+                        .epoch;
                     if epoch <= track.state.media_epoch {
                         return Err(ControlError::state("FLUSH epoch did not advance"));
                     }
@@ -5677,7 +5679,9 @@ fn handle_track(
                 "session is no longer live",
             ));
         }
-        if !open.verify(session.channel_key.expose()) {
+        if !open.verify(&vivid_protocol::auth::ChannelKey::new(
+            *session.channel_key.expose(),
+        )) {
             writer.write_record(
                 messages::ERROR,
                 open.track_id,
@@ -5882,8 +5886,8 @@ fn track_loop(
                 return Err(invalid("CHANNEL_EOS must be uncorrelated"));
             }
             let value = Value::Map(envelope.payload);
-            let eos = StrictMap::new("CHANNEL_EOS", &value, &[0, 1, 2, 3, 4, 5])
-                .map_err(io::Error::other)?;
+            let eos =
+                vivid_protocol::track::ChannelEos::decode(&value).map_err(io::Error::other)?;
             let mut state = lock(shared);
             let track = state
                 .tracks
@@ -5892,19 +5896,15 @@ fn track_loop(
             if track.state.channel_generation != generation {
                 return Ok(());
             }
-            if eos.required_u64(0).ok() != Some(key.surface.context)
-                || eos.required_u64(1).ok() != Some(key.surface.surface)
-                || eos.required_u64(2).ok() != Some(key.track)
-                || eos.required_u64(3).ok() != Some(generation.get())
-                || eos.required_u64(5).ok() != Some(record.sequence.saturating_sub(1))
+            if eos.context_id != key.surface.context
+                || eos.surface_id != key.surface.surface
+                || eos.track_id != key.track
+                || eos.channel_generation != generation
+                || eos.last_media_sequence != record.sequence.saturating_sub(1)
             {
                 return Err(invalid("CHANNEL_EOS identity or sequence is invalid"));
             }
-            let epoch = eos
-                .required_u64(4)
-                .ok()
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| invalid("CHANNEL_EOS epoch is invalid"))?;
+            let epoch = eos.epoch;
             if epoch < track.state.media_epoch {
                 return Err(invalid("CHANNEL_EOS epoch is stale"));
             }
@@ -5966,14 +5966,14 @@ fn track_loop(
             let track = state.tracks.get_mut(&key).unwrap();
             track
                 .state
-                .admit_media(
+                .admit_media(vivid_protocol::track::ReceivedMedia {
                     generation,
-                    u32::try_from(record.body.len())
+                    body_length: u32::try_from(record.body.len())
                         .map_err(|_| invalid("media body exceeds u32"))?,
                     epoch,
                     media_id,
                     random_access,
-                )
+                })
                 .map_err(io::Error::other)?;
             track.flush_pending_channel_advance = false;
             track.channel_advance_pending_flush = false;
@@ -6077,14 +6077,14 @@ fn track_loop(
             if !prime_live_audio_before_projection {
                 track
                     .state
-                    .admit_media(
+                    .admit_media(vivid_protocol::track::ReceivedMedia {
                         generation,
-                        u32::try_from(record.body.len())
+                        body_length: u32::try_from(record.body.len())
                             .map_err(|_| invalid("media body exceeds u32"))?,
                         epoch,
                         media_id,
                         random_access,
-                    )
+                    })
                     .map_err(io::Error::other)?;
                 track.flush_pending_channel_advance = false;
                 track.channel_advance_pending_flush = false;
@@ -6460,8 +6460,10 @@ fn update_retained_media(key: TrackKey, track: &mut TrackEntry, record: &Record)
             } else {
                 let frame = media::parse_delta_raster_frame(
                     &record.body,
-                    config.width,
-                    config.height,
+                    vivid_protocol::media::RasterSize {
+                        width: config.width,
+                        height: config.height,
+                    },
                     u32::from(config.maximum_delta_operations),
                 )?;
                 let Some(retained) = track.retained_raster.as_mut() else {
@@ -6656,8 +6658,10 @@ fn validate_media_record(
                 }
                 let frame = media::parse_delta_raster_frame(
                     &record.body,
-                    config.width,
-                    config.height,
+                    vivid_protocol::media::RasterSize {
+                        width: config.width,
+                        height: config.height,
+                    },
                     u32::from(config.maximum_delta_operations),
                 )?;
                 // The composed retained canvas changed just as it does for a full frame.
@@ -7131,14 +7135,16 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             KindConfiguration::Video(video) => {
                 media::is_portable_packetization(&video.codec, &video.packetization)
             }
-            KindConfiguration::Audio(audio) => media::validate_audio_initialization(
-                &audio.codec,
-                &audio.packetization,
-                &audio.extradata,
-                audio.sample_rate,
-                u16::from(audio.channels),
-            )
-            .is_ok(),
+            KindConfiguration::Audio(audio) => {
+                media::validate_audio_initialization(vivid_protocol::media::AudioInitialization {
+                    codec: &audio.codec,
+                    packetization: &audio.packetization,
+                    extradata: &audio.extradata,
+                    sample_rate: audio.sample_rate,
+                    channels: u16::from(audio.channels),
+                })
+                .is_ok()
+            }
             KindConfiguration::Raster(_) | KindConfiguration::EncodedImage(_) => true,
             // Structurally supported; whether this session negotiated `vector-scene-v1` at all is
             // checked at the CREATE_TRACK/PROBE_TRACK_CONFIG call sites, which have the session.
@@ -7148,14 +7154,15 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
 }
 
 fn surface_ready_payload(key: SurfaceKey, surface: &SurfaceState) -> Vec<(u64, Value)> {
-    vivid_protocol::surface::surface_ready_payload(
-        key.context,
-        key.surface,
-        surface.revision,
-        surface.generation,
-        surface.definition.policy,
-        surface.definition.profile_parameters.clone(),
-    )
+    vivid_protocol::surface::SurfaceReady {
+        context_id: key.context,
+        surface_id: key.surface,
+        revision: surface.revision,
+        generation: surface.generation,
+        policy: surface.definition.policy,
+        profile_parameters: surface.definition.profile_parameters.clone(),
+    }
+    .payload()
 }
 
 fn surface_status_payload(key: SurfaceKey, surface: &SurfaceEntry) -> Vec<(u64, Value)> {
@@ -7420,6 +7427,17 @@ fn surface_key_from_map(session: u64, map: &StrictMap<'_>) -> Result<SurfaceKey,
         context: required_u64(map, 0)?,
         surface: required_u64(map, 1)?,
     })
+}
+
+fn track_key(session: u64, context: u64, surface: u64, track: u64) -> TrackKey {
+    TrackKey {
+        surface: SurfaceKey {
+            session,
+            context,
+            surface,
+        },
+        track,
+    }
 }
 
 fn track_key_from_map(session: u64, map: &StrictMap<'_>) -> Result<TrackKey, ControlError> {
@@ -11555,7 +11573,12 @@ mod tests {
             ConnectionKind::Control,
             vivid_protocol::CONTROL_MAX_RECORD_BODY,
         );
-        hello.authenticate_resume(prior.expose(), &preface).unwrap();
+        hello
+            .authenticate_resume(
+                &vivid_protocol::auth::ResumeKey::new(*prior.expose()),
+                &preface,
+            )
+            .unwrap();
         let body = hello.encode(1).unwrap();
         let endpoint = Endpoint::parse(&presenter.endpoint()).unwrap();
         let connect = || {

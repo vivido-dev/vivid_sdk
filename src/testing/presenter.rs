@@ -356,7 +356,7 @@ impl TestPresenter {
                 (0, Value::Unsigned(context_id)),
                 (1, Value::Unsigned(surface_id)),
                 (2, Value::Unsigned(track_id)),
-                (3, Value::Unsigned(registry::error::DECODER)),
+                (3, Value::Unsigned(messages::ERROR_DECODER)),
                 (4, Value::Unsigned(2)),
                 (5, Value::Map(Vec::new())),
                 (6, Value::Text("decoder failed".to_owned())),
@@ -796,7 +796,14 @@ fn serve(serving: Serving) -> io::Result<()> {
     }
 
     let server_nonce = [7_u8; 32];
-    let prk = auth::extract_handshake_prk(&root, &hello.client_nonce, &server_nonce, &[0; 32]);
+    let prk = auth::extract_handshake_prk(
+        &root,
+        &vivid_protocol::auth::HandshakeNonces {
+            client: hello.client_nonce,
+            server: server_nonce,
+        },
+        &[0; 32],
+    );
     let mut accepted_profiles = hello.required_profiles.clone();
     accepted_profiles.extend(hello.optional_profiles.iter().cloned());
     accepted_profiles.sort();
@@ -869,7 +876,7 @@ fn serve(serving: Serving) -> io::Result<()> {
             welcome.resume_generation,
             &welcome.session_tag,
         );
-        Secret32::new(*keys.channel_key())
+        Secret32::new(*keys.channel_key().expose())
     };
 
     // Track connections arrive on the same endpoint; a dedicated acceptor keeps the control loop
@@ -1179,7 +1186,7 @@ fn serve(serving: Serving) -> io::Result<()> {
                     (
                         messages::ERROR,
                         messages::ErrorReply {
-                            code: registry::error::STALE_TARGET_GENERATION,
+                            code: messages::ERROR_STALE_TARGET_GENERATION,
                             request_id,
                             detail: messages::ErrorDetail::new(Vec::new())
                                 .map_err(io::Error::other)?,
@@ -1375,7 +1382,9 @@ fn serve_track_channel(
     }
     let open = messages::ChannelOpen::decode(open_record.object_id, &open_record.body)
         .map_err(io::Error::other)?;
-    if !open.verify(channel_key.expose()) {
+    if !open.verify(&vivid_protocol::auth::ChannelKey::new(
+        *channel_key.expose(),
+    )) {
         return Err(io::Error::other("CHANNEL_OPEN authentication tag failed"));
     }
 
@@ -1508,14 +1517,7 @@ fn serve_interactive_lane(
     }
     let envelope = messages::decode_control(&open_record.body).map_err(io::Error::other)?;
     let open = messages::LaneOpen::decode(&open_record.body).map_err(io::Error::other)?;
-    let expected = auth::lane_tag(
-        channel_key.expose(),
-        open.session_id,
-        messages::LaneClass::Interactive as u32,
-        open.lane_generation,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected, &open.authentication_tag) {
+    if !open.verify(&auth::ChannelKey::new(*channel_key.expose())) {
         return Err(io::Error::other("LANE_OPEN authentication tag failed"));
     }
 

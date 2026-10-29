@@ -11,7 +11,7 @@ use vivid_protocol::file_drop::{
     MaximumFileData, QueryFileDrop,
 };
 use vivid_protocol::messages;
-use vivid_protocol::registry::record as records;
+use vivid_protocol::messages as records;
 use vivid_protocol::revision::{
     FileDropEpoch, FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration,
 };
@@ -289,7 +289,10 @@ impl IncomingFileTransfer {
         let body = maximum.encode()?;
         self.writer
             .write_record(records::MAX_FILE_DATA, 0, self.request.transfer_id, &body)?;
-        self.flow.raise_maxima(maximum_body_bytes, maximum_records);
+        self.flow.raise_maxima(file_drop::FileCredit {
+            maximum_body_bytes,
+            maximum_records,
+        });
         Ok(())
     }
 
@@ -526,7 +529,9 @@ impl Session {
             client_nonce: nonce,
             authentication_tag: [0; file_drop::FILE_TRANSFER_TAG_BYTES],
         };
-        open.sign(self.channel_key.expose());
+        open.sign(&vivid_protocol::auth::ChannelKey::new(
+            *self.channel_key.expose(),
+        ));
         let mut connection = if let Some(directory) = &self.trace_dir {
             Connection::trace(
                 &directory.join(format!(
@@ -586,8 +591,10 @@ impl Session {
             flow: FileTransferFlow::new(
                 request.transfer_generation,
                 request.resume_offset,
-                request.maximum_body_bytes,
-                request.maximum_records,
+                vivid_protocol::file_drop::FileCredit {
+                    maximum_body_bytes: request.maximum_body_bytes,
+                    maximum_records: request.maximum_records,
+                },
             )?,
         })
     }

@@ -83,18 +83,18 @@ impl InputLaneEvent {
             messages::POINTER_MOTION => Ok(InputEvent::decode_motion(
                 *surface_id,
                 &value,
-                width,
-                height,
+                vivid_protocol::input::SurfaceExtent { width, height },
             )?),
             messages::POINTER_BUTTON => Ok(InputEvent::decode_button(
                 *surface_id,
                 &value,
-                width,
-                height,
+                vivid_protocol::input::SurfaceExtent { width, height },
             )?),
-            messages::POINTER_AXIS => {
-                Ok(InputEvent::decode_axis(*surface_id, &value, width, height)?)
-            }
+            messages::POINTER_AXIS => Ok(InputEvent::decode_axis(
+                *surface_id,
+                &value,
+                vivid_protocol::input::SurfaceExtent { width, height },
+            )?),
             _ => Err(invalid_data("unknown ordinary input record type")),
         }
     }
@@ -308,19 +308,13 @@ impl Session {
         }
         let mut nonce = [0; 16];
         random_bytes(&mut nonce)?;
-        let tag = auth::lane_tag(
-            self.channel_key.expose(),
-            self.info.session_id,
-            LaneClass::Interactive as u32,
-            lane_generation,
-            &nonce,
-        );
-        let open = LaneOpen {
+        let mut open = LaneOpen {
             session_id: self.info.session_id,
             lane_generation,
             client_nonce: nonce,
-            authentication_tag: tag,
+            authentication_tag: [0; 16],
         };
+        open.sign(&auth::ChannelKey::new(*self.channel_key.expose()));
         let body = zeroize::Zeroizing::new(messages::encode_payload(1, open.payload())?);
         let offline = matches!(&self.control, ControlPlane::Offline { .. });
         let mut connection = if let Some(directory) = &self.trace_dir {

@@ -120,7 +120,10 @@ pub(crate) fn build_hello(
             hello.authenticate_root(&session_secret, preface)?;
         }
         ProducerAuthentication::Resume { .. } => {
-            hello.authenticate_resume(session_secret.expose(), preface)?;
+            hello.authenticate_resume(
+                &vivid_protocol::auth::ResumeKey::new(*session_secret.expose()),
+                preface,
+            )?;
         }
         ProducerAuthentication::LeaseActivation { .. } => {
             hello.validate()?;
