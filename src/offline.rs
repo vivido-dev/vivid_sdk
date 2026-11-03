@@ -5,7 +5,6 @@
 
 use std::{env, io};
 
-#[cfg(unix)]
 use vivid_protocol::resource::{Resource, ResourceContract};
 use vivid_protocol::wire::Endpoint;
 
