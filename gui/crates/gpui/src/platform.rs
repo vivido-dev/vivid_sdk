@@ -2231,6 +2231,33 @@ impl PlatformInputHandler {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
+    pub(crate) fn prefers_hosted_composition(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        !window.has_pending_keystrokes() && self.handler.prefers_ime_for_printable_keys(window, cx)
+    }
+
+    pub(crate) fn dispatch_hosted_composition(
+        &mut self,
+        target: &crate::HostedTextTarget,
+        commit: Option<&str>,
+        preedit: &str,
+        selection: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(commit) = commit {
+            self.handler.replace_text_in_range(None, commit, window, cx);
+        }
+        if !window.hosted_text_target_live(target) {
+            return;
+        }
+        if preedit.is_empty() {
+            self.handler.unmark_text(window, cx);
+        } else {
+            self.handler
+                .replace_and_mark_text_in_range(None, preedit, selection, window, cx);
+        }
+    }
+
     pub fn compute_ime_candidate_bounds(
         marked_range: Option<Range<usize>>,
         selection: &UTF16Selection,

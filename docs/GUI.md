@@ -146,7 +146,7 @@ delivers release listeners while suppressing GPUI's default activation clicks.
 Custom release handlers can inspect `Window::is_input_cancelled` before
 committing a release-triggered action.
 Basic US physical keys, modifiers, pointer buttons/motion, and scroll are carried.
-Native repeats are suppressed. The producer applies bounded local typematic:
+Native physical-key repeats are suppressed. The producer applies bounded local typematic:
 500 ms initial delay and 50 ms interval by default, with at most one repeat per
 GUI turn and no catch-up burst after a stall. Repeats pass through the ordinary
 key-binding and text-insertion path with `KeyDownEvent::is_held = true`.
@@ -160,11 +160,77 @@ and clear the timer. Each producer owns its timer even when peers reuse local ID
 child. `run` and `run_persistent` validate this strict bounded JSON envelope before
 starting GUI or transport workers. This is a local launch policy, not wire layout
 negotiation; remote GUI pacing can make observed intervals longer than requested.
-The local-process text clipboard bridge is described below.
-Negotiated layouts, Caps Lock state,
-IME, clipboard images/files, popups, accessibility, and multiple windows are not implemented
-by this initial remote backend. Linked/native applications retain their native
-platform services.
+The local-process clipboard and native composition bridges are described below.
+In a native text field, character insertion comes from the host's input method;
+producer physical repeats do not synthesize duplicate text. Native text repeat
+still follows the input method/OS policy. Negotiated layouts and repeat policies,
+Caps Lock state, surrounding-document services, clipboard images/files, popups,
+accessibility and multiple windows remain unsupported by this remote backend.
+Linked/native applications retain their native platform services.
+
+### Local-process native composition
+
+`gui_remote::ime::Host::bind` supplies an owner-private local channel to one
+child through `configure`. It is an optional hosting service, independent of
+Vivid authentication and profiles. `run` and `run_persistent` activate it only
+when both launch credentials are present; partial or malformed credentials fail
+startup. Channel authentication uses a random launch nonce, constant-time
+comparison and strict versioned/sequence-checked bounded framing. Unix endpoints
+require private parent directories. Socket I/O stays on dedicated workers.
+
+The compositor installs only an actually displayed active owner's input binding
+with `set_binding`, reads cached eligibility and candidate geometry with
+`editor`, and calls `dispatch` from its native input handler. Capture the returned
+opaque `Target` on that handler; do not acquire a new target inside an old callback.
+The target includes channel owner, input incarnation, producer reset and editor
+incarnation. Focus/visibility loss, resize, reconnect, lane loss and process
+replacement invalidate old callbacks and queued edits, including rapid focus
+return to identical numeric bindings. Peers have independent channels and queues.
+
+The producer samples its focused registered `Window::hosted_text_state` only
+when the handler accepts text and prefers IME character input. Raw-key handlers
+and pending key chords retain their ordinary physical-key path. It
+rechecks the exact input tuple, keyboard class, control lifecycle and receipt-time
+watchdog immediately before GUI delivery. `Window::dispatch_hosted_composition`
+checks an opaque window/focus target, converts validated UTF-8 preedit selections
+to UTF-16 and invokes the original registered input handler. Focus round trips and
+foreign windows reject that target even when local numeric IDs match. Application
+text/selection notifications also retire it; notifications raised by the hosted
+composition call retain it across its own ordered updates. Components must use
+`notify_text_input_changed` / `notify_text_selection_changed` for external changes.
+Revocation
+clears the original still-focused composition; a newly focused field is never
+substituted. Components remain responsible for their ordinary local focus/blur
+cleanup and bounded document storage.
+
+Each commit and preedit is limited to 4,096 UTF-8 bytes. Each peer queues at most
+64 operations with a one-second local queue lifetime. Adjacent pure preedits may
+coalesce; commits retain order and are never retried after an uncertain transfer.
+Per-message I/O has a one-second deadline, and each side rejects cached eligibility
+older than 500 ms. Invalid frames or channel loss disable the service; a producer
+that negotiated it stops rather than inserting fallback US text. A legacy producer
+without this optional service retains the existing physical-input backend.
+
+Host native queries expose only the local preedit and clipped candidate rectangle.
+Committed producer document text never crosses this channel. Absolute replacement
+is supported within composition; surrounding-document queries/selection/replacement,
+text-assistance preferences and OS secure-input mode are separate work. Native
+printable-key callbacks supply text without producer-side duplicate insertion.
+A field begins native insertion after a current eligibility snapshot reaches the
+host. Transition callbacks may be rejected while it refreshes; rapid field changes
+and typing during that refresh remain physical acceptance gates. Native-first
+components must leave printable insertion to their input handler; asynchronous
+producer key-disposition/shortcut negotiation remains separate work.
+Physical key reports still use the existing US HID mapping; keyboard-layout and
+repeat-policy negotiation remain separate work.
+
+The compositor's `--sdk-editor` child demonstrates a bounded text model. Developer
+`--remote-ime-render-check OUTPUT` uses actual independent GUI processes and Metal
+rendering with simulated native composition callbacks. Set
+`VIVID_COMPOSITOR_CHECK_LEASE=1` for the lease-resume variant. These checks cover
+Unicode composition/commit, candidate bounds, focus return, reconnect and peer
+cleanup. Physical macOS input sources/candidate menus, OS secure-input behavior,
+other platforms/devices and sustained input-method performance remain unrun gates.
 
 ### Local-process text clipboard
 

@@ -27,6 +27,10 @@ use crate::{
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
+#[path = "window/hosted_text.rs"]
+mod hosted_text;
+pub use hosted_text::{HostedTextState, HostedTextTarget};
+
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
@@ -1305,6 +1309,8 @@ pub struct Window {
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
     pub(crate) focus_generation: u64,
+    hosted_text_scope: RefCell<Arc<()>>,
+    hosted_text_dispatching: Rc<Cell<bool>>,
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
     pub(crate) pending_input_observers: SingleSubscriberSet<AnyObserver>,
@@ -2429,6 +2435,8 @@ impl Window {
             focus: None,
             focus_enabled: true,
             focus_generation: 0,
+            hosted_text_scope: RefCell::new(Arc::new(())),
+            hosted_text_dispatching: Rc::new(Cell::new(false)),
             pending_input: None,
             pending_modifier: ModifierState::default(),
             pending_input_observers: SingleSubscriberSet::new(),
@@ -2636,6 +2644,7 @@ impl Window {
             return;
         }
 
+        *self.hosted_text_scope.get_mut() = Arc::new(());
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
@@ -2652,6 +2661,7 @@ impl Window {
         }
 
         if self.focus.is_some() {
+            *self.hosted_text_scope.get_mut() = Arc::new(());
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
         self.focus = None;
@@ -5764,6 +5774,9 @@ impl Window {
     /// to notifying GPUI to redraw. Unfocused or unregistered components are ignored.
     pub fn notify_text_input_changed(&self, focus_handle: &FocusHandle) {
         if self.focused_text_input == Some(focus_handle.id) && focus_handle.is_focused(self) {
+            if !self.hosted_text_dispatching.get() {
+                *self.hosted_text_scope.borrow_mut() = Arc::new(());
+            }
             self.platform_window
                 .text_input_state_changed(TextInputStateChange::ContentChanged);
         }
@@ -5775,6 +5788,9 @@ impl Window {
     /// in addition to notifying GPUI to redraw.
     pub fn notify_text_selection_changed(&self, focus_handle: &FocusHandle) {
         if self.focused_text_input == Some(focus_handle.id) && focus_handle.is_focused(self) {
+            if !self.hosted_text_dispatching.get() {
+                *self.hosted_text_scope.borrow_mut() = Arc::new(());
+            }
             self.platform_window
                 .text_input_state_changed(TextInputStateChange::SelectionChanged);
         }

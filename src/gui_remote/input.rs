@@ -167,6 +167,7 @@ pub(super) struct Translator {
     binding: Option<crate::InputTuple>,
     repeat: keyboard::Repeating,
     policy: KeyRepeat,
+    native_text: bool,
 }
 impl Default for Translator {
     fn default() -> Self {
@@ -178,14 +179,16 @@ impl Default for Translator {
             binding: None,
             repeat: Default::default(),
             policy: KeyRepeat::default(),
+            native_text: false,
         }
     }
 }
 
 impl Translator {
-    pub(super) fn new(policy: KeyRepeat) -> Self {
+    pub(super) fn new(policy: KeyRepeat, native_text: bool) -> Self {
         Self {
             policy,
+            native_text,
             ..Default::default()
         }
     }
@@ -219,6 +222,20 @@ impl Translator {
             key,
             key_char,
         })
+    }
+    fn key_down(&self, window: &mut Window, keystroke: Keystroke, repeated: bool, cx: &mut App) {
+        if self.native_text && window.hosted_text_state(cx).is_some() {
+            window.dispatch_event(
+                PlatformInput::KeyDown(gui::KeyDownEvent {
+                    prefer_character_input: keystroke.key_char.is_some(),
+                    keystroke,
+                    is_held: repeated,
+                }),
+                cx,
+            );
+        } else {
+            window.dispatch_keystroke_with_repeat(keystroke, repeated, cx);
+        }
     }
     fn release(&mut self, window: &mut Window, cx: &mut App) {
         for usage in 4..224 {
@@ -313,7 +330,7 @@ impl Translator {
                         );
                     } else if let Some(keystroke) = self.key(usage) {
                         if pressed {
-                            window.dispatch_keystroke(keystroke, cx);
+                            self.key_down(window, keystroke, false, cx);
                         } else {
                             window.dispatch_event(
                                 PlatformInput::KeyUp(gui::KeyUpEvent { keystroke }),
@@ -418,7 +435,7 @@ impl Translator {
             && self.held[usize::from(usage)]
             && let Some(key) = self.key(usage)
         {
-            window.dispatch_keystroke_with_repeat(key, true, cx);
+            self.key_down(window, key, true, cx);
         }
     }
 }

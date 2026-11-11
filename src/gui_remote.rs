@@ -5,6 +5,7 @@
 
 // Rust guideline compliant 2026-10-07
 pub mod clipboard;
+pub mod ime;
 mod input;
 mod keyboard;
 mod local;
@@ -218,7 +219,8 @@ impl Shared {
 /// no authority is sent through arguments, diagnostics, or a terminal PTY.
 /// `build` should establish the root's initial focus just as in a standalone app.
 /// macOS native termination may exit the process rather than return from `run`.
-/// This initial backend carries physical keys and pointer input, not IME services.
+/// Native composition is available through the owner-private local IME channel.
+/// Other transports retain physical keys and pointer input without native text services.
 /// Producer-owned repeat uses `KeyRepeat` launch policy; invalid policy fails
 /// before starting any transport or GUI resources.
 /// Root-authenticated connections recover transient loss with fresh sessions and
@@ -241,6 +243,7 @@ pub fn run<V: Render + 'static>(
     build: impl FnOnce(&mut Window, &mut gui::App) -> Entity<V> + 'static,
 ) -> io::Result<()> {
     let repeat = KeyRepeat::from_env()?;
+    let (mut ime, ime_service) = ime::Producer::from_env()?;
     let shared = Arc::new(Shared::new());
     let gate = shared
         .injection
@@ -299,7 +302,7 @@ pub fn run<V: Render + 'static>(
             let mut geometry = None;
             let mut last_pixels = None;
             let mut render_revision = 0;
-            let mut input = input::Translator::new(repeat);
+            let mut input = input::Translator::new(repeat, ime.enabled());
             while !app_state.stopped.load(Ordering::Acquire) {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
                 let requested = *app_state.geometry.lock().expect("geometry mutex");
@@ -314,6 +317,7 @@ pub fn run<V: Render + 'static>(
                             injection.revoke();
                         }
                         input.apply(&mut injection, window, cx);
+                        ime.pump(&injection, window, cx)?;
                     }
                     let Some(requested) = requested else {
                         geometry = None;
@@ -372,6 +376,7 @@ pub fn run<V: Render + 'static>(
                 let mut injection = app_state.injection.lock().expect("input mutex");
                 injection.revoke();
                 input.apply(&mut injection, window, cx);
+                let _ = ime.pump(&injection, window, cx);
             });
             if app_state.error.lock().expect("error mutex").is_some() {
                 std::process::exit(1);
@@ -382,6 +387,7 @@ pub fn run<V: Render + 'static>(
     });
     shared.stop(None);
     drop(clipboard_service);
+    drop(ime_service);
     let _ = control.join();
     let _ = media.join();
     let error = shared.error.lock().expect("error mutex").take();
