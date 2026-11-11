@@ -160,10 +160,56 @@ and clear the timer. Each producer owns its timer even when peers reuse local ID
 child. `run` and `run_persistent` validate this strict bounded JSON envelope before
 starting GUI or transport workers. This is a local launch policy, not wire layout
 negotiation; remote GUI pacing can make observed intervals longer than requested.
+The local-process text clipboard bridge is described below.
 Negotiated layouts, Caps Lock state,
-IME, clipboard, popups, accessibility, and multiple windows are not implemented
+IME, clipboard images/files, popups, accessibility, and multiple windows are not implemented
 by this initial remote backend. Linked/native applications retain their native
 platform services.
+
+### Local-process text clipboard
+
+`gui_remote::clipboard::Host::bind` starts a private same-owner native service
+for one child. Its launch environment is independent of Vivid authentication;
+this is a local hosting service, not a new Vivid profile. The compositor installs
+the child's exact actually-presented input binding and services `next_request`
+on the GUI thread through ordinary `gui_host::clipboard` leases. A new binding,
+focus/visibility loss, resize, reconnect or process replacement revokes queued
+and in-flight native work. Admission is serialized with revocation, including
+focus return to an identical numeric binding. Peer processes have independent
+channels, leases and resource budgets.
+
+`run` and `run_persistent` install an explicit `gui::HostedClipboard` provider
+before constructing the root view. Use `App::read_from_clipboard_async` or
+`read_clipboard_text_async` for paste and `write_to_clipboard` for copy. Clipboard
+text is limited to 1 MiB, with four queued/in-flight producer requests and one
+native transfer per owner. Each transfer has a one-second budget. Native socket
+I/O runs on dedicated workers; GUI, rendering, media and Vivid input never wait
+for it. Producer delivery checks the original binding's watchdog and control
+lifecycle. Dropped/expired replies cannot acquire a newer focus grant.
+
+Synchronous clipboard reads return None on this backend. Primary, Find, image
+and file-list APIs have no native fallback. With no private service endpoint,
+clipboard access is unavailable; partial credentials fail startup. The channel
+checks a random launch credential in constant time, strict version/sequence
+framing, native peer ownership and private Unix directories. Native service
+failure disables this process's clipboard until Restart without stopping media
+or a peer. A write API queues work and does not acknowledge native completion;
+never automatically retry an uncertain copy. This is process fault isolation,
+not an OS sandbox against a producer calling native APIs itself.
+
+The remote counter examples accept Ctrl/Cmd+C to copy their count and Ctrl/Cmd+V
+to restore a bounded decimal count. macOS automated acceptance covers real
+producer processes and IPC with the host's test clipboard. Physical keyboard
+shortcuts and interoperability with other native applications remain separate acceptance gates.
+
+macOS bounded text reads now request only UTF-8 text and check the native data
+length before allocating a Rust copy. They ignore file, image and metadata
+formats. Pasteboard I/O runs on the background executor with one actual read per
+platform, including a read whose awaiting view cancels. A one-second deadline
+rejects late results; an in-progress AppKit/provider call cannot be interrupted
+and retains its permit until it returns. Native provider allocations are outside
+the Rust byte budget. Unique native pasteboard tests cover Unicode, exact limits,
+invalid UTF-8 and ignored images without modifying the ordinary user clipboard.
 
 The compositor currently launches each app with a dedicated authenticated
 presenter. A stalled or crashed app does not share the shell's event loop or

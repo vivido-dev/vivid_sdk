@@ -11,8 +11,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt,
-    io::{self, Read, Write},
+    fmt, io,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -74,117 +73,35 @@ fn invalid() -> io::Error {
         "invalid application state channel",
     )
 }
-fn remaining(end: Instant) -> io::Result<Duration> {
-    let time = end.saturating_duration_since(Instant::now());
-    if time.is_zero() {
-        Err(io::ErrorKind::TimedOut.into())
-    } else {
-        Ok(time)
-    }
-}
-fn read_exact(stream: &mut LocalStream, mut bytes: &mut [u8], end: Instant) -> io::Result<()> {
-    while !bytes.is_empty() {
-        remaining(end)?;
-        #[cfg(not(unix))]
-        stream.set_read_timeout(Some(remaining(end)?))?;
-        match stream.read(bytes) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => bytes = &mut bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                thread::sleep(POLL.min(remaining(end)?))
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
+use super::local::remaining;
 fn write_message(stream: &mut LocalStream, message: Message, end: Instant) -> io::Result<()> {
-    stream.set_nonblocking(true)?;
-    let body = serde_json::to_vec(&Envelope {
-        version: 1,
-        message,
-    })
-    .map_err(|_| invalid())?;
-    if body.len() > MAX_FRAME {
-        return Err(invalid());
-    }
-    let header = u32::try_from(body.len())
-        .map_err(|_| invalid())?
-        .to_be_bytes();
-    for mut bytes in [&header[..], &body[..]] {
-        while !bytes.is_empty() {
-            remaining(end)?;
-            #[cfg(not(unix))]
-            stream.set_write_timeout(Some(remaining(end)?))?;
-            match stream.write(bytes) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => bytes = &bytes[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    thread::sleep(POLL.min(remaining(end)?))
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    Ok(())
+    super::local::send(
+        stream,
+        &Envelope {
+            version: 1,
+            message,
+        },
+        MAX_FRAME,
+        end,
+    )
 }
 fn read_message(stream: &mut LocalStream, end: Instant) -> io::Result<Message> {
-    // Unix reads are nonblocking under one absolute deadline. Reinstalling a
-    // socket timeout after peer FIN can fail with EINVAL on macOS even when a
-    // complete final reply remains buffered. Windows uses cancellable pipe I/O.
-    stream.set_nonblocking(true)?;
-    let mut header = [0; 4];
-    read_exact(stream, &mut header, end)?;
-    read_body(stream, header, end)
-}
-fn read_body(stream: &mut LocalStream, header: [u8; 4], end: Instant) -> io::Result<Message> {
-    let len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| invalid())?;
-    if len == 0 || len > MAX_FRAME {
-        return Err(invalid());
-    }
-    let mut body = vec![0; len];
-    read_exact(stream, &mut body, end)?;
-    let envelope: Envelope = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let envelope: Envelope = super::local::receive(stream, MAX_FRAME, end)?;
     if envelope.version != 1 {
         return Err(invalid());
     }
     Ok(envelope.message)
 }
 fn read_idle(stream: &mut LocalStream) -> io::Result<Option<Message>> {
-    stream.set_nonblocking(true)?;
-    let mut header = [0; 4];
-    #[cfg(not(unix))]
-    stream.set_read_timeout(Some(POLL))?;
-    match stream.read(&mut header[..1]) {
-        Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-        Ok(_) => (),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) =>
-        {
-            #[cfg(unix)]
-            thread::sleep(POLL);
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    }
-    let end = Instant::now() + BUDGET;
-    read_exact(stream, &mut header[1..], end)?;
-    read_body(stream, header, end).map(Some)
+    let envelope: Option<Envelope> = super::local::receive_idle(stream, MAX_FRAME, BUDGET)?;
+    envelope
+        .map(|envelope| {
+            if envelope.version != 1 {
+                return Err(invalid());
+            }
+            Ok(envelope.message)
+        })
+        .transpose()
 }
 
 #[derive(Default)]
@@ -252,24 +169,7 @@ impl Host {
     /// # Errors
     /// Returns an error for invalid/private-directory policy, entropy, bind or worker failure.
     pub fn bind(endpoint: &Path, initial: Option<AppState>) -> io::Result<(Self, Service)> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if !endpoint.is_absolute() {
-                return Err(invalid());
-            }
-            let parent = endpoint.parent().ok_or_else(invalid)?;
-            let metadata = std::fs::symlink_metadata(parent)?;
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || metadata.permissions().mode() & 0o077 != 0
-            {
-                return Err(invalid());
-            }
-            if endpoint.try_exists()? {
-                return Err(io::ErrorKind::AlreadyExists.into());
-            }
-        }
+        super::local::validate_endpoint(endpoint)?;
         let mut owner = [0; 16];
         getrandom::fill(&mut owner).map_err(io::Error::other)?;
         let listener = LocalListener::bind(endpoint)?;

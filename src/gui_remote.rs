@@ -4,8 +4,10 @@
 //! use independent workers, bounded mailboxes, and the existing Vivid transports.
 
 // Rust guideline compliant 2026-10-07
+pub mod clipboard;
 mod input;
 mod keyboard;
+mod local;
 mod reconnect;
 mod recovery;
 pub mod state;
@@ -123,6 +125,7 @@ struct Injection {
     events: VecDeque<InputEvent>,
     reset: u64,
     origin: Instant,
+    clipboard: Arc<clipboard::Gate>,
 }
 
 impl Injection {
@@ -132,6 +135,7 @@ impl Injection {
         )
     }
     fn revoke(&mut self) {
+        self.clipboard.revoke();
         self.guard.release();
         self.events.clear();
         self.reset = self
@@ -167,6 +171,7 @@ impl Shared {
                 events: VecDeque::new(),
                 reset: 0,
                 origin: Instant::now(),
+                clipboard: Arc::new(clipboard::Gate::default()),
             }),
             stopped: AtomicBool::new(false),
             media_id: AtomicU64::new(0),
@@ -237,6 +242,13 @@ pub fn run<V: Render + 'static>(
 ) -> io::Result<()> {
     let repeat = KeyRepeat::from_env()?;
     let shared = Arc::new(Shared::new());
+    let gate = shared
+        .injection
+        .lock()
+        .expect("input mutex")
+        .clipboard
+        .clone();
+    let (clipboard, clipboard_service) = clipboard::Producer::from_env(gate)?;
     let control_state = shared.clone();
     let control = std::thread::Builder::new()
         .name("vivid-gui-control".into())
@@ -263,6 +275,7 @@ pub fn run<V: Render + 'static>(
     };
     let app_state = shared.clone();
     crate::gui_platform::headless().run(move |cx| {
+        cx.set_hosted_clipboard(std::rc::Rc::new(clipboard));
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -368,6 +381,7 @@ pub fn run<V: Render + 'static>(
         .detach();
     });
     shared.stop(None);
+    drop(clipboard_service);
     let _ = control.join();
     let _ = media.join();
     let error = shared.error.lock().expect("error mutex").take();

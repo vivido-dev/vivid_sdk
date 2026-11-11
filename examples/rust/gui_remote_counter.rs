@@ -23,7 +23,34 @@ impl Render for Counter {
             .text_color(rgb(0xffffff))
             .track_focus(&self.focus)
             .on_key_down(
-                cx.listener(|_, event: &vivid_sdk::gui::KeyDownEvent, window, cx| {
+                cx.listener(|view, event: &vivid_sdk::gui::KeyDownEvent, window, cx| {
+                    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+                        match event.keystroke.key.as_str() {
+                            "c" => cx.write_to_clipboard(
+                                vivid_sdk::gui::ClipboardItem::new_string(view.count.to_string()),
+                            ),
+                            "v" => {
+                                let read = cx.read_clipboard_text_async(
+                                    vivid_sdk::gui::ClipboardSelection::Clipboard,
+                                    20,
+                                );
+                                cx.spawn(async move |view, cx| {
+                                    if let Ok(Some(text)) = read.await
+                                        && !text.is_empty()
+                                        && text.bytes().all(|b| b.is_ascii_digit())
+                                        && let Ok(count) = text.parse::<u64>()
+                                    {
+                                        let _ = view.update(cx, |view, cx| {
+                                            view.count = count;
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .detach();
+                            }
+                            _ => (),
+                        }
+                    }
                     if event.keystroke.modifiers.control && event.keystroke.key == "q" {
                         window.prevent_default();
                         cx.stop_propagation();

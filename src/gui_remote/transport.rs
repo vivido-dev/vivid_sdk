@@ -287,6 +287,7 @@ fn receive_input(shared: &Shared, lane: &InputLane, current: &Presentation) -> i
             }
             InputLaneEvent::Renew(renewal) => {
                 let _ = injection.guard.handle_renewal(&renewal, now);
+                injection.clipboard.refresh(&injection);
             }
             InputLaneEvent::Revoked(termination) | InputLaneEvent::Reset(termination) => {
                 if injection.guard.handle_revocation(&termination).is_ok() {
@@ -486,6 +487,7 @@ pub(super) fn connected(
                         let mut injection = shared.injection.lock().expect("input mutex");
                         let now = injection.now();
                         injection.guard.handle_bound_at(&status, now)?;
+                        injection.clipboard.refresh(&injection);
                         last_binding = Instant::now();
                     }
                 }

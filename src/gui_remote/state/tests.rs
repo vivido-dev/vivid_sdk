@@ -7,6 +7,7 @@ use crate::{
     gui_host::{AppConfig, AppDescriptor, AppFactory, AppHost, HostedApp, Lifecycle},
 };
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Render, TestAppContext, Window};
+use std::io::Write as _;
 
 #[derive(Debug)]
 struct View;

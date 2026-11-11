@@ -90,6 +90,10 @@ impl InputBindingGuard {
     pub fn is_expired(&self, now: Monotonic) -> bool {
         self.watchdog_deadline.is_some_and(|d| now >= d)
     }
+    #[cfg(feature = "gui-remote")]
+    pub(crate) fn watchdog_deadline(&self) -> Option<Monotonic> {
+        self.watchdog_deadline
+    }
     pub fn current_tag(&self) -> Option<InputTuple> {
         match self.state {
             GuardState::Active(g) => Some(InputTuple {

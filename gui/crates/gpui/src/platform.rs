@@ -3196,6 +3196,18 @@ pub struct ClipboardItem {
     pub entries: Vec<ClipboardEntry>,
 }
 
+/// Replaces native clipboard access for an explicitly hosted application.
+///
+/// Implementations must bound transfers and recheck owner authority on completion.
+/// Synchronous reads, primary/find selections and file-list APIs are unavailable
+/// while a provider is installed; they never fall back to the native clipboard.
+pub trait HostedClipboard: std::fmt::Debug {
+    /// Starts an asynchronous text read without blocking the GUI thread.
+    fn read(&self, cx: &crate::App) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>>;
+    /// Queues a bounded write; this callback does not acknowledge native completion.
+    fn write(&self, item: ClipboardItem);
+}
+
 /// Selects an operating-system text selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardSelection {

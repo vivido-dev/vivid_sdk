@@ -54,9 +54,13 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 const MAC_PLATFORM_IVAR: &CStr = c"platform";
+// Match the bounded GUI text service; native provider allocations are separate.
+const MAX_ASYNC_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(1);
 static mut APP_CLASS: *const AnyClass = ptr::null();
 static mut APP_DELEGATE_CLASS: *const AnyClass = ptr::null();
 
@@ -172,6 +176,7 @@ pub(crate) struct MacPlatformState {
     activation_policy: ActivationPolicy,
     application_created: bool,
     general_pasteboard: Pasteboard,
+    clipboard_text_read: Arc<AtomicBool>,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
@@ -242,6 +247,7 @@ impl MacPlatform {
             foreground_executor: ForegroundExecutor::new(dispatcher),
             renderer_context: renderer::Context::default(),
             general_pasteboard: Pasteboard::general(),
+            clipboard_text_read: Arc::new(AtomicBool::new(false)),
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
@@ -1206,6 +1212,49 @@ impl Platform for MacPlatform {
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         let state = self.0.lock();
         state.general_pasteboard.read()
+    }
+
+    fn read_clipboard_text_async(
+        &self,
+        selection: gpui::ClipboardSelection,
+        max_bytes: usize,
+    ) -> Task<std::result::Result<Option<String>, gpui::ClipboardReadError>> {
+        // Keep platform work bounded independently of a cancelled view's task.
+        // A native pasteboard provider can stall inside AppKit; only one such
+        // operation may remain live, and it never holds the GUI/state mutex.
+        if selection != gpui::ClipboardSelection::Clipboard
+            || max_bytes > MAX_ASYNC_CLIPBOARD_TEXT_BYTES
+        {
+            return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
+        }
+        let state = self.0.lock();
+        let busy = state.clipboard_text_read.clone();
+        let executor = state.background_executor.clone();
+        drop(state);
+        if busy.swap(true, Ordering::AcqRel) {
+            return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
+        }
+        struct Permit(Arc<AtomicBool>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let permit = Permit(busy);
+        let end = std::time::Instant::now() + CLIPBOARD_READ_TIMEOUT;
+        executor.spawn(async move {
+            let _permit = permit;
+            if std::time::Instant::now() >= end {
+                return Err(gpui::ClipboardReadError::Unavailable);
+            }
+            // A fresh pasteboard wrapper and autorelease pool stay on this
+            // worker. No AppKit object or platform mutex crosses an await.
+            let result = autoreleasepool(|_| Pasteboard::general().read_text_bounded(max_bytes));
+            if std::time::Instant::now() >= end {
+                return Err(gpui::ClipboardReadError::Unavailable);
+            }
+            result
+        })
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {

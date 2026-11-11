@@ -28,6 +28,23 @@ pub struct Pasteboard {
 }
 
 impl Pasteboard {
+    pub fn read_text_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Option<String>, gpui::ClipboardReadError> {
+        // SAFETY: This is the framework's immutable string-format constant.
+        let Some(data) = self.inner.dataForType(unsafe { NSPasteboardTypeString }) else {
+            return Ok(None);
+        };
+        // Check the native data length before allocating any Rust copy. This
+        // path deliberately requests neither file lists, images nor metadata.
+        if data.len() > max_bytes {
+            return Err(gpui::ClipboardReadError::UnsupportedContent);
+        }
+        String::from_utf8(data.to_vec())
+            .map(Some)
+            .map_err(|_| gpui::ClipboardReadError::UnsupportedContent)
+    }
     pub fn general() -> Self {
         Self::new(NSPasteboard::generalPasteboard())
     }
@@ -307,6 +324,40 @@ mod tests {
     use objc2::rc::autoreleasepool;
 
     use super::*;
+
+    #[test]
+    fn bounded_text_reads_preserve_utf8_and_skip_nontext_formats() {
+        autoreleasepool(|_| {
+            let pasteboard = Pasteboard::unique();
+            let text = "a\r\n🦀\0é";
+            pasteboard.write(ClipboardItem::new_string(text.into()));
+            assert_eq!(
+                pasteboard.read_text_bounded(text.len()).unwrap().as_deref(),
+                Some(text)
+            );
+            assert!(pasteboard.read_text_bounded(text.len() - 1).is_err());
+            pasteboard.inner.clearContents();
+            // SAFETY: Immutable framework type constants and retained NSData
+            // are valid for these ordinary pasteboard setter calls.
+            unsafe {
+                let invalid = NSData::with_bytes(&[0xff]);
+                pasteboard
+                    .inner
+                    .setData_forType(Some(&invalid), NSPasteboardTypeString);
+            }
+            assert!(pasteboard.read_text_bounded(32).is_err());
+            pasteboard.inner.clearContents();
+            // SAFETY: This publishes only small owned bytes under the immutable
+            // image type constant; the text path must never request those bytes.
+            unsafe {
+                let image = NSData::with_bytes(&[0; 32]);
+                pasteboard
+                    .inner
+                    .setData_forType(Some(&image), NSPasteboardTypePNG);
+            }
+            assert_eq!(pasteboard.read_text_bounded(0).unwrap(), None);
+        });
+    }
 
     #[test]
     fn test_string() {

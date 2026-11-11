@@ -267,6 +267,7 @@ impl Translator {
             self.reset = injection.reset;
             self.binding = injection.guard.current_tag();
         }
+        injection.clipboard.refresh(injection);
         for _ in 0..INPUT_CAPACITY {
             if injection
                 .lifecycle

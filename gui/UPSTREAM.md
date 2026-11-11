@@ -56,6 +56,17 @@ connection/reply waits still follow x11rb's transport behavior. The new path
 preserves text bytes, including CRLF, and does not request images. Legacy full
 clipboard reads retain their existing API.
 
+`App::set_hosted_clipboard` installs an explicit application-owned provider for
+asynchronous ordinary clipboard reads and writes. It disables synchronous,
+primary, Find and file-list fallback to native services. The remote SDK adapter
+uses it to route text through the compositor's owner-scoped lease service.
+
+macOS overrides bounded text reads to request only the string type, check native
+data length before copying and reject invalid UTF-8. Reads run off the GUI thread
+with one actual in-flight native operation per platform. Cancellation retains
+that permit through the uninterruptible native call; a one-second deadline
+discards late results. Native pasteboard/provider allocations remain external.
+
 `App::read_clipboard_uri_list_async` transfers bounded local file metadata through
 the same Linux external-read permit and deadline as text. Only explicit file
 entries or Wayland `text/uri-list` offers are accepted. Shared helpers validate

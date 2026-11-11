@@ -884,6 +884,7 @@ enum PlatformOwnedDragState {
 pub struct App {
     pub(crate) this: Weak<AppCell>,
     pub(crate) platform: Rc<dyn Platform>,
+    hosted_clipboard: Option<Rc<dyn crate::HostedClipboard>>,
     text_system: Arc<TextSystem>,
 
     pub(crate) actions: Rc<ActionRegistry>,
@@ -1022,6 +1023,7 @@ impl App {
             app: RefCell::new(App {
                 this: this.clone(),
                 platform: platform.clone(),
+                hosted_clipboard: None,
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 mode: GpuiMode::Production,
@@ -1832,6 +1834,9 @@ impl App {
 
     /// Reads data from the platform clipboard.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+        if self.hosted_clipboard.is_some() {
+            return None;
+        }
         self.platform.read_from_clipboard()
     }
 
@@ -1845,6 +1850,9 @@ impl App {
     pub fn read_from_clipboard_async(
         &self,
     ) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        if let Some(provider) = &self.hosted_clipboard {
+            return provider.read(self);
+        }
         self.platform.read_from_clipboard_async()
     }
 
@@ -1854,17 +1862,32 @@ impl App {
         selection: crate::ClipboardSelection,
         max_bytes: usize,
     ) -> Task<Result<Option<String>, ClipboardReadError>> {
+        if let Some(provider) = &self.hosted_clipboard {
+            if selection != crate::ClipboardSelection::Clipboard {
+                return Task::ready(Err(ClipboardReadError::Unavailable));
+            }
+            let read = provider.read(self);
+            return self
+                .foreground_executor
+                .spawn(async move { crate::clipboard_text(read.await?, max_bytes) });
+        }
         self.platform
             .read_clipboard_text_async(selection, max_bytes)
     }
 
     /// Reports bounded local file-list clipboard support on this platform.
     pub fn supports_uri_list_clipboard(&self) -> bool {
+        if self.hosted_clipboard.is_some() {
+            return false;
+        }
         self.platform.supports_uri_list_clipboard()
     }
 
     /// Reports an explicit file-list offer without reading external clipboard data.
     pub fn clipboard_has_file_list(&self) -> bool {
+        if self.hosted_clipboard.is_some() {
+            return false;
+        }
         self.platform.clipboard_has_file_list()
     }
 
@@ -1873,6 +1896,9 @@ impl App {
         &self,
         max_bytes: usize,
     ) -> Task<Result<Option<String>, ClipboardReadError>> {
+        if self.hosted_clipboard.is_some() {
+            return Task::ready(Err(ClipboardReadError::Unavailable));
+        }
         self.platform.read_clipboard_uri_list_async(max_bytes)
     }
 
@@ -1894,13 +1920,25 @@ impl App {
 
     /// Writes data to the platform clipboard.
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
+        if let Some(provider) = &self.hosted_clipboard {
+            provider.write(item);
+            return;
+        }
         self.platform.write_to_clipboard(item)
+    }
+
+    /// Installs a process-local hosted clipboard without native fallback.
+    pub fn set_hosted_clipboard(&mut self, provider: Rc<dyn crate::HostedClipboard>) {
+        self.hosted_clipboard = Some(provider);
     }
 
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn read_from_primary(&self) -> Option<ClipboardItem> {
+        if self.hosted_clipboard.is_some() {
+            return None;
+        }
         self.platform.read_from_primary()
     }
 
@@ -1908,6 +1946,9 @@ impl App {
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn write_to_primary(&self, item: ClipboardItem) {
+        if self.hosted_clipboard.is_some() {
+            return;
+        }
         self.platform.write_to_primary(item)
     }
 
@@ -1918,6 +1959,9 @@ impl App {
     /// https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find
     #[cfg(target_os = "macos")]
     pub fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
+        if self.hosted_clipboard.is_some() {
+            return None;
+        }
         self.platform.read_from_find_pasteboard()
     }
 
@@ -1928,6 +1972,9 @@ impl App {
     /// https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find
     #[cfg(target_os = "macos")]
     pub fn write_to_find_pasteboard(&self, item: ClipboardItem) {
+        if self.hosted_clipboard.is_some() {
+            return;
+        }
         self.platform.write_to_find_pasteboard(item)
     }
 
