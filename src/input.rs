@@ -383,7 +383,13 @@ impl Session {
             connection.writer()
         } else {
             let (reader, writer) = connection.split()?;
-            spawn_interactive_reader(reader, writer.clone(), shared.clone(), overlay)?;
+            spawn_interactive_reader(
+                reader,
+                writer.clone(),
+                shared.clone(),
+                overlay,
+                self.supports(vivid_protocol::registry::OVERLAY_EDITOR),
+            )?;
             writer
         };
         Ok(InputLane {
@@ -403,7 +409,7 @@ pub(crate) fn spawn_input_reader(
     writer: ConnectionWriter,
     pending: Arc<PendingInput>,
 ) -> io::Result<()> {
-    spawn_interactive_reader(reader, writer, pending, false)
+    spawn_interactive_reader(reader, writer, pending, false, false)
 }
 
 fn spawn_interactive_reader(
@@ -411,6 +417,7 @@ fn spawn_interactive_reader(
     writer: ConnectionWriter,
     pending: Arc<PendingInput>,
     overlay: bool,
+    editor: bool,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("vivid-input-reader".into())
@@ -421,6 +428,9 @@ fn spawn_interactive_reader(
                     let record = reader.read_record()?;
                     if record.flags & !vivid_protocol::wire::RECORD_OPTIONAL != 0 {
                         return Err(invalid_data("unknown interactive record flags"));
+                    }
+                    if record.record_type == messages::OVERLAY_TEXT_EDIT && !editor {
+                        return Err(invalid_data("overlay editor profile was not negotiated"));
                     }
                     let common = matches!(
                         record.record_type,
@@ -435,6 +445,7 @@ fn spawn_interactive_reader(
                                     | messages::OVERLAY_SUBMISSION_OUTCOME
                                     | messages::OVERLAY_VIEWPORT_CHANGED
                                     | messages::OVERLAY_ENV_CHANGED
+                                    | messages::OVERLAY_TEXT_EDIT
                             )
                     } else {
                         matches!(
@@ -518,6 +529,17 @@ fn spawn_interactive_reader(
                                 return Err(invalid_data("viewport revision did not advance"));
                             }
                             viewport_revision = update.revision;
+                            InputLaneEvent::Input {
+                                record_type: record.record_type,
+                                surface_id: record.object_id,
+                                payload: envelope.payload,
+                            }
+                        }
+                        messages::OVERLAY_TEXT_EDIT => {
+                            vivid_protocol::overlay::wire::text::editor::Edit::decode(
+                                record.object_id,
+                                &Value::Map(envelope.payload.clone()),
+                            )?;
                             InputLaneEvent::Input {
                                 record_type: record.record_type,
                                 surface_id: record.object_id,
@@ -633,6 +655,8 @@ fn spawn_interactive_reader(
 /// Actionable overlay input, with identities and revisions preserved at full width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayLaneEvent {
+    /// A bounded native document edit; the producer validates its editor revision.
+    EditorEdit(vivid_protocol::overlay::wire::text::editor::Edit),
     Input(vivid_protocol::overlay::wire::InputEvent),
     Outcome(vivid_protocol::overlay::wire::SubmissionOutcome),
     Viewport(vivid_protocol::overlay::wire::ViewportChanged),
@@ -786,6 +810,16 @@ impl OverlayInputLane {
                 payload,
             }) => Ok(Some(OverlayLaneEvent::Environment(
                 vivid_protocol::overlay::wire::EnvironmentChanged::decode(
+                    surface_id,
+                    &Value::Map(payload),
+                )?,
+            ))),
+            Some(InputLaneEvent::Input {
+                record_type: messages::OVERLAY_TEXT_EDIT,
+                surface_id,
+                payload,
+            }) => Ok(Some(OverlayLaneEvent::EditorEdit(
+                vivid_protocol::overlay::wire::text::editor::Edit::decode(
                     surface_id,
                     &Value::Map(payload),
                 )?,
@@ -1152,18 +1186,70 @@ mod audit_tests {
             event: vivid_protocol::overlay::Event::Text("x".repeat(4096)),
         };
         let body = Envelope::new(0, event.payload().unwrap()).encode().unwrap();
-        for (overlay, count, kind, body, accepted) in [
-            (true, 1, messages::OVERLAY_INPUT_EVENT, body.clone(), true),
-            (false, 1, messages::OVERLAY_INPUT_EVENT, body.clone(), false),
-            (true, 32, messages::OVERLAY_INPUT_EVENT, body, false),
+        let document = vivid_protocol::overlay::wire::text::editor::Edit {
+            address: event.address,
+            scene_revision: event.scene_revision,
+            editor: 1,
+            revision: 1,
+            replacement: None,
+            selection: None,
+            commit: Some("文".into()),
+            preedit: None,
+        };
+        let document = Envelope::new(0, document.payload().unwrap())
+            .encode()
+            .unwrap();
+        for (overlay, editor, count, kind, body, accepted) in [
             (
                 true,
+                true,
+                1,
+                messages::OVERLAY_TEXT_EDIT,
+                document.clone(),
+                true,
+            ),
+            (
+                true,
+                false,
+                1,
+                messages::OVERLAY_TEXT_EDIT,
+                document.clone(),
+                false,
+            ),
+            (false, true, 1, messages::OVERLAY_TEXT_EDIT, document, false),
+            (
+                true,
+                false,
+                1,
+                messages::OVERLAY_INPUT_EVENT,
+                body.clone(),
+                true,
+            ),
+            (
+                false,
+                false,
+                1,
+                messages::OVERLAY_INPUT_EVENT,
+                body.clone(),
+                false,
+            ),
+            (true, false, 32, messages::OVERLAY_INPUT_EVENT, body, false),
+            (
+                true,
+                false,
                 1,
                 messages::OVERLAY_INPUT_EVENT,
                 messages::empty(0),
                 false,
             ),
-            (true, 1, messages::KEY_INPUT, messages::empty(0), false),
+            (
+                true,
+                false,
+                1,
+                messages::KEY_INPUT,
+                messages::empty(0),
+                false,
+            ),
         ] {
             let mut records = vec![(messages::LANE_ACCEPTED, 0, vec![])];
             records.extend((0..count).map(|_| (kind, 2, body.clone())));
@@ -1198,7 +1284,7 @@ mod audit_tests {
                 events_ready: Condvar::new(),
                 closed: AtomicBool::new(false),
             });
-            spawn_interactive_reader(reader, writer, pending, overlay).unwrap();
+            spawn_interactive_reader(reader, writer, pending, overlay, editor).unwrap();
             assert_eq!(
                 receiver
                     .recv_timeout(Duration::from_secs(1))

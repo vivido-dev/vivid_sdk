@@ -101,6 +101,51 @@ pub struct VectorEditorState {
     pub target: VectorTextTarget,
     /// Clipped candidate rectangle normalized to the pane, or no current geometry.
     pub caret: Option<[f64; 4]>,
+    /// Last bounded document context published under this same editor focus.
+    pub document: Option<vivid_protocol::overlay::wire::text::editor::Context>,
+}
+
+/// A native document operation pinned to an immutable text focus target.
+#[derive(Clone, Default)]
+pub struct VectorDocumentEdit {
+    /// Original editor incarnation; external changes must advance it.
+    pub editor: u64,
+    /// Original excerpt revision for absolute ranges.
+    pub revision: u64,
+    /// Replacement range in excerpt UTF-8 bytes, or current selection/preedit.
+    pub replacement: Option<std::ops::Range<u32>>,
+    /// Standalone document cursor and anchor update.
+    pub selection: Option<(u32, u32)>,
+    /// Committed text, at most 4,096 UTF-8 bytes.
+    pub commit: Option<String>,
+    /// Optional new preedit and its UTF-8 selection; empty text clears composition.
+    pub preedit: Option<(String, Option<std::ops::Range<u32>>)>,
+}
+impl std::fmt::Debug for VectorDocumentEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorDocumentEdit")
+            .field("editor", &self.editor)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+impl VectorDocumentEdit {
+    fn wire(
+        &self,
+        address: WindowAddress,
+        scene_revision: u64,
+    ) -> vivid_protocol::overlay::wire::text::editor::Edit {
+        vivid_protocol::overlay::wire::text::editor::Edit {
+            address,
+            scene_revision,
+            editor: self.editor,
+            revision: self.revision,
+            replacement: self.replacement.clone(),
+            selection: self.selection,
+            commit: self.commit.clone(),
+            preedit: self.preedit.clone(),
+        }
+    }
 }
 
 /// An atomic committed-text and preedit update for a native input method.
@@ -190,6 +235,7 @@ struct Pending {
 enum PendingEvent {
     Physical(VectorInputEvent),
     Ime(Box<(VectorTextTarget, VectorImeEdit)>),
+    Document(Box<(VectorTextTarget, VectorDocumentEdit)>),
     Text(Box<(VectorTextTarget, String, std::time::Instant)>),
 }
 #[derive(Default)]
@@ -810,10 +856,117 @@ impl NativeVectorHost {
         let scope = target.0.scope.as_ref()?;
         Some(VectorEditorState {
             target: target.clone(),
+            document: state.overlays.native_editor_context(scope.window),
             caret: (ready != Deferred)
                 .then(|| state.overlays.native_editor_caret(scope.pane))
                 .flatten(),
         })
+    }
+
+    /// Sends a document edit under the original window, editor and focus authority.
+    ///
+    /// Absolute replacement/selection requires the exact excerpt revision.
+    /// Selection-relative input can continue across its own ordered replies.
+    /// Deferred operations enter the same bounded queue as physical input.
+    ///
+    /// # Errors
+    /// Rejects malformed edits, excess bytes and input queue exhaustion.
+    pub fn dispatch_document(
+        &mut self,
+        target: &VectorTextTarget,
+        edit: &VectorDocumentEdit,
+    ) -> io::Result<VectorInputResult> {
+        let Some(scope) = &target.0.scope else {
+            return Ok(Rejected);
+        };
+        // Bound borrowed text before constructing the owned wire operation.
+        if edit
+            .commit
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_EVENT_TEXT_BYTES)
+            || edit
+                .preedit
+                .as_ref()
+                .is_some_and(|(text, _)| text.len() > MAX_EVENT_TEXT_BYTES)
+        {
+            return Err(invalid("native document text exceeds limit"));
+        }
+        let address = WindowAddress {
+            context_id: scope.window.context().context_id(),
+            surface_id: scope.window.surface_id(),
+            generation: scope.generation,
+        };
+        edit.wire(address, 1)
+            .validate()
+            .map_err(|_| invalid("invalid native document edit"))?;
+        let result = {
+            let mut state = lock(&self.presenter.state);
+            overlay_input::maintain(&mut state);
+            if self.text_ready(&state, target) == Rejected {
+                Rejected
+            } else if self
+                .input
+                .pending
+                .iter()
+                .any(|p| p.target.0.pane == target.0.target.0.pane)
+            {
+                Deferred
+            } else {
+                self.document_locked(&mut state, target, edit)
+            }
+        };
+        if result == Deferred
+            && let Err(error) = self.input.enqueue(
+                &target.0.target,
+                PendingEvent::Document(Box::new((target.clone(), edit.clone()))),
+                None,
+            )
+        {
+            self.invalidate(target.0.target.0.pane);
+            return Err(error);
+        }
+        Ok(result)
+    }
+    fn document_locked(
+        &self,
+        state: &mut State,
+        target: &VectorTextTarget,
+        edit: &VectorDocumentEdit,
+    ) -> VectorInputResult {
+        let ready = self.text_ready(state, target);
+        if !matches!(ready, Delivered { .. }) {
+            return ready;
+        }
+        let scope = target.0.scope.as_ref().expect("validated text scope");
+        if !state
+            .sessions
+            .get(&scope.window.context().session().session_id())
+            .is_some_and(|s| s.accepted_profiles.contains(registry::OVERLAY_EDITOR))
+        {
+            return Rejected;
+        }
+        let Some(context) = state.overlays.native_editor_context(scope.window) else {
+            return Rejected;
+        };
+        let address = WindowAddress {
+            context_id: scope.window.context().context_id(),
+            surface_id: scope.window.surface_id(),
+            generation: scope.generation,
+        };
+        let wire = edit.wire(address, 1);
+        if wire.validate_context(&context).is_err() {
+            return Rejected;
+        }
+        match state.overlays.native_editor_edit(scope.window, wire) {
+            Some(true) => {
+                flush_overlay_lane(state, scope.window.context().session().session_id());
+                Delivered {
+                    text: edit.commit.as_ref().is_some_and(|s| !s.is_empty()),
+                }
+            }
+            Some(false) => Rejected,
+            None => Deferred,
+        }
     }
 
     /// Delivers an IME update atomically to its original live window and focus grant.
@@ -1207,6 +1360,9 @@ impl NativeVectorHost {
                     }
                 }
                 PendingEvent::Ime(value) => self.ime_locked(&mut state, &value.0, &value.1),
+                PendingEvent::Document(value) => {
+                    self.document_locked(&mut state, &value.0, &value.1)
+                }
                 PendingEvent::Text(value) => {
                     let ready = self.text_ready(&state, &value.0);
                     if std::time::Instant::now() >= value.2 {

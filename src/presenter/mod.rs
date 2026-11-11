@@ -40,8 +40,9 @@ pub use service::native_text::NativeTextHost;
 #[cfg(feature = "vector-render")]
 #[doc(inline)]
 pub use service::native_vector::{
-    MAX_VECTOR_TEXT_BYTES, NativePaneVisibility, NativeVectorHost, VectorEditorState, VectorFrame,
-    VectorImeEdit, VectorInputEvent, VectorInputResult, VectorInputTarget, VectorTextTarget,
+    MAX_VECTOR_TEXT_BYTES, NativePaneVisibility, NativeVectorHost, VectorDocumentEdit,
+    VectorEditorState, VectorFrame, VectorImeEdit, VectorInputEvent, VectorInputResult,
+    VectorInputTarget, VectorTextTarget,
 };
 #[doc(inline)]
 pub use service::overlay_clipboard::OverlayClipboardWrite;

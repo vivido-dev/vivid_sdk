@@ -1207,6 +1207,7 @@ impl VirtualVivid {
                         | registry::VECTOR_SCENE
                         | registry::OVERLAY_INPUT
                         | registry::OVERLAY_TEXT
+                        | registry::OVERLAY_EDITOR
                         | registry::OVERLAY_TEXT_LAYOUT
                         | registry::OVERLAY_TYPOGRAPHY
                         | registry::OVERLAY_PAINT
@@ -3999,7 +4000,17 @@ fn establish_session(
             "inner presenter target profile does not match the route",
         ));
     }
-    let supported = &state.config.supported_profiles;
+    // Document callbacks require local immutable native focus targets. A relay
+    // or font-only attachment cannot negotiate this service by configuration.
+    let supported: Vec<_> = state
+        .config
+        .supported_profiles
+        .iter()
+        .filter(|profile| {
+            profile.as_str() != registry::OVERLAY_EDITOR || state.overlays.document_host_available()
+        })
+        .cloned()
+        .collect();
     if hello.required_profiles.iter().any(|profile| {
         !supported.contains(profile)
             || permitted_profiles
@@ -4633,6 +4644,7 @@ fn dispatch_control_for_connection(
                 | messages::MEASURE_OVERLAY_TEXT_BATCH
                 | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
                 | messages::SET_OVERLAY_EDITOR
+                | messages::SET_OVERLAY_TEXT_CONTEXT
                 | messages::SET_OVERLAY_CLIPBOARD
                 | messages::SET_OVERLAY_SEMANTICS
         )
@@ -4648,6 +4660,7 @@ fn dispatch_control_for_connection(
         }
         let profile = match record.record_type {
             messages::SET_OVERLAY_EDITOR | messages::MEASURE_OVERLAY_TEXT => registry::OVERLAY_TEXT,
+            messages::SET_OVERLAY_TEXT_CONTEXT => registry::OVERLAY_EDITOR,
             messages::SET_OVERLAY_CLIPBOARD => registry::OVERLAY_CLIPBOARD,
             messages::SET_OVERLAY_SEMANTICS => registry::OVERLAY_A11Y,
             _ => registry::OVERLAY_TEXT_LAYOUT,
@@ -4688,6 +4701,23 @@ fn dispatch_control_for_connection(
                     &value,
                 )
                 .map_err(|_| ControlError::bad("invalid editor geometry"))?
+                .address
+            }
+            messages::SET_OVERLAY_TEXT_CONTEXT => {
+                if !state.overlays.document_host_available() {
+                    return Err(ControlError::state(
+                        "native document editing is unavailable",
+                    ));
+                }
+                state
+                    .overlays
+                    .set_text_context(session_id, record.object_id, &envelope.payload)
+                    .map_err(ControlError::state)?;
+                vivid_protocol::overlay::wire::text::editor::SetContext::decode(
+                    record.object_id,
+                    &value,
+                )
+                .map_err(|_| ControlError::bad("invalid editor context"))?
                 .address
             }
             messages::SET_OVERLAY_CLIPBOARD => {
@@ -6102,6 +6132,11 @@ fn dispatch_control_for_connection(
                 record.object_id,
                 Envelope::new(request_id, fields).encode(),
             )
+        }
+        messages::SET_OVERLAY_TEXT_CONTEXT if state.config.overlay => {
+            return Err(ControlError::state(
+                "document editing requires a native vector host",
+            ));
         }
         messages::SET_OVERLAY_EDITOR if state.config.overlay => {
             let (reply_type, fields) = state

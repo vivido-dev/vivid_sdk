@@ -711,6 +711,11 @@ pub fn event_data(event: &vivid_sdk::OverlayLaneEvent) -> EventData {
                 data.revision = result.submission.revision;
                 data.text = outcome(result.outcome).into();
             }
+            vivid_sdk::OverlayLaneEvent::EditorEdit(_) => {
+                // Typed document operations are currently Rust-only; bindings do
+                // not request this optional profile. Fail closed if opted in manually.
+                data.text = "document editing is unavailable in this binding".into();
+            }
             vivid_sdk::OverlayLaneEvent::Input(_) => unreachable!(),
         }
         return data;

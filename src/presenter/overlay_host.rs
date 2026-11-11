@@ -42,6 +42,8 @@ use vivid_protocol::overlay::wire::{
     Submission, SubmissionOutcome, Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics};
+#[path = "overlay_editor.rs"]
+mod editor;
 #[path = "overlay_windows.rs"]
 mod pane_windows;
 use pane_windows::PaneWindows as Windows;
@@ -151,6 +153,7 @@ pub(crate) struct Overlays {
     retained_layouts: HashMap<u64, TextMeasurement>,
     /// Where a focused editor last said its caret was, with the revision it said it at.
     editor_carets: HashMap<SurfaceIdentity, (u64, u64, Option<vivid_protocol::vector::Rect>)>,
+    editors: editor::Editors,
     next_layout: u64,
 }
 
@@ -1339,6 +1342,7 @@ impl Overlays {
             .retain(|id, _| self.windows.get(*id).is_some());
         self.editor_carets
             .retain(|id, _| self.windows.get(*id).is_some());
+        self.editors.retain(|id, _| self.windows.get(*id).is_some());
         self.accepted
             .retain(|id, _| self.windows.get(*id).is_some());
         self.semantics
@@ -1519,6 +1523,8 @@ impl Overlays {
         self.semantics
             .retain(|id, _| id.context().session().session_id() != session_id);
         self.editor_carets
+            .retain(|id, _| id.context().session().session_id() != session_id);
+        self.editors
             .retain(|id, _| id.context().session().session_id() != session_id);
         self.clear_owner_gesture(session_id);
         self.pending.remove(&session_id);

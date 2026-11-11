@@ -33,8 +33,8 @@ mod raster;
 mod visibility;
 #[doc(inline)]
 pub use input::{
-    MAX_VECTOR_TEXT_BYTES, VectorEditorState, VectorImeEdit, VectorInputEvent, VectorInputResult,
-    VectorInputTarget, VectorTextTarget,
+    MAX_VECTOR_TEXT_BYTES, VectorDocumentEdit, VectorEditorState, VectorImeEdit, VectorInputEvent,
+    VectorInputResult, VectorInputTarget, VectorTextTarget,
 };
 #[doc(inline)]
 pub use visibility::NativePaneVisibility;
@@ -401,7 +401,10 @@ impl NativeVectorHost {
         super::native_video::tick(&mut lock(&self.presenter.state));
         self.flush_input();
         let request = self.text.poll()?;
-        if request.record_type == messages::SET_OVERLAY_EDITOR {
+        if matches!(
+            request.record_type,
+            messages::SET_OVERLAY_EDITOR | messages::SET_OVERLAY_TEXT_CONTEXT
+        ) {
             let response = Envelope::new(1, Vec::new())
                 .encode()
                 .map_err(|_| "editor reply encoding failed".into());

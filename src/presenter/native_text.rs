@@ -93,6 +93,12 @@ impl NativeTextHost {
             state.config.supported_profiles = previous;
             return Err(error);
         }
+        if state.overlays.native.is_none() {
+            state
+                .config
+                .supported_profiles
+                .retain(|p| p != registry::OVERLAY_EDITOR);
+        }
         state.overlay_relay.enabled = true;
         state.overlay_relay.local_host_claimed = true;
         state.overlay_relay.local_host_available = true;

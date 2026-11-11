@@ -357,6 +357,18 @@ impl OverlaySession {
         Ok(window.address == event.address)
     }
 
+    /// Matches a document edit to this session's exact current window address.
+    pub fn editor_event_targets(
+        &self,
+        event: &vivid_protocol::overlay::wire::text::editor::Edit,
+        window: &OverlayWindow,
+    ) -> io::Result<bool> {
+        Ok(
+            Weak::ptr_eq(&window.session, &Arc::downgrade(&self.session))
+                && window.address == event.address,
+        )
+    }
+
     pub fn capture_pointer(&self, window: &OverlayWindow, capture: bool) -> io::Result<()> {
         if !Weak::ptr_eq(&window.session, &Arc::downgrade(&self.session)) {
             return Err(invalid_input("overlay window belongs to another session"));
@@ -516,6 +528,44 @@ impl OverlayWindow {
                     None,
                 )?
                 .ok_or_else(|| invalid_input("offline presenter has no text service"))?;
+            expect_record(&reply, messages::OK, self.address.surface_id)?;
+            Ok(())
+        })
+    }
+    /// Publishes bounded surrounding text for the actually displayed focused editor.
+    ///
+    /// Advance the editor incarnation on external text/selection changes or field
+    /// replacement. Own ordered native edits advance the context revision instead.
+    ///
+    /// # Errors
+    /// Rejects unnegotiated support, invalid context, stale focus/display or transport failure.
+    pub fn set_text_context(
+        &self,
+        scene_revision: u64,
+        context: Option<vivid_protocol::overlay::wire::text::editor::Context>,
+    ) -> io::Result<()> {
+        self.with_state(|session, _| {
+            if !session.supports(vivid_protocol::registry::OVERLAY_EDITOR) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "presenter does not support overlay-editor-v1",
+                ));
+            }
+            let request = vivid_protocol::overlay::wire::text::editor::SetContext {
+                address: self.address,
+                scene_revision,
+                context,
+            };
+            let reply = session
+                .request(
+                    messages::SET_OVERLAY_TEXT_CONTEXT,
+                    self.address.surface_id,
+                    request.payload().map_err(io::Error::other)?,
+                    &RequestMetadata::default(),
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| invalid_input("offline presenter has no editor service"))?;
             expect_record(&reply, messages::OK, self.address.surface_id)?;
             Ok(())
         })

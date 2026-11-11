@@ -452,7 +452,18 @@ Requests are bounded to 4,096 UTF-8 text bytes and replies to 1,024 lines and 1,
 subject to negotiated control-record limits. Vivido permits one outstanding shaping job per
 owner and at most 16 globally; overload fails explicitly without blocking input or rendering.
 
-### Batched measurements and retained styled layouts
+#### Optional native document snapshots
+
+Rust producers can additionally negotiate `overlay-editor-v1` with a local
+`NativeVectorHost` and use `set_text_context` for bounded surrounding text.
+`OverlayLaneEvent::EditorEdit` carries revision-scoped document selection and
+replacement; producers must match the exact window and validate editor identity
+before mutation. This is an optional extension to composition and caret geometry.
+Generic/font-only presenters and gateway/mux relays withhold it. See the
+[native document contract](NATIVE-VECTOR.md#surrounding-documents-and-native-replacement)
+and [normative wire fields](../../vivid_protocol/vivid-protocol-1.5-overlays.md#native-document-editing).
+
+## Batched measurements and retained styled layouts
 
 Connection helpers also optionally negotiate `overlay-text-layout-v1`. `StyledText` describes a
 paragraph of `TextRun` values with `TextStyle`: size, family, weight, italic, color, underline,

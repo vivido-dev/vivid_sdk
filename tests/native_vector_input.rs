@@ -23,6 +23,9 @@ fn fixture() -> (Arc<VirtualVivid>, NativeVectorHost) {
     config
         .supported_profiles
         .push(vivid_protocol::registry::OVERLAY_CLIPBOARD.into());
+    config
+        .supported_profiles
+        .push(vivid_protocol::registry::OVERLAY_EDITOR.into());
     let presenter = Arc::new(
         VirtualVivid::start_configured_eventless(
             SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
@@ -45,6 +48,7 @@ fn connect_at(presenter: &VirtualVivid, pane: u64) -> OverlaySession {
         endpoint_realtime: Some(presenter.endpoint()),
         endpoint_bulk: Some(presenter.endpoint()),
         authentication: ProducerAuthentication::root_hex(&secret).unwrap(),
+        optional_profiles: vec![vivid_protocol::registry::OVERLAY_EDITOR.into()],
         ..ProducerConfig::default()
     })
     .unwrap()
@@ -182,6 +186,334 @@ fn set_editor(
         }
         job.join().unwrap().unwrap();
     });
+}
+
+fn set_context(
+    host: &mut NativeVectorHost,
+    window: &OverlayWindow,
+    scene: u64,
+    context: Option<vivid_protocol::overlay::wire::text::editor::Context>,
+) -> std::io::Result<()> {
+    std::thread::scope(|scope| {
+        let job = scope.spawn(|| window.set_text_context(scene, context));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !job.is_finished() {
+            host.poll();
+            assert!(
+                Instant::now() < deadline,
+                "native document context did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        job.join().unwrap()
+    })
+}
+
+fn document_context() -> vivid_protocol::overlay::wire::text::editor::Context {
+    vivid_protocol::overlay::wire::text::editor::Context {
+        editor: 1,
+        revision: 1,
+        text: "a😀éz".into(),
+        cursor: 7,
+        anchor: 5,
+        sensitive: false,
+    }
+}
+
+fn document_event(session: &OverlaySession) -> vivid_protocol::overlay::wire::text::editor::Edit {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(OverlayLaneEvent::EditorEdit(edit)) =
+            session.wait_event(Duration::from_millis(10)).unwrap()
+        {
+            return edit;
+        }
+        assert!(Instant::now() < deadline, "document edit did not arrive");
+    }
+}
+
+#[test]
+fn native_document_edits_require_the_original_editor_revision_and_remain_owner_scoped() {
+    use vivid_sdk::presenter::VectorDocumentEdit;
+    let (presenter, mut host) = fixture();
+    presenter.update_metrics(2, 16, 16, (8, 8));
+    let first = connect(&presenter);
+    let peer = connect_at(&presenter, 2);
+    let a = window(&first, 0.);
+    let b = window(&peer, 0.);
+    submit(&a, HitRole::Input);
+    submit(&b, HitRole::Input);
+    a.request_focus().unwrap();
+    b.request_focus().unwrap();
+    let image = display(&mut host, 1);
+    let peer_image = display_at(&mut host, 2, 1);
+    let target = host.text_target(&image).unwrap();
+    let peer_target = host.text_target(&peer_image).unwrap();
+    let mut context = document_context();
+    set_context(&mut host, &a, 1, Some(context.clone())).unwrap();
+    set_context(&mut host, &b, 1, Some(context.clone())).unwrap();
+    assert_eq!(
+        host.editor_state(&target).unwrap().document,
+        Some(context.clone())
+    );
+    let mut edit = VectorDocumentEdit {
+        editor: 1,
+        revision: 1,
+        replacement: Some(1..7),
+        commit: Some("好".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    let received = document_event(&first);
+    assert!(first.editor_event_targets(&received, &a).unwrap());
+    assert!(!first.editor_event_targets(&received, &b).unwrap());
+    assert_eq!(received.replacement, Some(1..7));
+    assert_eq!(received.address.surface_id, 1);
+    received.validate_context(&context).unwrap();
+    context.revision = 2;
+    context.text = "a好z".into();
+    context.cursor = 4;
+    context.anchor = 4;
+    set_context(&mut host, &a, 1, Some(context.clone())).unwrap();
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    edit.replacement = None;
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    document_event(&first).validate_context(&context).unwrap();
+    assert!(set_context(&mut host, &a, 1, Some(document_context())).is_err());
+    let mut changed = context.clone();
+    changed.text.push('!');
+    assert!(set_context(&mut host, &a, 1, Some(changed)).is_err());
+    context.editor = 2;
+    context.revision = 1;
+    set_context(&mut host, &a, 1, Some(context.clone())).unwrap();
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    edit.editor = 2;
+    edit.commit = None;
+    edit.selection = Some((4, 1));
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Delivered { text: false }
+    );
+    assert_eq!(document_event(&first).selection, Some((4, 1)));
+    context.editor = 3;
+    context.sensitive = true;
+    context.text.clear();
+    context.cursor = 0;
+    context.anchor = 0;
+    set_context(&mut host, &a, 1, Some(context.clone())).unwrap();
+    edit.editor = 3;
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    edit.selection = None;
+    edit.commit = Some("secret".into());
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    assert!(!format!("{edit:?}").contains("secret"));
+    document_event(&first);
+    set_context(&mut host, &a, 1, None).unwrap();
+    assert!(
+        set_context(&mut host, &a, 1, Some(context)).is_err(),
+        "clearing cannot revive old editor callbacks"
+    );
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    assert!(set_context(&mut host, &a, 1, Some(document_context())).is_err());
+    first.close().unwrap();
+    host.poll();
+    let peer_edit = VectorDocumentEdit {
+        editor: 1,
+        revision: 1,
+        commit: Some("peer".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        host.dispatch_document(&peer_target, &peer_edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    let peer_event = document_event(&peer);
+    assert_eq!(
+        received.address, peer_event.address,
+        "owners must reuse the complete local address"
+    );
+    assert_eq!(peer_event.commit.as_deref(), Some("peer"));
+}
+
+#[test]
+fn document_edits_wait_for_repaint_context_and_cannot_cross_editor_or_visibility_replacement() {
+    use vivid_sdk::presenter::VectorDocumentEdit;
+    let (presenter, mut host) = fixture();
+    let first = connect(&presenter);
+    let a = window(&first, 0.);
+    submit(&a, HitRole::Input);
+    a.request_focus().unwrap();
+    let image = display(&mut host, 1);
+    let target = host.text_target(&image).unwrap();
+    set_context(&mut host, &a, 1, Some(document_context())).unwrap();
+    submit(&a, HitRole::Input);
+    display(&mut host, 1);
+    let edit = VectorDocumentEdit {
+        editor: 1,
+        revision: 1,
+        commit: Some("queued".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Deferred
+    );
+    assert!(!drain(&first).iter().any(|e| matches!(e, Event::Text(_))));
+    let mut next = document_context();
+    next.editor = 2;
+    set_context(&mut host, &a, 2, Some(next.clone())).unwrap();
+    host.poll();
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    let current = VectorDocumentEdit { editor: 2, ..edit };
+    assert_eq!(
+        host.dispatch_document(&target, &current).unwrap(),
+        Result::Delivered { text: true }
+    );
+    assert_eq!(document_event(&first).commit.as_deref(), Some("queued"));
+    // The discarded edit must not have been emitted as a second record.
+    assert!(!matches!(
+        first.wait_event(Duration::from_millis(20)).unwrap(),
+        Some(OverlayLaneEvent::EditorEdit(_))
+    ));
+    host.set_visible(1, false).unwrap();
+    host.set_visible(1, true).unwrap();
+    display(&mut host, 1);
+    assert_eq!(
+        host.dispatch_document(&target, &current).unwrap(),
+        Result::Rejected
+    );
+}
+
+#[test]
+fn a_generic_or_font_only_presenter_cannot_negotiate_native_document_editing() {
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(vivid_protocol::registry::OVERLAY_EDITOR.into());
+    let presenter = Arc::new(
+        VirtualVivid::start_configured_eventless(
+            SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            config,
+        )
+        .unwrap(),
+    );
+    presenter.update_metrics(1, 16, 16, (8, 8));
+    let first = connect(&presenter);
+    let a = window(&first, 0.);
+    assert_eq!(
+        a.set_text_context(1, Some(document_context()))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    first.close().unwrap();
+    presenter.shutdown();
+
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(vivid_protocol::registry::OVERLAY_EDITOR.into());
+    let presenter = Arc::new(
+        VirtualVivid::start_configured_eventless(
+            SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            config,
+        )
+        .unwrap(),
+    );
+    let _fonts = vivid_sdk::presenter::NativeTextHost::attach(presenter.clone(), "").unwrap();
+    presenter.update_metrics(1, 16, 16, (8, 8));
+    let first = connect(&presenter);
+    let a = window(&first, 0.);
+    assert_eq!(
+        a.set_text_context(1, Some(document_context()))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn saturated_document_input_revokes_only_its_original_pane() {
+    use vivid_sdk::presenter::VectorDocumentEdit;
+    let (presenter, mut host) = fixture();
+    presenter.update_metrics(2, 16, 16, (8, 8));
+    let first = connect(&presenter);
+    let peer = connect_at(&presenter, 2);
+    let a = window(&first, 0.);
+    let b = window(&peer, 0.);
+    submit(&a, HitRole::Input);
+    submit(&b, HitRole::Input);
+    a.request_focus().unwrap();
+    b.request_focus().unwrap();
+    let image = display(&mut host, 1);
+    let other = display_at(&mut host, 2, 1);
+    let target = host.text_target(&image).unwrap();
+    let peer_target = host.text_target(&other).unwrap();
+    set_context(&mut host, &a, 1, Some(document_context())).unwrap();
+    set_context(&mut host, &b, 1, Some(document_context())).unwrap();
+    submit(&a, HitRole::Input);
+    display(&mut host, 1);
+    let edit = VectorDocumentEdit {
+        editor: 1,
+        revision: 1,
+        commit: Some("x".into()),
+        ..Default::default()
+    };
+    for _ in 0..64 {
+        assert_eq!(
+            host.dispatch_document(&target, &edit).unwrap(),
+            Result::Deferred
+        );
+    }
+    let oversized = VectorDocumentEdit {
+        commit: Some("x".repeat(4097)),
+        ..edit.clone()
+    };
+    assert!(host.dispatch_document(&peer_target, &oversized).is_err());
+    assert_eq!(
+        host.dispatch_document(&peer_target, &edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    assert_eq!(document_event(&peer).commit.as_deref(), Some("x"));
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        host.dispatch_document(&target, &edit).unwrap(),
+        Result::Rejected
+    );
+    first.close().unwrap();
+    host.poll();
+    assert_eq!(
+        host.dispatch_document(&peer_target, &edit).unwrap(),
+        Result::Delivered { text: true }
+    );
+    assert_eq!(document_event(&peer).commit.as_deref(), Some("x"));
 }
 
 #[test]

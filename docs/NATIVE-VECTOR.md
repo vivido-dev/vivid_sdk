@@ -427,10 +427,55 @@ visibility, lane or runtime loss. Physical character keys defer text insertion
 to the native input method when requested, avoiding duplicate committed text.
 The counter renders preedit separately from committed-text byte counts.
 
-This is a composition-only editor contract. Surrounding producer document text,
-replacement outside the current composition and document selection are not
-exposed. Full native editing and physical input-source/candidate-menu acceptance
-remain work beyond the automated handler and GPU checks.
+### Surrounding documents and native replacement
+
+Local native hosts can explicitly offer `overlay-editor-v1` in
+`PresenterConfig.supported_profiles`. It requires `overlay-text-v1`; generic,
+font-only and terminating relay hosts decline it. The Rust `OverlaySession`
+helper accepts it through `ProducerConfig.optional_profiles`; request it explicitly
+when handling document events. Producers that publish no document context retain
+the composition-only behavior above. Python, TypeScript and Lua do not automatically
+request this profile or expose typed document operations yet.
+
+After displaying a focused scene, publish `OverlayWindow::set_text_context` with
+an `overlay::wire::text::editor::Context` (available through `vivid_protocol`).
+The excerpt excludes preedit, includes the entire selection, and contains at
+most 4,096 UTF-8 bytes. Cursor/anchor are checked UTF-8 byte offsets and may form
+a reversed selection. Sensitive contexts carry no surrounding text and zero
+offsets; this masks native document queries, without promising OS secure-input
+mode. Passing `None` disables document editing and retains the identity floor.
+Re-enabling it or changing sensitivity requires a newer editor incarnation.
+
+Advance the nonzero `editor` incarnation on field switches and external document
+or selection changes. Ordered native edits retain it and advance `revision` when
+they change text/selection. An unchanged revision must publish identical context.
+Republish after each displayed repaint; queries retain the previous snapshot
+while edits wait for that scene's context. The presenter retains at most 64
+contexts separately from drawing/layout budgets.
+
+`VectorEditorState::document` exposes the bounded local snapshot under the same
+immutable `VectorTextTarget`. Capture its editor incarnation on the native handler.
+`dispatch_document` takes a `VectorDocumentEdit`, queues deferred operations under
+the existing 64-report ceiling, and checks editor, source, channel, surface, focus,
+visibility and host lifetime again before delivery. Absolute selection/replacement
+requires the exact snapshot revision. Relative typing may retain an earlier
+revision from its own ordered replies. Commits/preedit are each limited to 4,096
+bytes in this profile. Producers receive `OverlayLaneEvent::EditorEdit`, check
+`editor_event_targets`, and validate against their current context before mutation.
+They remain responsible for bounded document storage and advancing identities.
+
+The compositor's native handler maps document and preedit UTF-16 ranges to checked
+UTF-8 boundaries. It supports surrounding text queries, reversed selection, document
+selection, replacement covering the current selection, partial preedit replacement
+and composition spanning document text. Absolute operations wait for the producer's
+new context after a commit/selection; no native callback queries a producer
+synchronously. A field-incarnation change installs a fresh handler and rejects old
+callbacks. The counter demonstrates bounded producer-owned document mutation.
+
+Automated native Metal checks exercise these callbacks with real producer processes.
+Physical input sources, candidate menus, OS secure-input behavior, VoiceOver,
+non-macOS platforms and gateway/mux document re-origination remain unrun gates.
+`timed-media-sync-v1` remains withheld.
 
 ## Live video
 

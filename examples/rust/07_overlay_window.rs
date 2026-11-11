@@ -119,7 +119,7 @@ fn main() -> io::Result<()> {
             OverlayLaneEvent::Outcome(_) | OverlayLaneEvent::Viewport(_) => {}
             // An action can only come back for a semantic tree this window published, and a
             // drawing-only example publishes none.
-            OverlayLaneEvent::Accessibility { .. } => {}
+            OverlayLaneEvent::Accessibility { .. } | OverlayLaneEvent::EditorEdit(_) => {}
         }
     }
 

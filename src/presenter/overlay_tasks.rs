@@ -33,6 +33,7 @@ pub(super) fn defer(
             | messages::MEASURE_OVERLAY_TEXT_BATCH
             | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
             | messages::SET_OVERLAY_EDITOR
+            | messages::SET_OVERLAY_TEXT_CONTEXT
             | messages::SET_OVERLAY_CLIPBOARD
             | messages::SET_OVERLAY_SEMANTICS
     ) {
