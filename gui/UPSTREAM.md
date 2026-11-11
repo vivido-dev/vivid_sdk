@@ -36,6 +36,11 @@ held-state releases after authority loss while suppressing default pointer and
 keyboard activation clicks. A core regression verifies pending clicks clear and
 later ordinary activation still works.
 
+`Window::dispatch_keystroke_with_repeat` shares ordinary synthetic keystroke
+dispatch and text insertion while retaining `KeyDownEvent::is_held`. The remote
+producer checks its original input binding and watchdog before synthesizing
+typematic; this GUI helper supplies no input authority.
+
 `Window::advance_offscreen_frame` drives local next-frame callbacks for production
 headless callers. It drains one callback generation per turn and does not claim
 remote presentation. The SDK counter example updates through this callback path.

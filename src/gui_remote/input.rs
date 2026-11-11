@@ -164,6 +164,9 @@ pub(super) struct Translator {
     buttons: [bool; 5],
     position: gui::Point<gui::Pixels>,
     reset: u64,
+    binding: Option<crate::InputTuple>,
+    repeat: keyboard::Repeating,
+    policy: KeyRepeat,
 }
 impl Default for Translator {
     fn default() -> Self {
@@ -172,11 +175,20 @@ impl Default for Translator {
             buttons: [false; 5],
             position: point(px(0.), px(0.)),
             reset: 0,
+            binding: None,
+            repeat: Default::default(),
+            policy: KeyRepeat::default(),
         }
     }
 }
 
 impl Translator {
+    pub(super) fn new(policy: KeyRepeat) -> Self {
+        Self {
+            policy,
+            ..Default::default()
+        }
+    }
     fn modifiers(&self) -> Modifiers {
         Modifiers {
             control: self.held[224] || self.held[228],
@@ -234,6 +246,7 @@ impl Translator {
         }
         self.held.fill(false);
         self.buttons.fill(false);
+        self.repeat = Default::default();
         window.dispatch_cancelled_input(
             PlatformInput::ModifiersChanged(gui::ModifiersChangedEvent::default()),
             cx,
@@ -249,9 +262,10 @@ impl Translator {
         {
             injection.revoke();
         }
-        if self.reset != injection.reset {
+        if self.reset != injection.reset || self.binding != injection.guard.current_tag() {
             self.release(window, cx);
             self.reset = injection.reset;
+            self.binding = injection.guard.current_tag();
         }
         for _ in 0..INPUT_CAPACITY {
             if injection
@@ -263,6 +277,7 @@ impl Translator {
                     injection.revoke();
                     self.release(window, cx);
                     self.reset = injection.reset;
+                    self.binding = None;
                 }
                 break;
             }
@@ -285,6 +300,8 @@ impl Translator {
                         continue;
                     }
                     *held = pressed;
+                    self.repeat
+                        .transition(usage, pressed, injection.origin.elapsed(), self.policy);
                     if usage >= 224 {
                         window.dispatch_event(
                             PlatformInput::ModifiersChanged(gui::ModifiersChangedEvent {
@@ -378,6 +395,30 @@ impl Translator {
                 _ => injection.revoke(),
             }
         }
+        if self.reset != injection.reset {
+            self.release(window, cx);
+            self.reset = injection.reset;
+            self.binding = None;
+        }
+        // Repeat is new input, so validate its authority at the actual dispatch
+        // boundary even in idle turns without incoming physical reports.
+        if injection.guard.is_armed(injection.now())
+            && injection
+                .guard
+                .grant()
+                .is_some_and(|grant| grant.effective_classes & crate::INPUT_CLASS_KEYBOARD != 0)
+            && injection
+                .lifecycle
+                .as_ref()
+                .is_some_and(|state| !state.closed.load(Ordering::Acquire))
+            && let Some(usage) = self
+                .repeat
+                .take_due(injection.origin.elapsed(), self.policy)
+            && self.held[usize::from(usage)]
+            && let Some(key) = self.key(usage)
+        {
+            window.dispatch_keystroke_with_repeat(key, true, cx);
+        }
     }
 }
 
@@ -404,5 +445,152 @@ mod tests {
         for unsupported in ["é", "😀", "f13", "f0", "unknown"] {
             assert_eq!(hid_usage(unsupported), None);
         }
+    }
+
+    #[cfg(feature = "gui-testing")]
+    #[test]
+    fn repeat_dispatch_checks_watchdog_and_owner_lifecycle_with_reused_ids() {
+        use gui::{
+            AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Render,
+            Styled as _, TestAppContext,
+        };
+        use std::{cell::RefCell, rc::Rc};
+        use vivid_protocol::{revision::SurfaceGeneration, time::Monotonic};
+
+        #[derive(Default)]
+        struct Reports {
+            down: Vec<(String, bool)>,
+            up: Vec<bool>,
+        }
+        struct View {
+            focus: FocusHandle,
+            reports: Rc<RefCell<Reports>>,
+        }
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                gui::div()
+                    .size_full()
+                    .track_focus(&self.focus)
+                    .on_key_down(cx.listener(|view, event: &gui::KeyDownEvent, _, _| {
+                        view.reports
+                            .borrow_mut()
+                            .down
+                            .push((event.keystroke.key.clone(), event.is_held));
+                    }))
+                    .on_key_up(cx.listener(|view, _: &gui::KeyUpEvent, window, _| {
+                        view.reports
+                            .borrow_mut()
+                            .up
+                            .push(window.is_input_cancelled());
+                    }))
+            }
+        }
+
+        fn injection() -> Injection {
+            let mut input = Shared::new().injection.into_inner().unwrap();
+            input.lifecycle = Some(Arc::new(crate::SessionLifecycle::new()));
+            input.guard.set_preconditions(crate::DesktopPreconditions {
+                surface_present: true,
+                surface_generation: SurfaceGeneration::new(1),
+                capability_mask: crate::INPUT_CLASS_KEYBOARD,
+                presented: true,
+                lane_live: true,
+            });
+            input
+                .guard
+                .enable(
+                    7,
+                    SurfaceGeneration::new(1),
+                    crate::INPUT_CLASS_KEYBOARD,
+                    2_000_000,
+                    0,
+                )
+                .unwrap();
+            input
+                .guard
+                .handle_bound_at(
+                    &crate::InputBindingStatus {
+                        producer_epoch: 1,
+                        grant_generation: 1,
+                        context_id: 1,
+                        surface_id: 7,
+                        surface_generation: 1,
+                        effective_classes: crate::INPUT_CLASS_KEYBOARD,
+                        state: 1,
+                        reason: 0,
+                        watchdog_timeout_us: 2_000_000,
+                    },
+                    Monotonic::ZERO,
+                )
+                .unwrap();
+            input.events.push_back(InputEvent::Key {
+                binding: input.guard.current_tag().unwrap(),
+                usage: 4,
+                pressed: true,
+            });
+            input
+        }
+
+        let mut cx = TestAppContext::single();
+        let reports = [
+            Rc::new(RefCell::new(Reports::default())),
+            Rc::new(RefCell::new(Reports::default())),
+        ];
+        let windows = reports.each_ref().map(|reports| {
+            cx.add_window(|window, cx| {
+                let focus = cx.focus_handle();
+                focus.focus(window, cx);
+                View {
+                    focus,
+                    reports: reports.clone(),
+                }
+            })
+        });
+        let mut inputs = [injection(), injection()];
+        assert_eq!(inputs[0].guard.current_tag(), inputs[1].guard.current_tag());
+        let mut translators = [Translator::default(), Translator::default()];
+        for index in 0..2 {
+            cx.update_window(windows[index].into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                translators[index].apply(&mut inputs[index], window, cx);
+                inputs[index].origin = Instant::now() - Duration::from_millis(600);
+                translators[index].apply(&mut inputs[index], window, cx);
+            })
+            .unwrap();
+            assert_eq!(
+                reports[index].borrow().down,
+                [("a".into(), false), ("a".into(), true)]
+            );
+        }
+
+        // Disconnect without a worker-side reset: final GUI admission must still
+        // release the original owner's held state and disarm its local timer.
+        inputs[0]
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .closed
+            .store(true, Ordering::Release);
+        inputs[0].origin = Instant::now() - Duration::from_secs(1);
+        inputs[1].origin = Instant::now() - Duration::from_secs(1);
+        for index in 0..2 {
+            cx.update_window(windows[index].into(), |_, window, cx| {
+                translators[index].apply(&mut inputs[index], window, cx);
+            })
+            .unwrap();
+        }
+        assert_eq!(reports[0].borrow().down.len(), 2);
+        assert_eq!(reports[0].borrow().up, [true]);
+        assert_eq!(reports[1].borrow().down.len(), 3);
+        assert!(reports[1].borrow().up.is_empty());
+
+        // Expiration is checked on an idle GUI turn, without any new lane event.
+        inputs[1].origin = Instant::now() - Duration::from_secs(3);
+        cx.update_window(windows[1].into(), |_, window, cx| {
+            translators[1].apply(&mut inputs[1], window, cx);
+        })
+        .unwrap();
+        assert_eq!(reports[1].borrow().down.len(), 3);
+        assert_eq!(reports[1].borrow().up, [true]);
     }
 }

@@ -5,6 +5,7 @@
 
 // Rust guideline compliant 2026-10-07
 mod input;
+mod keyboard;
 mod reconnect;
 mod recovery;
 pub mod state;
@@ -13,6 +14,8 @@ mod tests;
 mod transport;
 #[doc(inline)]
 pub use input::hid_usage;
+#[doc(inline)]
+pub use keyboard::KeyRepeat;
 
 use crate::{
     InputBindingGuard, InputEvent, ProducerConfig,
@@ -211,6 +214,8 @@ impl Shared {
 /// `build` should establish the root's initial focus just as in a standalone app.
 /// macOS native termination may exit the process rather than return from `run`.
 /// This initial backend carries physical keys and pointer input, not IME services.
+/// Producer-owned repeat uses `KeyRepeat` launch policy; invalid policy fails
+/// before starting any transport or GUI resources.
 /// Root-authenticated connections recover transient loss with fresh sessions and
 /// retained view state. Activated leases recover the same logical session using
 /// bounded reconciliation, exact uncertain-create receipts and fresh channels.
@@ -220,7 +225,7 @@ impl Shared {
 /// authority alone is unsupported because the retained graph lives in memory.
 ///
 /// # Errors
-/// Returns an error for non-live configuration, startup/runtime failure, fatal
+/// Returns an error for invalid repeat policy, non-live configuration, startup/runtime failure, fatal
 /// protocol/authority errors, or exhausted reconnect admission budget.
 ///
 /// # Abort
@@ -230,6 +235,7 @@ pub fn run<V: Render + 'static>(
     config: ProducerConfig,
     build: impl FnOnce(&mut Window, &mut gui::App) -> Entity<V> + 'static,
 ) -> io::Result<()> {
+    let repeat = KeyRepeat::from_env()?;
     let shared = Arc::new(Shared::new());
     let control_state = shared.clone();
     let control = std::thread::Builder::new()
@@ -280,7 +286,7 @@ pub fn run<V: Render + 'static>(
             let mut geometry = None;
             let mut last_pixels = None;
             let mut render_revision = 0;
-            let mut input = input::Translator::default();
+            let mut input = input::Translator::new(repeat);
             while !app_state.stopped.load(Ordering::Acquire) {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
                 let requested = *app_state.geometry.lock().expect("geometry mutex");

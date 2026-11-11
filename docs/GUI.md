@@ -146,7 +146,21 @@ delivers release listeners while suppressing GPUI's default activation clicks.
 Custom release handlers can inspect `Window::is_input_cancelled` before
 committing a release-triggered action.
 Basic US physical keys, modifiers, pointer buttons/motion, and scroll are carried.
-Native repeats are suppressed; negotiated layouts, Caps Lock state, typematic,
+Native repeats are suppressed. The producer applies bounded local typematic:
+500 ms initial delay and 50 ms interval by default, with at most one repeat per
+GUI turn and no catch-up burst after a stall. Repeats pass through the ordinary
+key-binding and text-insertion path with `KeyDownEvent::is_held = true`.
+They require the still-live original binding and keyboard class at dispatch;
+revocation, watchdog expiry, geometry change and disconnect release held input
+and clear the timer. Each producer owns its timer even when peers reuse local IDs.
+
+`gui_remote::KeyRepeat::new(delay_ms, interval_ms)` accepts 100–5,000 ms delay and
+33–1,000 ms interval, or two zeros to disable repeat. A local launcher calls
+`KeyRepeat::configure(&mut command)` to supply `VIVID_GUI_KEY_REPEAT` only to its
+child. `run` and `run_persistent` validate this strict bounded JSON envelope before
+starting GUI or transport workers. This is a local launch policy, not wire layout
+negotiation; remote GUI pacing can make observed intervals longer than requested.
+Negotiated layouts, Caps Lock state,
 IME, clipboard, popups, accessibility, and multiple windows are not implemented
 by this initial remote backend. Linked/native applications retain their native
 platform services.

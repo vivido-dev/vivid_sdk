@@ -5926,11 +5926,24 @@ impl Window {
     /// Dispatch a given keystroke as though the user had typed it.
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
+        self.dispatch_keystroke_with_repeat(keystroke, false, cx)
+    }
+
+    /// Dispatches a keystroke with its producer-owned repeat state.
+    ///
+    /// Repeats use the same key binding and text insertion path as an initial
+    /// press. Remote adapters must authorize repeats before calling this method.
+    pub fn dispatch_keystroke_with_repeat(
+        &mut self,
+        keystroke: Keystroke,
+        is_held: bool,
+        cx: &mut App,
+    ) -> bool {
         let keystroke = keystroke.with_simulated_ime();
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
-                is_held: false,
+                is_held,
                 prefer_character_input: false,
             }),
             cx,
