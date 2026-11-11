@@ -1,0 +1,17 @@
+[package]
+name = "vivid_audio_output"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Bounded audio output and device clocks for Vivid application hosts"
+
+[workspace]
+
+[features]
+testing = []
+
+[dependencies]
+cpal = "0.18"
+ringbuf = "0.6"
+vivid_protocol = { version = "1.5.12", path = "../../vivid_protocol", default-features = false }

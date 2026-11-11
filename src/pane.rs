@@ -3,13 +3,15 @@
 use std::fmt;
 use std::io;
 
-use vivid_protocol::surface::SurfaceDescriptor;
+use vivid_protocol::{messages, surface::SurfaceDescriptor};
 
 use crate::*;
 
 const DEFAULT_MAX_COLUMNS: u32 = 80;
 const DEFAULT_MAX_ROWS: u32 = 24;
 const FIXED_ONE: i64 = 1_i64 << 32;
+// Bound target-event work independently of a busy presenter.
+const TARGET_EVENTS_PER_CALL: usize = 64;
 
 /// Placement and descriptor options for one pane image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,40 @@ impl fmt::Debug for PaneSession {
 }
 
 impl PaneSession {
+    fn synchronize_target(&mut self) -> io::Result<()> {
+        for _ in 0..TARGET_EVENTS_PER_CALL {
+            match self.session.take_event()? {
+                Some(SessionEvent::TargetChanged(payload)) => {
+                    self.session.apply_target_changed(&payload)?;
+                }
+                Some(_) => (),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn with_current_target<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut Session) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.synchronize_target()?;
+        let result = operation(&mut self.session);
+        if result
+            .as_ref()
+            .err()
+            .and_then(io::Error::get_ref)
+            .and_then(|error| error.downcast_ref::<PresenterError>())
+            .is_some_and(|error| error.code == messages::ERROR_STALE_TARGET_GENERATION)
+        {
+            // The ordered control reader queues TARGET_CHANGED before the rejection.
+            // Retry the aborted scene mutation once, retaining its original object IDs.
+            self.synchronize_target()?;
+            operation(&mut self.session)
+        } else {
+            result
+        }
+    }
     /// Connect using the standard Vivid discovery and authentication environment.
     pub fn from_env() -> io::Result<Self> {
         Self::from_session(Session::connect(ProducerConfig::default())?)
@@ -194,11 +230,13 @@ impl PaneSession {
             return Ok(());
         };
         let mut first_error = presentation.channel.close().err();
-        if let Err(error) = self.session.delete_node(
-            presentation.context_id,
-            presentation.node_id,
-            &RequestMetadata::default(),
-        ) {
+        if let Err(error) = self.with_current_target(|session| {
+            session.delete_node(
+                presentation.context_id,
+                presentation.node_id,
+                &RequestMetadata::default(),
+            )
+        }) {
             first_error.get_or_insert(error);
         }
         if let Err(error) = self
@@ -281,15 +319,17 @@ impl PaneSession {
         let result = (|| {
             let columns = options.columns.unwrap_or(width.min(DEFAULT_MAX_COLUMNS));
             let rows = options.rows.unwrap_or(height.min(DEFAULT_MAX_ROWS));
-            self.session.place_terminal_surface(
-                &surface,
-                node_id,
-                0,
-                0,
-                fixed_cells(columns)?,
-                fixed_cells(rows)?,
-                options.text_layer,
-            )?;
+            self.with_current_target(|session| {
+                session.place_terminal_surface(
+                    &surface,
+                    node_id,
+                    0,
+                    0,
+                    fixed_cells(columns)?,
+                    fixed_cells(rows)?,
+                    options.text_layer,
+                )
+            })?;
             let track = self.session.create_track(
                 TrackConfiguration {
                     direction: Default::default(),

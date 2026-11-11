@@ -616,13 +616,14 @@ impl TrackChannel {
     /// The size check is important because a track's maximum record body is commonly claimed from
     /// the raw framebuffer size. An incompressible zstd frame can be slightly larger than that
     /// claim, while a raw fallback is always admissible.
+    /// An unavailable compression codec also selects raw encoding; malformed input still fails.
     pub fn send_raster_adaptive(&self, epoch: u32, frame_id: u64, rgba: &[u8]) -> io::Result<u64> {
         let configuration = self.track.shared_configuration()?;
         let KindConfiguration::Raster(raster) = &configuration.kind else {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
         if raster.zstd_enabled {
-            let compressed = media::raster_frame_body_with_compression(
+            let compressed = match media::raster_frame_body_with_compression(
                 &vivid_protocol::media::RasterFrame {
                     epoch,
                     frame_id,
@@ -631,7 +632,15 @@ impl TrackChannel {
                     rgba,
                 },
                 true,
-            )?;
+            )
+            .map_err(io::Error::from)
+            {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    return self.send_raw_raster(epoch, frame_id, raster, rgba);
+                }
+                Err(error) => return Err(error),
+            };
             let raw_length = usize::try_from(
                 media::rgba8_raw_frame_body_len(raster.width, raster.height)
                     .map_err(|error| invalid_input(error.to_string()))?,
@@ -687,6 +696,7 @@ impl TrackChannel {
 
     /// Send a raster delta using zstd only when every negotiated constraint permits it and the
     /// resulting body is smaller than the raw delta.
+    /// An unavailable compression codec selects the validated raw delta.
     pub fn send_raster_delta_adaptive(
         &self,
         epoch: u32,
@@ -710,7 +720,7 @@ impl TrackChannel {
             return Err(invalid_input("RASTER_FRAME requires a raster track"));
         };
         let body = if raster.zstd_enabled {
-            let compressed = self.raster_delta_body(
+            match self.raster_delta_body(
                 epoch,
                 frame_id,
                 base_frame_id,
@@ -718,11 +728,11 @@ impl TrackChannel {
                 duration_us,
                 operations,
                 true,
-            )?;
-            if compressed.len() < raw.len() {
-                compressed
-            } else {
-                raw
+            ) {
+                Ok(compressed) if compressed.len() < raw.len() => compressed,
+                Ok(_) => raw,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => raw,
+                Err(error) => return Err(error),
             }
         } else {
             raw

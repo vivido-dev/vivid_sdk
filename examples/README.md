@@ -27,6 +27,24 @@ the optional lane endpoints, and `VIVID_ROOT_SECRET`. Do not copy credentials in
 arguments or print them. Media uses authenticated SDK connections, never the terminal PTY.
 Example 06 starts its own loopback presenter and needs no terminal or external credentials.
 
+The additional Rust-only [production GUI round trip](rust/gui_offscreen_roundtrip.rs)
+renders offscreen frames and verifies their exact authenticated raster delivery:
+
+```sh
+cargo run --example sdk_gui_offscreen_roundtrip \
+  --features gui-offscreen,gui-runtime-shaders,presenter -- /tmp/sdk-frame.png
+```
+
+The Rust-only [remote GUI counter](rust/gui_remote_counter.rs) uses one root-view
+constructor for a standalone native window and an independent compositor-hosted
+process. Build with `gui-remote,gui-runtime-shaders`; run with `--remote` only
+when a desktop presenter supplies discovery and credentials through the child
+environment. [GUI.md](../docs/GUI.md) documents its limits and hosting setup.
+
+It needs native GUI services on macOS, or a working Vulkan adapter (including
+software Vulkan) for Linux headless rendering. It does not enable `gui-testing`.
+See [GUI.md](../docs/GUI.md) for the backend limits and remaining remote-app work.
+
 Python source installation:
 
 ```sh

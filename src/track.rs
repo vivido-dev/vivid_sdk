@@ -675,9 +675,16 @@ impl Session {
         }
     }
 
+    /// Destroys an owned track, including a terminally lost retained track.
+    ///
+    /// Loss prevents further media admission but does not relinquish the server's
+    /// object or resource charge. Explicit cleanup must remain available after
+    /// an authoritative query marks the local handle unusable for media.
+    ///
+    /// # Errors
+    /// Returns an error for an absent track, transport failure or rejected cleanup.
     pub fn destroy_track(&mut self, track: &Track, metadata: &RequestMetadata) -> io::Result<()> {
         let snapshot = lock(&track.inner, "track")?.clone();
-        ensure_live_track(&snapshot)?;
         self.request_ok(
             messages::DESTROY_TRACK,
             snapshot.configuration.track_id,
@@ -799,12 +806,16 @@ impl Session {
         Ok(())
     }
 
-    pub fn drain(&mut self, track: &Track) -> io::Result<()> {
+    /// Waits for audio decoder and device drain while control remains available.
+    ///
+    /// # Errors
+    /// Returns an error for missing EOS, retirement, timeout, or presenter refusal.
+    pub fn drain(&self, track: &Track) -> io::Result<()> {
         self.track_control(messages::DRAIN, track, vec![])
     }
 
     pub(crate) fn track_control(
-        &mut self,
+        &self,
         record_type: u16,
         track: &Track,
         mut suffix: PayloadMap,

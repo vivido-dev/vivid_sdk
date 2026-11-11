@@ -5,8 +5,12 @@ Direct Vivido connections have window-control, vector-channel, cached Vello rend
 interactive-lane integration. This is a development preview: the complete cross-language overlay
 and GPUI-inspired UI plan has not passed live pane acceptance.
 
-The terminating SDK presenter and terminating gateways still reject these profiles explicitly.
-Vivido offers them only for terminal targets with native viewport geometry installed: the window,
+Default SDK presenter configurations reject these profiles. Explicit overlay-host opt-in supplies
+bookkeeping and relay primitives. With `presenter,vector-render`, an explicitly attached
+`presenter::NativeTextHost` supplies native font measurements and retained drawing resources;
+see [shared vector rendering](VECTOR-RENDERER.md). The opt-in alone supplies no local renderer.
+A terminating gateway also needs a physical host to supply those services. Vivido offers the profiles only for
+terminal targets with native viewport geometry installed: the window,
 vector, input, paint, pointer, clipboard, and environment bundles, with cursor and hover
 behaviour applied where the platform reports it. It reports the desktop appearance and the
 display refresh rate, and reports no reduced-motion preference because it cannot read one.
@@ -16,7 +20,13 @@ For tests, `vivid_sdk::testing::TestPresenter` serves the profile bundle headles
 window, focus and revision state in the protocol's own state machine, validates every display
 list against the negotiated limits, and exposes the accepted lists plus pointer, wheel, key,
 text, focus and viewport injection. It composes nothing, so it needs neither a GPU nor a
-terminal. The production terminating presenter still refuses these profiles outright.
+terminal. Bookkeeping and accepted lists alone do not provide a local production renderer.
+
+The optional [shared vector renderer](VECTOR-RENDERER.md) supplies the compiler,
+shaped-text painter and GPU overlay cache used by Vivido. Explicitly attaching
+[`NativeVectorHost`](NATIVE-VECTOR.md) integrates native text, compiled input
+geometry and exact host display receipts with an eventless SDK presenter.
+The outer application still owns physical display and ordered input dispatch.
 
 ## Rust window API
 

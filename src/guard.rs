@@ -204,11 +204,21 @@ impl InputBindingGuard {
         if status.producer_epoch != self.epoch {
             return Err(err("INPUT_BOUND returned a different epoch"));
         }
-        if status.context_id != self.context_id
-            || status.surface_id != self.surface_id
-            || status.surface_generation != self.surface_generation.get()
+        if status.state == 1
+            && (status.context_id != self.context_id
+                || status.surface_id != self.surface_id
+                || status.surface_generation != self.surface_generation.get())
         {
             return Err(err("INPUT_BOUND returned a different binding identity"));
+        }
+        if status.state != 1
+            && (status.context_id != 0
+                || status.surface_id != 0
+                || status.surface_generation != 0
+                || status.effective_classes != 0
+                || status.watchdog_timeout_us != 0)
+        {
+            return Err(err("inactive INPUT_BOUND carries effective authority"));
         }
         if status.effective_classes & !self.requested_classes != 0
             || status.watchdog_timeout_us > self.requested_watchdog_us
@@ -247,6 +257,31 @@ impl InputBindingGuard {
         }
         Ok(())
     }
+
+    /// Applies an input binding and starts its watchdog at actual receipt time.
+    ///
+    /// # Errors
+    /// Returns an error for invalid grant fields or an overflowing deadline.
+    pub fn handle_bound_at(
+        &mut self,
+        status: &InputBindingStatus,
+        now: Monotonic,
+    ) -> io::Result<()> {
+        if status.grant_generation == 0 {
+            return Err(err("input grant generation is zero"));
+        }
+        let deadline = if status.state == 1 {
+            Some(
+                now.checked_add_micros(status.watchdog_timeout_us)
+                    .ok_or_else(|| err("input watchdog deadline overflowed"))?,
+            )
+        } else {
+            None
+        };
+        self.handle_bound(status)?;
+        self.watchdog_deadline = deadline;
+        Ok(())
+    }
     pub fn handle_renewal(
         &mut self,
         renewal: &InputLeaseRenewal,
@@ -283,7 +318,16 @@ impl InputBindingGuard {
         Ok(())
     }
     pub fn handle_revocation(&mut self, termination: &InputGrantTermination) -> io::Result<()> {
-        if self.current_tag() != Some(termination.binding) {
+        let Some(active) = self.current_tag() else {
+            return Err(err("revocation has no active grant"));
+        };
+        let incoming = termination.binding;
+        if incoming.producer_epoch != active.producer_epoch
+            || incoming.context_id != active.context_id
+            || incoming.surface_id != active.surface_id
+            || incoming.surface_generation != active.surface_generation
+            || incoming.grant_generation <= active.grant_generation
+        {
             return Err(err("revocation belongs to a different grant"));
         }
         self.release();

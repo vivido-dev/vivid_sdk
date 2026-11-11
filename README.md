@@ -1,6 +1,39 @@
 # vivid_sdk
 
+See [optional desktop GUI runtime](docs/GUI.md) for the migrated GPUI framework, embedded views, and independent application processes.
+
+[Native local control](docs/LOCAL-CONTROL.md) provides optional same-owner sockets
+and pipes shared by Vivido and compositor management, independently of the GUI.
+
+[Native video decoding](docs/VIDEO.md) exposes Vivido's shared FFmpeg decoder
+through optional `video-decode`, independently of GUI and presenter features.
+
+[Native audio decoding](docs/AUDIO.md) similarly exposes the shared bounded audio
+decoder and capture resampler through optional `audio-decode`, without an audio device.
+
+Independent `audio-output` adds bounded native device output and source clocks
+without FFmpeg, GUI or terminal dependencies; see [native audio services](docs/AUDIO.md).
+
+Experimental `presenter,vector-audio` adds explicitly enabled audio source workers
+to `NativeVectorHost`. Device/decoder ownership and retirement stay off host
+threads. Standalone timed audio adds bounded pre-roll, PLAY, PAUSE/resume and
+device-consumed DRAIN. With `vector-video`, linked timed video follows the audio
+master. Matching Live tracks also use the active audio clock after callback
+progress, with latest-picture fallback when no usable clock exists. Synchronized
+starts remain unfinished. See the
+[native audio contract](docs/AUDIO.md#native-live-hosting).
+
+Native mixed raster/vector hosting can enable `vector-images` for bounded,
+asynchronous static PNG/JPEG decoding. See [native vector hosting](docs/NATIVE-VECTOR.md)
+for image limits, color conversion, display receipts and feature negotiation.
+
 See [pane overlays](docs/OVERLAYS.md) for Rust, Python, TypeScript, and Lua window APIs, Vello drawing, and current acceptance status.
+
+See [shared vector rendering](docs/VECTOR-RENDERER.md) for optional display-list compilation,
+host-shaped text painting, hit geometry, and cached GPU composition used by Vivido.
+
+See [native vector presentation](docs/NATIVE-VECTOR.md) for authenticated window
+composition, exact display receipts and optional asynchronous GPU readback.
 
 See the [progressive examples](examples/README.md) for eight runnable tutorials in each language, from displaying an image to a producer/presenter round trip.
 
@@ -171,6 +204,11 @@ channel.eos()?;
 # Ok::<(), std::io::Error>(())
 ```
 
+`send_raster_adaptive` and `send_raster_delta_adaptive` use raw encoding when
+compression is unavailable or would make the body larger. Malformed frames and
+deltas still fail before consuming a media ID; explicit compression requests
+continue to report an unavailable codec.
+
 Native discovery uses `VIVID_ENDPOINT_CONTROL`, `VIVID_ENDPOINT_INTERACTIVE`,
 `VIVID_ENDPOINT_REALTIME`, `VIVID_ENDPOINT_BULK`, and `VIVID_ROOT_SECRET`. Missing lane endpoints
 select the protocol-defined fallback endpoint value while remaining separate connections. The
@@ -187,6 +225,12 @@ an `InputBinding` with a fresh producer epoch. Decode ordinary `InputLaneEvent` 
 current surface dimensions, then apply `InputGate` immediately before the OS injection call.
 `Revoked`, `Reset`, `LaneClosed`, or watchdog expiry must atomically disable injection and release
 held keys and buttons. Queue overflow closes the affected lane rather than discarding transitions.
+
+The Rust terminating presenter offers opt-in physical input through
+`PresenterConfig::desktop_with_input`. Hosts explicitly select a presented,
+owner-qualified `DesktopInputTarget`; selection alone never grants input. See
+[desktop presenter input](docs/DESKTOP-INPUT.md) for admission, revocation,
+generation, reconnect, and producer injection requirements.
 
 See [MIGRATING-1.1-TO-1.5.md](MIGRATING-1.1-TO-1.5.md) for the old-to-new API mapping.
 

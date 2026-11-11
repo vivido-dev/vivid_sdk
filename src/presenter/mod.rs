@@ -33,6 +33,18 @@ pub use config::{
 };
 pub use listener::{ConnectionCancel, PresenterListener, Transport};
 pub use resource::{Binding, MediaResourceDescription, ResourceError, TrackFacts};
+pub use service::DesktopInputTarget;
+#[cfg(feature = "vector-render")]
+#[doc(inline)]
+pub use service::native_text::NativeTextHost;
+#[cfg(feature = "vector-render")]
+#[doc(inline)]
+pub use service::native_vector::{
+    MAX_VECTOR_TEXT_BYTES, NativePaneVisibility, NativeVectorHost, VectorEditorState, VectorFrame,
+    VectorImeEdit, VectorInputEvent, VectorInputResult, VectorInputTarget, VectorTextTarget,
+};
+#[doc(inline)]
+pub use service::overlay_clipboard::OverlayClipboardWrite;
 pub use service::{
     AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
     KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, PaneCapture,

@@ -205,6 +205,8 @@ impl OverlaySession {
                         break;
                     };
                     if lane.renew(2_000_000, Duration::from_secs(1)).is_err() {
+                        // A failed renewal cannot leave a live input receiver behind.
+                        let _ = lane.close();
                         break;
                     }
                 }

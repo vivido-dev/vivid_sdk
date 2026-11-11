@@ -3,7 +3,7 @@
 //! It mints real activation secrets and tracks live grants, so a test exercises the
 //! [`LeaseHandle`](crate::LeaseHandle) lifecycle — take, revoke, drop-revoke — without a socket. It
 //! is also the shape [`BridgeAdmin`](crate::BridgeAdmin) will take: the worker consumes a
-//! [`LeaseGrant`](crate::LeaseGrant) and cannot tell whether a Vivido window or a gateway issued it.
+//! [`LeaseGrant`] and cannot tell whether a Vivido window or a gateway issued it.
 
 use std::collections::HashMap;
 use std::io;

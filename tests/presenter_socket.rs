@@ -81,6 +81,109 @@ fn a_producer_reaches_the_presenter_over_a_bound_socket_and_its_frame_can_be_cap
 }
 
 #[test]
+fn empty_eos_uses_sequence_zero_and_does_not_end_another_owners_track() {
+    use vivid_protocol::track::{KindConfiguration, MILESTONE_EOS_ACCEPTED, RasterConfiguration};
+    use vivid_sdk::*;
+    let (presenter, endpoint) = start();
+    let mut owners = Vec::new();
+    for pane in [1, 2] {
+        presenter.update_metrics(pane, 80, 24, (8, 16));
+        let mut session = connect(&endpoint, &presenter.issue_pane_capability(pane).unwrap());
+        session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id: 1,
+                    surface_id: 1,
+                    semantic_profile: GENERIC_CONTENT.into(),
+                    coordinate_model: CoordinateModel::DesktopLogicalPixels,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: String::new(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    direction: Default::default(),
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_POSTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: vivid_protocol::media::rgba8_raw_frame_body_len(2, 2)
+                        .unwrap(),
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 1024,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: 1,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 16_000,
+                    maximum_latency_us: 100_000,
+                    retained_pixel_charge: 4,
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        owners.push((session, track, channel));
+    }
+    owners[0].2.eos().unwrap();
+    owners[0]
+        .0
+        .wait_track(
+            &owners[0].1,
+            TrackWaitCondition::MilestoneSet,
+            Some(MILESTONE_EOS_ACCEPTED),
+            3_000_000,
+        )
+        .unwrap();
+    let first = owners[0].0.query_track(&owners[0].1).unwrap();
+    let peer = owners[1].0.query_track(&owners[1].1).unwrap();
+    assert_eq!(first.last_media_record_sequence, 0);
+    assert_eq!(first.cumulative_media_records, 0);
+    assert_eq!(peer.milestones & MILESTONE_EOS_ACCEPTED, 0);
+    owners[1].2.eos().unwrap();
+    owners[1]
+        .0
+        .wait_track(
+            &owners[1].1,
+            TrackWaitCondition::MilestoneSet,
+            Some(MILESTONE_EOS_ACCEPTED),
+            3_000_000,
+        )
+        .unwrap();
+    assert_eq!(
+        owners[1]
+            .0
+            .query_track(&owners[1].1)
+            .unwrap()
+            .last_media_record_sequence,
+        0
+    );
+}
+
+#[test]
 fn two_owners_reusing_local_ids_capture_only_their_own_pixels_over_a_socket() {
     // The rule the root AGENTS.md states for owner-scoped work. Both producers below are driven by
     // the same helper, so both allocate the same local surface, track, and node numbers.
@@ -112,6 +215,47 @@ fn two_owners_reusing_local_ids_capture_only_their_own_pixels_over_a_socket() {
 
     first.close().expect("close first");
     second.close().expect("close second");
+}
+
+#[test]
+fn pane_images_follow_target_changes_without_touching_a_peer_with_reused_ids() {
+    let (presenter, endpoint) = start();
+    for pane in [1, 2] {
+        presenter.update_metrics(pane, 80, 24, (8, 16));
+    }
+    let mut first = PaneSession::from_session(connect(
+        &endpoint,
+        &presenter.issue_pane_capability(1).unwrap(),
+    ))
+    .unwrap();
+    let mut peer = PaneSession::from_session(connect(
+        &endpoint,
+        &presenter.issue_pane_capability(2).unwrap(),
+    ))
+    .unwrap();
+    first.show_rgba(2, 2, &PIXELS).unwrap();
+    peer.show_rgba(2, 2, &[42; 16]).unwrap();
+    for columns in [90, 100, 80] {
+        presenter.update_metrics(1, columns, 30, (8, 16));
+        first.show_rgba(2, 2, &PIXELS).unwrap();
+        let capture = presenter.capture_pane(1, 0);
+        assert_eq!(
+            capture.layers.len(),
+            1,
+            "old placement cannot accumulate after resize"
+        );
+        assert!(
+            matches!(&capture.layers[0].content, CaptureContent::Raster(r) if r.pixels.as_ref() == PIXELS)
+        );
+        let peer_capture = presenter.capture_pane(2, 0);
+        assert_eq!(peer_capture.layers.len(), 1);
+        assert!(
+            matches!(&peer_capture.layers[0].content, CaptureContent::Raster(r) if r.pixels.as_ref() == [42; 16])
+        );
+    }
+    first.close().unwrap();
+    assert_eq!(presenter.capture_pane(2, 0).layers.len(), 1);
+    peer.close().unwrap();
 }
 
 /// The connection was already gone, so failing is right — but the session knows *why* it went, and
@@ -184,6 +328,60 @@ fn closing_after_aborting_still_performs_the_goodbye() {
     session
         .close()
         .expect("an aborted session still closes cleanly");
+}
+
+#[test]
+fn shutdown_retires_authenticated_and_incomplete_connections_and_clears_owners() {
+    let (presenter, endpoint) = start();
+    let presenter = std::sync::Arc::new(presenter);
+    let mut owners = Vec::new();
+    for pane in [1, 2] {
+        presenter.update_metrics(pane, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(pane).unwrap();
+        let mut owner = PaneSession::from_session(connect(&endpoint, &secret)).unwrap();
+        owner.show_rgba(2, 2, &PIXELS).unwrap();
+        assert!(presenter.wait_for_retained_media(pane, Duration::from_secs(5)));
+        owners.push(owner);
+    }
+    let incomplete = std::net::TcpStream::connect(endpoint.strip_prefix("tcp:").unwrap()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while presenter.active_connection_count() < 5 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    while presenter
+        .wait_media_event(Duration::ZERO)
+        .unwrap()
+        .is_some()
+    {}
+    let waiting = presenter.clone();
+    let (done, result) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = done.send(waiting.wait_media_event(Duration::from_secs(30)));
+    });
+    presenter.shutdown();
+    presenter.shutdown();
+    assert!(
+        result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    waiter.join().unwrap();
+    for pane in [1, 2] {
+        assert!(presenter.capture_pane(pane, 0).layers.is_empty());
+    }
+    while presenter.active_connection_count() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "presenter connections did not retire: {}",
+            presenter.active_connection_count()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(incomplete);
+    drop(owners);
 }
 
 /// The control reader runs on its own thread, so a revocation lands asynchronously. Sending until a

@@ -1,0 +1,11 @@
+[
+  {
+    "crate": "wayland-scanner",
+    "version": "0.31.11",
+    "sha256": "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0",
+    "revision": "05196740da57e41b60a9e9f8e35079e9bd29b89a",
+    "member": "wayland-scanner-0.31.11/tests/scanner_assets/test-protocol.xml",
+    "destination": "wayland-backend/tests/assets/test-protocol.xml",
+    "file_sha256": "7fe9c5e157e09c3a5bae8e0a43fc74d0036a462d6ce21d6e56d5269a58a1cb1c"
+  }
+]

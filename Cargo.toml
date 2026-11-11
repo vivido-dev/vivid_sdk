@@ -33,6 +33,43 @@ exclude = [
 ]
 
 [features]
+# Bounded platform-neutral readable text snapshots; no GUI or device dependency.
+accessible-text = []
+# Optional native audio decoder/resampler; no GUI, presenter or device dependency.
+audio-decode = ["dep:vivid_audio"]
+# Device output and clocks are independent of FFmpeg, GUI and presenter roles.
+audio-output = ["dep:vivid_audio_output"]
+audio-output-testing = ["audio-output", "vivid_audio_output/testing"]
+# Optional native elementary-video decoder; no GUI or presenter dependency.
+video-decode = ["dep:vivid_video"]
+# Native video scene nodes with live and timed presentation.
+vector-video = ["vector-render", "video-decode", "dep:moxcms"]
+# Per-source native audio workers for local pane presentation.
+vector-audio = ["vector-render", "audio-decode", "audio-output"]
+# Native same-owner control sockets/pipes, independent of Vivid wire authority and GUI.
+local-control = ["dep:vivid_local_control"]
+# Experimental bounded Metal/IOSurface frame sharing; does not enable GUI.
+gpu-share = ["dep:vivid_gpu_share"]
+# Shared portable display-list compilation; independent of GPUI and a GPU device.
+vector-render = ["dep:vello", "dep:parley", "dep:bytemuck", "dep:unicode-segmentation"]
+# Bounded PNG/JPEG decoding on a separate native presenter worker.
+vector-images = ["vector-render", "dep:image", "dep:moxcms", "dep:crc32fast"]
+# Cached GPU composition using an existing host-owned Vello renderer and device.
+vector-gpu = ["vector-render", "dep:wgpu", "vello/wgpu"]
+# Native adapter and bounded asynchronous CPU readback for hosted GUI images.
+vector-offscreen = ["vector-gpu", "wgpu/metal", "wgpu/vulkan", "wgpu/dx12"]
+# Desktop GUI runtime is opt-in; protocol consumers retain their existing dependency graph.
+gui = ["accessible-text", "dep:gpui", "dep:gpui_platform", "dep:serde", "dep:serde_json", "dep:async-channel", "vivid_gpu_share?/gui"]
+# Compile Metal shaders at runtime when the Xcode Metal command-line tool is absent.
+gui-runtime-shaders = ["gui", "gpui_platform/runtime_shaders"]
+# Production frame readback without enabling deterministic test runtimes.
+gui-offscreen = ["gui", "gpui/offscreen", "gpui_platform/offscreen"]
+# Production GUI application rendered into an authenticated desktop surface.
+gui-remote = ["gui-offscreen", "local-control"]
+# Optional Linux nested Wayland server; independent of Vivid wire authority.
+gui-wayland = ["gui", "dep:smithay", "dep:tempfile", "dep:rustix", "dep:wayland-backend"]
+# Deterministic GUI contexts for host lifecycle integration tests.
+gui-testing = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 default = ["native-media"]
 native-media = ["vivid_protocol/native"]
 # The terminating presenter. Off by default: most consumers only produce, and it roughly doubles
@@ -44,19 +81,43 @@ presenter = ["dep:log", "dep:serde", "dep:sha2"]
 # that ask for it, and it never affects a production build of the SDK. Requires `presenter`: its
 # overlay window/focus/revision bookkeeping is shared with the real terminating presenter, so a
 # producer-side regression against this fake and against a live host agree on the same state.
-testing = ["presenter"]
+testing = ["presenter", "vivid_audio_output?/testing"]
 
 [dependencies]
+vivid_gpu_share = { version = "0.1.0", path = "gpu-share", optional = true, default-features = false }
+async-channel = { version = "2.5", optional = true }
+vivid_audio = { version = "0.1.0", path = "audio", optional = true }
+vivid_audio_output = { version = "0.1.0", path = "audio-output", optional = true }
+vivid_video = { version = "0.1.0", path = "video", optional = true }
+vivid_local_control = { version = "0.1.0", path = "local-control", optional = true }
+moxcms = { version = "0.8.1", optional = true }
+crc32fast = { version = "1.5", optional = true }
+image = { version = "0.25.10", optional = true, default-features = false, features = ["png", "jpeg"] }
+unicode-segmentation = { version = "1.12", optional = true }
+bytemuck = { version = "1.25", optional = true }
+parley = { version = "0.12", path = "vendor/parley", optional = true, features = ["bytemuck", "complex-scripts"] }
+vello = { version = "0.11", optional = true, default-features = false }
+wgpu = { version = "30.0", optional = true, default-features = false, features = ["std", "wgsl"] }
+gpui = { path = "gui/crates/gpui", optional = true, default-features = false }
+gpui_platform = { path = "gui/crates/gpui_platform", optional = true, default-features = false, features = ["font-kit", "wayland"] }
 getrandom = "0.4"
 log = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 sha2 = { version = "0.11", optional = true }
 vivid_protocol = { version = "1.5.12", path = "../vivid_protocol", default-features = false, features = [
   "native-transport",
 ] }
 zeroize = "1.9"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", optional = true, features = ["fs", "event", "net"] }
+smithay = { path = "vendor/smithay", optional = true, default-features = false, features = ["wayland_frontend", "renderer_pixman"] }
+tempfile = { version = "3", optional = true }
+wayland-backend = { path = "vendor/wayland/wayland-backend", optional = true }
+
 [dev-dependencies]
+pollster = "0.4"
 tempfile = "3"
 # `test-util` lets the presenter tests send a preface that claims another protocol version.
 vivid_protocol = { version = "1.5.12", path = "../vivid_protocol", default-features = false, features = [
@@ -64,9 +125,12 @@ vivid_protocol = { version = "1.5.12", path = "../vivid_protocol", default-featu
   "test-util",
 ] }
 
-# The conformance example prints JSON that a cross-language runner reads; nothing in the crate
-# itself depends on serde.
+# Producer-only conformance builds print JSON without enabling GUI/presenter serialization.
 serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wayland-client = { path = "vendor/wayland/wayland-client" }
+wayland-protocols = { path = "vendor/wayland/wayland-protocols", features = ["client"] }
 
 # A std-only send-path benchmark: `cargo bench --bench send`. The adaptive raster scenarios need
 # zstd.
@@ -83,6 +147,7 @@ required-features = ["presenter"]
 [workspace]
 members = ["python-bindings", "node-bindings"]
 resolver = "3"
+exclude = ["gui", "local-control", "video", "audio", "audio-output", "gpu-share", "vendor/smithay", "vendor/wayland", "vendor/parley"]
 
 [[example]]
 name = "sdk_01_show_image"
@@ -116,3 +181,13 @@ path = "examples/rust/07_overlay_window.rs"
 [[example]]
 name = "sdk_08_overlay_paths"
 path = "examples/rust/08_overlay_paths.rs"
+
+[[example]]
+name = "sdk_gui_offscreen_roundtrip"
+path = "examples/rust/gui_offscreen_roundtrip.rs"
+required-features = ["gui-offscreen", "presenter"]
+
+[[example]]
+name = "sdk_gui_remote_counter"
+path = "examples/rust/gui_remote_counter.rs"
+required-features = ["gui-remote"]

@@ -3,6 +3,41 @@
 //! This module terminates the inner session. Nothing secret-bearing or authoritative is relayed:
 //! projection snapshots contain validated semantic state and portable media bodies only.
 
+#[path = "desktop_input.rs"]
+mod desktop_input;
+#[path = "overlay_input.rs"]
+mod overlay_input;
+pub use desktop_input::DesktopInputTarget;
+#[cfg(feature = "vector-audio")]
+#[path = "native_audio.rs"]
+mod native_audio;
+#[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+#[path = "native_hold.rs"]
+mod native_hold;
+#[cfg(all(
+    test,
+    feature = "vector-audio",
+    feature = "vector-video",
+    feature = "testing"
+))]
+#[path = "native_sync_tests.rs"]
+mod native_sync_tests;
+#[cfg(feature = "vector-render")]
+#[path = "native_text.rs"]
+pub mod native_text;
+#[cfg(feature = "vector-render")]
+#[path = "native_vector.rs"]
+pub mod native_vector;
+#[cfg(feature = "vector-video")]
+#[path = "native_video.rs"]
+mod native_video;
+#[path = "overlay_clipboard.rs"]
+pub(crate) mod overlay_clipboard;
+#[path = "overlay_tasks.rs"]
+mod overlay_tasks;
+#[path = "session_status.rs"]
+mod session_status;
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -637,6 +672,8 @@ struct TerminalAnchor {
 }
 
 struct SessionRuntime {
+    status_revision: vivid_protocol::session_status::Revision,
+    control_body_limit: u32,
     pane: PaneId,
     closed: bool,
     accepted_profiles: HashSet<String>,
@@ -659,6 +696,7 @@ struct SessionRuntime {
     /// Unsolicited overlay records (window events, submission outcomes, viewport/environment
     /// snapshots) are pushed here as soon as they are queued, rather than waiting for a request.
     overlay_lane: Option<Arc<Writer>>,
+    desktop_input: desktop_input::InputState,
 }
 
 // An exact authenticated transcript can recognize a lost-response retry after old keys
@@ -671,6 +709,7 @@ struct EstablishmentRetry {
 }
 
 struct LeaseEntry {
+    desktop_input_classes: u64,
     pane: PaneId,
     definition: SessionLeaseDefinition,
     contract: ResourceContract,
@@ -687,9 +726,31 @@ struct SurfaceEntry {
     state: SurfaceState,
     active_slots: HashMap<u64, u64>,
     hold: Option<crate::PlaybackHold>,
+    #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+    native_checkpoint: native_hold::Checkpoint,
 }
 
 struct TrackEntry {
+    #[cfg(feature = "vector-audio")]
+    audio_reservation: Option<Arc<native_audio::Reservation>>,
+    #[cfg(feature = "vector-audio")]
+    native_audio: Option<native_audio::Binding>,
+    #[cfg(feature = "vector-audio")]
+    audio_play_serial: u64,
+    #[cfg(feature = "vector-video")]
+    native_video: Option<native_video::Frame>,
+    #[cfg(all(feature = "vector-video", feature = "vector-audio"))]
+    live_video_pending: Option<native_video::Pending>,
+    #[cfg(all(feature = "vector-video", feature = "vector-audio"))]
+    live_video_scope: Option<native_video::Admission>,
+    #[cfg(feature = "vector-video")]
+    video_reservation: Option<Arc<native_video::Reservation>>,
+    #[cfg(feature = "vector-video")]
+    video_playback: Option<native_video::Playback>,
+    #[cfg(feature = "vector-video")]
+    native_frame_serial: u64,
+    #[cfg(feature = "vector-video")]
+    video_drained: Option<u32>,
     microphone: Option<MicrophoneEndpoint>,
     configuration: TrackConfiguration,
     state: TrackState,
@@ -708,6 +769,8 @@ struct TrackEntry {
     last_record_sequence: u64,
     last_pts_us: i64,
     outer_presented: bool,
+    native_visual_presented: Option<(ChannelGeneration, u32, u64)>,
+    accepted_surface_generation: Option<(SurfaceGeneration, ChannelGeneration)>,
     outer_position: Option<super::BridgePositionSnapshot>,
     recovery_pending: bool,
     recovery_requested: bool,
@@ -742,6 +805,8 @@ struct PendingDelivery {
     track: TrackKey,
     bytes: u64,
     random_access: bool,
+    surface_generation: SurfaceGeneration,
+    channel_generation: ChannelGeneration,
 }
 
 #[derive(Clone)]
@@ -770,7 +835,30 @@ struct TargetState {
 }
 
 struct State {
+    #[cfg(feature = "vector-audio")]
+    audio_drains: HashMap<(u64, [u8; 16]), native_audio::PendingDrain>,
+    #[cfg(feature = "vector-audio")]
+    audio_host: bool,
+    #[cfg(feature = "vector-audio")]
+    native_audio_configured: bool,
+    #[cfg(feature = "vector-audio")]
+    audio_workers: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    audio_test_device: bool,
+    #[cfg(feature = "vector-video")]
+    video_host: bool,
+    #[cfg(feature = "vector-render")]
+    native_charges: Vec<(usize, std::sync::Weak<()>)>,
+    #[cfg(feature = "vector-render")]
+    native_hidden: HashSet<PaneId>,
+    #[cfg(feature = "vector-render")]
+    native_visibility: HashMap<PaneId, u64>,
+    #[cfg(feature = "vector-render")]
+    native_host_generation: u64,
+    #[cfg(feature = "vector-render")]
+    native_host_alive: std::sync::Weak<AtomicBool>,
     config: PresenterConfig,
+    input_focus: Option<(DesktopInputTarget, u64)>,
     presenter: PresenterInstanceId,
     capabilities: HashMap<PaneId, Secret32>,
     root_nonces: HashMap<(PaneId, [u8; 32]), Instant>,
@@ -820,6 +908,38 @@ struct State {
 }
 
 impl State {
+    #[cfg(feature = "vector-render")]
+    fn native_pane_hidden(&self, pane: PaneId) -> bool {
+        self.native_hidden.contains(&pane)
+            || (self.native_host_generation > 1 && !self.native_visibility.contains_key(&pane))
+    }
+
+    fn timed_track_held(&self, key: TrackKey) -> bool {
+        #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+        if native_hold::blocked(self, key.surface) {
+            return true;
+        }
+        if self
+            .surfaces
+            .get(&key.surface)
+            .and_then(|surface| surface.hold.as_ref())
+            .is_some_and(|hold| hold.held)
+        {
+            return true;
+        }
+        #[cfg(feature = "vector-render")]
+        if self.tracks.get(&key).is_some_and(|track| {
+            track.configuration.mode == TrackMode::Timed
+                && self
+                    .sessions
+                    .get(&key.surface.session)
+                    .is_some_and(|session| self.native_pane_hidden(session.pane))
+        }) {
+            return true;
+        }
+        false
+    }
+
     /// Wake every parked track wait so it re-evaluates its condition.
     ///
     /// Call this while still holding the state lock after any mutation that can satisfy or fail a
@@ -895,6 +1015,7 @@ impl VirtualVivid {
             return Err(invalid("overlay input owner mismatch"));
         }
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let changes_projection = matches!(
             input.event,
             vivid_protocol::overlay::Event::Geometry { .. }
@@ -937,7 +1058,11 @@ impl VirtualVivid {
     }
 
     pub fn complete_overlay_host_request(&self, id: u64, response: Result<Vec<u8>, String>) {
-        if let Some(sender) = lock(&self.state).overlay_relay.pending.get(&id) {
+        let mut state = lock(&self.state);
+        if let Some(grant) = state.overlay_relay.clipboard.get_mut(&id) {
+            grant.finished = true;
+        }
+        if let Some(sender) = state.overlay_relay.pending.get(&id) {
             let response = response.and_then(|body| {
                 if body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
                     Err("overlay host reply exceeds transport budget".into())
@@ -1133,7 +1258,30 @@ impl VirtualVivid {
         let mut presenter = [0_u8; 16];
         getrandom::fill(&mut presenter).map_err(io::Error::other)?;
         let state = Arc::new(Mutex::new(State {
+            #[cfg(feature = "vector-audio")]
+            audio_drains: HashMap::new(),
+            #[cfg(feature = "vector-audio")]
+            audio_host: false,
+            #[cfg(feature = "vector-audio")]
+            native_audio_configured: false,
+            #[cfg(feature = "vector-audio")]
+            audio_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(all(feature = "vector-audio", feature = "testing"))]
+            audio_test_device: false,
+            #[cfg(feature = "vector-video")]
+            video_host: false,
+            #[cfg(feature = "vector-render")]
+            native_charges: Vec::new(),
+            #[cfg(feature = "vector-render")]
+            native_hidden: HashSet::new(),
+            #[cfg(feature = "vector-render")]
+            native_visibility: HashMap::new(),
+            #[cfg(feature = "vector-render")]
+            native_host_generation: 0,
+            #[cfg(feature = "vector-render")]
+            native_host_alive: std::sync::Weak::new(),
             config,
+            input_focus: None,
             presenter: PresenterInstanceId(presenter),
             capabilities: HashMap::new(),
             root_nonces: HashMap::new(),
@@ -1178,6 +1326,19 @@ impl VirtualVivid {
             shutdown: shutdown.clone(),
             media_events,
         };
+        if lock(&state)
+            .config
+            .supported_profiles
+            .iter()
+            .any(|profile| {
+                matches!(
+                    profile.as_str(),
+                    registry::DESKTOP_INPUT | registry::OVERLAY_INPUT
+                )
+            })
+        {
+            desktop_input::start_maintenance(state.clone(), shutdown.clone())?;
+        }
         thread::Builder::new()
             .name("vivid-presenter-listener".into())
             .spawn(move || accept_loop(listener, state, delivery_changed, shutdown))?;
@@ -1186,6 +1347,48 @@ impl VirtualVivid {
 
     pub fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+
+    /// Counts live connection handlers, including bounded incomplete handshakes.
+    ///
+    /// After revoking a principal, a worker can wait for its dedicated presenter's
+    /// handlers to retire before returning runtime admission capacity.
+    pub fn active_connection_count(&self) -> usize {
+        lock(&self.state).connections
+    }
+
+    /// Counts live transport handlers and native audio device workers.
+    ///
+    /// Wait for zero after shutdown before releasing a dedicated runtime's
+    /// admission permit. Native calls can delay retirement without blocking GUI
+    /// or control work; their resource reservation remains charged meanwhile.
+    pub fn active_worker_count(&self) -> usize {
+        let state = lock(&self.state);
+        #[cfg(feature = "vector-audio")]
+        let audio = state.audio_workers.load(Ordering::Acquire);
+        #[cfg(not(feature = "vector-audio"))]
+        let audio = 0;
+        state.connections + audio
+    }
+
+    /// Stops listener admission and cancels every session owned by this presenter.
+    ///
+    /// Idempotent. Dedicated-runtime supervisors can wait for
+    /// `active_worker_count` to reach zero before releasing admission capacity.
+    /// Incomplete handshakes retain their existing bounded deadline.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let mut state = lock(&self.state);
+        desktop_input::shutdown(&mut state);
+        let sessions: Vec<_> = state.sessions.keys().copied().collect();
+        for session in sessions {
+            cleanup_session(&mut state, session);
+        }
+        state.capabilities.clear();
+        state.leases.clear();
+        state.events = None;
+        state.wake_waits();
+        self.delivery_changed.notify_all();
     }
 
     pub fn set_media_wakeup(&self, wakeup: Arc<dyn Fn() + Send + Sync>) {
@@ -1249,6 +1452,7 @@ impl VirtualVivid {
         for session in sessions {
             cleanup_session(&mut state, session);
         }
+        state.overlays.remove_pane(pane);
         state.metrics.remove(&pane);
         state.targets.remove(&pane);
         state.alternate_panes.remove(&pane);
@@ -1288,9 +1492,11 @@ impl VirtualVivid {
                 "lease profile set is not supported by this presentation target",
             ));
         }
-        let ceiling = state.config.resource_contract.clone().unwrap_or_else(|| {
-            presenter_contract(&state.config.media, state.config.target.as_ref())
-        });
+        let ceiling = state
+            .config
+            .resource_contract
+            .clone()
+            .unwrap_or_else(|| presenter_contract(&state.config));
         let contract = definition.requested_contract.component_min(&ceiling);
         let key = (definition.context_id, definition.lease_id);
         if let Some(existing) = state.leases.get(&key) {
@@ -1315,6 +1521,7 @@ impl VirtualVivid {
             });
         }
         let entry = LeaseEntry {
+            desktop_input_classes: 0,
             pane,
             machine: LeaseMachine::new(
                 definition.cleanup_policy,
@@ -1396,7 +1603,7 @@ impl VirtualVivid {
     }
 
     /// Advances one desktop principal's target and announces the new descriptor to its live
-    /// session. The configured desktop is used as generation one when the capability is issued.
+    /// session. Generation one is installed when its root capability or lease is issued.
     pub fn update_desktop_target(
         &self,
         pane: PaneId,
@@ -1411,7 +1618,9 @@ impl VirtualVivid {
                 "desktop target updates require a desktop presenter",
             ));
         }
-        if !state.capabilities.contains_key(&pane) {
+        if !state.capabilities.contains_key(&pane)
+            && !state.leases.values().any(|lease| lease.pane == pane)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "presentation principal is unknown",
@@ -1433,6 +1642,14 @@ impl VirtualVivid {
 }
 
 fn announce_target_change(state: &mut State, pane: PaneId, target: &TargetState, reason_mask: u64) {
+    let owners: Vec<_> = state
+        .sessions
+        .iter()
+        .filter_map(|(owner, session)| (session.pane == pane).then_some(*owner))
+        .collect();
+    for owner in owners {
+        desktop_input::revoke(state, owner, 4, false);
+    }
     for session in state
         .sessions
         .values_mut()
@@ -2162,6 +2379,18 @@ impl VirtualVivid {
         let mut resync = !delivered;
         let mut recovery_completed = false;
         release_delivery_allowance(&mut state, &delivery);
+        if state
+            .tracks
+            .get(&delivery.track)
+            .is_none_or(|track| track.state.channel_generation != delivery.channel_generation)
+        {
+            return false;
+        }
+        let delivered = delivered
+            && state
+                .surfaces
+                .get(&delivery.track.surface)
+                .is_some_and(|surface| surface.state.generation == delivery.surface_generation);
         if let Some(track) = state.tracks.get_mut(&delivery.track) {
             if delivered {
                 let first_outer_delivery = !track.outer_presented;
@@ -2243,15 +2472,30 @@ impl VirtualVivid {
 
     /// Whether an actor-queued event still owns the exact live bridge delivery it names.
     pub fn bridge_delivery_is_pending(&self, delivery_id: u64, source: SourceKey) -> bool {
-        lock(&self.state)
-            .deliveries
-            .get(&delivery_id)
-            .is_some_and(|delivery| delivery.track == inner_track_key(source))
+        let state = lock(&self.state);
+        state.deliveries.get(&delivery_id).is_some_and(|delivery| {
+            delivery.track == inner_track_key(source)
+                && state.tracks.get(&delivery.track).is_some_and(|track| {
+                    track.state.channel_generation == delivery.channel_generation
+                })
+                && state
+                    .surfaces
+                    .get(&delivery.track.surface)
+                    .is_some_and(|surface| surface.state.generation == delivery.surface_generation)
+        })
     }
 
     pub fn complete_retained_hydration(&self, source: SourceKey) {
         let mut state = lock(&self.state);
-        if let Some(track) = state.tracks.get_mut(&inner_track_key(source)) {
+        let key = inner_track_key(source);
+        let surface_generation = state
+            .surfaces
+            .get(&key.surface)
+            .map(|surface| surface.state.generation);
+        if let Some(track) = state.tracks.get_mut(&key).filter(|track| {
+            track.accepted_surface_generation
+                == surface_generation.map(|generation| (generation, track.state.channel_generation))
+        }) {
             track.outer_presented = true;
             track.state.milestones |= MILESTONE_PRESENTED;
             state.wake_waits();
@@ -2892,8 +3136,7 @@ impl VirtualVivid {
 
 impl Drop for VirtualVivid {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.delivery_changed.notify_all();
+        self.shutdown();
     }
 }
 
@@ -2908,14 +3151,14 @@ fn accept_loop<L: PresenterListener>(
             Ok(stream) => {
                 {
                     let mut state = lock(&state);
-                    if state.connections >= MAX_CONNECTIONS {
+                    if shutdown.load(Ordering::Acquire) || state.connections >= MAX_CONNECTIONS {
                         continue;
                     }
                     state.connections += 1;
                 }
                 let state_clone = state.clone();
                 let changed_clone = changed.clone();
-                let _ = thread::Builder::new()
+                let spawned = thread::Builder::new()
                     .name("vivid-presenter-connection".into())
                     .spawn(move || {
                         if let Err(error) = handle_connection(stream, &state_clone, &changed_clone)
@@ -2925,6 +3168,10 @@ fn accept_loop<L: PresenterListener>(
                         let mut state = lock(&state_clone);
                         state.connections = state.connections.saturating_sub(1);
                     });
+                if spawned.is_err() {
+                    let mut state = lock(&state);
+                    state.connections = state.connections.saturating_sub(1);
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -2949,7 +3196,16 @@ fn handle_connection(
         ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, state, changed),
         ConnectionKind::Track => handle_track(&mut reader, state, changed),
         ConnectionKind::Lane => {
-            if lock(state).config.overlay {
+            let serves_input = {
+                let state = lock(state);
+                state.config.overlay
+                    || state
+                        .config
+                        .supported_profiles
+                        .iter()
+                        .any(|profile| profile == registry::DESKTOP_INPUT)
+            };
+            if serves_input {
                 handle_lane(&mut reader, state)
             } else {
                 let writer = reader.writer();
@@ -2992,9 +3248,9 @@ fn handle_connection(
     }
 }
 
-/// Serves the overlay interactive lane: one independently authenticated connection per session,
-/// carrying renewal, pointer capture requests, and every unsolicited overlay record the session is
-/// owed. A stalled or malformed bulk track must never delay this connection, so it shares nothing
+/// Serves one independently authenticated interactive connection per session.
+/// It carries negotiated desktop input or overlay input, renewal, and host notifications.
+/// A stalled or malformed bulk track must never delay this connection, so it shares nothing
 /// with `handle_track` but the session lookup.
 fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()> {
     let writer = reader.writer();
@@ -3024,12 +3280,14 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
                 "session is no longer live",
             ));
         }
-        if !session.accepted_profiles.contains(registry::OVERLAY_INPUT) {
+        if !session.accepted_profiles.contains(registry::OVERLAY_INPUT)
+            && !session.accepted_profiles.contains(registry::DESKTOP_INPUT)
+        {
             return Err(send_fatal(
                 &writer,
                 request_id,
                 messages::ERROR_UNSUPPORTED_PROFILE,
-                "overlay-input-v1 was not negotiated",
+                "no interactive input profile was negotiated",
             ));
         }
         if !open.verify(&auth::ChannelKey::new(*session.channel_key.expose())) {
@@ -3053,6 +3311,37 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
             ],
         )
         .encode()?;
+        if open.lane_generation <= session.desktop_input.lane_generation {
+            let duplicate_live = open.lane_generation == session.desktop_input.lane_generation
+                && session.desktop_input.lane_nonce == Some(open.client_nonce)
+                && session
+                    .overlay_lane
+                    .as_ref()
+                    .is_some_and(|lane| !lane.is_closed());
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                if duplicate_live {
+                    messages::ERROR_CHANNEL_BUSY
+                } else {
+                    messages::ERROR_BAD_STATE
+                },
+                "input lane generation is stale or already active",
+            ));
+        }
+        desktop_input::revoke(&mut state, session_id, 6, true);
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("authenticated session")
+            .desktop_input
+            .lane_generation = open.lane_generation;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("authenticated session")
+            .desktop_input
+            .lane_nonce = Some(open.client_nonce);
         writer.write_record(messages::LANE_ACCEPTED, 0, &accepted_body)?;
         state
             .sessions
@@ -3061,9 +3350,15 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
             .overlay_lane = Some(writer.clone());
         // The spec requires an initial viewport and environment snapshot right after lane
         // authentication, not on the next unrelated change.
-        state.overlays.open_lane(session_id);
-        flush_overlay_lane(&mut state, session_id);
+        if state.sessions[&session_id]
+            .accepted_profiles
+            .contains(registry::OVERLAY_INPUT)
+        {
+            state.overlays.open_lane(session_id, open.lane_generation);
+            flush_overlay_lane(&mut state, session_id);
+        }
     }
+    let lane_guard = desktop_input::LaneGuard::new(shared.clone(), session_id, writer.clone());
     // Refuse inbound records larger than the allowance just granted. Without this the lane would
     // accept whatever the connection preface negotiated, which is the bulk ceiling.
     reader.set_maximum(vivid_protocol::LANE_MAX_RECORD_BODY)?;
@@ -3076,6 +3371,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
         };
         let envelope = messages::decode_control(&record.body)?;
         let mut state = lock(shared);
+        overlay_input::maintain(&mut state);
         // A session end or a newer lane superseding this one both retire it without error: the
         // producer's own transport close or replacement lane already explains why.
         let Some(session) = state.sessions.get(&session_id) else {
@@ -3088,6 +3384,58 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
                 .is_some_and(|current| Arc::ptr_eq(current, &writer))
         {
             break;
+        }
+        if session.accepted_profiles.contains(registry::DESKTOP_INPUT) {
+            if record.record_type == messages::PING {
+                drop(state);
+                writer.write_record(
+                    messages::PONG,
+                    0,
+                    &crate::wire::pong_body(envelope.request_id, envelope.payload)?,
+                )?;
+                continue;
+            }
+            if record.record_type == messages::PONG {
+                continue;
+            }
+            if record.record_type == messages::ERROR {
+                if messages::parse_error_reply(&record.body)?.fatal {
+                    break;
+                }
+                continue;
+            }
+        }
+        if session.accepted_profiles.contains(registry::DESKTOP_INPUT)
+            && record.record_type == messages::SET_INPUT_BINDING
+        {
+            if envelope.request_id == 0 {
+                return Err(invalid("input binding requires a request ID"));
+            }
+            let result = vivid_protocol::input::InputBinding::decode(
+                record.object_id,
+                &Value::Map(envelope.payload.clone()),
+            )
+            .map_err(io::Error::from)
+            .and_then(|binding| desktop_input::bind(&mut state, session_id, binding));
+            let (kind, body) = match result {
+                Ok(status) => (
+                    messages::INPUT_BOUND,
+                    Envelope::new(envelope.request_id, desktop_input::status_payload(status))
+                        .encode()?,
+                ),
+                Err(_) => (
+                    messages::ERROR,
+                    protocol_error(
+                        envelope.request_id,
+                        messages::ERROR_BAD_STATE,
+                        false,
+                        "desktop input binding is invalid or unavailable",
+                    )?,
+                ),
+            };
+            drop(state);
+            writer.write_record(kind, record.object_id, &body)?;
+            continue;
         }
         let mut outcome: OverlayReply = match record.record_type {
             messages::OVERLAY_INPUT_RENEW => {
@@ -3104,6 +3452,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
         };
         if outcome.is_ok()
             && state.overlay_relay.enabled
+            && !state.overlays.local_native()
             && record.record_type == messages::OVERLAY_INPUT_CAPTURE
         {
             let capture = vivid_protocol::overlay::wire::Capture::decode(
@@ -3169,15 +3518,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
         let mut state = lock(shared);
         flush_overlay_lane(&mut state, session_id);
     }
-    let mut state = lock(shared);
-    if let Some(session) = state.sessions.get_mut(&session_id)
-        && session
-            .overlay_lane
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &writer))
-    {
-        session.overlay_lane = None;
-    }
+    drop(lane_guard);
     Ok(())
 }
 
@@ -3215,7 +3556,15 @@ fn handle_control(
                     break;
                 }
             };
-            let dispatched = dispatch_control(shared, session_id, &record);
+            let dispatched = match overlay_tasks::defer(shared, session_id, &writer, &record) {
+                Ok(true) => continue,
+                Ok(false) => dispatch_control_for_connection(shared, session_id, &record, &writer),
+                Err(error) => Err(error),
+            };
+            #[cfg(feature = "vector-audio")]
+            if record.record_type == messages::PLAY && dispatched.is_ok() {
+                native_audio::prime_requested(shared, changed, Some(session_id));
+            }
             // Control records advance revisions and generations, start clocks, cancel waits, and
             // destroy tracks. Waking every parked wait after each one is cheaper and safer than
             // tracking which of the many control mutations a wait reads. The mutation is already
@@ -3241,11 +3590,14 @@ fn handle_control(
                     }
                 }
             }
-            if record.record_type == messages::ADVANCE_CHANNEL {
-                // A timed channel can be parked behind projection or linked-video recovery while the
-                // producer advances it. Wake the retired worker after the mutation is visible so it
-                // observes the generation mismatch and exits; otherwise a producer that synchronously
-                // retires its old audio worker during a seek can wait forever.
+            if matches!(
+                record.record_type,
+                messages::ADVANCE_CHANNEL | messages::FLUSH
+            ) {
+                // Media may be parked behind projection or linked-video recovery.
+                // Wake it after retirement becomes visible so a generation change
+                // exits, or an old epoch releases its ingress capacity. Neither
+                // transition can depend on a subsequent outer projection update.
                 changed.notify_all();
             }
             if record.record_type == messages::GOODBYE {
@@ -3446,10 +3798,11 @@ fn establish_session(
     if let Some(result) = retry_establishment(&mut state, &writer, preface, hello, hello_body) {
         return result;
     }
-    let root_contract =
-        state.config.resource_contract.clone().unwrap_or_else(|| {
-            presenter_contract(&state.config.media, state.config.target.as_ref())
-        });
+    let root_contract = state
+        .config
+        .resource_contract
+        .clone()
+        .unwrap_or_else(|| presenter_contract(&state.config));
     let principal = match &hello.authentication {
         HelloAuthentication::Root { proof } => {
             let authless = hello.authless_payload()?;
@@ -3738,6 +4091,9 @@ fn establish_session(
     let maximum = hello
         .maximum_control_body
         .min(vivid_protocol::CONTROL_MAX_RECORD_BODY);
+    let session_contract_input_limit = session_contract
+        .get(Resource::InputEventsPerSecond)
+        .min(1000);
     let mut welcome = Welcome {
         session_id,
         session_tag,
@@ -3758,8 +4114,17 @@ fn establish_session(
             },
             activation_attempt_status: 0,
         },
-        session_revision: 1,
-        scene_revision: 0,
+        session_revision: state.sessions.get(&session_id).map_or(Ok(1), |session| {
+            session
+                .status_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("session revision exhausted"))
+        })?,
+        scene_revision: state
+            .sessions
+            .get(&session_id)
+            .map_or(0, |session| session.scene_revision.get()),
         resource_contract: session_contract,
         establishment_state: u64::from(matches!(principal, Principal::Resume { .. })),
         resume_generation,
@@ -3883,9 +4248,31 @@ fn establish_session(
             Instant::now() + Duration::from_secs(300),
         );
     }
+    if state.config.overlay
+        && decided
+            .accepted_profiles
+            .iter()
+            .any(|profile| profile == registry::VECTOR_SCENE)
+    {
+        state
+            .overlays
+            .bind_session(session_id, pane)
+            .map_err(io::Error::other)?;
+    }
+    let mut input_state = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|session| std::mem::take(&mut session.desktop_input))
+        .unwrap_or_default();
+    input_state.limit = session_contract_input_limit;
     state.sessions.insert(
         session_id,
         SessionRuntime {
+            status_revision: vivid_protocol::session_status::Revision::new(
+                decided.session_revision,
+            )
+            .map_err(io::Error::other)?,
+            control_body_limit: decided.maximum_control_body,
             pane,
             closed: false,
             accepted_profiles,
@@ -3905,6 +4292,7 @@ fn establish_session(
             resume_key: Secret32::new(*keys.resume_key().expose()),
             resume_generation,
             overlay_lane: None,
+            desktop_input: input_state,
         },
     );
     // Seed this session's viewport from the pane it authenticated against, so its first window
@@ -3919,7 +4307,8 @@ fn establish_session(
     {
         state
             .overlays
-            .install_session_viewport(session_id, viewport);
+            .install_session_viewport(session_id, pane, viewport)
+            .map_err(io::Error::other)?;
     }
     if let Some(key) = lease_key
         && let Some(lease) = state.leases.get_mut(&key)
@@ -4021,7 +4410,12 @@ fn mutation_fingerprint(record_type: u16, object_id: u64, envelope: &Envelope) -
     digest.finalize().into()
 }
 
-fn recorrelate_cached_reply(body: &[u8], request_id: u64) -> io::Result<Vec<u8>> {
+fn recorrelate_cached_reply(kind: u16, body: &[u8], request_id: u64) -> io::Result<Vec<u8>> {
+    if kind == messages::ERROR {
+        let mut error = messages::parse_error_reply(body).map_err(io::Error::other)?;
+        error.request_id = request_id;
+        return error.encode().map_err(io::Error::other);
+    }
     let mut envelope = messages::decode_control(body)?;
     envelope.request_id = request_id;
     envelope.encode().map_err(io::Error::other)
@@ -4083,6 +4477,7 @@ impl VirtualVivid {
     ) -> io::Result<bool> {
         let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let sessions = overlay_sessions_for_pane(&state, pane);
         let consumed = state
             .overlays
@@ -4102,6 +4497,7 @@ impl VirtualVivid {
         let position = vivid_protocol::vector::Point::new(x, y).map_err(io::Error::other)?;
         let pressure = vivid_protocol::vector::Scalar::new(pressure).map_err(io::Error::other)?;
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let sessions = overlay_sessions_for_pane(&state, pane);
         let consumed = state
             .overlays
@@ -4130,6 +4526,7 @@ impl VirtualVivid {
             phase: vivid_protocol::overlay::ScrollPhase::Changed,
         };
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let sessions = overlay_sessions_for_pane(&state, pane);
         let consumed = state.overlays.wheel(&sessions, position, scroll, modifiers);
         flush_overlay_lanes(&mut state, &sessions);
@@ -4165,6 +4562,7 @@ impl VirtualVivid {
         };
         let escape = usage == 0x29;
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let sessions = overlay_sessions_for_pane(&state, pane);
         let consumed = state.overlays.keyboard(&sessions, event, escape);
         flush_overlay_lanes(&mut state, &sessions);
@@ -4176,6 +4574,7 @@ impl VirtualVivid {
     pub fn overlay_text(&self, pane: PaneId, text: &str) -> bool {
         let event = vivid_protocol::overlay::Event::Text(text.to_owned());
         let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
         let sessions = overlay_sessions_for_pane(&state, pane);
         let consumed = state.overlays.keyboard(&sessions, event, false);
         flush_overlay_lanes(&mut state, &sessions);
@@ -4187,15 +4586,16 @@ impl VirtualVivid {
     pub fn set_overlay_pane_focus(&self, pane: PaneId, focused: bool) {
         let mut state = lock(&self.state);
         let sessions = overlay_sessions_for_pane(&state, pane);
-        state.overlays.set_pane_focus(&sessions, focused);
+        state.overlays.set_pane_focus(pane, &sessions, focused);
         flush_overlay_lanes(&mut state, &sessions);
     }
 }
 
-fn dispatch_control(
+fn dispatch_control_for_connection(
     shared: &Arc<Mutex<State>>,
     session_id: u64,
     record: &Record,
+    connection: &Arc<Writer>,
 ) -> Result<ControlReply, ControlError> {
     if record.flags & !RECORD_OPTIONAL != 0 {
         return Err(ControlError::bad("unknown control record flags"));
@@ -4208,14 +4608,29 @@ fn dispatch_control(
     let request_id = envelope.request_id;
     let value = Value::Map(envelope.payload.clone());
     let mut state = lock(shared);
+    overlay_input::maintain(&mut state);
     if !state.sessions.contains_key(&session_id) {
         return Err(ControlError::missing("session does not exist"));
     }
+    if state
+        .sessions
+        .get(&session_id)
+        .is_none_or(|session| session.closed || !Arc::ptr_eq(&session.writer, connection))
+    {
+        return Err(ControlError::state(
+            "control connection is no longer current",
+        ));
+    }
+    #[cfg(feature = "vector-audio")]
+    native_audio::tick(&mut state);
+    #[cfg(feature = "vector-video")]
+    native_video::tick(&mut state);
     admit_session_post_hello(&mut state, session_id);
     if state.overlay_relay.enabled
         && matches!(
             record.record_type,
-            messages::MEASURE_OVERLAY_TEXT_BATCH
+            messages::MEASURE_OVERLAY_TEXT
+                | messages::MEASURE_OVERLAY_TEXT_BATCH
                 | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
                 | messages::SET_OVERLAY_EDITOR
                 | messages::SET_OVERLAY_CLIPBOARD
@@ -4223,13 +4638,16 @@ fn dispatch_control(
         )
     {
         use vivid_protocol::overlay::wire::text::styled::{MeasureBatch, ReleaseLayouts};
+        if state.overlay_relay.local_host_claimed && !state.overlay_relay.local_host_available {
+            return Err(ControlError::state("native overlay host is unavailable"));
+        }
         if record.body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
             return Err(ControlError::bad(
                 "overlay host request exceeds transport budget",
             ));
         }
         let profile = match record.record_type {
-            messages::SET_OVERLAY_EDITOR => registry::OVERLAY_TEXT,
+            messages::SET_OVERLAY_EDITOR | messages::MEASURE_OVERLAY_TEXT => registry::OVERLAY_TEXT,
             messages::SET_OVERLAY_CLIPBOARD => registry::OVERLAY_CLIPBOARD,
             messages::SET_OVERLAY_SEMANTICS => registry::OVERLAY_A11Y,
             _ => registry::OVERLAY_TEXT_LAYOUT,
@@ -4243,7 +4661,13 @@ fn dispatch_control(
                 "overlay host profile was not negotiated",
             ));
         }
+        let mut clipboard = None;
         let address = match record.record_type {
+            messages::MEASURE_OVERLAY_TEXT => {
+                vivid_protocol::overlay::wire::text::MeasureText::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text measurement request"))?
+                    .address
+            }
             messages::MEASURE_OVERLAY_TEXT_BATCH => {
                 MeasureBatch::decode(record.object_id, &value)
                     .map_err(|_| ControlError::bad("invalid text measurement request"))?
@@ -4267,13 +4691,15 @@ fn dispatch_control(
                 .address
             }
             messages::SET_OVERLAY_CLIPBOARD => {
-                state
+                let request = state
                     .overlays
-                    .set_clipboard(session_id, record.object_id, &envelope.payload)
+                    .validate_clipboard(session_id, record.object_id, &envelope.payload)
                     .map_err(ControlError::state)?;
-                vivid_protocol::overlay::wire::Clipboard::decode(record.object_id, &value)
-                    .map_err(|_| ControlError::bad("invalid clipboard request"))?
-                    .address
+                let address = request.address;
+                clipboard = Some(overlay_clipboard::Grant::capture(
+                    &state, session_id, request,
+                )?);
+                address
             }
             messages::SET_OVERLAY_SEMANTICS => {
                 state
@@ -4406,6 +4832,9 @@ fn dispatch_control(
         );
         let (sender, receiver) = mpsc::sync_channel(1);
         state.overlay_relay.pending.insert(id, sender);
+        if let Some(clipboard) = clipboard {
+            state.overlay_relay.clipboard.insert(id, clipboard);
+        }
         state
             .overlay_relay
             .queued
@@ -4430,6 +4859,7 @@ fn dispatch_control(
         let mut state = lock(shared);
         state.overlay_relay.pending.remove(&id);
         state.overlay_relay.reservations.remove(&id);
+        state.overlay_relay.clipboard.remove(&id);
         state
             .overlay_relay
             .queued
@@ -4437,6 +4867,15 @@ fn dispatch_control(
         let body = response
             .map_err(|_| ControlError::state("overlay host request timed out"))?
             .map_err(|_| ControlError::state("outer overlay host refused request"))?;
+        if state
+            .sessions
+            .get(&session_id)
+            .is_none_or(|session| session.closed || !Arc::ptr_eq(&session.writer, connection))
+        {
+            return Err(ControlError::state(
+                "control connection changed during host request",
+            ));
+        }
         if state
             .surfaces
             .get(&key)
@@ -4473,6 +4912,18 @@ fn dispatch_control(
                 .or_default()
                 .extend(retained_layouts);
             advance_projection(&mut state);
+        } else if record.record_type == messages::MEASURE_OVERLAY_TEXT {
+            let query =
+                vivid_protocol::overlay::wire::text::MeasureText::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid text measurement request"))?;
+            let metrics = vivid_protocol::overlay::wire::text::TextMeasurement::decode(
+                address,
+                &Value::Map(response.payload.clone()),
+            )
+            .map_err(|_| ControlError::bad("invalid outer text measurement"))?;
+            metrics
+                .validate_text(&query.text.text)
+                .map_err(|_| ControlError::bad("invalid outer text geometry"))?;
         } else if record.record_type == messages::RELEASE_OVERLAY_TEXT_LAYOUTS {
             let release = ReleaseLayouts::decode(record.object_id, &value)
                 .map_err(|_| ControlError::bad("invalid layout release"))?;
@@ -4482,10 +4933,10 @@ fn dispatch_control(
             prune_overlay_layouts(&mut state, key);
             advance_projection(&mut state);
         }
-        let kind = if record.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH {
-            messages::OVERLAY_TEXT_BATCH_MEASURED
-        } else {
-            messages::OK
+        let kind = match record.record_type {
+            messages::MEASURE_OVERLAY_TEXT_BATCH => messages::OVERLAY_TEXT_BATCH_MEASURED,
+            messages::MEASURE_OVERLAY_TEXT => messages::OVERLAY_TEXT_MEASURED,
+            _ => messages::OK,
         };
         return Ok(Some((
             kind,
@@ -4514,11 +4965,79 @@ fn dispatch_control(
                 "idempotency key was reused with different mutation bytes",
             ));
         }
-        let body = recorrelate_cached_reply(&cached.body, request_id)
+        let body = recorrelate_cached_reply(cached.record_type, &cached.body, request_id)
             .map_err(|_| ControlError::bad("cached mutation reply is invalid"))?;
         return Ok(Some((cached.record_type, cached.object_id, body)));
     }
+    #[cfg(feature = "vector-audio")]
+    if let Some((key, fingerprint)) = mutation_cache
+        && let Some(pending) = state.audio_drains.get(&(session_id, key))
+        && pending.fingerprint != fingerprint
+    {
+        return Err(ControlError::bad(
+            "idempotency key changed during audio DRAIN",
+        ));
+    }
+    if is_idempotent_mutation(record.record_type) {
+        state.sessions[&session_id]
+            .status_revision
+            .check_advance()
+            .map_err(|_| ControlError::state("session revision exhausted"))?;
+    }
+    if record.record_type == messages::DRAIN
+        && state.timed_track_held(track_key_from_value(session_id, &value)?)
+    {
+        return Err(ControlError {
+            code: messages::ERROR_NOT_VISIBLE,
+            message: "timed surface is held",
+        });
+    }
+    #[cfg(feature = "vector-audio")]
+    if record.record_type == messages::DRAIN {
+        let key = track_key_from_value(session_id, &value)?;
+        let pending = mutation_cache
+            .is_some_and(|(id, _)| state.audio_drains.contains_key(&(session_id, id)));
+        if pending
+            || state
+                .tracks
+                .get(&key)
+                .is_some_and(|t| t.audio_reservation.is_some())
+        {
+            StrictMap::new("audio DRAIN", &value, &[0, 1, 2])
+                .map_err(|_| ControlError::bad("invalid audio DRAIN"))?;
+            match native_audio::prepare_drain(
+                &mut state,
+                shared,
+                key,
+                request_id,
+                record.object_id,
+                mutation_cache,
+            )? {
+                native_audio::DrainAdmission::Complete => {}
+                native_audio::DrainAdmission::Joined => return Ok(None),
+                native_audio::DrainAdmission::Start(wait) => {
+                    drop(state);
+                    wait.spawn()?;
+                    return Ok(None);
+                }
+            }
+        }
+    }
     let reply = match record.record_type {
+        messages::QUERY_SESSION => {
+            let page = session_status::query(
+                &mut state,
+                session_id,
+                record.object_id,
+                request_id,
+                &value,
+            )?;
+            (
+                messages::SESSION_STATUS,
+                0,
+                Envelope::new(request_id, page).encode(),
+            )
+        }
         messages::PING => (
             messages::PONG,
             0,
@@ -4548,6 +5067,8 @@ fn dispatch_control(
                     state: surface,
                     active_slots: HashMap::new(),
                     hold: None,
+                    #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+                    native_checkpoint: native_hold::Checkpoint::default(),
                 },
             );
             advance_projection(&mut state);
@@ -4592,18 +5113,31 @@ fn dispatch_control(
                     .to_vec(),
             };
             validate_surface_for_target(state.config.target.as_ref(), &replacement)?;
-            let current = state
-                .surfaces
-                .get_mut(&key)
-                .ok_or_else(|| ControlError::missing("surface does not exist"))?;
-            current
-                .state
+            let mut updated = current.state.clone();
+            updated
                 .replace_mutable(
                     SurfaceRevision::new(required_u64(&map, 2)?),
                     SurfaceGeneration::new(required_u64(&map, 3)?),
                     replacement,
                 )
                 .map_err(|_| ControlError::state("stale surface revision or generation"))?;
+            if updated.generation != state.surfaces[&key].state.generation {
+                desktop_input::invalidate_surface(&mut state, key, 4);
+                for (track_key, track) in &mut state.tracks {
+                    if track_key.surface == key {
+                        track.state.milestones &= !MILESTONE_PRESENTED;
+                        track.outer_presented = false;
+                        track.native_visual_presented = track
+                            .native_visual_presented
+                            .map(|_| (track.state.channel_generation, 0, 0));
+                    }
+                }
+            }
+            state
+                .surfaces
+                .get_mut(&key)
+                .expect("validated surface")
+                .state = updated;
             advance_projection(&mut state);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         }
@@ -4611,6 +5145,7 @@ fn dispatch_control(
             let map = StrictMap::new("surface identity", &value, &[0, 1])
                 .map_err(|_| ControlError::bad("invalid surface identity"))?;
             let key = surface_key_from_map(session_id, &map)?;
+            desktop_input::invalidate_surface(&mut state, key, 3);
             if state.surfaces.remove(&key).is_none() {
                 return Err(ControlError::missing("surface does not exist"));
             }
@@ -4635,7 +5170,7 @@ fn dispatch_control(
         messages::PROBE_TRACK_CONFIG => {
             let configuration = TrackConfiguration::decode(0, &value, true)
                 .map_err(|_| ControlError::bad("invalid track probe"))?;
-            let supported = supports_track(&configuration)
+            let supported = supports_track(&configuration, state.overlays.local_native())
                 && (configuration.direction != crate::TrackDirection::Uplink
                     || state
                         .sessions
@@ -4646,6 +5181,10 @@ fn dispatch_control(
                         .sessions
                         .get(&session_id)
                         .is_some_and(|s| s.accepted_profiles.contains(registry::VECTOR_SCENE)));
+            #[cfg(feature = "vector-video")]
+            let supported = supported && native_video::admissible(&state, &configuration);
+            #[cfg(feature = "vector-audio")]
+            let supported = supported && native_audio::admissible(&state, &configuration);
             (
                 messages::TRACK_SUPPORT,
                 0,
@@ -4655,12 +5194,25 @@ fn dispatch_control(
                         (0, Value::Bool(supported)),
                         (
                             1,
-                            // A descriptive hint, not a matched value. Left as-is: it rides in a
-                            // success payload rather than a diagnostic, and no peer in this tree
-                            // reads it, so renaming it would be an unverifiable wire change for
-                            // cosmetic gain.
                             Value::Text(if supported {
-                                "vvmux-relay".into()
+                                if cfg!(feature = "vector-video")
+                                    && state.overlays.local_native()
+                                    && matches!(configuration.kind, KindConfiguration::Video(_))
+                                {
+                                    if configuration.mode == TrackMode::Timed {
+                                        "native-ffmpeg-timed-srgb".into()
+                                    } else {
+                                        "native-ffmpeg-live-srgb".into()
+                                    }
+                                } else if cfg!(feature = "vector-audio")
+                                    && state.overlays.local_native()
+                                    && matches!(configuration.kind, KindConfiguration::Audio(_))
+                                    && configuration.direction == crate::TrackDirection::Downlink
+                                {
+                                    "native-ffmpeg-audio".into()
+                                } else {
+                                    "vvmux-relay".into()
+                                }
                             } else {
                                 "unsupported".into()
                             }),
@@ -4686,7 +5238,14 @@ fn dispatch_control(
             if !state.surfaces.contains_key(&surface) {
                 return Err(ControlError::missing("owning surface does not exist"));
             }
-            if !supports_track(&configuration)
+            let supported = supports_track(&configuration, state.overlays.local_native());
+            #[cfg(feature = "vector-audio")]
+            let supported = supported
+                && (!state.overlays.local_native()
+                    || !matches!(configuration.kind, KindConfiguration::Audio(_))
+                    || configuration.direction == crate::TrackDirection::Uplink
+                    || state.audio_host);
+            if !supported
                 || (configuration.direction == crate::TrackDirection::Uplink
                     && !state
                         .sessions
@@ -4718,10 +5277,61 @@ fn dispatch_control(
                 });
             }
             let track_state = TrackState::new();
+            #[cfg(feature = "vector-audio")]
+            let audio_reservation = if state.overlays.local_native()
+                && configuration.direction == crate::TrackDirection::Downlink
+                && matches!(configuration.kind, KindConfiguration::Audio(_))
+            {
+                Some(
+                    native_audio::reserve(&mut state, &configuration).map_err(|_| {
+                        ControlError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "native audio resource capacity exhausted",
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
+            #[cfg(feature = "vector-video")]
+            let video_reservation = if state.overlays.local_native()
+                && matches!(configuration.kind, KindConfiguration::Video(_))
+            {
+                Some(
+                    native_video::reserve(&mut state, &configuration).map_err(|_| {
+                        ControlError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "native video resource capacity exhausted",
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
             let payload = track_ready_payload(key, &configuration, &track_state);
             state.tracks.insert(
                 key,
                 TrackEntry {
+                    #[cfg(feature = "vector-audio")]
+                    audio_reservation,
+                    #[cfg(feature = "vector-audio")]
+                    native_audio: None,
+                    #[cfg(feature = "vector-audio")]
+                    audio_play_serial: 0,
+                    #[cfg(feature = "vector-video")]
+                    native_video: None,
+                    #[cfg(all(feature = "vector-video", feature = "vector-audio"))]
+                    live_video_pending: None,
+                    #[cfg(all(feature = "vector-video", feature = "vector-audio"))]
+                    live_video_scope: None,
+                    #[cfg(feature = "vector-video")]
+                    video_playback: native_video::playback_for(&video_reservation),
+                    #[cfg(feature = "vector-video")]
+                    video_reservation,
+                    #[cfg(feature = "vector-video")]
+                    native_frame_serial: 0,
+                    #[cfg(feature = "vector-video")]
+                    video_drained: None,
                     microphone: None,
                     configuration,
                     state: track_state,
@@ -4740,6 +5350,8 @@ fn dispatch_control(
                     last_record_sequence: 0,
                     last_pts_us: 0,
                     outer_presented: false,
+                    native_visual_presented: None,
+                    accepted_surface_generation: None,
                     outer_position: None,
                     recovery_pending: true,
                     recovery_requested: false,
@@ -4773,6 +5385,8 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         }
         messages::QUERY_TRACK => {
+            #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+            native_hold::tick(&mut state);
             let key = track_key_from_value(session_id, &value)?;
             let gain_supported = state
                 .sessions
@@ -4831,6 +5445,12 @@ fn dispatch_control(
                     track.channel_advance_pending_flush = true;
                 }
                 track.channel_writer = None;
+                #[cfg(feature = "vector-audio")]
+                native_audio::clear(track);
+                #[cfg(feature = "vector-video")]
+                {
+                    native_video::clear(track);
+                }
                 track.hold_pause_decoder = None;
                 track.eos_epoch = None;
                 track.outer_position = None;
@@ -4942,6 +5562,12 @@ fn dispatch_control(
                 }
                 active.insert(slot, track_id);
             }
+            #[cfg(feature = "vector-audio")]
+            native_audio::validate_activation(&state, surface_key, &active).map_err(|_| {
+                ControlError::state(
+                    "native A/V activation requires matching modes and timed intent",
+                )
+            })?;
             let surface = state
                 .surfaces
                 .get_mut(&surface_key)
@@ -5141,13 +5767,7 @@ fn dispatch_control(
                     message: "track wait generation is stale",
                 });
             }
-            if matches!(condition, 3..=6)
-                && state
-                    .surfaces
-                    .get(&key.surface)
-                    .and_then(|surface| surface.hold.as_ref())
-                    .is_some_and(|hold| hold.held)
-            {
+            if matches!(condition, 3..=6) && state.timed_track_held(key) {
                 return Err(ControlError {
                     code: messages::ERROR_NOT_VISIBLE,
                     message: "timed surface is held",
@@ -5220,7 +5840,7 @@ fn dispatch_control(
             let mut retire_deliveries = false;
             let track = state
                 .tracks
-                .get_mut(&key)
+                .get(&key)
                 .ok_or_else(|| ControlError::missing("track does not exist"))?;
             match record.record_type {
                 messages::PLAY => {
@@ -5259,11 +5879,29 @@ fn dispatch_control(
                     {
                         return Err(ControlError::state("PLAY policy or generation is invalid"));
                     }
+                    #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+                    native_hold::validate_play(&state, key.surface, request).map_err(|_| {
+                        ControlError::state(
+                            "native replacement PLAY requires fresh synchronized members",
+                        )
+                    })?;
+                    #[cfg(feature = "vector-video")]
+                    native_video::validate_group_play(&state, key, request).map_err(|_| {
+                        ControlError::state("native timed PLAY exceeds admitted group policy")
+                    })?;
+                    #[cfg(feature = "vector-audio")]
+                    native_audio::admit_group_play(&mut state, key, request).map_err(|_| {
+                        ControlError::state("native timed audio PLAY exceeds admitted group policy")
+                    })?;
+                    let track = state.tracks.get_mut(&key).expect("validated PLAY target");
                     track.outer_position = None;
                     track.playing = true;
                     track.play_request = request;
                     track.hold_pause_decoder = None;
-                    if request.start_policy == 1 {
+                    let clock_started = request.start_policy == 1;
+                    #[cfg(feature = "vector-audio")]
+                    let clock_started = clock_started && track.audio_reservation.is_none();
+                    if clock_started {
                         track.state.milestones |= MILESTONE_CLOCK_STARTED;
                     } else {
                         track.state.milestones &= !MILESTONE_CLOCK_STARTED;
@@ -5273,11 +5911,13 @@ fn dispatch_control(
                     state.play_commands.push(bridge_track_key(key));
                 }
                 messages::PAUSE => {
+                    let track = state.tracks.get_mut(&key).expect("validated PAUSE target");
                     track.outer_position = None;
                     track.playing = false;
                     linked_pause = true;
                 }
                 messages::FLUSH => {
+                    let track = state.tracks.get_mut(&key).expect("validated FLUSH target");
                     let epoch = vivid_protocol::track::Flush::decode(&value)
                         .map_err(|_| ControlError::bad("invalid FLUSH"))?
                         .epoch;
@@ -5300,7 +5940,14 @@ fn dispatch_control(
                     track.discard_blocked_for_recovery = false;
                     track.retained = None;
                     track.retained_raster = None;
+                    #[cfg(feature = "vector-audio")]
+                    native_audio::clear(track);
+                    #[cfg(feature = "vector-video")]
+                    {
+                        native_video::clear(track);
+                    }
                     retire_deliveries = true;
+                    linked_pause = true;
                     if track.channel_advance_pending_flush {
                         track.channel_advance_pending_flush = false;
                     } else {
@@ -5336,7 +5983,10 @@ fn dispatch_control(
                     if let Some(request) = linked_play {
                         track.playing = true;
                         track.play_request = request;
-                        if request.start_policy == 1 {
+                        let clock_started = request.start_policy == 1;
+                        #[cfg(feature = "vector-audio")]
+                        let clock_started = clock_started && track.audio_reservation.is_none();
+                        if clock_started {
                             track.state.milestones |= MILESTONE_CLOCK_STARTED;
                         } else {
                             track.state.milestones &= !MILESTONE_CLOCK_STARTED;
@@ -5346,13 +5996,37 @@ fn dispatch_control(
                     }
                 }
             }
+            #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+            if (linked_play.is_some() || linked_pause)
+                && record.record_type != messages::FLUSH
+                && !native_hold::intent(
+                    &mut state,
+                    key.surface,
+                    linked_play.is_some(),
+                    linked_play.is_some(),
+                )
+            {
+                return Err(ControlError::state("native hold intent publication failed"));
+            }
+            #[cfg(feature = "vector-audio")]
+            if record.record_type != messages::PLAY {
+                native_audio::tick(&mut state);
+            }
+            #[cfg(feature = "vector-video")]
+            native_video::control(&mut state, key, record.record_type, linked_play)
+                .map_err(|_| ControlError::state("native video playback control failed"))?;
+            #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+            if linked_play.is_some() {
+                native_hold::arm_play(&mut state, key.surface);
+            }
             if retire_deliveries {
                 retire_track_deliveries(&mut state, key);
             }
-            if let Some(hold) = state
-                .surfaces
-                .get_mut(&key.surface)
-                .and_then(|surface| surface.hold.as_mut())
+            if !state.overlays.local_native()
+                && let Some(hold) = state
+                    .surfaces
+                    .get_mut(&key.surface)
+                    .and_then(|surface| surface.hold.as_mut())
             {
                 if linked_play.is_some() {
                     hold.playing_intent = true;
@@ -5474,6 +6148,15 @@ fn dispatch_control(
         .2
         .map_err(|_| ControlError::bad("reply encoding failed"))?;
     let response = (reply.0, reply.1, body);
+    if is_idempotent_mutation(record.record_type) {
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("checked session")
+            .status_revision
+            .advance()
+            .map_err(|_| ControlError::state("session revision exhausted"))?;
+    }
     if let Some((key, fingerprint)) = mutation_cache {
         let cache_key = (session_id, key);
         if !state.idempotency.contains_key(&cache_key) {
@@ -5495,6 +6178,10 @@ fn dispatch_control(
             },
         );
     }
+    #[cfg(feature = "vector-audio")]
+    native_audio::tick(&mut state);
+    #[cfg(feature = "vector-video")]
+    native_video::tick(&mut state);
     let wakeup = (state.projection_revision != projection_revision_before)
         .then(|| state.media_wakeup.clone())
         .flatten();
@@ -5551,7 +6238,8 @@ fn microphone_channel(
     generation: ChannelGeneration,
     configuration: &TrackConfiguration,
 ) -> io::Result<()> {
-    let writer = reader.writer();
+    let attachment = reader.writer();
+    let writer = attachment.clone();
     let sender = Arc::new(crate::AudioInputSender::new(
         configuration,
         generation,
@@ -5614,7 +6302,7 @@ fn microphone_channel(
         let track = state
             .tracks
             .get_mut(&key)
-            .filter(|t| t.state.channel_generation == generation)
+            .filter(|t| owns_media_channel(t, generation, &attachment))
             .ok_or_else(|| io::Error::other("microphone owner disappeared"))?;
         track.microphone = Some(MicrophoneEndpoint { sender: tx, cancel });
         advance_projection(&mut state);
@@ -5631,7 +6319,7 @@ fn microphone_channel(
         if let Some(track) = state
             .tracks
             .get_mut(&key)
-            .filter(|t| t.state.channel_generation == generation)
+            .filter(|t| owns_media_channel(t, generation, &attachment))
         {
             track.microphone.take();
             track.channel_writer = None;
@@ -5781,6 +6469,7 @@ fn handle_track(
             )
             .map_err(io::Error::other)?;
         track.channel_writer = Some(writer.clone());
+        track.last_record_sequence = 0;
         writer.write_record(
             messages::CHANNEL_ACCEPTED,
             open.track_id,
@@ -5803,13 +6492,15 @@ fn handle_track(
             .encode()?,
         )?;
         is_vector_scene = matches!(track.configuration.kind, KindConfiguration::VectorScene(_));
+        #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+        native_hold::tick(&mut state);
         state.wake_waits();
     }
     reader.clear_read_deadline()?;
     let result = if is_vector_scene {
-        vector_track_loop(reader, shared, changed, key, generation)
+        vector_track_loop(reader, shared, changed, key, generation, &writer)
     } else {
-        track_loop(reader, shared, changed, key, generation)
+        track_loop(reader, shared, changed, key, generation, &writer)
     };
     let mut state = lock(shared);
     let mut changed_payload = None;
@@ -5817,17 +6508,32 @@ fn handle_track(
         .sessions
         .get(&key.surface.session)
         .is_some_and(|session| session.accepted_profiles.contains(registry::AUDIO_GAIN));
-    if let Some(track) = state
-        .tracks
-        .get_mut(&key)
-        .filter(|track| track.state.channel_generation == generation)
-    {
+    #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+    if state.tracks.get(&key).is_some_and(|track| {
+        owns_media_channel(track, generation, &writer)
+            && (result.is_err() || track.eos_epoch.is_none())
+    }) {
+        native_hold::device_failed(&mut state, key);
+    }
+    if let Some(track) = state.tracks.get_mut(&key).filter(|track| {
+        track.state.channel_generation == generation
+            && track
+                .channel_writer
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &writer))
+    }) {
         // A retired channel can observe EOF after ADVANCE_CHANNEL has already accepted its
         // replacement. Only the generation that still owns the track attachment may detach or
         // mark it lost; otherwise the old cleanup stops the newly opened video generation.
         track.channel_writer = None;
         let _ = track.state.detach();
         if result.is_err() || track.eos_epoch.is_none() {
+            #[cfg(feature = "vector-audio")]
+            native_audio::clear(track);
+            #[cfg(feature = "vector-video")]
+            {
+                native_video::clear(track);
+            }
             let _ = track.state.lose();
             track.recovery_pending = true;
             track.recovery_requested = false;
@@ -5864,14 +6570,77 @@ fn handle_track(
     result
 }
 
+fn owns_media_channel(
+    track: &TrackEntry,
+    generation: ChannelGeneration,
+    connection: &Arc<Writer>,
+) -> bool {
+    track.state.channel_generation == generation
+        && track
+            .channel_writer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+}
+
+// Call only after structural validation and exact channel-ownership checks, under
+// the presenter lock. FLUSH deliberately does not wait for media ingress. An old
+// record still consumes its wire allowance, but cannot initialize the new epoch,
+// satisfy its key-unit requirement, or acquire decode/presentation authority.
+fn discard_stale_media(
+    key: TrackKey,
+    track: &mut TrackEntry,
+    record: &Record,
+    epoch: u32,
+    already_admitted: bool,
+) -> io::Result<bool> {
+    if epoch >= track.state.media_epoch {
+        return Ok(false);
+    }
+    if track.state.lost {
+        return Err(invalid("stale media belongs to a lost track"));
+    }
+    let length = u32::try_from(record.body.len()).map_err(|_| invalid("media body exceeds u32"))?;
+    let flow = &mut track.state.flow;
+    let bytes = flow
+        .maximum_body_bytes
+        .checked_add(u64::from(length))
+        .ok_or_else(|| invalid("stale media byte allowance exhausted"))?;
+    let records = flow
+        .maximum_media_records
+        .checked_add(1)
+        .ok_or_else(|| invalid("stale media record allowance exhausted"))?;
+    if !already_admitted {
+        flow.admit(length).map_err(io::Error::other)?;
+    }
+    flow.raise_maxima(bytes, records);
+    track.projection_blocked = false;
+    if let Some(writer) = &track.channel_writer {
+        writer.write_record(
+            messages::ERROR,
+            key.track,
+            &protocol_error(
+                0,
+                messages::ERROR_STALE_EPOCH,
+                false,
+                "media record belongs to a retired epoch",
+            )?,
+        )?;
+    }
+    send_flow_update(key, track);
+    Ok(true)
+}
+
 fn track_loop(
     reader: &mut Reader,
     shared: &Arc<Mutex<State>>,
     changed: &Arc<Condvar>,
     key: TrackKey,
     generation: ChannelGeneration,
+    connection: &Arc<Writer>,
 ) -> io::Result<()> {
-    loop {
+    #[cfg(feature = "vector-video")]
+    let mut video = native_video::Decoder::default();
+    'records: loop {
         let record = match reader.read_record(ConnectionKind::Track) {
             Ok(record) => record,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -5889,18 +6658,24 @@ fn track_loop(
             let eos =
                 vivid_protocol::track::ChannelEos::decode(&value).map_err(io::Error::other)?;
             let mut state = lock(shared);
+            #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+            let native_surface_generation = state
+                .overlays
+                .local_native()
+                .then(|| state.surfaces.get(&key.surface).map(|s| s.state.generation))
+                .flatten();
             let track = state
                 .tracks
                 .get_mut(&key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "track disappeared"))?;
-            if track.state.channel_generation != generation {
+            if !owns_media_channel(track, generation, connection) {
                 return Ok(());
             }
             if eos.context_id != key.surface.context
                 || eos.surface_id != key.surface.surface
                 || eos.track_id != key.track
                 || eos.channel_generation != generation
-                || eos.last_media_sequence != record.sequence.saturating_sub(1)
+                || eos.last_media_sequence != track.last_record_sequence
             {
                 return Err(invalid("CHANNEL_EOS identity or sequence is invalid"));
             }
@@ -5908,11 +6683,54 @@ fn track_loop(
             if epoch < track.state.media_epoch {
                 return Err(invalid("CHANNEL_EOS epoch is stale"));
             }
+            #[cfg(feature = "vector-audio")]
+            if track.audio_reservation.is_some() && epoch != track.state.media_epoch {
+                return Err(invalid("native audio EOS epoch mismatch"));
+            }
             track.eos_epoch = Some(epoch);
             track.state.milestones |= MILESTONE_EOS_ACCEPTED;
-            track.last_record_sequence = record.sequence;
+            #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+            if track.configuration.mode == TrackMode::Timed
+                && matches!(
+                    track.configuration.kind,
+                    KindConfiguration::Audio(_) | KindConfiguration::Video(_)
+                )
+                && let Some(surface) = native_surface_generation
+            {
+                // Empty streams still admit this exact surface/channel pair.
+                // Decoder-drained EOS, not this admission, resolves readiness.
+                track.accepted_surface_generation = Some((surface, generation));
+            }
             advance_projection(&mut state);
             state.wake_waits();
+            #[cfg(feature = "vector-audio")]
+            if state.audio_host
+                && matches!(
+                    state.tracks[&key].configuration.kind,
+                    KindConfiguration::Audio(_)
+                )
+            {
+                let admission =
+                    native_audio::Admission::capture(&state, key, generation, connection)
+                        .ok_or_else(|| invalid("native audio EOS source retired"))?;
+                drop(state);
+                native_audio::submit(shared, changed, admission, None)?;
+                continue;
+            }
+            #[cfg(feature = "vector-video")]
+            if state.events.is_none()
+                && state.overlays.local_native()
+                && matches!(
+                    state.tracks[&key].configuration.kind,
+                    KindConfiguration::Video(_)
+                )
+            {
+                let admission =
+                    native_video::Admission::capture(&state, key, generation, connection)
+                        .ok_or_else(|| invalid("native video EOS source retired"))?;
+                drop(state);
+                video.finish(shared, changed, &admission)?;
+            }
             continue;
         }
 
@@ -5922,16 +6740,37 @@ fn track_loop(
         let Some(track) = state.tracks.get(&key) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "track disappeared"));
         };
-        if track.state.channel_generation != generation {
+        if !owns_media_channel(track, generation, connection) {
             return Ok(());
         }
         let configuration = track.configuration.clone();
         let (epoch, media_id, random_access, pts, retained) =
             validate_media_record(&configuration, &record)?;
+        if discard_stale_media(
+            key,
+            state.tracks.get_mut(&key).unwrap(),
+            &record,
+            epoch,
+            false,
+        )? {
+            continue;
+        }
         let timed = matches!(
             configuration.kind,
             KindConfiguration::Video(_) | KindConfiguration::Audio(_)
         );
+        #[cfg(feature = "vector-audio")]
+        let native_audio = events.is_none()
+            && state.audio_host
+            && matches!(configuration.kind, KindConfiguration::Audio(_));
+        #[cfg(not(feature = "vector-audio"))]
+        let native_audio = false;
+        #[cfg(feature = "vector-video")]
+        let native_video = events.is_none()
+            && state.overlays.local_native()
+            && matches!(configuration.kind, KindConfiguration::Video(_));
+        #[cfg(not(feature = "vector-video"))]
+        let native_video = false;
         let source = bridge_track_key(key);
         let linked_video = matches!(configuration.kind, KindConfiguration::Audio(_))
             .then(|| {
@@ -5950,7 +6789,8 @@ fn track_loop(
             && state.tracks.get(&key).is_some_and(|track| {
                 track.outer_presented && track.state.milestones & MILESTONE_OUTPUT_READY == 0
             });
-        let prime_live_audio_before_projection = configuration.mode == TrackMode::Live
+        let prime_live_audio_before_projection = !native_audio
+            && configuration.mode == TrackMode::Live
             && matches!(configuration.kind, KindConfiguration::Audio(_))
             && state
                 .tracks
@@ -5984,6 +6824,18 @@ fn track_loop(
             changed.notify_all();
         }
         loop {
+            // Waiting for an outer projection releases the state lock. FLUSH
+            // may overtake even a packet already primed for live audio; return
+            // that packet's capacity exactly once without forwarding old work.
+            if discard_stale_media(
+                key,
+                state.tracks.get_mut(&key).unwrap(),
+                &record,
+                epoch,
+                prime_live_audio_before_projection,
+            )? {
+                continue 'records;
+            }
             let projected = state.projected_sources.contains(&source)
                 && state.tracks.get(&key).is_some_and(|track| {
                     state.projected_decoder_resets.get(&source) == Some(&track.decoder_reset_serial)
@@ -6000,7 +6852,7 @@ fn track_loop(
                         track.recovery_pending && track.gate_linked_audio_for_recovery
                     })
                 });
-            if !timed || (projected && !linked_video_recovering) {
+            if native_video || native_audio || !timed || (projected && !linked_video_recovering) {
                 break;
             }
             // Hidden and detached timed media must exert backpressure. Rejecting a packet and
@@ -6021,7 +6873,7 @@ fn track_loop(
                         "track disappeared while waiting for projection",
                     ));
                 }
-                Some(track) if track.state.channel_generation != generation => return Ok(()),
+                Some(track) if !owns_media_channel(track, generation, connection) => return Ok(()),
                 Some(_) => {}
             }
         }
@@ -6072,9 +6924,13 @@ fn track_loop(
             false
         };
         let discard_locally = discard_for_recovery || discard_for_audio_catchup;
+        let native_image = events.is_none()
+            && state.overlays.local_native()
+            && matches!(configuration.kind, KindConfiguration::EncodedImage(_));
         {
             let track = state.tracks.get_mut(&key).unwrap();
             if !prime_live_audio_before_projection {
+                let previous_epoch = track.state.media_epoch;
                 track
                     .state
                     .admit_media(vivid_protocol::track::ReceivedMedia {
@@ -6086,9 +6942,42 @@ fn track_loop(
                         random_access,
                     })
                     .map_err(io::Error::other)?;
+                #[cfg(feature = "vector-video")]
+                if native_video && epoch > previous_epoch {
+                    // A new key epoch cannot inherit queued pictures or delayed
+                    // codec output from the preceding native timeline.
+                    track.decoder_reset_serial = track
+                        .decoder_reset_serial
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("decoder reset serial exhausted"))?;
+                    native_video::clear(track);
+                    track.outer_position = None;
+                    track.native_visual_presented = None;
+                    track.state.milestones &= !(MILESTONE_OUTPUT_READY
+                        | MILESTONE_PRESENTED
+                        | MILESTONE_CLOCK_STARTED
+                        | MILESTONE_EOS_ACCEPTED
+                        | MILESTONE_BUFFERED_ENDED);
+                    track.eos_epoch = None;
+                    if track.video_playback.is_some() {
+                        track.playing = false;
+                    }
+                }
+                #[cfg(feature = "vector-audio")]
+                if native_audio && epoch > previous_epoch {
+                    native_audio::clear(track);
+                    track.eos_epoch = None;
+                    track.state.milestones &= !(MILESTONE_OUTPUT_READY
+                        | MILESTONE_PRESENTED
+                        | MILESTONE_CLOCK_STARTED
+                        | MILESTONE_EOS_ACCEPTED
+                        | MILESTONE_BUFFERED_ENDED);
+                }
+                #[cfg(not(feature = "vector-video"))]
+                let _ = previous_epoch;
                 track.flush_pending_channel_advance = false;
                 track.channel_advance_pending_flush = false;
-                if !discard_locally {
+                if !discard_locally && !native_image && !native_video && !native_audio {
                     track.state.milestones |=
                         MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
                 }
@@ -6103,7 +6992,7 @@ fn track_loop(
                 // already earned, so the seek's prebuffer does not deadlock against its own PLAY.
                 grant_rolling_flow(key, track);
             }
-            if random_access && events.is_none() {
+            if random_access && events.is_none() && !native_video && !native_audio {
                 // Focused eventless tests terminate delivery locally. A live bridge keeps
                 // recovery pending until complete_bridge_delivery confirms outer acceptance.
                 track.recovery_pending = false;
@@ -6112,6 +7001,12 @@ fn track_loop(
             }
             update_retained_media(key, track, &record)?;
         }
+        let admitted_surface_generation = state.surfaces[&key.surface].state.generation;
+        state
+            .tracks
+            .get_mut(&key)
+            .expect("admitted track")
+            .accepted_surface_generation = Some((admitted_surface_generation, generation));
         state.wake_waits();
         if recovering_keyframe && recovery_gates_audio {
             let linked_audio = state
@@ -6157,11 +7052,48 @@ fn track_loop(
             continue;
         }
         if events.is_none() {
+            #[cfg(feature = "vector-audio")]
+            if native_audio {
+                let admission =
+                    native_audio::Admission::capture(&state, key, generation, connection)
+                        .ok_or_else(|| invalid("native audio source retired"))?;
+                drop(state);
+                native_audio::submit(shared, changed, admission, Some(record))?;
+                continue;
+            }
+            #[cfg(feature = "vector-video")]
+            if native_video {
+                let admission =
+                    native_video::Admission::capture(&state, key, generation, connection)
+                        .ok_or_else(|| invalid("native video source retired"))?;
+                drop(state);
+                video.decode(shared, changed, &admission, &record)?;
+                continue;
+            }
             // The eventless constructor is used by focused presenter/bridge tests. It terminates
             // the media locally, so successful validation is immediately reusable flow.
+            let native_visual = state.overlays.local_native()
+                && matches!(
+                    state.tracks[&key].configuration.kind,
+                    KindConfiguration::Raster(_) | KindConfiguration::EncodedImage(_)
+                );
             let track = state.tracks.get_mut(&key).unwrap();
-            track.outer_presented = true;
-            track.state.milestones |= MILESTONE_PRESENTED;
+            if native_visual
+                && track
+                    .native_visual_presented
+                    .is_none_or(|(channel, epoch, _)| {
+                        channel != track.state.channel_generation
+                            || epoch != track.state.media_epoch
+                    })
+            {
+                track.native_visual_presented =
+                    Some((track.state.channel_generation, track.state.media_epoch, 0));
+                track.outer_presented = false;
+            }
+            if !native_visual {
+                track.outer_presented = true;
+                track.state.milestones |= MILESTONE_PRESENTED;
+            }
             track.state.flow.raise_maxima(
                 track
                     .state
@@ -6188,6 +7120,8 @@ fn track_loop(
                 track: key,
                 bytes: record.body.len() as u64,
                 random_access,
+                surface_generation: admitted_surface_generation,
+                channel_generation: generation,
             },
         );
         let recovered_keyframe = recovering_keyframe.then_some((epoch, pts));
@@ -6236,6 +7170,7 @@ fn vector_track_loop(
     changed: &Arc<Condvar>,
     key: TrackKey,
     generation: ChannelGeneration,
+    connection: &Arc<Writer>,
 ) -> io::Result<()> {
     loop {
         let record = match reader.read_record(ConnectionKind::Track) {
@@ -6257,7 +7192,7 @@ fn vector_track_loop(
         let Some(track) = state.tracks.get_mut(&key) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "track disappeared"));
         };
-        if track.state.channel_generation != generation {
+        if !owns_media_channel(track, generation, connection) {
             return Ok(());
         }
         // Charge the record against the grant this channel was given before doing anything with
@@ -6301,18 +7236,31 @@ fn vector_track_loop(
                 }
             }
         }
-        state
+        let mut retained = state
             .tracks
-            .get_mut(&key)
+            .get(&key)
             .ok_or_else(|| invalid("vector track disappeared"))?
             .retained_vector
-            .accept(record.record_type, &record.body)?;
-        let accepted = state.overlays.media_record(
-            key.surface.session,
+            .clone();
+        retained.accept(record.record_type, &record.body)?;
+        let window = super::overlay_host::owner(key.surface.session)
+            .context(key.surface.context)
+            .and_then(|context| context.surface(key.surface.surface))
+            .map_err(io::Error::other)?;
+        let accepted = state.overlays.media_record_for(
+            window,
             record.record_type,
             key.track,
+            generation.get(),
             &record.body,
         );
+        if accepted {
+            state
+                .tracks
+                .get_mut(&key)
+                .expect("validated vector track")
+                .retained_vector = retained;
+        }
         if accepted
             && let Some(track) = state.tracks.get_mut(&key)
             && record.record_type == messages::VECTOR_FRAME
@@ -6330,6 +7278,12 @@ fn vector_track_loop(
             return Err(invalid("vector track record was refused"));
         }
         if record.record_type == messages::VECTOR_FRAME {
+            let surface_generation = state.surfaces[&key.surface].state.generation;
+            state
+                .tracks
+                .get_mut(&key)
+                .expect("validated vector track")
+                .accepted_surface_generation = Some((surface_generation, generation));
             prune_overlay_layouts(&mut state, key.surface);
         }
         let wakeup = state.media_wakeup.clone();
@@ -6339,12 +7293,15 @@ fn vector_track_loop(
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("delivery ID exhausted"))?;
             let delivery_id = state.next_delivery;
+            let surface_generation = state.surfaces[&key.surface].state.generation;
             state.deliveries.insert(
                 delivery_id,
                 PendingDelivery {
                     track: key,
                     bytes: u64::from(length),
                     random_access: false,
+                    surface_generation,
+                    channel_generation: generation,
                 },
             );
             let mut event = MediaEvent {
@@ -6375,7 +7332,7 @@ fn vector_track_loop(
                 if state
                     .tracks
                     .get(&key)
-                    .is_none_or(|track| track.state.channel_generation != generation)
+                    .is_none_or(|track| !owns_media_channel(track, generation, connection))
                     || !state.deliveries.contains_key(&delivery_id)
                 {
                     state.deliveries.remove(&delivery_id);
@@ -6733,19 +7690,9 @@ fn spawn_wait(
                             "channel generation changed while waiting",
                         ))
                     }
-                    Some(_)
-                        if matches!(condition, 3..=6)
-                            && state
-                                .surfaces
-                                .get(&key.surface)
-                                .and_then(|surface| surface.hold.as_ref())
-                                .is_some_and(|hold| hold.held) =>
-                    {
-                        Some(WaitOutcome::Failed(
-                            messages::ERROR_NOT_VISIBLE,
-                            "timed surface is held",
-                        ))
-                    }
+                    Some(_) if matches!(condition, 3..=6) && state.timed_track_held(key) => Some(
+                        WaitOutcome::Failed(messages::ERROR_NOT_VISIBLE, "timed surface is held"),
+                    ),
                     Some(track) => {
                         evaluate_wait(track, condition, condition_value).map(|observed| {
                             match Envelope::new(
@@ -6811,8 +7758,24 @@ fn evaluate_wait(track: &TrackEntry, condition: u64, value: Option<u64>) -> Opti
             let mask = value?;
             (mask != 0 && track.state.milestones & mask == mask).then_some(track.state.milestones)
         }
-        3 => (track.outer_presented && track.state.last_media_id >= value?)
-            .then_some(track.state.last_media_id),
+        3 => {
+            let presented = track.native_visual_presented.map_or(
+                if track.outer_presented {
+                    track.state.last_media_id
+                } else {
+                    0
+                },
+                |(channel, epoch, id)| {
+                    if channel == track.state.channel_generation && epoch == track.state.media_epoch
+                    {
+                        id
+                    } else {
+                        0
+                    }
+                },
+            );
+            (presented != 0 && presented >= value?).then_some(presented)
+        }
         4 => {
             let pts = i64::try_from(value?).ok()?;
             let position = track
@@ -7126,10 +8089,32 @@ fn semantic_descriptor(descriptor: &SurfaceDescriptor) -> SemanticDescriptor {
     }
 }
 
-fn supports_track(configuration: &TrackConfiguration) -> bool {
+fn supports_track(configuration: &TrackConfiguration, native: bool) -> bool {
     if configuration.direction == crate::TrackDirection::Uplink {
         return vivid_protocol::audio_input::supports(configuration);
     }
+    if native
+        && configuration.mode == TrackMode::Timed
+        && !matches!(
+            configuration.kind,
+            KindConfiguration::Video(_) | KindConfiguration::Audio(_)
+        )
+    {
+        return false;
+    }
+    #[cfg(feature = "vector-render")]
+    if native && !native_vector::supports_kind(&configuration.kind) {
+        return false;
+    }
+    #[cfg(feature = "vector-video")]
+    if native
+        && matches!(configuration.kind, KindConfiguration::Video(_))
+        && !native_video::supports(configuration)
+    {
+        return false;
+    }
+    #[cfg(not(feature = "vector-render"))]
+    let _ = native;
     (1..=5).contains(&configuration.slot)
         && match &configuration.kind {
             KindConfiguration::Video(video) => {
@@ -7167,6 +8152,12 @@ fn surface_ready_payload(key: SurfaceKey, surface: &SurfaceState) -> Vec<(u64, V
 
 fn surface_status_payload(key: SurfaceKey, surface: &SurfaceEntry) -> Vec<(u64, Value)> {
     let definition = &surface.state.definition;
+    let mut active_slots = surface
+        .active_slots
+        .iter()
+        .map(|(slot, track)| (*slot, Value::Unsigned(*track)))
+        .collect::<Vec<_>>();
+    active_slots.sort_unstable_by_key(|(slot, _)| *slot);
     vec![
         (0, Value::Unsigned(key.context)),
         (1, Value::Unsigned(key.surface)),
@@ -7187,16 +8178,7 @@ fn surface_status_payload(key: SurfaceKey, surface: &SurfaceEntry) -> Vec<(u64, 
                 .unwrap_or(Value::Map(vec![])),
         ),
         (12, Value::Unsigned(definition.policy)),
-        (
-            13,
-            Value::Map(
-                surface
-                    .active_slots
-                    .iter()
-                    .map(|(slot, track)| (*slot, Value::Unsigned(*track)))
-                    .collect(),
-            ),
-        ),
+        (13, Value::Map(active_slots)),
         (14, Value::Unsigned(1)),
         (15, Value::Map(definition.profile_parameters.clone())),
     ]
@@ -7365,6 +8347,8 @@ fn track_status_payload(
     let position = track
         .outer_position
         .filter(|p| p.decoder_reset_serial == track.decoder_reset_serial);
+    #[cfg(feature = "vector-video")]
+    let position = native_video::playback_position(track, Instant::now()).or(position);
     let timed_video = matches!(track.configuration.kind, KindConfiguration::Video(_));
     let mut payload = vec![
         (0, Value::Unsigned(key.surface.context)),
@@ -7391,7 +8375,18 @@ fn track_status_payload(
                 if timed_video {
                     0
                 } else {
-                    u64::from(track.outer_presented)
+                    track.native_visual_presented.map_or(
+                        u64::from(track.outer_presented),
+                        |(channel, epoch, id)| {
+                            if channel == track.state.channel_generation
+                                && epoch == track.state.media_epoch
+                            {
+                                id
+                            } else {
+                                0
+                            }
+                        },
+                    )
                 },
                 |p| p.presentation_id,
             )),
@@ -7413,6 +8408,14 @@ fn track_status_payload(
                 (5, Value::Unsigned(u64::from(track.state.media_epoch))),
                 (10, Value::Unsigned(track.state.revision.get())),
             ]),
+        ));
+    }
+    #[cfg(feature = "vector-video")]
+    if let Some(fields) = native_video::playback_fields(key, track, Instant::now()) {
+        payload.retain(|(key, _)| *key != 21);
+        payload.push((
+            21,
+            Value::Map(fields.into_iter().filter(|(key, _)| *key >= 3).collect()),
         ));
     }
     if gain_supported && matches!(track.configuration.kind, KindConfiguration::Audio(_)) {
@@ -7499,11 +8502,22 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
     if !state.tracks.contains_key(&key) {
         return Err(ControlError::missing("track does not exist"));
     }
+    if let Ok(window) = super::overlay_host::owner(key.surface.session)
+        .context(key.surface.context)
+        .and_then(|context| context.surface(key.surface.surface))
+    {
+        state.overlays.forget_track(window, key.track);
+    }
     retire_track_deliveries(state, key);
-    state
+    let removed = state
         .tracks
         .remove(&key)
         .expect("track existence checked above");
+    if let Some(writer) = removed.channel_writer {
+        // The connection reader owns another writer reference. Removing the
+        // retained track alone cannot unblock an idle authenticated channel.
+        writer.close();
+    }
     state.wake_waits();
     if let Some(surface) = state.surfaces.get_mut(&key.surface) {
         let slots = surface.active_slots.len();
@@ -7521,7 +8535,43 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
     Ok(())
 }
 
+fn cancel_overlay_host_requests(state: &mut State, matches: impl Fn(BridgeSurfaceKey) -> bool) {
+    let mut ids: HashSet<_> = state
+        .overlay_relay
+        .reservations
+        .iter()
+        .filter_map(|(id, (surface, _, _))| matches(*surface).then_some(*id))
+        .collect();
+    ids.extend(
+        state
+            .overlay_relay
+            .queued
+            .iter()
+            .filter_map(|request| matches(request.surface).then_some(request.id)),
+    );
+    for id in &ids {
+        state.overlay_relay.pending.remove(id);
+        state.overlay_relay.reservations.remove(id);
+        state.overlay_relay.clipboard.remove(id);
+    }
+    state
+        .overlay_relay
+        .queued
+        .retain(|request| !ids.contains(&request.id));
+}
+
 fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
+    if let Ok(id) = super::overlay_host::owner(surface.session)
+        .context(surface.context)
+        .and_then(|context| context.surface(surface.surface))
+    {
+        state.overlays.close_surface(id);
+    }
+    cancel_overlay_host_requests(state, |key| {
+        key.producer == surface.session
+            && key.context == surface.context
+            && key.surface == surface.surface
+    });
     state.overlay_layouts.remove(&surface);
     state
         .released_overlay_layouts
@@ -7574,6 +8624,8 @@ fn flush_overlay_lanes(state: &mut State, sessions: &[u64]) {
 }
 
 fn cleanup_session(state: &mut State, session: u64) {
+    cancel_overlay_host_requests(state, |key| key.producer == session);
+    desktop_input::revoke(state, session, 5, true);
     state
         .overlay_layouts
         .retain(|key, _| key.session != session);
@@ -7602,6 +8654,8 @@ fn cleanup_session(state: &mut State, session: u64) {
         .transactions
         .retain(|(owner, _, _), _| *owner != session);
     state.idempotency.retain(|(owner, _), _| *owner != session);
+    #[cfg(feature = "vector-audio")]
+    state.audio_drains.retain(|(owner, _), _| *owner != session);
     state
         .idempotency_order
         .retain(|(owner, _)| *owner != session);
@@ -7616,6 +8670,10 @@ fn suspend_session(
     session_id: u64,
     lease_key: (u64, u64),
 ) -> Option<((u64, u64), u64, Instant)> {
+    #[cfg(feature = "vector-render")]
+    state.overlays.suspend_native(session_id);
+    cancel_overlay_host_requests(state, |key| key.producer == session_id);
+    desktop_input::revoke(state, session_id, 7, true);
     let (resume_key, generation) = state.sessions.get(&session_id).map(|session| {
         (
             Secret32::new(*session.resume_key.expose()),
@@ -7646,6 +8704,12 @@ fn suspend_session(
         lease.revision = lease.revision.saturating_add(1);
         deadline
     };
+    #[cfg(any(feature = "vector-audio", feature = "vector-video"))]
+    if !native_hold::suspend(state, session_id) {
+        cleanup_session(state, session_id);
+        state.leases.remove(&lease_key);
+        return None;
+    }
     if let Some(session) = state.sessions.get_mut(&session_id) {
         session.closed = true;
         session.cancelled_waits.clear();
@@ -7653,11 +8717,18 @@ fn suspend_session(
         session.anchors.clear();
         session.seen_anchors.clear();
     }
+    // Uncommitted work cannot survive the connection that owned its transaction.
+    state
+        .transactions
+        .retain(|(owner, _, _), _| *owner != session_id);
     for (key, track) in &mut state.tracks {
         if key.surface.session != session_id {
             continue;
         }
-        track.channel_writer = None;
+        if let Some(writer) = track.channel_writer.take() {
+            writer.close();
+        }
+        track.microphone.take();
         track.playing = false;
         track.recovery_pending = matches!(track.configuration.kind, KindConfiguration::Video(_));
         track.recovery_requested = false;
@@ -7668,6 +8739,12 @@ fn suspend_session(
         ) {
             track.retained = None;
             track.retained_raster = None;
+            #[cfg(feature = "vector-audio")]
+            native_audio::clear(track);
+            #[cfg(feature = "vector-video")]
+            {
+                native_video::clear(track);
+            }
         }
         let _ = track.state.detach();
     }
@@ -7719,6 +8796,8 @@ fn spawn_lease_expiry(
 }
 
 fn detach_session(state: &mut State, session: u64) {
+    cancel_overlay_host_requests(state, |key| key.producer == session);
+    desktop_input::revoke(state, session, 10, true);
     let Some(runtime) = state.sessions.get_mut(&session) else {
         return;
     };
@@ -7726,6 +8805,16 @@ fn detach_session(state: &mut State, session: u64) {
     runtime.cancelled_waits.clear();
     runtime.pending_waits = 0;
     let anchors = runtime.anchors.clone();
+
+    // Clean root close may retain anchored static pixels, but vector windows
+    // and text services have ended. Retire their native scenes and owner charges.
+    state.overlays.remove_session(session);
+    state
+        .overlay_layouts
+        .retain(|key, _| key.session != session);
+    state
+        .released_overlay_layouts
+        .retain(|(key, _)| key.session != session);
 
     let tracks = state
         .tracks
@@ -7795,6 +8884,8 @@ fn detach_session(state: &mut State, session: u64) {
         .transactions
         .retain(|(owner, _, _), _| *owner != session);
     state.idempotency.retain(|(owner, _), _| *owner != session);
+    #[cfg(feature = "vector-audio")]
+    state.audio_drains.retain(|(owner, _), _| *owner != session);
     state
         .idempotency_order
         .retain(|(owner, _)| *owner != session);
@@ -7864,6 +8955,9 @@ fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
     let Some(track) = state.tracks.get_mut(&delivery.track) else {
         return;
     };
+    if track.state.channel_generation != delivery.channel_generation {
+        return;
+    }
     // Flow maxima and sent totals are cumulative. A completed delivery returns exactly the bytes
     // and one record that it occupied; topping the *available* balance back up to the full rolling
     // window here would grant a fresh window for every one record retired. The one-time transition
@@ -7947,10 +9041,9 @@ fn send_need_full_frame(key: TrackKey, track: &TrackEntry) {
     }
 }
 
-fn presenter_contract(
-    config: &MediaConfig,
-    target: &dyn crate::presenter::PresentationTarget,
-) -> ResourceContract {
+fn presenter_contract(policy: &PresenterConfig) -> ResourceContract {
+    let config = &policy.media;
+    let target = policy.target.as_ref();
     let mut contract = ResourceContract::denied();
     for (resource, value) in [
         (Resource::Surfaces, config.max_sources as u64),
@@ -7986,7 +9079,18 @@ fn presenter_contract(
         (Resource::IdempotencyEntries, 256),
         (Resource::ChildSessionLeases, 0),
         (Resource::DisconnectGraceUs, 0),
-        (Resource::InputEventsPerSecond, 0),
+        (
+            Resource::InputEventsPerSecond,
+            if policy
+                .supported_profiles
+                .iter()
+                .any(|profile| profile == registry::DESKTOP_INPUT)
+            {
+                1000
+            } else {
+                0
+            },
+        ),
         (Resource::ObservationQueueEntries, 64),
         (Resource::ImageCacheBytes, config.aggregate_retained_bytes),
         (Resource::OpenSceneTransactions, config.max_nodes as u64),
@@ -8393,6 +9497,178 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector-video")]
+    fn native_video_owner(
+        presenter: &VirtualVivid,
+    ) -> (
+        crate::Session,
+        crate::Track,
+        crate::TrackChannel,
+        TrackKey,
+        Arc<Writer>,
+    ) {
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client = crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        client
+            .create_surface(surface(1, 1), &RequestMetadata::default())
+            .unwrap();
+        let mut configuration = video(1, 1, 1);
+        configuration.mode = TrackMode::Live;
+        if let KindConfiguration::Video(video) = &mut configuration.kind {
+            video.maximum_reorder_depth = 0;
+            video.matrix = 2;
+            video.transfer = 2;
+        }
+        let track = client
+            .create_track(configuration, &RequestMetadata::default())
+            .unwrap();
+        let channel = client.open_track_channel(&track).unwrap();
+        let key = track_key(client.info().session_id, 1, 1, 1);
+        let writer = lock(&presenter.state).tracks[&key]
+            .channel_writer
+            .clone()
+            .unwrap();
+        (client, track, channel, key, writer)
+    }
+
+    #[cfg(feature = "vector-video")]
+    fn native_video_record(epoch: u32, id: u64, pts: i64) -> Record {
+        Record {
+            record_type: messages::VIDEO_PACKET,
+            flags: 0,
+            object_id: 1,
+            sequence: id,
+            body: media::video_packet_body(media::VideoPacket {
+                epoch,
+                key: true,
+                packet_id: id,
+                pts_us: pts,
+                dts_us: pts,
+                duration_us: 40_000,
+                data: &include_bytes!("../../video/fixtures/red.h264")[..652],
+            })
+            .unwrap(),
+        }
+    }
+
+    #[cfg(feature = "vector-video")]
+    fn native_video_flush_handoff(eos: bool) {
+        use crate::presenter::{NativeVectorHost, SocketListener};
+        let presenter = Arc::new(
+            VirtualVivid::start_configured_eventless(
+                SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+                PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+            )
+            .unwrap(),
+        );
+        let _host = NativeVectorHost::attach(presenter.clone(), "").unwrap();
+        presenter.update_metrics(7, 32, 32, (1, 1));
+        let (mut a, track_a, _channel_a, key_a, writer_a) = native_video_owner(&presenter);
+        let (b, track_b, _channel_b, key_b, writer_b) = native_video_owner(&presenter);
+        let mut decoder = native_video::Decoder::default();
+        let mut peer_decoder = native_video::Decoder::default();
+        let pending = native_video_record(0, 1, 10_000);
+        // Model the exact handoff: admission is complete under the presenter lock,
+        // but the worker has not entered the native decoder yet.
+        {
+            let mut state = lock(&presenter.state);
+            for key in [key_a, key_b] {
+                state
+                    .tracks
+                    .get_mut(&key)
+                    .unwrap()
+                    .state
+                    .admit_media(vivid_protocol::track::ReceivedMedia {
+                        generation: ChannelGeneration::ONE,
+                        body_length: pending.body.len() as u32,
+                        epoch: 0,
+                        media_id: 1,
+                        random_access: true,
+                    })
+                    .unwrap();
+            }
+        }
+        let capture = |key, writer: &Arc<Writer>| {
+            native_video::Admission::capture(
+                &lock(&presenter.state),
+                key,
+                ChannelGeneration::ONE,
+                writer,
+            )
+            .unwrap()
+        };
+        let admission = capture(key_a, &writer_a);
+        peer_decoder
+            .decode(
+                &presenter.state,
+                &presenter.delivery_changed,
+                &capture(key_b, &writer_b),
+                &pending,
+            )
+            .unwrap();
+        if eos {
+            decoder
+                .decode(
+                    &presenter.state,
+                    &presenter.delivery_changed,
+                    &admission,
+                    &pending,
+                )
+                .unwrap();
+            let mut state = lock(&presenter.state);
+            let track = state.tracks.get_mut(&key_a).unwrap();
+            track.eos_epoch = Some(0);
+            track.state.milestones |= MILESTONE_EOS_ACCEPTED;
+        }
+        a.flush(&track_a, 1).unwrap();
+        if eos {
+            decoder
+                .finish(&presenter.state, &presenter.delivery_changed, &admission)
+                .unwrap();
+        } else {
+            decoder
+                .decode(
+                    &presenter.state,
+                    &presenter.delivery_changed,
+                    &admission,
+                    &pending,
+                )
+                .unwrap();
+        }
+        let state = lock(&presenter.state);
+        let retired = &state.tracks[&key_a];
+        assert!(
+            retired.native_video.is_none(),
+            "old work published in the flushed epoch"
+        );
+        assert!(
+            retired.video_drained.is_none(),
+            "old EOS drained the flushed epoch"
+        );
+        assert_eq!(
+            retired.state.milestones & (MILESTONE_OUTPUT_READY | MILESTONE_BUFFERED_ENDED),
+            0
+        );
+        let peer = &state.tracks[&key_b];
+        assert_eq!(peer.native_video.as_ref().unwrap().pts, 10_000);
+        assert_eq!(peer.state.media_epoch, 0);
+        assert!(peer.video_drained.is_none());
+        drop(state);
+        assert_eq!(b.query_track(&track_b).unwrap().last_decoded_pts_us, 10_000);
+    }
+
+    #[test]
+    #[cfg(feature = "vector-video")]
+    fn native_video_flush_cancels_a_packet_between_admission_and_decode() {
+        native_video_flush_handoff(false);
+    }
+
+    #[test]
+    #[cfg(feature = "vector-video")]
+    fn native_video_flush_cancels_eos_between_admission_and_drain() {
+        native_video_flush_handoff(true);
+    }
+
     fn wait_for_connection_count(presenter: &VirtualVivid, maximum: usize) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -8437,6 +9713,351 @@ mod tests {
             maximum_latency_us: 1_000_000,
             retained_pixel_charge: 0,
         }
+    }
+
+    #[test]
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    fn native_audio_drain_is_bounded_idempotent_and_cancelled_with_its_admitted_epoch() {
+        native_audio_drain(false);
+    }
+
+    #[test]
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    fn hidden_audio_drain_wakes_all_joined_requests_and_allows_the_same_nonce_after_show() {
+        native_audio_drain(true);
+    }
+
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    fn native_audio_drain(visibility: bool) {
+        let presenter = Arc::new(
+            VirtualVivid::start_configured_eventless(
+                crate::presenter::SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+                PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+            )
+            .unwrap(),
+        );
+        let mut host = native_vector::NativeVectorHost::attach(presenter.clone(), "").unwrap();
+        host.enable_audio().unwrap();
+        host.use_test_audio_output().unwrap();
+        presenter.update_metrics(7, 32, 32, (1, 1));
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let mut client =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            client
+                .create_surface(surface(1, 1), &Default::default())
+                .unwrap();
+            let track = client
+                .create_track(audio(1, 1, 1), &Default::default())
+                .unwrap();
+            let channel = client.open_track_channel(&track).unwrap();
+            channel
+                .send_audio(media::AudioPacket {
+                    epoch: 0,
+                    packet_id: 1,
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 0,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &[0; 256],
+                })
+                .unwrap();
+            channel.eos().unwrap();
+            client
+                .wait_track(
+                    &track,
+                    crate::TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_EOS_ACCEPTED),
+                    5_000_000,
+                )
+                .unwrap();
+            peers.push((Arc::new(client), track, channel));
+        }
+        let a = peers[0].0.clone();
+        let owner = a.info().session_id;
+        let metadata = crate::RequestMetadata {
+            idempotency_key: Some([0x51; 16]),
+            ..Default::default()
+        };
+        let payload = || {
+            vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(1)),
+                (2, Value::Unsigned(1)),
+            ]
+        };
+        let mut results = Vec::new();
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let client = a.clone();
+            let metadata = metadata.clone();
+            let body = payload();
+            let (tx, rx) = mpsc::sync_channel(1);
+            threads.push(thread::spawn(move || {
+                tx.send(client.request_ok(messages::DRAIN, 1, body, &metadata))
+                    .unwrap()
+            }));
+            results.push(rx);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if lock(&presenter.state).sessions[&owner].pending_waits == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idempotent audio DRAIN did not park"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(lock(&presenter.state).audio_drains.len(), 1);
+        a.query_session().unwrap();
+        for result in &results {
+            assert!(result.try_recv().is_err());
+        }
+        let changed = a
+            .request_ok(messages::DESTROY_TRACK, 1, payload(), &metadata)
+            .unwrap_err();
+        assert_eq!(
+            changed
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                .unwrap()
+                .code,
+            messages::ERROR_BAD_MESSAGE
+        );
+        // Saturation is refused before allocating another waiter or changing the
+        // pending operation. Keep the original two real requests parked.
+        lock(&presenter.state)
+            .sessions
+            .get_mut(&owner)
+            .unwrap()
+            .pending_waits = MAX_WAITS;
+        let limit = a.drain(&peers[0].1).unwrap_err();
+        assert_eq!(
+            limit
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                .unwrap()
+                .code,
+            messages::ERROR_LIMIT_EXCEEDED
+        );
+        lock(&presenter.state)
+            .sessions
+            .get_mut(&owner)
+            .unwrap()
+            .pending_waits = 2;
+        if visibility {
+            let client = a.clone();
+            let track = peers[0].1.clone();
+            let waiter = thread::spawn(move || {
+                client.wait_track(
+                    &track,
+                    crate::TrackWaitCondition::PlaybackEnded,
+                    None,
+                    5_000_000,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&presenter.state).sessions[&owner].pending_waits != 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "native playback wait did not park"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            host.set_visible(7, false).unwrap();
+            let error = waiter.join().unwrap().unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                    .unwrap()
+                    .code,
+                messages::ERROR_NOT_VISIBLE
+            );
+            for result in &results {
+                let error = result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                        .unwrap()
+                        .code,
+                    messages::ERROR_NOT_VISIBLE
+                );
+            }
+            for thread in threads.drain(..) {
+                thread.join().unwrap();
+            }
+            assert!(
+                !lock(&presenter.state)
+                    .idempotency
+                    .contains_key(&(owner, [0x51; 16]))
+            );
+            host.set_visible(7, true).unwrap();
+            results.clear();
+            for _ in 0..2 {
+                let client = a.clone();
+                let metadata = metadata.clone();
+                let body = payload();
+                let (tx, rx) = mpsc::sync_channel(1);
+                threads.push(thread::spawn(move || {
+                    tx.send(client.request_ok(messages::DRAIN, 1, body, &metadata))
+                        .unwrap()
+                }));
+                results.push(rx);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&presenter.state).sessions[&owner].pending_waits != 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "shown DRAIN nonce did not park again"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        a.request_ok(
+            messages::FLUSH,
+            1,
+            vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(1)),
+                (2, Value::Unsigned(1)),
+                (3, Value::Unsigned(1)),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        for result in results {
+            let error = result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|e| e.is::<crate::PresenterError>()),
+                "audio DRAIN returned a nonprotocol failure: {error:?}"
+            );
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                    .unwrap()
+                    .code,
+                messages::ERROR_CANCELLED
+            );
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let retry = a
+            .request_ok(messages::DRAIN, 1, payload(), &metadata)
+            .unwrap_err();
+        assert_eq!(
+            retry
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::PresenterError>())
+                .unwrap()
+                .code,
+            messages::ERROR_CANCELLED
+        );
+        let replaced = a.query_track(&peers[0].1).unwrap();
+        assert_eq!(replaced.media_epoch, 1);
+        assert_eq!(replaced.milestones & MILESTONE_BUFFERED_ENDED, 0);
+        let peer = peers[1].0.query_track(&peers[1].1).unwrap();
+        assert_eq!(peer.media_epoch, 0);
+        assert_ne!(peer.milestones & MILESTONE_EOS_ACCEPTED, 0);
+        assert_eq!(peer.milestones & MILESTONE_BUFFERED_ENDED, 0);
+        presenter.shutdown();
+    }
+
+    #[test]
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    fn a_native_audio_error_returning_after_flush_cannot_fail_the_replacement_epoch() {
+        let presenter = Arc::new(
+            VirtualVivid::start_configured_eventless(
+                crate::presenter::SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+                PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+            )
+            .unwrap(),
+        );
+        let mut host = native_vector::NativeVectorHost::attach(presenter.clone(), "").unwrap();
+        host.enable_audio().unwrap();
+        presenter.update_metrics(7, 32, 32, (1, 1));
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let mut client =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            client
+                .create_surface(surface(1, 1), &Default::default())
+                .unwrap();
+            let mut config = audio(1, 1, 1);
+            config.mode = TrackMode::Live;
+            let length = config.maximum_record_body as usize;
+            let track = client.create_track(config, &Default::default()).unwrap();
+            let channel = client.open_track_channel(&track).unwrap();
+            let key = track_key(client.info().session_id, 1, 1, 1);
+            let mut state = lock(&presenter.state);
+            let entry = state.tracks.get_mut(&key).unwrap();
+            entry
+                .state
+                .admit_media(vivid_protocol::track::ReceivedMedia {
+                    generation: ChannelGeneration::ONE,
+                    body_length: length as u32,
+                    epoch: 0,
+                    media_id: 1,
+                    random_access: true,
+                })
+                .unwrap();
+            let scope = native_audio::Admission::capture(
+                &state,
+                key,
+                ChannelGeneration::ONE,
+                state.tracks[&key].channel_writer.as_ref().unwrap(),
+            )
+            .unwrap();
+            drop(state);
+            owners.push((client, track, channel, scope, key, length));
+        }
+        let (client, track, _, scope, key, length) = &mut owners[0];
+        client.flush(track, 1).unwrap();
+        assert!(
+            native_audio::complete(
+                &presenter.state,
+                &presenter.delivery_changed,
+                scope,
+                Some(*length),
+                Err(invalid("retired decoder failure"))
+            )
+            .is_ok()
+        );
+        let state = lock(&presenter.state);
+        assert_eq!(state.tracks[key].state.media_epoch, 1);
+        assert!(!state.tracks[key].state.lost);
+        assert_eq!(state.tracks[key].state.flow.maximum_media_records, 2);
+        drop(state);
+        let (_, _, _, scope, key, length) = &owners[1];
+        assert!(
+            native_audio::complete(
+                &presenter.state,
+                &presenter.delivery_changed,
+                scope,
+                Some(*length),
+                Err(invalid("current decoder failure"))
+            )
+            .is_err()
+        );
+        let state = lock(&presenter.state);
+        assert_eq!(state.tracks[key].state.media_epoch, 0);
+        assert_eq!(state.tracks[key].state.flow.maximum_media_records, 2);
     }
 
     #[test]
@@ -8574,22 +10195,25 @@ mod tests {
 
         owners[1].2.grant_audio_input().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let packet = crate::InputPacket {
+        let mut packet = crate::InputPacket {
             epoch: 1,
             packet_id: 1,
             pts_us: 0,
             pcm: [23; vivid_protocol::audio_input::PCM_BYTES],
-        }
-        .encode()
-        .unwrap();
+        };
         loop {
             assert!(Instant::now() < deadline, "unrelated microphone stopped");
+            // Capture is best effort before credit arrives. Submit fresh
+            // sequential samples at the capture cadence instead of replaying
+            // one ID while a previous delivery may still be in flight.
             if let Some(route) = presenter.microphone_requests().iter().find(|r| r.pane == 8) {
                 presenter
-                    .queue_microphone(route.source, route.generation, &packet)
+                    .queue_microphone(route.source, route.generation, &packet.encode().unwrap())
                     .unwrap();
             }
-            thread::sleep(Duration::from_millis(5));
+            packet.packet_id += 1;
+            packet.pts_us += 20_000;
+            thread::sleep(Duration::from_millis(20));
             if let Some(received) = owners[1].2.take_audio_input().unwrap() {
                 assert_eq!(received.pcm, [23; vivid_protocol::audio_input::PCM_BYTES]);
                 break;
@@ -8640,21 +10264,21 @@ mod tests {
         assert_eq!(requests[0].source.surface, requests[1].source.surface);
         assert_eq!(requests[0].source.track, requests[1].source.track);
         let route_b = requests.iter().find(|r| r.pane == 8).unwrap();
-        let pcm = crate::InputPacket {
+        let mut pcm = crate::InputPacket {
             epoch: 1,
             packet_id: 1,
             pts_us: 0,
             pcm: [17; vivid_protocol::audio_input::PCM_BYTES],
-        }
-        .encode()
-        .unwrap();
+        };
         presenter.revoke_pane(7);
         let received = loop {
             assert!(Instant::now() < deadline);
             presenter
-                .queue_microphone(route_b.source, route_b.generation, &pcm)
+                .queue_microphone(route_b.source, route_b.generation, &pcm.encode().unwrap())
                 .unwrap();
-            thread::sleep(Duration::from_millis(5));
+            pcm.packet_id += 1;
+            pcm.pts_us += 20_000;
+            thread::sleep(Duration::from_millis(20));
             if let Some(packet) = owners[1].2.take_audio_input().unwrap() {
                 break packet;
             }
@@ -8662,7 +10286,11 @@ mod tests {
         assert_eq!(received.pcm, [17; vivid_protocol::audio_input::PCM_BYTES]);
         assert!(
             !presenter
-                .queue_microphone(route_b.source, route_b.generation + 1, &pcm)
+                .queue_microphone(
+                    route_b.source,
+                    route_b.generation + 1,
+                    &pcm.encode().unwrap()
+                )
                 .unwrap()
         );
         assert!(
@@ -8768,10 +10396,17 @@ mod tests {
         );
 
         let cached = messages::ok(41);
-        let recorrelated = recorrelate_cached_reply(&cached, 99).unwrap();
+        let recorrelated = recorrelate_cached_reply(messages::OK, &cached, 99).unwrap();
         assert_eq!(
             messages::decode_control(&recorrelated).unwrap().request_id,
             99
+        );
+        let error = protocol_error(41, messages::ERROR_CANCELLED, false, "retired source").unwrap();
+        let retried = recorrelate_cached_reply(messages::ERROR, &error, 99).unwrap();
+        let reply = messages::parse_error_reply(&retried).unwrap();
+        assert_eq!(
+            (reply.request_id, reply.code),
+            (99, messages::ERROR_CANCELLED)
         );
     }
 
@@ -9350,6 +10985,116 @@ mod tests {
         assert!(source_playing(neighbor.info().session_id));
         seeking.close().unwrap();
         neighbor.close().unwrap();
+    }
+
+    fn flush_overtakes_parked_audio(mode: TrackMode) {
+        use crate::presenter::SocketListener;
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            SocketListener::bind("tcp:127.0.0.1:0").unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let owner = || {
+            let mut client =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            client
+                .create_surface(surface(1, 1), &RequestMetadata::default())
+                .unwrap();
+            let mut configuration = audio(1, 1, 1);
+            configuration.mode = mode;
+            let track = client
+                .create_track(configuration, &RequestMetadata::default())
+                .unwrap();
+            let channel = client.open_track_channel(&track).unwrap();
+            (client, track, channel)
+        };
+        let (mut a, track_a, channel_a) = owner();
+        let (b, track_b, channel_b) = owner();
+        let key_a = track_key(a.info().session_id, 1, 1, 1);
+        let key_b = track_key(b.info().session_id, 1, 1, 1);
+        let send = |channel: &crate::TrackChannel, epoch, id| {
+            channel
+                .send_audio(media::AudioPacket {
+                    epoch,
+                    packet_id: id,
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &[0; 16],
+                })
+                .unwrap();
+        };
+        send(&channel_a, 0, 1);
+        send(&channel_b, 0, 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = lock(&presenter.state);
+            if state.tracks[&key_a].projection_blocked && state.tracks[&key_b].projection_blocked {
+                // Live audio is primed before projection; timed audio is not.
+                assert_eq!(
+                    state.tracks[&key_a].state.flow.sent_media_records,
+                    u64::from(mode == TrackMode::Live)
+                );
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "audio did not park at projection"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        a.flush(&track_a, 1).unwrap();
+        let event = channel_a.wait_event(Duration::from_secs(3)).unwrap();
+        let Some(crate::ChannelEvent::Error(error)) = event else {
+            panic!("expected stale audio rejection: {event:?}");
+        };
+        assert_eq!(error.code, messages::ERROR_STALE_EPOCH);
+        assert!(!error.fatal);
+        {
+            let state = lock(&presenter.state);
+            let track = &state.tracks[&key_a];
+            assert!(!track.state.lost);
+            assert_eq!(track.state.last_media_id, 0);
+            assert_eq!(track.state.flow.sent_media_records, 1);
+            assert_eq!(track.state.flow.sent_body_bytes, 64);
+            assert_eq!(track.state.flow.maximum_media_records, 2);
+            assert!(state.tracks[&key_b].projection_blocked);
+        }
+        assert!(received.try_recv().is_err(), "old audio reached the bridge");
+        send(&channel_a, 1, 2);
+        presenter.projection_snapshot(&HashSet::from([7]));
+        let mut owners = HashSet::new();
+        for _ in 0..2 {
+            let event = received.recv_timeout(Duration::from_secs(3)).unwrap();
+            let packet = media::parse_audio_packet(&event.body).unwrap();
+            if event.source.producer == a.info().session_id {
+                assert_eq!((packet.epoch, packet.packet_id), (1, 2));
+            } else {
+                assert_eq!(event.source.producer, b.info().session_id);
+                assert_eq!((packet.epoch, packet.packet_id), (0, 1));
+            }
+            owners.insert(event.source.producer);
+            assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+        }
+        assert_eq!(owners.len(), 2);
+        assert_eq!(b.query_track(&track_b).unwrap().media_epoch, 0);
+    }
+
+    #[test]
+    fn flush_rejects_primed_live_audio_parked_at_projection_and_returns_one_credit() {
+        flush_overtakes_parked_audio(TrackMode::Live);
+    }
+
+    #[test]
+    fn flush_rejects_unadmitted_timed_audio_parked_at_projection_and_returns_one_credit() {
+        flush_overtakes_parked_audio(TrackMode::Timed);
     }
 
     #[test]

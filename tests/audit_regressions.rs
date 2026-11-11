@@ -553,15 +553,9 @@ fn public_attempt_recovers_lost_activation_and_resume_welcomes() {
         EstablishmentAttempt::new(config, Duration::from_secs(5)).unwrap(),
         &endpoint,
     );
-    // This presenter reports QUERY_SESSION as unsupported; a typed reply proves admission.
-    assert!(
-        session
-            .query_session()
-            .unwrap_err()
-            .get_ref()
-            .unwrap()
-            .is::<PresenterError>()
-    );
+    let initial = session.query_session_page(&Default::default()).unwrap();
+    assert_eq!(initial.resume_generation, 0);
+    assert!(initial.input_disabled);
     let id = session.info().session_id;
     let authentication = session.resume_authentication().unwrap();
     drop(session);
@@ -578,13 +572,13 @@ fn public_attempt_recovers_lost_activation_and_resume_welcomes() {
         (resumed.info().session_id, resumed.info().resume_generation),
         (id, 1)
     );
-    assert!(
-        other
-            .query_session()
-            .unwrap_err()
-            .get_ref()
-            .unwrap()
-            .is::<PresenterError>()
+    let status = resumed.query_session_page(&Default::default()).unwrap();
+    assert_eq!(status.resume_generation, 1);
+    assert!(status.session_revision > initial.session_revision);
+    assert!(status.input_disabled);
+    assert_eq!(
+        other.query_session_page(&Default::default()).unwrap().usage,
+        [0, 0, 0]
     );
     resumed.close().unwrap();
     other.close().unwrap();

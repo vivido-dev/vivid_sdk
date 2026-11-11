@@ -158,6 +158,7 @@ pub(crate) struct SessionLifecycle {
     /// Set with `diagnostic`, under the same first-close-wins rule: the first cause is the real one,
     /// and a later local close is only the caller catching up to it.
     pub(crate) cause: Mutex<Option<CloseCause>>,
+    pub(crate) failure_kind: Mutex<Option<io::ErrorKind>>,
     pub(crate) track_flows: Mutex<Vec<Weak<FlowSync>>>,
     pub(crate) input_lanes: Mutex<Vec<Weak<PendingInput>>>,
 }
@@ -168,6 +169,7 @@ impl SessionLifecycle {
             closed: AtomicBool::new(false),
             diagnostic: Mutex::new(None),
             cause: Mutex::new(None),
+            failure_kind: Mutex::new(None),
             track_flows: Mutex::new(Vec::new()),
             input_lanes: Mutex::new(Vec::new()),
         }
@@ -309,6 +311,15 @@ impl ControlPlane {
                 }
                 if let Err(error) = writer.write_record(record_type, 0, object_id, body) {
                     let _ = lock(&pending.requests, "pending request table")?.remove(&request_id);
+                    // A fast peer can reply and close before write_record observes
+                    // cancellation after its syscall. The reader queues that exact
+                    // correlated outcome before shutting this writer down. Preserve
+                    // a received reply (including ERROR), never invent write success.
+                    if let Ok(result) = receive.try_recv() {
+                        return result
+                            .map(Some)
+                            .map_err(|message| io::Error::new(io::ErrorKind::BrokenPipe, message));
+                    }
                     return Err(error);
                 }
                 let result = receive.recv().map_err(|_| {
@@ -1109,6 +1120,11 @@ fn spawn_control_watchdog(
                     Err(_) => break,
                 };
                 if silence >= Duration::from_secs(15) {
+                    lifecycle
+                        .failure_kind
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_or_insert(io::ErrorKind::TimedOut);
                     lifecycle.close(CloseCause::Lost, "Vivid control peer stopped responding");
                     let _ = writer.shutdown();
                     break;
@@ -1144,6 +1160,11 @@ fn spawn_control_watchdog(
                                 0,
                                 &messages::empty(id),
                             ) {
+                                probe_lifecycle
+                                    .failure_kind
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get_or_insert(error.kind());
                                 probe_lifecycle.close(CloseCause::Lost, &error.to_string());
                                 let _ = probe_writer.shutdown();
                             }
@@ -1283,6 +1304,13 @@ pub(crate) fn spawn_control_reader(
                     pending.events_ready.notify_all();
                 }
             })();
+            if let Err(error) = &result {
+                lifecycle
+                    .failure_kind
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_or_insert(error.kind());
+            }
             let message = result.err().map_or_else(
                 || "control connection closed".into(),
                 |error| error.to_string(),
@@ -1449,6 +1477,72 @@ mod audit_tests {
     use super::*;
     use std::time::{Duration, Instant};
     use vivid_protocol::cbor::Value;
+
+    #[test]
+    fn a_correlated_reply_survives_write_cancellation_but_missing_replies_do_not() {
+        struct ReplyThenFail {
+            pending: Arc<PendingControl>,
+            reply: Option<u16>,
+        }
+        impl io::Write for ReplyThenFail {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let sender = self.pending.requests.lock().unwrap().remove(&1);
+                let Some(sender) = sender else {
+                    return Ok(bytes.len());
+                };
+                if let Some(record_type) = self.reply {
+                    // Emulate the reader forwarding a complete correlated record
+                    // just before EOF cancels a writer finishing its syscall.
+                    sender
+                        .send(Ok(Record {
+                            record_type,
+                            flags: 0,
+                            object_id: 0,
+                            sequence: 1,
+                            body: messages::ok(1),
+                        }))
+                        .unwrap();
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "write cancelled after receipt",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for reply in [Some(messages::OK), Some(messages::ERROR), None] {
+            let pending = Arc::new(PendingControl {
+                requests: Mutex::new(HashMap::new()),
+                events: Mutex::new(VecDeque::new()),
+                events_ready: Condvar::new(),
+                last_inbound: Mutex::new(Instant::now()),
+                closed: AtomicBool::new(false),
+            });
+            let writer = Connection::from_streams(
+                io::empty(),
+                ReplyThenFail {
+                    pending: pending.clone(),
+                    reply,
+                },
+                ConnectionKind::Control,
+            )
+            .unwrap()
+            .writer();
+            let control = ControlPlane::Live {
+                writer,
+                pending: pending.clone(),
+            };
+            let result = control.request(1, messages::GOODBYE, 0, &messages::empty(1));
+            if let Some(expected) = reply {
+                assert_eq!(result.unwrap().unwrap().record_type, expected);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            }
+            assert!(pending.requests.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn cancellation_wakes_pending_requests_without_waiting_for_the_reader() {
@@ -1760,6 +1854,10 @@ mod audit_tests {
         assert!(writer.write_record(messages::GOODBYE, 0, 0, &[]).is_err());
         let (cause, diagnostic) = lifecycle.unwritable().expect("no reason was recorded");
         assert_eq!(cause, CloseCause::Lost);
+        assert_eq!(
+            *lifecycle.failure_kind.lock().unwrap(),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
         assert!(
             !diagnostic.contains("Vivid connection writer is closed"),
             "the recorded reason is the writer's own error, not the reader's: {diagnostic}"

@@ -38,6 +38,10 @@ impl Session {
         let profiles = self.info.accepted_profiles.clone();
         Some(Arc::new(move |kind, object, payload| {
             let (profile, reply_kind) = match kind {
+                messages::MEASURE_OVERLAY_TEXT => (
+                    vivid_protocol::registry::OVERLAY_TEXT,
+                    messages::OVERLAY_TEXT_MEASURED,
+                ),
                 messages::MEASURE_OVERLAY_TEXT_BATCH => (
                     vivid_protocol::registry::OVERLAY_TEXT_LAYOUT,
                     messages::OVERLAY_TEXT_BATCH_MEASURED,

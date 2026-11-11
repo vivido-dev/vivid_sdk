@@ -12,12 +12,50 @@
 //! is re-exported here, so `vivid_sdk::Session` and its neighbours keep the paths producers
 //! already use. Module boundaries are an implementation detail; the public surface is this file.
 //!
-//! [`presenter`] is the exception, and stays namespaced. It is the other role rather than another
+//! The feature-gated `presenter` module is the exception, and stays namespaced.
+//! It is the other role rather than another
 //! object family, and the two roles name some things alike: a presenter's `SceneNode` is its own
 //! projection of a node, not the producer's [`SceneNode`]. `vivid_sdk::presenter::` keeps that
 //! distinction visible instead of resolving it by collision.
 
 #![forbid(unsafe_code)]
+
+/// Bounded readable text snapshots independent of native accessibility adapters.
+#[cfg(feature = "accessible-text")]
+pub mod accessible_text;
+
+/// Optional native audio decoding and resampling without an audio device.
+#[cfg(feature = "audio-decode")]
+pub use vivid_audio as audio;
+
+/// Optional bounded native output and device clocks, independent of decoding.
+#[cfg(feature = "audio-output")]
+pub use vivid_audio_output as audio_output;
+
+/// Optional native video decoding, independent of GUI and presenter roles.
+#[cfg(feature = "video-decode")]
+pub use vivid_video as video;
+
+/// Native owner-authenticated sockets and pipes for application control.
+#[cfg(feature = "local-control")]
+pub use vivid_local_control as local_control;
+
+/// Experimental bounded Metal/IOSurface transfer without CPU pixel readback.
+#[cfg(all(feature = "gpu-share", target_os = "macos"))]
+pub use vivid_gpu_share as gpu_share;
+
+/// Optional GPUI-derived desktop framework.
+#[cfg(feature = "gui")]
+pub use gpui as gui;
+/// Native platform constructors for the optional desktop framework.
+#[cfg(feature = "gui")]
+pub use gpui_platform as gui_platform;
+#[cfg(feature = "gui")]
+pub mod gui_host;
+#[cfg(feature = "gui-remote")]
+pub mod gui_remote;
+#[cfg(all(feature = "gui-wayland", target_os = "linux"))]
+pub mod gui_wayland;
 
 mod audio_input;
 mod channel;
@@ -40,6 +78,8 @@ mod resume;
 mod scene;
 mod session;
 mod surface;
+#[cfg(feature = "vector-render")]
+pub mod vector_renderer;
 
 #[cfg(feature = "presenter")]
 pub mod presenter;
@@ -292,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_raster_encoding_falls_back_to_raw_when_zstd_is_larger() {
+    fn adaptive_raster_encoding_preserves_raw_fallback_and_invalid_input_atomicity() {
         let mut session = Session::connect(ProducerConfig::offline()).unwrap();
         session
             .create_surface(surface(1, 7), &RequestMetadata::default())
@@ -306,9 +346,38 @@ mod tests {
         let channel = session.open_track_channel(&track).unwrap();
         let rgba = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
+        assert_eq!(
+            channel
+                .send_raster_adaptive(0, 1, &rgba[..15])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
         // A zstd wrapper is larger than this tiny, deliberately incompressible frame. The track's
         // body ceiling is exactly the raw size, so succeeding proves the adaptive path used raw.
+        // Without the optional native codec, adaptive sending still uses that same raw path.
         channel.send_raster_adaptive(0, 1, &rgba).unwrap();
+        assert_eq!(
+            channel
+                .send_raster_delta_adaptive(
+                    0,
+                    2,
+                    1,
+                    0,
+                    0,
+                    &[RasterDeltaOperation::Overwrite {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                        rgba: &rgba[..3]
+                    }]
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         channel
             .send_raster_delta_adaptive(
                 0,

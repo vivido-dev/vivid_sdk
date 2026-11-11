@@ -202,7 +202,8 @@ impl Session {
     /// The session's reconciliation root, core §10.
     ///
     /// After an authenticated resume a producer compares these revisions against what it retained
-    /// rather than replaying requests, so the payload is returned unparsed for the caller to walk.
+    /// rather than replaying requests. This returns the unparsed initial page;
+    /// [`Self::query_session_page`] validates pages and accepts continuation cursors.
     pub fn query_session(&self) -> io::Result<PayloadMap> {
         let reply = self.request(
             messages::QUERY_SESSION,
@@ -217,5 +218,39 @@ impl Session {
         };
         expect_record(&record, messages::SESSION_STATUS, 0)?;
         decoded_payload(&record)
+    }
+
+    /// Queries one bounded owner-scoped reconciliation page.
+    ///
+    /// Continue with the returned cursor and restart on `PRECONDITION_FAILED`.
+    /// Never merge pages from different revisions or use status as input authority.
+    ///
+    /// # Errors
+    /// Returns an error for offline sessions, malformed pages, stale cursors or I/O failure.
+    pub fn query_session_page(
+        &self,
+        query: &vivid_protocol::session_status::Query,
+    ) -> io::Result<vivid_protocol::session_status::Page> {
+        let reply = self
+            .request(
+                messages::QUERY_SESSION,
+                0,
+                query.payload()?,
+                &RequestMetadata::default(),
+                None,
+                None,
+            )?
+            .ok_or_else(|| invalid_input("session status requires a live presenter"))?;
+        expect_record(&reply, messages::SESSION_STATUS, 0)?;
+        let page =
+            vivid_protocol::session_status::Page::decode(0, &Value::Map(decoded_payload(&reply)?))?;
+        if page.entries.len() > usize::from(query.maximum_entries)
+            || page.cursor.is_some() && page.cursor == query.cursor
+        {
+            return Err(invalid_data(
+                "session status exceeded its limit or repeated its cursor",
+            ));
+        }
+        Ok(page)
     }
 }

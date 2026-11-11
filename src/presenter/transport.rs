@@ -242,6 +242,10 @@ impl Writer {
         })
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.cancel.cancel();

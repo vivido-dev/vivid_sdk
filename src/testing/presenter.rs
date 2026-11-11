@@ -423,7 +423,7 @@ impl TestPresenter {
 
     /// Where the focused editor last said its caret was, with the revision it said it at.
     pub fn overlay_editor_caret(&self) -> Option<(u64, Option<vivid_protocol::vector::Rect>)> {
-        self.shared.lock().expect("shared").overlays.editor_caret()
+        self.shared.lock().expect("shared").overlays.editor_caret(1)
     }
 
     /// Deliver an assistive-technology action for a node, exactly as the adapter would.
@@ -449,7 +449,7 @@ impl TestPresenter {
 
     /// The cursor the currently hovered overlay region asks for, as the display layer sees it.
     pub fn overlay_cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
-        self.shared.lock().expect("shared").overlays.cursor()
+        self.shared.lock().expect("shared").overlays.cursor(1)
     }
 
     /// Whether any overlay window currently holds focus.
@@ -458,7 +458,7 @@ impl TestPresenter {
             .lock()
             .expect("shared")
             .overlays
-            .focused()
+            .focused(1)
             .is_some()
     }
 
@@ -593,7 +593,7 @@ impl TestPresenter {
             .lock()
             .expect("shared")
             .overlays
-            .set_pane_focus(&[TEST_SESSION_ID], focused);
+            .set_pane_focus(1, &[TEST_SESSION_ID], focused);
         flush_overlay_lane(&self.shared, &self.lane_writer);
         Ok(())
     }
@@ -1557,7 +1557,7 @@ fn serve_interactive_lane(
             .lock()
             .expect("shared")
             .overlays
-            .open_lane(session_id);
+            .open_lane(session_id, open.lane_generation);
         flush_overlay_lane(&shared, &lane_writer);
     }
 

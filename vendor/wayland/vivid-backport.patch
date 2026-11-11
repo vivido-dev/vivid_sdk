@@ -1,0 +1,1977 @@
+--- a/wayland-backend/Cargo.toml
++++ b/wayland-backend/Cargo.toml
+@@ -120,3 +120,23 @@
+ 
+ [build-dependencies.cc]
+ version = "1.0"
++
++# Restore test dependencies omitted from the published normalized manifest.
++[dev-dependencies.wayland-scanner]
++version = "0.31.10"
++
++[dev-dependencies.wayland-sys]
++version = "0.31.11"
++features = ["client", "server"]
++
++[[test]]
++name = "object_limits"
++path = "tests/object_limits.rs"
++
++[[test]]
++name = "fd_limits"
++path = "tests/fd_limits.rs"
++
++[[test]]
++name = "request_limits"
++path = "tests/request_limits.rs"
+--- a/wayland-backend/src/rs/client_impl/mod.rs
++++ b/wayland-backend/src/rs/client_impl/mod.rs
+@@ -758,7 +758,7 @@
+                     let child_id = InnerObjectId { id: new_id, serial: child_obj.data.serial, interface: child_obj.interface };
+                     created_id = Some(child_id.clone());
+ 
+-                    if let Err(()) = guard.map.insert_at(new_id, child_obj) {
++                    if guard.map.insert_at(new_id, child_obj).is_err() {
+                         // abort parsing, this is an unrecoverable error
+                         let err = WaylandError::Protocol(ProtocolError {
+                             code: 0,
+--- a/wayland-backend/src/rs/map.rs
++++ b/wayland-backend/src/rs/map.rs
+@@ -2,7 +2,13 @@
+ 
+ use crate::protocol::Interface;
+ 
+-use std::cmp::Ordering;
++use std::{cmp::Ordering, num::NonZeroUsize};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum InsertError {
++    InvalidId,
++    Limit,
++}
+ 
+ /// Limit separating server-created from client-created objects IDs in the namespace
+ pub const SERVER_ID_LIMIT: u32 = 0xFF00_0000;
+@@ -26,12 +32,27 @@
+ pub struct ObjectMap<Data> {
+     client_objects: Vec<Option<Object<Data>>>,
+     server_objects: Vec<Option<Object<Data>>>,
++    max_slots: Option<NonZeroUsize>,
+ }
+ 
+ impl<Data: Clone> ObjectMap<Data> {
+     /// Create a new empty object map
+     pub fn new() -> Self {
+-        Self { client_objects: Vec::new(), server_objects: Vec::new() }
++        Self { client_objects: Vec::new(), server_objects: Vec::new(), max_slots: None }
++    }
++
++    pub(crate) fn set_max_slots(&mut self, limit: Option<NonZeroUsize>) {
++        self.max_slots = limit;
++    }
++
++    fn can_grow(&self) -> bool {
++        self.max_slots.map_or(true, |limit| {
++            self.client_objects
++                .len()
++                .checked_add(self.server_objects.len())
++                .and_then(|slots| slots.checked_add(1))
++                .is_some_and(|slots| slots <= limit.get())
++        })
+     }
+ 
+     /// Find an object in the store
+@@ -64,13 +85,23 @@
+     ///
+     /// Can fail if the requested id is not the next free id of this store.
+     /// (In which case this is a protocol error)
+-    pub fn insert_at(&mut self, id: u32, object: Object<Data>) -> Result<(), ()> {
+-        if id == 0 {
+-            Err(())
+-        } else if id >= SERVER_ID_LIMIT {
+-            insert_in_at(&mut self.server_objects, (id - SERVER_ID_LIMIT) as usize, object)
++    pub fn insert_at(&mut self, id: u32, object: Object<Data>) -> Result<(), InsertError> {
++        if id == 0 {
++            Err(InsertError::InvalidId)
++        } else if id >= SERVER_ID_LIMIT {
++            let index = (id - SERVER_ID_LIMIT) as usize;
++            if index == self.server_objects.len() && !self.can_grow() {
++                return Err(InsertError::Limit);
++            }
++            insert_in_at(&mut self.server_objects, index, object)
++                .map_err(|()| InsertError::InvalidId)
+         } else {
+-            insert_in_at(&mut self.client_objects, (id - 1) as usize, object)
++            let index = (id - 1) as usize;
++            if index == self.client_objects.len() && !self.can_grow() {
++                return Err(InsertError::Limit);
++            }
++            insert_in_at(&mut self.client_objects, index, object)
++                .map_err(|()| InsertError::InvalidId)
+         }
+     }
+ 
+@@ -80,8 +111,14 @@
+     }
+ 
+     /// Allocate a new id for an object in the server namespace
+-    pub fn server_insert_new(&mut self, object: Object<Data>) -> u32 {
+-        insert_in(&mut self.server_objects, object) + SERVER_ID_LIMIT
++    pub fn server_insert_new(&mut self, object: Object<Data>) -> Result<u32, InsertError> {
++        if !self.server_objects.iter().any(Option::is_none)
++            && (!self.can_grow()
++                || self.server_objects.len() > (u32::MAX - SERVER_ID_LIMIT) as usize)
++        {
++            return Err(InsertError::Limit);
++        }
++        Ok(insert_in(&mut self.server_objects, object) + SERVER_ID_LIMIT)
+     }
+ 
+     /// Mutably access an object of the map
+@@ -157,3 +194,34 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::ANONYMOUS_INTERFACE;
++
++    fn object() -> Object<()> {
++        Object { interface: &ANONYMOUS_INTERFACE, version: 1, data: () }
++    }
++
++    #[test]
++    fn limits_charge_both_namespaces_and_retired_slots_but_allow_reuse() {
++        let mut map = ObjectMap::new();
++        map.set_max_slots(NonZeroUsize::new(4));
++        map.insert_at(1, object()).unwrap();
++        let server = map.server_insert_new(object()).unwrap();
++        map.insert_at(2, object()).unwrap();
++        map.remove(2);
++        map.insert_at(2, object()).unwrap();
++        map.insert_at(3, object()).unwrap();
++        map.remove(2);
++        assert_eq!(map.insert_at(4, object()), Err(InsertError::Limit));
++        assert_eq!(map.server_insert_new(object()), Err(InsertError::Limit));
++        assert_eq!(map.insert_at(1000, object()), Err(InsertError::InvalidId));
++        assert_eq!(map.client_objects.len() + map.server_objects.len(), 4);
++        map.remove(server);
++        assert_eq!(map.server_insert_new(object()).unwrap(), server);
++        map.insert_at(2, object()).unwrap();
++        assert_eq!(map.all_objects().count(), 4);
++    }
++}
+--- a/wayland-backend/src/rs/server_impl/client.rs
++++ b/wayland-backend/src/rs/server_impl/client.rs
+@@ -22,7 +22,7 @@
+ use smallvec::SmallVec;
+ 
+ use crate::rs::{
+-    map::{Object, ObjectMap},
++    map::{InsertError, Object, ObjectMap},
+     socket::{BufferedSocket, Socket},
+     wire::MessageParseError,
+ };
+@@ -53,12 +53,61 @@
+     pub(crate) id: InnerClientId,
+     pub(crate) killed: bool,
+     pub(crate) data: Arc<dyn ClientData>,
++    request_budget: Option<crate::types::server::RequestBudget>,
++    admitted_request: bool,
+ }
+ 
+ impl<D> Client<D> {
+-    fn next_serial(&mut self) -> u32 {
+-        self.last_serial = self.last_serial.wrapping_add(1);
+-        self.last_serial
++    fn descriptor_limit_exceeded(&mut self) {
++        // Drop all queued descriptors before attempting the core error. A peer
++        // that stopped reading may never receive it; ClientData still records
++        // the exact protocol failure independently of delivery.
++        self.socket.discard_buffers();
++        self.post_display_error(
++            DisplayError::NoMemory,
++            CString::new("native buffered descriptor limit exceeded").unwrap(),
++        );
++    }
++
++    fn next_serial(&mut self) -> Option<u32> {
++        match self.last_serial.checked_add(1) {
++            Some(serial) => {
++                self.last_serial = serial;
++                Some(serial)
++            }
++            None => {
++                self.post_display_error(
++                    DisplayError::NoMemory,
++                    CString::new("object identity exhausted").unwrap(),
++                );
++                None
++            }
++        }
++    }
++
++    fn insert_client_object(&mut self, id: u32, object: Object<Data<D>>) -> bool {
++        let result = if id >= SERVER_ID_LIMIT {
++            Err(InsertError::InvalidId)
++        } else {
++            self.map.insert_at(id, object)
++        };
++        match result {
++            Ok(()) => true,
++            Err(InsertError::InvalidId) => {
++                self.post_display_error(
++                    DisplayError::InvalidObject,
++                    CString::new("invalid client object ID").unwrap(),
++                );
++                false
++            }
++            Err(InsertError::Limit) => {
++                self.post_display_error(
++                    DisplayError::NoMemory,
++                    CString::new("object ID slot budget exceeded").unwrap(),
++                );
++                false
++            }
++        }
+     }
+ }
+ 
+@@ -70,8 +119,10 @@
+         data: Arc<dyn ClientData>,
+         buffer_size: usize,
+     ) -> Self {
+-        let socket = BufferedSocket::new(Socket::from(stream), Some(buffer_size));
++        let mut socket = BufferedSocket::new(Socket::from(stream), Some(buffer_size));
++        socket.set_max_buffered_fds(data.max_buffered_fds());
+         let mut map = ObjectMap::new();
++        map.set_max_slots(data.max_object_slots());
+         map.insert_at(
+             1,
+             Object {
+@@ -83,8 +134,18 @@
+         .unwrap();
+ 
+         data.initialized(ClientId { id: id.clone() });
+-
+-        Self { socket, map, debug, id, killed: false, last_serial: 0, data }
++        let request_budget = data.request_limits().map(crate::types::server::RequestBudget::new);
++        Self {
++            socket,
++            map,
++            debug,
++            id,
++            killed: false,
++            last_serial: 0,
++            data,
++            request_budget,
++            admitted_request: false,
++        }
+     }
+ 
+     pub(crate) fn create_object(
+@@ -92,14 +153,23 @@
+         interface: &'static Interface,
+         version: u32,
+         user_data: Arc<dyn ObjectData<D>>,
+-    ) -> InnerObjectId {
+-        let serial = self.next_serial();
+-        let id = self.map.server_insert_new(Object {
+-            interface,
+-            version,
+-            data: Data { serial, user_data },
+-        });
+-        InnerObjectId { id, serial, client_id: self.id.clone(), interface }
++    ) -> Result<InnerObjectId, InvalidId> {
++        if self.killed {
++            return Err(InvalidId);
++        }
++        let serial = self.next_serial().ok_or(InvalidId)?;
++        let object = Object { interface, version, data: Data { serial, user_data } };
++        let id = match self.map.server_insert_new(object) {
++            Ok(id) => id,
++            Err(_) => {
++                self.post_display_error(
++                    DisplayError::NoMemory,
++                    CString::new("object ID slot budget exceeded").unwrap(),
++                );
++                return Err(InvalidId);
++            }
++        };
++        Ok(InnerObjectId { id, serial, client_id: self.id.clone(), interface })
+     }
+ 
+     pub(crate) fn destroy_object(
+@@ -207,7 +277,11 @@
+ 
+         let msg = Message { sender_id: object_id.id.id, opcode, args: msg_args };
+ 
+-        if self.socket.write_message(&msg).is_err() {
++        if let Err(error) = self.socket.write_message(&msg) {
++            if crate::rs::socket::is_descriptor_limit(&error) {
++                self.descriptor_limit_exceeded();
++                return Err(InvalidId);
++            }
+             self.kill(DisconnectReason::ConnectionClosed);
+         }
+ 
+@@ -351,17 +425,43 @@
+             return Err(rustix::io::Errno::PIPE.into());
+         }
+         loop {
++            if !self.admitted_request {
++                if let Some(bytes) = self.socket.buffered_message_size() {
++                    let local =
++                        self.request_budget.as_ref().map_or(true, |budget| budget.admit(bytes));
++                    let shared = local
++                        && self
++                            .data
++                            .shared_request_budget()
++                            .as_ref()
++                            .map_or(true, |budget| budget.admit(bytes));
++                    if !shared {
++                        self.socket.discard_buffers();
++                        self.post_display_error(
++                            DisplayError::NoMemory,
++                            CString::new("native request rate budget exceeded").unwrap(),
++                        );
++                        return Err(rustix::io::Errno::PROTO.into());
++                    }
++                    self.admitted_request = true;
++                }
++            }
+             let map = &self.map;
+             let msg = match self.socket.read_one_message(|id, opcode| {
+                 map.find(id)
+                     .and_then(|o| o.interface.requests.get(opcode as usize))
+                     .map(|desc| desc.signature)
+             }) {
+-                Ok(msg) => msg,
++                Ok(msg) => {
++                    self.admitted_request = false;
++                    msg
++                }
+                 Err(MessageParseError::MissingData) | Err(MessageParseError::MissingFD) => {
+                     // need to read more data
+                     if let Err(e) = self.socket.fill_incoming_buffers() {
+-                        if e.kind() != std::io::ErrorKind::WouldBlock {
++                        if crate::rs::socket::is_descriptor_limit(&e) {
++                            self.descriptor_limit_exceeded();
++                        } else if e.kind() != std::io::ErrorKind::WouldBlock {
+                             self.kill(DisconnectReason::ConnectionClosed);
+                         }
+                         return Err(e);
+@@ -431,17 +531,15 @@
+             // wl_display.sync(new id wl_callback)
+             0 => {
+                 if let [Argument::NewId(new_id)] = message.args[..] {
+-                    let serial = self.next_serial();
++                    let Some(serial) = self.next_serial() else {
++                        return;
++                    };
+                     let callback_obj = Object {
+                         interface: &WL_CALLBACK_INTERFACE,
+                         version: 1,
+                         data: Data { user_data: Arc::new(DumbObjectData), serial },
+                     };
+-                    if let Err(()) = self.map.insert_at(new_id, callback_obj) {
+-                        self.post_display_error(
+-                            DisplayError::InvalidObject,
+-                            CString::new(format!("Invalid new_id: {new_id}.")).unwrap(),
+-                        );
++                    if !self.insert_client_object(new_id, callback_obj) {
+                         return;
+                     }
+                     let cb_id = ObjectId {
+@@ -461,7 +559,9 @@
+             // wl_display.get_registry(new id wl_registry)
+             1 => {
+                 if let [Argument::NewId(new_id)] = message.args[..] {
+-                    let serial = self.next_serial();
++                    let Some(serial) = self.next_serial() else {
++                        return;
++                    };
+                     let registry_obj = Object {
+                         interface: &WL_REGISTRY_INTERFACE,
+                         version: 1,
+@@ -473,11 +573,7 @@
+                         client_id: self.id.clone(),
+                         interface: &WL_REGISTRY_INTERFACE,
+                     };
+-                    if let Err(()) = self.map.insert_at(new_id, registry_obj) {
+-                        self.post_display_error(
+-                            DisplayError::InvalidObject,
+-                            CString::new(format!("Invalid new_id: {new_id}.")).unwrap(),
+-                        );
++                    if !self.insert_client_object(new_id, registry_obj) {
+                         return;
+                     }
+                     let _ = registry.new_registry(registry_id, self);
+@@ -514,17 +610,13 @@
+                     if let Some((interface, global_id, handler)) =
+                         registry.check_bind(self, name, interface_name, version)
+                     {
+-                        let serial = self.next_serial();
++                        let serial = self.next_serial()?;
+                         let object = Object {
+                             interface,
+                             version,
+                             data: Data { serial, user_data: Arc::new(UninitObjectData) },
+                         };
+-                        if let Err(()) = self.map.insert_at(new_id, object) {
+-                            self.post_display_error(
+-                                DisplayError::InvalidObject,
+-                                CString::new(format!("Invalid new_id: {new_id}.")).unwrap(),
+-                            );
++                        if !self.insert_client_object(new_id, object) {
+                             return None;
+                         }
+                         Some((
+@@ -664,19 +756,14 @@
+                         version: object.version,
+                         data: Data {
+                             user_data: child_udata,
+-                            serial: self.next_serial(),
++                            serial: self.next_serial()?,
+                         }
+                     };
+ 
+                     let child_id = InnerObjectId { id: new_id, client_id: self.id.clone(), serial: child_obj.data.serial, interface: child_obj.interface };
+                     created_id = Some(child_id.clone());
+ 
+-                    if let Err(()) = self.map.insert_at(new_id, child_obj) {
+-                        // abort parsing, this is an unrecoverable error
+-                        self.post_display_error(
+-                            DisplayError::InvalidObject,
+-                            CString::new(format!("Invalid new_id: {new_id}.")).unwrap()
+-                        );
++                    if !self.insert_client_object(new_id, child_obj) {
+                         return None;
+                     }
+ 
+@@ -711,8 +798,11 @@
+         stream: UnixStream,
+         data: Arc<dyn ClientData>,
+         buffer_size: usize,
+-    ) -> InnerClientId {
+-        let serial = self.next_serial();
++    ) -> std::io::Result<InnerClientId> {
++        let serial = self.last_serial.checked_add(1).ok_or_else(|| {
++            std::io::Error::new(std::io::ErrorKind::Other, "client identity exhausted")
++        })?;
++        self.last_serial = serial;
+         // Find the next free place
+         let (id, place) = match self.clients.iter_mut().enumerate().find(|(_, c)| c.is_none()) {
+             Some((id, place)) => (id, place),
+@@ -726,7 +816,7 @@
+ 
+         *place = Some(Client::new(stream, id.clone(), self.debug, data, buffer_size));
+ 
+-        id
++        Ok(id)
+     }
+ 
+     pub(crate) fn get_client(&self, id: InnerClientId) -> Result<&Client<D>, InvalidId> {
+@@ -763,11 +853,6 @@
+         cleaned
+     }
+ 
+-    fn next_serial(&mut self) -> u32 {
+-        self.last_serial = self.last_serial.wrapping_add(1);
+-        self.last_serial
+-    }
+-
+     pub(crate) fn clients_mut(&mut self) -> impl Iterator<Item = &mut Client<D>> {
+         self.clients.iter_mut().flat_map(|o| o.as_mut()).filter(|c| !c.killed)
+     }
+@@ -778,3 +863,51 @@
+         })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Mutex;
++
++    #[derive(Default)]
++    struct Status(Mutex<Option<u32>>);
++    impl ClientData for Status {
++        fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++            if let DisconnectReason::ProtocolError(error) = reason {
++                *self.0.lock().unwrap() = Some(error.code);
++            }
++        }
++    }
++
++    #[test]
++    fn exhausted_object_generations_revoke_the_client_without_wrapping() {
++        let (socket, _peer) = UnixStream::pair().unwrap();
++        let status = Arc::new(Status::default());
++        let mut client = Client::<()>::new(
++            socket,
++            InnerClientId { id: 0, serial: 1 },
++            false,
++            status.clone(),
++            4096,
++        );
++        client.last_serial = u32::MAX;
++        assert!(client.next_serial().is_none());
++        assert!(client.killed);
++        assert_eq!(client.last_serial, u32::MAX);
++        assert_eq!(*status.0.lock().unwrap(), Some(DisplayError::NoMemory as u32));
++    }
++
++    #[test]
++    fn exhausted_connection_generations_preserve_the_last_admitted_owner() {
++        let mut clients = ClientStore::<()>::new(false);
++        clients.last_serial = u32::MAX - 1;
++        let (socket, _peer) = UnixStream::pair().unwrap();
++        let owner = clients.create_client(socket, Arc::new(()), 4096).unwrap();
++        assert_eq!(owner.serial, u32::MAX);
++        let (other, _other_peer) = UnixStream::pair().unwrap();
++        assert!(clients.create_client(other, Arc::new(()), 4096).is_err());
++        assert_eq!(clients.last_serial, u32::MAX);
++        assert_eq!(clients.clients.len(), 1);
++        assert!(!clients.get_client(owner).unwrap().killed);
++    }
++}
+--- a/wayland-backend/src/rs/server_impl/handle.rs
++++ b/wayland-backend/src/rs/server_impl/handle.rs
+@@ -175,7 +175,10 @@
+             .downcast_mut::<State<D>>()
+             .expect("Wrong type parameter passed to Handle::create_object().");
+         let client = state.clients.get_client_mut(client_id)?;
+-        Ok(ObjectId { id: client.create_object(interface, version, data) })
++        Ok(ObjectId {
++            // Retain user data until the protocol mutex is released on failure.
++            id: client.create_object(interface, version, data.clone())?,
++        })
+     }
+ 
+     pub fn destroy_object<D: 'static>(&self, id: &ObjectId) -> Result<(), InvalidId> {
+@@ -357,7 +360,7 @@
+         stream: UnixStream,
+         data: Arc<dyn ClientData>,
+     ) -> std::io::Result<InnerClientId> {
+-        let id = self.clients.create_client(stream, data, self.default_max_buffer_size);
++        let id = self.clients.create_client(stream, data, self.default_max_buffer_size)?;
+         let client = self.clients.get_client(id.clone()).unwrap();
+ 
+         // register the client to the internal epoll
+--- a/wayland-backend/src/rs/socket.rs
++++ b/wayland-backend/src/rs/socket.rs
+@@ -3,17 +3,18 @@
+ use std::collections::VecDeque;
+ use std::io::{ErrorKind, IoSlice, IoSliceMut, Result as IoResult};
+ use std::mem::MaybeUninit;
++use std::num::NonZeroUsize;
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+ use std::os::unix::net::UnixStream;
+ use std::slice;
+ 
+ use rustix::io::retry_on_intr;
+ use rustix::net::{
+-    recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
++    recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+     SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+ };
+ 
+-use crate::protocol::{ArgumentType, Message};
++use crate::protocol::{Argument, ArgumentType, Message};
+ use crate::rs::DEFAULT_MAX_BUFFER_SIZE;
+ 
+ use super::wire::{parse_message, write_to_buffers, MessageParseError, MessageWriteError};
+@@ -22,6 +23,23 @@
+ pub const MAX_FDS_OUT: usize = 28;
+ /// Maximum number of bytes that can be sent in a single socket message
+ pub const MAX_BYTES_OUT: usize = 4096;
++
++#[derive(Debug)]
++struct DescriptorLimit;
++impl std::fmt::Display for DescriptorLimit {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("native buffered descriptor limit exceeded")
++    }
++}
++impl std::error::Error for DescriptorLimit {}
++
++fn descriptor_limit_error() -> std::io::Error {
++    std::io::Error::new(ErrorKind::InvalidData, DescriptorLimit)
++}
++
++pub(crate) fn is_descriptor_limit(error: &std::io::Error) -> bool {
++    error.get_ref().is_some_and(|error| error.is::<DescriptorLimit>())
++}
+ 
+ /*
+  * Socket
+@@ -72,7 +90,12 @@
+     /// The `buffer` slice should be at least `MAX_BYTES_OUT` long and the `fds`
+     /// slice `MAX_FDS_OUT` long, otherwise some data of the received message may
+     /// be lost.
+-    pub fn rcv_msg(&self, buffer: &mut [u8], fds: &mut VecDeque<OwnedFd>) -> IoResult<usize> {
++    pub fn rcv_msg(
++        &self,
++        buffer: &mut [u8],
++        fds: &mut VecDeque<OwnedFd>,
++        limit: Option<NonZeroUsize>,
++    ) -> IoResult<usize> {
+         #[cfg(not(any(target_os = "macos", target_os = "redox")))]
+         let flags = RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC;
+         #[cfg(any(target_os = "macos", target_os = "redox"))]
+@@ -83,13 +106,31 @@
+         let mut iov = [IoSliceMut::new(buffer)];
+         let msg = retry_on_intr(|| recvmsg(&self.stream, &mut iov[..], &mut cmsg_buffer, flags))?;
+ 
+-        let received_fds = cmsg_buffer
++        if msg.flags.contains(ReturnFlags::CTRUNC) {
++            // RecvAncillaryBuffer owns and closes every delivered descriptor.
++            return Err(descriptor_limit_error());
++        }
++        let mut received_fds = smallvec::SmallVec::<[OwnedFd; MAX_FDS_OUT]>::new();
++        for fd in cmsg_buffer
+             .drain()
+             .filter_map(|cmsg| match cmsg {
+                 RecvAncillaryMessage::ScmRights(fds) => Some(fds),
+                 _ => None,
+             })
+-            .flatten();
++            .flatten()
++        {
++            // Ancillary storage includes alignment padding. Enforce the logical
++            // batch ceiling before SmallVec can spill into a heap allocation.
++            if received_fds.len() == MAX_FDS_OUT {
++                return Err(descriptor_limit_error());
++            }
++            received_fds.push(fd);
++        }
++        if limit.is_some_and(|limit| {
++            !fds.len().checked_add(received_fds.len()).is_some_and(|count| count <= limit.get())
++        }) {
++            return Err(descriptor_limit_error());
++        }
+         fds.extend(received_fds);
+         #[cfg(any(target_os = "macos", target_os = "redox"))]
+         for fd in fds.iter() {
+@@ -136,6 +177,7 @@
+     out_data: Buffer<u8>,
+     out_fds: Vec<OwnedFd>,
+     max_buffer_size: Option<usize>,
++    max_buffered_fds: Option<NonZeroUsize>,
+ }
+ 
+ impl BufferedSocket {
+@@ -148,6 +190,7 @@
+             out_data: Buffer::new(DEFAULT_MAX_BUFFER_SIZE),
+             out_fds: Vec::new(),
+             max_buffer_size: max_buffer_size.map(round_max_buffer_size),
++            max_buffered_fds: None,
+         }
+     }
+ 
+@@ -209,6 +252,9 @@
+     // if false is returned, it means there is not enough space
+     // in the buffer
+     fn attempt_write_message(&mut self, msg: &Message<u32, RawFd>) -> IoResult<bool> {
++        if !self.admits_outgoing_fds(msg) {
++            return Ok(false);
++        }
+         let fds_len = self.out_fds.len();
+         loop {
+             match write_to_buffers(msg, self.out_data.get_writable_storage(), &mut self.out_fds) {
+@@ -246,6 +292,9 @@
+                 }
+             }
+             if !self.attempt_write_message(msg)? {
++                if !self.admits_outgoing_fds(msg) {
++                    return Err(descriptor_limit_error());
++                }
+                 // If this fails again, this means the message is too big
+                 // to be transmitted at all
+                 return Err(rustix::io::Errno::TOOBIG.into());
+@@ -262,7 +311,7 @@
+         // receive a message
+         let in_bytes = {
+             let bytes = self.in_data.get_writable_storage();
+-            self.socket.rcv_msg(bytes, &mut self.in_fds)?
++            self.socket.rcv_msg(bytes, &mut self.in_fds, self.max_buffered_fds)?
+         };
+         if in_bytes == 0 {
+             // the other end of the socket was closed
+@@ -271,6 +320,13 @@
+         // advance the storage
+         self.in_data.advance(in_bytes);
+         Ok(())
++    }
++
++    /// Returns the declared wire size when a header is available.
++    pub(crate) fn buffered_message_size(&self) -> Option<usize> {
++        let data = self.in_data.get_contents();
++        let header = data.get(4..8)?;
++        Some((u32::from_ne_bytes(header.try_into().expect("four-byte header")) >> 16) as usize)
+     }
+ 
+     /// Read and deserialize a single message from the incoming buffers socket
+@@ -313,6 +369,24 @@
+         // TODO: what if it decreases?
+         self.max_buffer_size = max_buffer_size.map(round_max_buffer_size);
+     }
++
++    pub(crate) fn set_max_buffered_fds(&mut self, limit: Option<NonZeroUsize>) {
++        self.max_buffered_fds = limit;
++    }
++
++    fn admits_outgoing_fds(&self, msg: &Message<u32, RawFd>) -> bool {
++        self.max_buffered_fds.map_or(true, |limit| {
++            let count = msg.args.iter().filter(|arg| matches!(arg, Argument::Fd(_))).count();
++            self.out_fds.len().checked_add(count).is_some_and(|count| count <= limit.get())
++        })
++    }
++
++    pub(crate) fn discard_buffers(&mut self) {
++        self.in_fds.clear();
++        self.out_fds.clear();
++        self.in_data.clear();
++        self.out_data.clear();
++    }
+ }
+ 
+ impl AsRawFd for BufferedSocket {
+@@ -401,6 +475,43 @@
+     use std::os::unix::io::IntoRawFd;
+ 
+     use smallvec::smallvec;
++
++    #[test]
++    fn consumed_incoming_descriptors_release_transport_capacity() {
++        let (sender, receiver) = UnixStream::pair().unwrap();
++        let mut sender = BufferedSocket::new(sender.into(), Some(4096));
++        let mut receiver = BufferedSocket::new(receiver.into(), Some(4096));
++        receiver.set_max_buffered_fds(NonZeroUsize::new(1));
++        let file = std::fs::File::open("/dev/null").unwrap();
++        for _ in 0..128 {
++            sender.write_message(&message!(42, 0, [Argument::Fd(file.as_raw_fd())])).unwrap();
++            sender.flush().unwrap();
++            receiver.fill_incoming_buffers().unwrap();
++            assert_eq!(receiver.in_fds.len(), 1);
++            let parsed = receiver.read_one_message(|_, _| Some(&[ArgumentType::Fd])).unwrap();
++            assert!(matches!(parsed.args[0], Argument::Fd(_)));
++            assert!(receiver.in_fds.is_empty());
++        }
++    }
++
++    #[test]
++    fn oversized_outgoing_message_does_not_duplicate_or_retain_descriptors() {
++        let (sender, _receiver) = UnixStream::pair().unwrap();
++        let mut sender = BufferedSocket::new(sender.into(), Some(4096));
++        sender.set_max_buffered_fds(NonZeroUsize::new(1));
++        let (mut probe, writer) = UnixStream::pair().unwrap();
++        probe.set_nonblocking(true).unwrap();
++        let raw = writer.as_raw_fd();
++        assert!(is_descriptor_limit(
++            &sender
++                .write_message(&message!(42, 0, [Argument::Fd(raw), Argument::Fd(raw)]))
++                .unwrap_err()
++        ));
++        assert!(sender.out_fds.is_empty());
++        drop(writer);
++        use std::io::Read as _;
++        assert_eq!(probe.read(&mut [0]).unwrap(), 0);
++    }
+ 
+     fn same_file(a: BorrowedFd, b: BorrowedFd) -> bool {
+         let stat1 = rustix::fs::fstat(a).unwrap();
+@@ -571,7 +682,7 @@
+             recv_msgs.push(message);
+         }
+         assert_eq!(recv_msgs.len(), 3);
+-        for (msg1, msg2) in messages.into_iter().zip(recv_msgs.into_iter()) {
++        for (msg1, msg2) in messages.into_iter().zip(recv_msgs) {
+             assert_eq_msgs(&msg1.map_fd(|fd| fd.as_raw_fd()), &msg2.map_fd(IntoRawFd::into_raw_fd));
+         }
+     }
+--- a/wayland-backend/src/server_api.rs
++++ b/wayland-backend/src/server_api.rs
+@@ -10,6 +10,7 @@
+ 
+ use crate::protocol::{Interface, Message, ObjectInfo};
+ pub use crate::types::server::{Credentials, DisconnectReason, GlobalInfo, InitError, InvalidId};
++pub use crate::types::server::{RequestBudget, RequestLimits};
+ 
+ use super::server_impl;
+ 
+@@ -108,6 +109,49 @@
+ 
+ /// A trait representing your data associated to a client
+ pub trait ClientData: downcast_rs::DowncastSync {
++    /// Sets this connection's request and wire-byte admission policy.
++    ///
++    /// The Rust server charges each header once before payload parsing. Overflow
++    /// posts core no-memory and disconnects that client. The default is unbounded;
++    /// the system backend ignores this hook.
++    fn request_limits(&self) -> Option<RequestLimits> {
++        None
++    }
++
++    /// Selects a shared allowance for this request's current client role.
++    ///
++    /// Evaluated once for each new request, in addition to connection limits.
++    /// Hosts can separate protected roots from helper groups and retain their
++    /// allowances across reconnects. The default is absent; the system backend
++    /// ignores this hook.
++    fn shared_request_budget(&self) -> Option<Arc<RequestBudget>> {
++        None
++    }
++    /// Bounds each buffered descriptor queue on the Rust server backend.
++    ///
++    /// Limits incoming descriptors awaiting request parsing and outgoing
++    /// descriptors awaiting transport separately. Consumed descriptors belong
++    /// to the application and need its own resource policy. Admission precedes
++    /// queue growth or descriptor duplication. A receive also has a fixed
++    /// ancillary batch bound, and truncated ancillary data is rejected.
++    /// The default is unbounded; the system backend ignores this hook.
++    fn max_buffered_fds(&self) -> Option<std::num::NonZeroUsize> {
++        None
++    }
++    /// Bounds retained object-ID table slots on the Rust server backend.
++    ///
++    /// Includes the display object, both ID namespaces, and empty slots retained
++    /// after destruction. This prevents increasing-ID churn from growing the
++    /// tables while keeping few objects alive. Free slots remain reusable.
++    /// Exceeding the limit posts a core no-memory error before table growth and
++    /// disconnects only this client. The default is unbounded.
++    ///
++    /// The system server backend does not implement this policy. Hosts requiring
++    /// the bound must reject that backend before accepting clients.
++    fn max_object_slots(&self) -> Option<std::num::NonZeroUsize> {
++        None
++    }
++
+     /// Notification that the client was initialized
+     fn initialized(&self, _client_id: ClientId) {}
+     /// Notification that the client is disconnected
+--- a/wayland-backend/src/test/mod.rs
++++ b/wayland-backend/src/test/mod.rs
+@@ -50,9 +50,7 @@
+ 
+ mod interfaces {
+     use crate as wayland_backend;
+-    wayland_scanner::generate_interfaces!(
+-        "../wayland-scanner/tests/scanner_assets/test-protocol.xml"
+-    );
++    wayland_scanner::generate_interfaces!("tests/assets/test-protocol.xml");
+ }
+ 
+ mod destroy_object;
+--- /dev/null
++++ b/wayland-backend/src/types/server/request_budget.rs
+@@ -0,0 +1,130 @@
++//! Monotonic request admission shared by selected Rust-backend clients.
++
++// Rust guideline compliant 2026-10-07
++use std::{num::NonZeroU32, sync::Mutex, time::Instant};
++
++/// Burst and sustained ceilings for incoming native requests.
++///
++/// Request counts and declared wire bytes use independent token buckets.
++/// Each bucket starts full, refills with monotonic time, and never exceeds its
++/// burst ceiling. Wire sizes are charged once before payload parsing, including
++/// a request that subsequently waits for more bytes or descriptors.
++#[derive(Clone, Copy, Debug)]
++pub struct RequestLimits {
++    /// Maximum requests admitted in an immediate burst.
++    pub request_burst: NonZeroU32,
++    /// Request tokens replenished each second.
++    pub requests_per_second: NonZeroU32,
++    /// Maximum declared wire bytes admitted in an immediate burst.
++    pub byte_burst: NonZeroU32,
++    /// Declared wire-byte tokens replenished each second.
++    pub bytes_per_second: NonZeroU32,
++}
++
++/// A shared request allowance for a group of native clients.
++///
++/// Hosts can retain this across client connections so reconnecting cannot reset
++/// a group's allowance. The Rust server evaluates the client-data policy for
++/// every newly admitted request; switching a client's group does not reset that
++/// group's allowance. Admission never waits for tokens and rejects atomically
++/// if either the request or byte bucket is exhausted.
++#[derive(Debug)]
++pub struct RequestBudget(Mutex<State>);
++
++#[derive(Debug)]
++struct State {
++    requests: Bucket,
++    bytes: Bucket,
++}
++#[derive(Debug)]
++struct Bucket {
++    credit: u128,
++    capacity: u128,
++    rate: u128,
++    updated: Instant,
++}
++const UNITS_PER_TOKEN: u128 = 1_000_000_000;
++
++impl Bucket {
++    fn new(burst: NonZeroU32, rate: NonZeroU32, now: Instant) -> Self {
++        let capacity = u128::from(burst.get()) * UNITS_PER_TOKEN;
++        Self { credit: capacity, capacity, rate: u128::from(rate.get()), updated: now }
++    }
++    fn refill(&mut self, now: Instant) {
++        let elapsed = now.checked_duration_since(self.updated).unwrap_or_default();
++        self.updated = self.updated.max(now);
++        let refill = elapsed.as_nanos().saturating_mul(self.rate);
++        self.credit = self.credit.saturating_add(refill).min(self.capacity);
++    }
++}
++
++impl RequestBudget {
++    /// Creates a full allowance with independent request and wire-byte buckets.
++    pub fn new(limits: RequestLimits) -> Self {
++        let now = Instant::now();
++        Self(Mutex::new(State {
++            requests: Bucket::new(limits.request_burst, limits.requests_per_second, now),
++            bytes: Bucket::new(limits.byte_burst, limits.bytes_per_second, now),
++        }))
++    }
++    pub(crate) fn admit(&self, bytes: usize) -> bool {
++        self.admit_at(bytes, Instant::now())
++    }
++    fn admit_at(&self, bytes: usize, now: Instant) -> bool {
++        let cost = (bytes as u128).saturating_mul(UNITS_PER_TOKEN);
++        let mut state = self.0.lock().unwrap();
++        state.requests.refill(now);
++        state.bytes.refill(now);
++        if state.requests.credit < UNITS_PER_TOKEN || state.bytes.credit < cost {
++            return false;
++        }
++        state.requests.credit -= UNITS_PER_TOKEN;
++        state.bytes.credit -= cost;
++        true
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++    fn limits(requests: u32, bytes: u32) -> RequestLimits {
++        RequestLimits {
++            request_burst: NonZeroU32::new(requests).unwrap(),
++            requests_per_second: NonZeroU32::new(requests).unwrap(),
++            byte_burst: NonZeroU32::new(bytes).unwrap(),
++            bytes_per_second: NonZeroU32::new(bytes).unwrap(),
++        }
++    }
++    #[test]
++    fn fractional_refill_is_retained_and_idle_time_cannot_expand_the_burst() {
++        let budget = RequestBudget::new(limits(2, 100));
++        let start = budget.0.lock().unwrap().requests.updated;
++        assert!(budget.admit_at(0, start));
++        assert!(budget.admit_at(0, start));
++        assert!(!budget.admit_at(0, start + Duration::from_millis(250)));
++        assert!(budget.admit_at(0, start + Duration::from_millis(500)));
++        assert!(!budget.admit_at(0, start + Duration::from_millis(500)));
++        let later = start + Duration::from_secs(3600);
++        assert!(budget.admit_at(0, later));
++        assert!(budget.admit_at(0, later));
++        assert!(!budget.admit_at(0, later));
++    }
++    #[test]
++    fn byte_denial_does_not_spend_request_credit() {
++        let budget = RequestBudget::new(limits(1, 1));
++        let now = budget.0.lock().unwrap().requests.updated;
++        assert!(!budget.admit_at(2, now));
++        assert!(budget.admit_at(1, now));
++        assert!(!budget.admit_at(1, now));
++    }
++    #[test]
++    fn backwards_samples_cannot_mint_refill_credit() {
++        let budget = RequestBudget::new(limits(1, 100));
++        let start = budget.0.lock().unwrap().requests.updated;
++        assert!(budget.admit_at(0, start + Duration::from_secs(2)));
++        assert!(!budget.admit_at(0, start));
++        assert!(!budget.admit_at(0, start + Duration::from_millis(2500)));
++        assert!(budget.admit_at(0, start + Duration::from_secs(3)));
++    }
++}
+--- a/wayland-backend/src/types/server.rs
++++ b/wayland-backend/src/types/server.rs
+@@ -1,4 +1,6 @@
+ use crate::protocol::Interface;
++mod request_budget;
++pub use request_budget::{RequestBudget, RequestLimits};
+ 
+ /// Description of a global advertised to some clients.
+ #[derive(Debug)]
+--- /dev/null
++++ b/wayland-backend/tests/assets/test-protocol.xml
+@@ -0,0 +1,253 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="test-protocol">
++
++  <copyright>
++    A dummy copyright to make the parser work
++
++    Including a few more lines.
++    Of text.
++  </copyright>
++
++  <!-- Include the core interfaces display/registry/callback -->
++
++  <interface name="wl_display" version="1">
++    <description summary="core global object">
++      The core global object.  This is a special singleton object.  It
++      is used for internal Wayland protocol features.
++    </description>
++
++    <request name="sync">
++      <description summary="asynchronous roundtrip">
++        The sync request asks the server to emit the 'done' event
++        on the returned wl_callback object.  Since requests are
++        handled in-order and events are delivered in-order, this can
++        be used as a barrier to ensure all previous requests and the
++        resulting events have been handled.
++
++        The object returned by this request will be destroyed by the
++        compositor after the callback is fired and as such the client must not
++        attempt to use it after that point.
++
++        The callback_data passed in the callback is the event serial.
++      </description>
++      <arg name="callback" type="new_id" interface="wl_callback"
++	   summary="callback object for the sync request"/>
++    </request>
++
++    <request name="get_registry">
++      <description summary="get global registry object">
++        This request creates a registry object that allows the client
++        to list and bind the global objects available from the
++        compositor.
++
++        It should be noted that the server side resources consumed in
++        response to a get_registry request can only be released when the
++        client disconnects, not when the client side proxy is destroyed.
++        Therefore, clients should invoke get_registry as infrequently as
++        possible to avoid wasting memory.
++      </description>
++      <arg name="registry" type="new_id" interface="wl_registry"
++	   summary="global registry object"/>
++    </request>
++
++    <event name="error">
++      <description summary="fatal error event">
++        The error event is sent out when a fatal (non-recoverable)
++        error has occurred.  The object_id argument is the object
++        where the error occurred, most often in response to a request
++        to that object.  The code identifies the error and is defined
++        by the object interface.  As such, each interface defines its
++        own set of error codes.  The message is a brief description
++        of the error, for (debugging) convenience.
++      </description>
++      <arg name="object_id" type="object" summary="object where the error occurred"/>
++      <arg name="code" type="uint" summary="error code"/>
++      <arg name="message" type="string" summary="error description"/>
++    </event>
++
++    <enum name="error">
++      <description summary="global error values">
++        These errors are global and can be emitted in response to any
++        server request.
++      </description>
++      <entry name="invalid_object" value="0"
++	     summary="server couldn't find object"/>
++      <entry name="invalid_method" value="1"
++	     summary="method doesn't exist on the specified interface or malformed request"/>
++      <entry name="no_memory" value="2"
++	     summary="server is out of memory"/>
++      <entry name="implementation" value="3"
++	     summary="implementation error in compositor"/>
++    </enum>
++
++    <event name="delete_id">
++      <description summary="acknowledge object ID deletion">
++        This event is used internally by the object ID management
++        logic. When a client deletes an object that it had created,
++        the server will send this event to acknowledge that it has
++        seen the delete request. When the client receives this event,
++        it will know that it can safely reuse the object ID.
++      </description>
++      <arg name="id" type="uint" summary="deleted object ID"/>
++    </event>
++  </interface>
++
++  <interface name="wl_registry" version="1">
++    <description summary="global registry object">
++      The singleton global registry object.  The server has a number of
++      global objects that are available to all clients.  These objects
++      typically represent an actual object in the server (for example,
++      an input device) or they are singleton objects that provide
++      extension functionality.
++
++      When a client creates a registry object, the registry object
++      will emit a global event for each global currently in the
++      registry.  Globals come and go as a result of device or
++      monitor hotplugs, reconfiguration or other events, and the
++      registry will send out global and global_remove events to
++      keep the client up to date with the changes.  To mark the end
++      of the initial burst of events, the client can use the
++      wl_display.sync request immediately after calling
++      wl_display.get_registry.
++
++      A client can bind to a global object by using the bind
++      request.  This creates a client-side handle that lets the object
++      emit events to the client and lets the client invoke requests on
++      the object.
++    </description>
++
++    <request name="bind">
++      <description summary="bind an object to the display">
++        Binds a new, client-created object to the server using the
++        specified name as the identifier.
++      </description>
++      <arg name="name" type="uint" summary="unique numeric name of the object"/>
++      <arg name="id" type="new_id" summary="bounded object"/>
++    </request>
++
++    <event name="global">
++      <description summary="announce global object">
++        Notify the client of global objects.
++
++        The event notifies the client that a global object with
++        the given name is now available, and it implements the
++        given version of the given interface.
++      </description>
++      <arg name="name" type="uint" summary="numeric name of the global object"/>
++      <arg name="interface" type="string" summary="interface implemented by the object"/>
++      <arg name="version" type="uint" summary="interface version"/>
++    </event>
++
++    <event name="global_remove">
++      <description summary="announce removal of global object">
++        Notify the client of removed global objects.
++
++        This event notifies the client that the global identified
++        by name is no longer available.  If the client bound to
++        the global using the bind request, the client should now
++        destroy that object.
++
++        The object remains valid and requests to the object will be
++        ignored until the client destroys it, to avoid races between
++        the global going away and a client sending a request to it.
++      </description>
++      <arg name="name" type="uint" summary="numeric name of the global object"/>
++    </event>
++  </interface>
++
++  <interface name="wl_callback" version="1">
++    <description summary="callback object">
++      Clients can handle the 'done' event to get notified when
++      the related request is done.
++    </description>
++
++    <event name="done" type="destructor">
++      <description summary="done event">
++        Notify the client when the related request is done.
++      </description>
++      <arg name="callback_data" type="uint" summary="request-specific data for the callback"/>
++    </event>
++  </interface>
++
++  <!-- And now the test interfaces -->
++
++  <interface name="test_global" version="5">
++    <request name="many_args">
++      <description summary="a request with every possible non-object arg"></description>
++      <arg name="unsigned_int" type="uint" summary="an unsigned int" />
++      <arg name="signed_int" type="int" summary="a singed int" />
++      <arg name="fixed_point" type="fixed" summary="a fixed point number" />
++      <arg name="number_array" type="array" summary="an array" />
++      <arg name="some_text" type="string" summary="some text" />
++      <arg name="file_descriptor" type="fd" summary="a file descriptor" />
++    </request>
++
++    <request name="get_secondary" since="2">
++      <arg name="sec" type="new_id" interface="secondary" summary="create a secondary" />
++    </request>
++
++    <request name="get_tertiary" since="3">
++      <arg name="ter" type="new_id" interface="tertiary" summary="create a tertiary" />
++    </request>
++
++    <request name="link" since="3">
++      <description summary="link a secondary and a tertiary"></description>
++      <arg name="sec" type="object" interface="secondary" />
++      <arg name="ter" type="object" interface="tertiary" allow-null="true" />
++      <arg name="time" type="uint" />
++    </request>
++
++    <request name="destroy" type="destructor" since="4">
++    </request>
++
++    <request name="reverse_link" since="5">
++      <description summary="reverse link a secondary and a tertiary"></description>
++      <arg name="sec" type="object" interface="secondary" allow-null="true" />
++      <arg name="ter" type="object" interface="tertiary" />
++    </request>
++
++    <request name="newid_and_allow_null" since="5">
++      <description summary="a newid request that also takes allow null arg"></description>
++      <arg name="quad" type="new_id" interface="quad" />
++      <arg name="sec" type="object" interface="secondary" allow-null="true" />
++      <arg name="ter" type="object" interface="tertiary" />
++    </request>
++
++    <event name="many_args_evt">
++      <description summary="an event with every possible non-object arg"></description>
++      <arg name="unsigned_int" type="uint" summary="an unsigned int" />
++      <arg name="signed_int" type="int" summary="a singed int" />
++      <arg name="fixed_point" type="fixed" summary="a fixed point number" />
++      <arg name="number_array" type="array" summary="an array" />
++      <arg name="some_text" type="string" summary="some text" />
++      <arg name="file_descriptor" type="fd" summary="a file descriptor" />
++    </event>
++
++    <event name="ack_secondary">
++      <description summary="acking the creation of a secondary"></description>
++      <arg name="sec" type="object" interface="secondary" />
++    </event>
++
++    <event name="cycle_quad">
++      <description summary="create a new quad optionally replacing a previous one"></description>
++      <arg name="new_quad" type="new_id" interface="quad" />
++      <arg name="old_quad" type="object" interface="quad" allow-null="true" />
++    </event>
++  </interface>
++
++  <interface name="secondary" version="5">
++    <request name="destroy" type="destructor" since="2">
++    </request>
++  </interface>
++
++  <interface name="tertiary" version="5">
++    <request name="destroy" type="destructor" since="3">
++    </request>
++  </interface>
++
++  <interface name="quad" version="5">
++    <request name="destroy" type="destructor" since="3">
++    </request>
++  </interface>
++
++</protocol>
+\ No newline at end of file
+--- /dev/null
++++ b/wayland-backend/tests/fd_limits.rs
+@@ -0,0 +1,141 @@
++//! Outbound saturation and exact-owner descriptor cleanup through the Rust API.
++
++// Rust guideline compliant 2026-10-07
++use rustix::net::{
++    recvmsg, send, sockopt, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags,
++};
++use std::{
++    io::{IoSliceMut, Read as _, Write as _},
++    mem::MaybeUninit,
++    num::NonZeroUsize,
++    os::{
++        fd::{AsRawFd as _, OwnedFd},
++        unix::net::UnixStream,
++    },
++    sync::{Arc, Mutex},
++};
++use wayland_backend::{
++    protocol::{Argument, ArgumentType, Interface, Message, MessageDesc},
++    rs::server::{Backend, ClientData, ClientId, DisconnectReason, Handle, ObjectData, ObjectId},
++    smallvec::smallvec,
++};
++
++#[derive(Default)]
++struct Status(Mutex<Option<u32>>);
++impl ClientData for Status {
++    fn max_buffered_fds(&self) -> Option<NonZeroUsize> {
++        NonZeroUsize::new(2)
++    }
++    fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++        if let DisconnectReason::ProtocolError(error) = reason {
++            *self.0.lock().unwrap() = Some(error.code);
++        }
++    }
++}
++struct Object;
++impl ObjectData<()> for Object {
++    fn request(
++        self: Arc<Self>,
++        _: &Handle,
++        _: &mut (),
++        _: ClientId,
++        _: Message<ObjectId, OwnedFd>,
++    ) -> Option<Arc<dyn ObjectData<()>>> {
++        unreachable!("fixture has no requests")
++    }
++    fn destroyed(self: Arc<Self>, _: &Handle, _: &mut (), _: ClientId, _: ObjectId) {}
++}
++static INTERFACE: Interface = Interface {
++    name: "vivid_fd_fixture",
++    version: 1,
++    requests: &[],
++    c_ptr: None,
++    events: &[MessageDesc {
++        name: "descriptor",
++        signature: &[ArgumentType::Fd],
++        since: 1,
++        is_destructor: false,
++        child_interface: None,
++        arg_interfaces: &[],
++    }],
++};
++
++#[test]
++fn blocked_outbound_queue_releases_only_its_owner_and_preserves_reused_ids() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let mut handle = backend.handle();
++    let (socket, _blocked_peer) = UnixStream::pair().unwrap();
++    sockopt::set_socket_send_buffer_size(&socket, 1024).unwrap();
++    loop {
++        match send(&socket, &[0; 4096], SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
++            Ok(count) => assert!(count > 0),
++            Err(rustix::io::Errno::AGAIN) => break,
++            Err(error) => panic!("fill fixture socket: {error}"),
++        }
++    }
++    let status = Arc::new(Status::default());
++    let owner = handle.insert_client(socket, status.clone()).unwrap();
++    let object = handle.create_object::<()>(owner, &INTERFACE, 1, Arc::new(Object)).unwrap();
++    let (socket, peer) = UnixStream::pair().unwrap();
++    let other_status = Arc::new(Status::default());
++    let other = handle.insert_client(socket, other_status.clone()).unwrap();
++    let other_object = handle.create_object::<()>(other, &INTERFACE, 1, Arc::new(Object)).unwrap();
++    assert_eq!(object.protocol_id(), other_object.protocol_id());
++    let (mut probe, writer) = UnixStream::pair().unwrap();
++    probe.set_nonblocking(true).unwrap();
++    let (mut other_probe, other_writer) = UnixStream::pair().unwrap();
++    handle
++        .send_event(Message {
++            sender_id: other_object,
++            opcode: 0,
++            args: smallvec![Argument::Fd(other_writer.as_raw_fd())],
++        })
++        .unwrap();
++    for _ in 0..2 {
++        handle
++            .send_event(Message {
++                sender_id: object.clone(),
++                opcode: 0,
++                args: smallvec![Argument::Fd(writer.as_raw_fd())],
++            })
++            .unwrap();
++    }
++    assert!(handle
++        .send_event(Message {
++            sender_id: object,
++            opcode: 0,
++            args: smallvec![Argument::Fd(writer.as_raw_fd())]
++        })
++        .is_err());
++    assert_eq!(*status.0.lock().unwrap(), Some(2));
++    assert_eq!(*other_status.0.lock().unwrap(), None);
++    drop(writer);
++    assert_eq!(
++        probe.read(&mut [0]).unwrap(),
++        0,
++        "rejected owner's outbound descriptors survived failure"
++    );
++    backend.flush(None).unwrap();
++    let mut bytes = [0; 64];
++    let mut storage = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
++    let mut ancillary = RecvAncillaryBuffer::new(&mut storage);
++    assert_eq!(
++        recvmsg(&peer, &mut [IoSliceMut::new(&mut bytes)], &mut ancillary, RecvFlags::DONTWAIT)
++            .unwrap()
++            .bytes,
++        8
++    );
++    let fds = ancillary
++        .drain()
++        .filter_map(|item| match item {
++            RecvAncillaryMessage::ScmRights(fds) => Some(fds),
++            _ => None,
++        })
++        .flatten()
++        .collect::<Vec<_>>();
++    assert_eq!(fds.len(), 1);
++    UnixStream::from(fds.into_iter().next().unwrap()).write_all(b"x").unwrap();
++    let mut byte = [0];
++    other_probe.read_exact(&mut byte).unwrap();
++    assert_eq!(&byte, b"x");
++}
+--- /dev/null
++++ b/wayland-backend/tests/object_limits.rs
+@@ -0,0 +1,193 @@
++//! Scoped object admission through the Rust backend's public transport API.
++
++// Rust guideline compliant 2026-10-07
++use std::{
++    io::{Read as _, Write as _},
++    num::NonZeroUsize,
++    os::{fd::OwnedFd, unix::net::UnixStream},
++    sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc, Mutex,
++    },
++    time::Duration,
++};
++use wayland_backend::{
++    protocol::{Interface, Message, ANONYMOUS_INTERFACE},
++    rs::server::{
++        Backend, ClientData, ClientId, DisconnectReason, GlobalHandler, GlobalId, Handle,
++        ObjectData, ObjectId,
++    },
++};
++
++#[derive(Default)]
++struct Status(Mutex<Option<u32>>);
++impl ClientData for Status {
++    fn max_object_slots(&self) -> Option<NonZeroUsize> {
++        NonZeroUsize::new(4)
++    }
++    fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++        if let DisconnectReason::ProtocolError(error) = reason {
++            *self.0.lock().unwrap() = Some(error.code);
++        }
++    }
++}
++
++struct Object;
++impl ObjectData<()> for Object {
++    fn request(
++        self: Arc<Self>,
++        _: &Handle,
++        _: &mut (),
++        _: ClientId,
++        _: Message<ObjectId, OwnedFd>,
++    ) -> Option<Arc<dyn ObjectData<()>>> {
++        unreachable!("test objects have no requests")
++    }
++    fn destroyed(self: Arc<Self>, _: &Handle, _: &mut (), _: ClientId, _: ObjectId) {}
++}
++
++fn sync(socket: &mut UnixStream, id: u32) {
++    let request =
++        [1u32, 12u32 << 16, id].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>();
++    socket.write_all(&request).unwrap();
++}
++
++#[test]
++fn server_object_exhaustion_preserves_another_owner_with_reused_numeric_ids() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let mut handle = backend.handle();
++    let (first, _first_peer) = UnixStream::pair().unwrap();
++    let status = Arc::new(Status::default());
++    let owner = handle.insert_client(first, status.clone()).unwrap();
++    let (other, mut peer) = UnixStream::pair().unwrap();
++    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
++    let other_status = Arc::new(Status::default());
++    let other_owner = handle.insert_client(other, other_status.clone()).unwrap();
++    let first_id = handle
++        .create_object::<()>(owner.clone(), &ANONYMOUS_INTERFACE, 1, Arc::new(Object))
++        .unwrap();
++    let other_id =
++        handle.create_object::<()>(other_owner, &ANONYMOUS_INTERFACE, 1, Arc::new(Object)).unwrap();
++    assert_eq!(first_id.protocol_id(), other_id.protocol_id());
++    for _ in 0..2 {
++        handle
++            .create_object::<()>(owner.clone(), &ANONYMOUS_INTERFACE, 1, Arc::new(Object))
++            .unwrap();
++    }
++    assert!(handle.create_object::<()>(owner, &ANONYMOUS_INTERFACE, 1, Arc::new(Object)).is_err());
++    assert_eq!(*status.0.lock().unwrap(), Some(2));
++    assert_eq!(*other_status.0.lock().unwrap(), None);
++    assert!(handle.object_info(other_id).is_ok());
++    sync(&mut peer, 2);
++    backend.dispatch_all_clients(&mut ()).unwrap();
++    backend.flush(None).unwrap();
++    assert!(peer.read(&mut [0; 64]).unwrap() > 0);
++}
++
++#[test]
++fn malformed_client_ids_cannot_claim_the_server_namespace_or_skip_table_slots() {
++    for id in [0xff00_0000, 0, 1000] {
++        let mut backend = Backend::<()>::new().unwrap();
++        let mut handle = backend.handle();
++        let (socket, mut peer) = UnixStream::pair().unwrap();
++        let status = Arc::new(Status::default());
++        handle.insert_client(socket, status.clone()).unwrap();
++        sync(&mut peer, id);
++        backend.dispatch_all_clients(&mut ()).unwrap();
++        assert_eq!(*status.0.lock().unwrap(), Some(0));
++    }
++}
++
++#[test]
++fn completed_callbacks_reuse_slots_but_increasing_ids_remain_charged() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let mut handle = backend.handle();
++    let (socket, mut peer) = UnixStream::pair().unwrap();
++    let status = Arc::new(Status::default());
++    handle.insert_client(socket, status.clone()).unwrap();
++    for _ in 0..20 {
++        sync(&mut peer, 2);
++        backend.dispatch_all_clients(&mut ()).unwrap();
++    }
++    assert_eq!(*status.0.lock().unwrap(), None);
++    for id in 3..=5 {
++        sync(&mut peer, id);
++        backend.dispatch_all_clients(&mut ()).unwrap();
++    }
++    assert_eq!(*status.0.lock().unwrap(), Some(2));
++}
++
++#[test]
++fn registry_allocation_is_bounded_without_application_callbacks() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let mut handle = backend.handle();
++    let (socket, mut peer) = UnixStream::pair().unwrap();
++    let status = Arc::new(Status::default());
++    handle.insert_client(socket, status.clone()).unwrap();
++    for id in 2..=5 {
++        let bytes = [1u32, (12u32 << 16) | 1, id]
++            .into_iter()
++            .flat_map(u32::to_ne_bytes)
++            .collect::<Vec<_>>();
++        peer.write_all(&bytes).unwrap();
++        backend.dispatch_all_clients(&mut ()).unwrap();
++    }
++    assert_eq!(*status.0.lock().unwrap(), Some(2));
++}
++
++struct Global(AtomicUsize);
++static TEST_INTERFACE: Interface =
++    Interface { name: "vivid_test", version: 1, requests: &[], events: &[], c_ptr: None };
++impl GlobalHandler<()> for Global {
++    fn bind(
++        self: Arc<Self>,
++        _: &Handle,
++        _: &mut (),
++        _: ClientId,
++        _: GlobalId,
++        _: ObjectId,
++    ) -> Arc<dyn ObjectData<()>> {
++        self.0.fetch_add(1, Ordering::Relaxed);
++        Arc::new(Object)
++    }
++}
++
++#[test]
++fn registry_binding_checks_admission_before_initializing_user_data() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let mut handle = backend.handle();
++    let global = Arc::new(Global(AtomicUsize::new(0)));
++    handle.create_global::<()>(&TEST_INTERFACE, 1, global.clone());
++    let (socket, mut peer) = UnixStream::pair().unwrap();
++    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
++    let status = Arc::new(Status::default());
++    handle.insert_client(socket, status.clone()).unwrap();
++    peer.write_all(
++        &[1u32, (12u32 << 16) | 1, 2].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>(),
++    )
++    .unwrap();
++    backend.dispatch_all_clients(&mut ()).unwrap();
++    backend.flush(None).unwrap();
++    let mut event = [0; 128];
++    assert!(peer.read(&mut event).unwrap() >= 12);
++    let name = u32::from_ne_bytes(event[8..12].try_into().unwrap());
++    for id in 3..=5 {
++        let mut interface = TEST_INTERFACE.name.as_bytes().to_vec();
++        interface.push(0);
++        let len = interface.len() as u32;
++        while interface.len() % 4 != 0 {
++            interface.push(0);
++        }
++        let size = (24 + interface.len()) as u32;
++        let mut request = [2u32, size << 16, name, len]
++            .into_iter()
++            .flat_map(u32::to_ne_bytes)
++            .collect::<Vec<_>>();
++        request.extend(interface);
++        request.extend([1u32, id].into_iter().flat_map(u32::to_ne_bytes));
++        peer.write_all(&request).unwrap();
++        backend.dispatch_all_clients(&mut ()).unwrap();
++    }
++    assert_eq!(global.0.load(Ordering::Relaxed), 2);
++    assert_eq!(*status.0.lock().unwrap(), Some(2));
++}
+--- /dev/null
++++ b/wayland-backend/tests/request_limits.rs
+@@ -0,0 +1,238 @@
++//! Count, byte, fragmentation and reconnect admission through real sockets.
++
++// Rust guideline compliant 2026-10-07
++use std::{
++    io::Write as _,
++    num::NonZeroU32,
++    os::unix::net::UnixStream,
++    sync::{Arc, Mutex},
++};
++use wayland_backend::rs::server::{
++    Backend, ClientData, ClientId, DisconnectReason, RequestBudget, RequestLimits,
++};
++
++struct Status {
++    limits: Option<RequestLimits>,
++    shared: Option<Arc<RequestBudget>>,
++    error: Mutex<Option<u32>>,
++}
++impl ClientData for Status {
++    fn request_limits(&self) -> Option<RequestLimits> {
++        self.limits
++    }
++    fn shared_request_budget(&self) -> Option<Arc<RequestBudget>> {
++        self.shared.clone()
++    }
++    fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++        if let DisconnectReason::ProtocolError(error) = reason {
++            *self.error.lock().unwrap() = Some(error.code);
++        }
++    }
++}
++fn limits(requests: u32, bytes: u32) -> RequestLimits {
++    RequestLimits {
++        request_burst: NonZeroU32::new(requests).unwrap(),
++        requests_per_second: NonZeroU32::new(1).unwrap(),
++        byte_burst: NonZeroU32::new(bytes).unwrap(),
++        bytes_per_second: NonZeroU32::new(1).unwrap(),
++    }
++}
++fn connect(
++    backend: &Backend<()>,
++    limits: Option<RequestLimits>,
++    shared: Option<Arc<RequestBudget>>,
++) -> (UnixStream, Arc<Status>) {
++    let (server, peer) = UnixStream::pair().unwrap();
++    let state = Arc::new(Status { limits, shared, error: Mutex::new(None) });
++    backend.handle().insert_client(server, state.clone()).unwrap();
++    (peer, state)
++}
++fn sync() -> Vec<u8> {
++    [1u32, 12u32 << 16, 2].into_iter().flat_map(u32::to_ne_bytes).collect()
++}
++fn dispatch(backend: &mut Backend<()>) {
++    backend.dispatch_all_clients(&mut ()).unwrap();
++}
++
++#[test]
++fn core_request_count_is_charged_without_application_callbacks() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let (mut peer, state) = connect(&backend, Some(limits(2, 1024)), None);
++    peer.write_all(&sync()).unwrap();
++    dispatch(&mut backend);
++    peer.write_all(&sync()).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*state.error.lock().unwrap(), None);
++    peer.write_all(&sync()).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*state.error.lock().unwrap(), Some(2));
++}
++
++#[test]
++fn declared_wire_bytes_are_charged_once_across_body_read_splits() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let (mut peer, state) = connect(&backend, Some(limits(100, 24)), None);
++    for _ in 0..2 {
++        let bytes = sync();
++        peer.write_all(&bytes[..8]).unwrap();
++        dispatch(&mut backend);
++        assert_eq!(*state.error.lock().unwrap(), None);
++        peer.write_all(&bytes[8..]).unwrap();
++        dispatch(&mut backend);
++        assert_eq!(*state.error.lock().unwrap(), None);
++    }
++    // A header alone is enough for pre-parse admission to reject the next body.
++    peer.write_all(&sync()[..8]).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*state.error.lock().unwrap(), Some(2));
++}
++
++#[test]
++fn a_header_waiting_for_a_descriptor_keeps_its_original_admission() {
++    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
++    use std::{
++        io::IoSlice,
++        mem::MaybeUninit,
++        os::fd::{AsFd as _, OwnedFd},
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++    use wayland_backend::{
++        protocol::{Argument, ArgumentType, Interface, Message, MessageDesc},
++        rs::server::{Handle, ObjectData, ObjectId},
++    };
++    struct Receiver(Arc<AtomicUsize>);
++    impl ObjectData<()> for Receiver {
++        fn request(
++            self: Arc<Self>,
++            _: &Handle,
++            _: &mut (),
++            _: ClientId,
++            request: Message<ObjectId, OwnedFd>,
++        ) -> Option<Arc<dyn ObjectData<()>>> {
++            assert!(matches!(request.args[0], Argument::Fd(_)));
++            self.0.fetch_add(1, Ordering::Relaxed);
++            None
++        }
++        fn destroyed(self: Arc<Self>, _: &Handle, _: &mut (), _: ClientId, _: ObjectId) {}
++    }
++    static INTERFACE: Interface = Interface {
++        name: "vivid_rate_fd",
++        version: 1,
++        c_ptr: None,
++        events: &[],
++        requests: &[MessageDesc {
++            name: "receive",
++            signature: &[ArgumentType::Fd],
++            since: 1,
++            is_destructor: false,
++            child_interface: None,
++            arg_interfaces: &[],
++        }],
++    };
++    let mut backend = Backend::<()>::new().unwrap();
++    let (server, mut peer) = UnixStream::pair().unwrap();
++    let state =
++        Arc::new(Status { limits: Some(limits(1, 8)), shared: None, error: Mutex::new(None) });
++    let owner = backend.handle().insert_client(server, state.clone()).unwrap();
++    let received = Arc::new(AtomicUsize::new(0));
++    let object = backend
++        .handle()
++        .create_object::<()>(owner, &INTERFACE, 1, Arc::new(Receiver(received.clone())))
++        .unwrap();
++    let bytes = [object.protocol_id(), 8u32 << 16]
++        .into_iter()
++        .flat_map(u32::to_ne_bytes)
++        .collect::<Vec<_>>();
++    peer.write_all(&bytes).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(received.load(Ordering::Relaxed), 0);
++    assert_eq!(*state.error.lock().unwrap(), None);
++    let file = std::fs::File::open("/dev/null").unwrap();
++    let fds = [file.as_fd()];
++    let mut storage = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
++    let mut ancillary = SendAncillaryBuffer::new(&mut storage);
++    assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
++    assert_eq!(
++        sendmsg(&peer, &[IoSlice::new(&bytes[..1])], &mut ancillary, SendFlags::NOSIGNAL).unwrap(),
++        1
++    );
++    dispatch(&mut backend);
++    assert_eq!(received.load(Ordering::Relaxed), 1);
++    assert_eq!(*state.error.lock().unwrap(), None);
++    peer.write_all(&bytes[1..]).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*state.error.lock().unwrap(), Some(2));
++    assert_eq!(received.load(Ordering::Relaxed), 1);
++}
++
++#[test]
++fn reconnects_share_group_debt_while_another_group_reuses_the_same_callback_id() {
++    let mut backend = Backend::<()>::new().unwrap();
++    let budget = Arc::new(RequestBudget::new(limits(2, 1024)));
++    let (mut first, a) = connect(&backend, None, Some(budget.clone()));
++    for _ in 0..2 {
++        first.write_all(&sync()).unwrap();
++        dispatch(&mut backend);
++    }
++    assert_eq!(*a.error.lock().unwrap(), None);
++    for _ in 0..2 {
++        let (mut next, b) = connect(&backend, None, Some(budget.clone()));
++        next.write_all(&sync()).unwrap();
++        dispatch(&mut backend);
++        assert_eq!(*b.error.lock().unwrap(), Some(2));
++        assert_eq!(*a.error.lock().unwrap(), None);
++    }
++    let other_budget = Arc::new(RequestBudget::new(limits(2, 1024)));
++    let (mut other, state) = connect(&backend, None, Some(other_budget));
++    other.write_all(&sync()).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*state.error.lock().unwrap(), None);
++}
++
++#[test]
++fn role_transitions_select_existing_group_debt_without_resetting_it() {
++    use std::sync::atomic::{AtomicBool, Ordering};
++    struct Role {
++        protected: AtomicBool,
++        root: Arc<RequestBudget>,
++        helpers: Arc<RequestBudget>,
++        error: Mutex<Option<u32>>,
++    }
++    impl ClientData for Role {
++        fn shared_request_budget(&self) -> Option<Arc<RequestBudget>> {
++            Some(if self.protected.load(Ordering::Acquire) {
++                self.root.clone()
++            } else {
++                self.helpers.clone()
++            })
++        }
++        fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++            if let DisconnectReason::ProtocolError(error) = reason {
++                *self.error.lock().unwrap() = Some(error.code);
++            }
++        }
++    }
++    let mut backend = Backend::<()>::new().unwrap();
++    let (server, mut peer) = UnixStream::pair().unwrap();
++    let role = Arc::new(Role {
++        protected: AtomicBool::new(false),
++        root: Arc::new(RequestBudget::new(limits(2, 1024))),
++        helpers: Arc::new(RequestBudget::new(limits(2, 1024))),
++        error: Mutex::new(None),
++    });
++    backend.handle().insert_client(server, role.clone()).unwrap();
++    for _ in 0..2 {
++        peer.write_all(&sync()).unwrap();
++        dispatch(&mut backend);
++    }
++    role.protected.store(true, Ordering::Release);
++    for _ in 0..2 {
++        peer.write_all(&sync()).unwrap();
++        dispatch(&mut backend);
++    }
++    assert_eq!(*role.error.lock().unwrap(), None);
++    role.protected.store(false, Ordering::Release);
++    peer.write_all(&sync()).unwrap();
++    dispatch(&mut backend);
++    assert_eq!(*role.error.lock().unwrap(), Some(2));
++}
+--- a/wayland-client/Cargo.toml
++++ b/wayland-client/Cargo.toml
+@@ -75,6 +75,7 @@
+ features = ["event"]
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.15"
+ 
+ [dependencies.wayland-scanner]
+@@ -88,3 +89,8 @@
+ 
+ [dev-dependencies.tempfile]
+ version = "3.2"
++
++[dev-dependencies.wayland-protocols]
++path = "../wayland-protocols"
++version = "0.32.13"
++features = ["client"]
+--- a/wayland-server/Cargo.toml
++++ b/wayland-server/Cargo.toml
+@@ -71,6 +71,7 @@
+ features = ["fs"]
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.15"
+ 
+ [dependencies.wayland-scanner]
+--- a/wayland-protocols/Cargo.toml
++++ b/wayland-protocols/Cargo.toml
+@@ -51,7 +51,6 @@
+ ]
+ license = "MIT"
+ repository = "https://github.com/smithay/wayland-rs"
+-resolver = "2"
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+@@ -74,9 +73,11 @@
+ version = "2"
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.15"
+ 
+ [dependencies.wayland-client]
++path = "../wayland-client"
+ version = "0.31.14"
+ optional = true
+ 
+@@ -84,5 +85,6 @@
+ version = "0.31.10"
+ 
+ [dependencies.wayland-server]
++path = "../wayland-server"
+ version = "0.31.13"
+ optional = true
+--- a/wayland-protocols-wlr/Cargo.toml
++++ b/wayland-protocols-wlr/Cargo.toml
+@@ -63,18 +63,22 @@
+ version = "2"
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.15"
+ 
+ [dependencies.wayland-client]
++path = "../wayland-client"
+ version = "0.31.14"
+ optional = true
+ 
+ [dependencies.wayland-protocols]
++path = "../wayland-protocols"
+ version = "0.32.12"
+ 
+ [dependencies.wayland-scanner]
+ version = "0.31.10"
+ 
+ [dependencies.wayland-server]
++path = "../wayland-server"
+ version = "0.31.13"
+ optional = true
+--- a/wayland-protocols-misc/Cargo.toml
++++ b/wayland-protocols-misc/Cargo.toml
+@@ -63,13 +63,16 @@
+ version = "2"
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.15"
+ 
+ [dependencies.wayland-client]
++path = "../wayland-client"
+ version = "0.31.14"
+ optional = true
+ 
+ [dependencies.wayland-protocols]
++path = "../wayland-protocols"
+ version = "0.32.12"
+ features = ["unstable"]
+ 
+@@ -77,5 +80,6 @@
+ version = "0.31.10"
+ 
+ [dependencies.wayland-server]
++path = "../wayland-server"
+ version = "0.31.13"
+ optional = true
+--- a/wayland-cursor/Cargo.toml
++++ b/wayland-cursor/Cargo.toml
+@@ -51,6 +51,7 @@
+ features = ["shm"]
+ 
+ [dependencies.wayland-client]
++path = "../wayland-client"
+ version = "0.31.14"
+ 
+ [dependencies.xcursor]
+--- a/wayland-egl/Cargo.toml
++++ b/wayland-egl/Cargo.toml
+@@ -47,6 +47,7 @@
+ path = "src/lib.rs"
+ 
+ [dependencies.wayland-backend]
++path = "../wayland-backend"
+ version = "0.3.10"
+ features = ["client_system"]
+ 

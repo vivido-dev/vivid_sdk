@@ -312,6 +312,10 @@ impl Session {
         state.definition.rotation = status.rotation;
         state.definition.descriptor = status.descriptor.clone();
         state.definition.policy = status.effective_policy;
+        state
+            .definition
+            .profile_parameters
+            .clone_from(&status.profile_status);
         state.destroyed = status.lifecycle == 3;
         Ok(status)
     }

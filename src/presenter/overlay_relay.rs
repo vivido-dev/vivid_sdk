@@ -1,7 +1,7 @@
 //! Bounded host-service requests between a terminating presenter and its outer bridge.
 use super::BridgeSurfaceKey;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 
 // These envelopes also cross bounded JSON control transports (byte arrays expand up to 4x).
@@ -32,5 +32,9 @@ pub(super) struct OverlayRelay {
     pub next_layout: u64,
     pub queued: VecDeque<OverlayHostRequest>,
     pub pending: HashMap<u64, mpsc::SyncSender<Result<Vec<u8>, String>>>,
+    pub clipboard: HashMap<u64, super::service::overlay_clipboard::Grant>,
     pub reservations: HashMap<u64, (BridgeSurfaceKey, usize, usize)>,
+    pub active_jobs: HashSet<(u64, u64, u64)>,
+    pub local_host_claimed: bool,
+    pub local_host_available: bool,
 }

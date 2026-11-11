@@ -18,12 +18,18 @@
 //! numbers never observe or disturb each other's state, and [`Overlays::remove_session`] tears down
 //! exactly one owner's state when its session ends.
 
+// Rust guideline compliant 2026-10-07
 use std::collections::{BTreeSet, HashMap};
 
+#[cfg(feature = "vector-render")]
+#[path = "overlay_native.rs"]
+pub(super) mod native;
+
+use crate::presenter::PaneId;
 use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity, SurfaceIdentity};
 use vivid_protocol::messages::{self, PayloadMap};
-#[cfg(any(test, feature = "testing"))]
+#[cfg(feature = "testing")]
 use vivid_protocol::overlay::AccessibleAction;
 use vivid_protocol::overlay::wire::Environment;
 use vivid_protocol::overlay::wire::text::EditorGeometry;
@@ -35,7 +41,10 @@ use vivid_protocol::overlay::wire::{
     Action, Capture, Clipboard, PresentationOutcome, Query, Renew, SetSemantics, SetWindow, Status,
     Submission, SubmissionOutcome, Viewport, WindowAddress,
 };
-use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics, Windows};
+use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics};
+#[path = "overlay_windows.rs"]
+mod pane_windows;
+use pane_windows::PaneWindows as Windows;
 use vivid_protocol::vector::{Canvas, Frame, Limits, Point, Scalar};
 
 /// A display list the presenter accepted, with the identity a real host would key it by.
@@ -44,6 +53,8 @@ pub struct PresentedScene {
     pub window: SurfaceIdentity,
     pub revision: u64,
     pub canvas: Canvas,
+    /// Exact source, channel, epoch and revision represented by this scene.
+    pub submission: Submission,
 }
 
 /// One retained image upload, by the channel-qualified identity the protocol requires.
@@ -75,22 +86,42 @@ struct SessionViewport {
     revision: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Click {
+    at: std::time::Instant,
+    window: SurfaceIdentity,
+    region: u64,
+    button: u16,
+    position: Point,
+    count: u8,
+    focus_generation: u64,
+}
+
+struct InputLease {
+    generation: u64,
+    deadline: Option<std::time::Instant>,
+}
+
 #[derive(Default)]
 pub(crate) struct Overlays {
+    #[cfg(feature = "vector-render")]
+    pub(super) native: Option<native::Native>,
     windows: Windows,
     viewports: HashMap<u64, SessionViewport>,
     limits: Limits,
     /// Which surface a bulk track belongs to, learned at CREATE_TRACK — before the overlay
     /// window exists, because a producer builds its track first. Keyed by owner as well as track:
     /// two producers may each name track 5, and they are not the same track.
-    tracks: HashMap<(u64, u64), (u64, u64)>,
+    tracks: HashMap<(u64, u64, u64), u64>,
     /// The last accepted display list per window, and the revision that published it.
     displayed: HashMap<SurfaceIdentity, PresentedScene>,
     accepted: HashMap<SurfaceIdentity, u64>,
-    assets: HashMap<(u64, u64, u64), RetainedAsset>,
+    assets: HashMap<(SurfaceIdentity, u64, u64, u64), RetainedAsset>,
     /// Strictly increasing per channel generation, including after release.
-    highest_asset: HashMap<(u64, u64), u64>,
-    lane_generation: HashMap<u64, u64>,
+    highest_asset: HashMap<(SurfaceIdentity, u64, u64), u64>,
+    /// Latest authenticated channel generation for each complete vector source.
+    channels: HashMap<(SurfaceIdentity, u64), u64>,
+    input_leases: HashMap<u64, InputLease>,
     /// Records a session is owed on its interactive lane, drained in arrival order. An environment
     /// change is broadcast to every session with overlay state, because it describes the host
     /// itself; viewports, window events, scene outcomes and accessibility actions are queued only
@@ -103,18 +134,23 @@ pub(crate) struct Overlays {
     environment: Environment,
     environment_revision: u64,
     /// The last press of the current click sequence, as the real host tracks it.
-    last_click: Option<(std::time::Instant, u16, Point, u8)>,
+    last_click: HashMap<PaneId, Click>,
+    /// Last host-observed pointer position, scoped to each pane owner.
+    last_pointer: HashMap<u64, Point>,
     /// The window a key or pointer press last reached, as the real host tracks it.
-    last_gesture: Option<(SurfaceIdentity, std::time::Instant)>,
+    last_gesture: HashMap<PaneId, (SurfaceIdentity, std::time::Instant, u64)>,
+    #[cfg(feature = "vector-render")]
+    native_press: Option<(SurfaceIdentity, u64)>,
     /// Clipboard text this presenter accepted, in acceptance order. A refused write leaves no
     /// trace here, so asserting on this is asserting the guard allowed it.
+    #[cfg(any(test, feature = "testing"))]
     clipboard: Vec<String>,
     /// Each window's semantic tree, retired when the scene it described is replaced.
     semantics: HashMap<SurfaceIdentity, Semantics>,
     /// Retained text layouts, by the identity the producer was given.
     retained_layouts: HashMap<u64, TextMeasurement>,
     /// Where a focused editor last said its caret was, with the revision it said it at.
-    editor_caret: Option<(u64, Option<vivid_protocol::vector::Rect>)>,
+    editor_carets: HashMap<SurfaceIdentity, (u64, u64, Option<vivid_protocol::vector::Rect>)>,
     next_layout: u64,
 }
 
@@ -189,6 +225,14 @@ pub(crate) fn owner(session_id: u64) -> SessionIdentity {
 }
 
 impl Overlays {
+    #[cfg(feature = "vector-render")]
+    pub(crate) fn local_native(&self) -> bool {
+        self.native.is_some()
+    }
+    #[cfg(not(feature = "vector-render"))]
+    pub(crate) fn local_native(&self) -> bool {
+        false
+    }
     /// Test-only convenience for a viewport given as a plain logical size at scale 1.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn install_viewport(&mut self, session_id: u64, width: f64, height: f64) {
@@ -198,7 +242,8 @@ impl Overlays {
             scale_numerator: 1,
             scale_denominator: 1,
         };
-        self.install_session_viewport(session_id, viewport);
+        self.install_session_viewport(session_id, 1, viewport)
+            .expect("test pane binding");
     }
 
     /// Record the pane geometry a session's windows lay out against, without queueing a record.
@@ -206,9 +251,24 @@ impl Overlays {
     /// A session learns its viewport from the initial snapshot [`Overlays::open_lane`] queues at
     /// lane authentication, so seeding it at session establishment — before any lane exists —
     /// must not also queue one.
-    pub(crate) fn install_session_viewport(&mut self, session_id: u64, viewport: Viewport) {
+    pub(crate) fn bind_session(
+        &mut self,
+        session: u64,
+        pane: PaneId,
+    ) -> Result<(), vivid_protocol::vector::InvalidScene> {
+        self.windows.bind(owner(session), pane)
+    }
+
+    pub(crate) fn install_session_viewport(
+        &mut self,
+        session_id: u64,
+        pane: PaneId,
+        viewport: Viewport,
+    ) -> Result<(), vivid_protocol::vector::InvalidScene> {
+        self.bind_session(session_id, pane)?;
         self.note_session(session_id);
         self.store_viewport(session_id, viewport);
+        Ok(())
     }
 
     /// Move one session's viewport and tell it, as a pane resize or DPI change does. Unchanged
@@ -312,7 +372,7 @@ impl Overlays {
     }
 
     /// The environment a producer sees.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub(crate) fn environment(&self) -> &Environment {
         &self.environment
     }
@@ -324,7 +384,16 @@ impl Overlays {
     ///
     /// The environment goes first: a producer that adopts the host's font wants it before it lays
     /// anything out against the viewport.
-    pub(crate) fn open_lane(&mut self, session_id: u64) {
+    pub(crate) fn open_lane(&mut self, session_id: u64, generation: u64) {
+        // Authentication supplies identity; only the first renewal grants input.
+        // An unused overlay profile must not time out a healthy shared desktop lane.
+        self.input_leases.insert(
+            session_id,
+            InputLease {
+                generation,
+                deadline: None,
+            },
+        );
         self.note_session(session_id);
         if let Some(record) = self.environment_record() {
             self.queue_for(session_id, record);
@@ -345,7 +414,35 @@ impl Overlays {
 
     /// Queue every window event the protocol state machine produced for this owner.
     fn drain_events(&mut self, owner: SessionIdentity) {
-        while let Some(event) = self.windows.take_event(owner) {
+        while let Some(mut event) = self.windows.take_event(owner) {
+            #[cfg(feature = "vector-render")]
+            if matches!(event.event, Event::Cancel) {
+                self.note_native_cancel(event.window);
+            }
+            #[cfg(feature = "vector-render")]
+            if matches!(
+                event.event,
+                Event::Key {
+                    down: true,
+                    repeat: false,
+                    ..
+                } | Event::Pointer {
+                    button: Some((_, true)),
+                    ..
+                }
+            ) {
+                self.note_native_press(event.window);
+            }
+            #[cfg(feature = "vector-render")]
+            if let Event::Pointer {
+                button: Some((_, true)),
+                region,
+                ..
+            } = &event.event
+            {
+                self.native_press = Some((event.window, *region));
+            }
+            self.record_pointer_event(event.window, &mut event.event);
             let input = vivid_protocol::overlay::wire::InputEvent::from(event);
             let object_id = input.address.surface_id;
             if let Ok(payload) = input.payload() {
@@ -371,10 +468,49 @@ impl Overlays {
         let Ok(id) = input.address.identity(owner(session)) else {
             return false;
         };
-        let Some(window) = self.windows.get(id) else {
+        let Some(window) = self.windows.get(id).cloned() else {
             return false;
         };
-        if window.generation != input.address.generation || !window.options.visible {
+        if window.generation != input.address.generation
+            || !window.options.visible
+            || !self.input_enabled(session)
+        {
+            return false;
+        }
+        if matches!(
+            input.event,
+            Event::Pointer { .. }
+                | Event::Wheel { .. }
+                | Event::Key { .. }
+                | Event::Text(_)
+                | Event::Ime { .. }
+                | Event::Accessibility { .. }
+                | Event::Focus(true)
+                | Event::Hover { entered: true, .. }
+        ) && !self.windows.input_eligible(id)
+        {
+            return false;
+        }
+        let pointer = if let Event::Pointer { position, .. } = &input.event {
+            let bounds = window.options.bounds;
+            let Ok(position) = Point::new(
+                bounds.origin.x.get() + position.x.get(),
+                bounds.origin.y.get() + position.y.get(),
+            ) else {
+                return false;
+            };
+            Some(position)
+        } else {
+            None
+        };
+        if matches!(
+            input.event,
+            Event::Pointer {
+                button: Some((_, true)),
+                ..
+            }
+        ) && self.windows.request_focus(id).is_err()
+        {
             return false;
         }
         if matches!(
@@ -385,7 +521,18 @@ impl Overlays {
                     ..
                 }
         ) {
-            self.last_gesture = Some((id, std::time::Instant::now()));
+            self.record_gesture(
+                self.windows
+                    .pane(id.context().session())
+                    .expect("bound overlay"),
+                Some(id),
+            );
+        }
+        // The authenticated outer host already performed hit testing. Preserve
+        // its window-local observation in this pane's coordinates for capture;
+        // another owner with matching local IDs must not inherit that sample.
+        if let Some(position) = pointer {
+            self.last_pointer.insert(session, position);
         }
         match input.event {
             Event::Geometry { bounds, .. } if window.options.bounds != bounds => {
@@ -402,9 +549,7 @@ impl Overlays {
             Event::Focus(true) => {
                 let _ = self.windows.request_focus(id);
             }
-            Event::Focus(false) if self.windows.focus() == Some(id) => {
-                self.windows.set_pane_focus(false)
-            }
+            Event::Focus(false) => self.windows.clear_focus(id),
             _ => {}
         }
         // Native routing already performed hit testing, click counting, keyboard translation,
@@ -424,34 +569,77 @@ impl Overlays {
         true
     }
 
-    /// Count a press in the current sequence, matching the real host's policy so a producer
-    /// testing against this presenter sees the same counts it will see live.
-    fn count_clicks(&mut self, position: Point, button: Option<(u16, bool)>) -> u8 {
-        let Some((button_id, true)) = button else {
-            return 0;
+    /// Record the focus grant that authorized a physical gesture.
+    fn record_gesture(&mut self, pane: PaneId, id: Option<SurfaceIdentity>) {
+        if let Some(id) = id {
+            self.last_gesture.insert(
+                pane,
+                (
+                    id,
+                    std::time::Instant::now(),
+                    self.windows.focus_generation(pane).expect("bound pane"),
+                ),
+            );
+        } else {
+            self.last_gesture.remove(&pane);
+        }
+    }
+    fn clear_owner_gesture(&mut self, session: u64) {
+        self.last_gesture
+            .retain(|_, (id, _, _)| id.context().session().session_id() != session);
+    }
+
+    fn record_pointer_event(&mut self, window: SurfaceIdentity, event: &mut Event) {
+        let Event::Pointer {
+            position,
+            region,
+            button: Some((button, true)),
+            clicks,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let Some(pane) = self.windows.pane(window.context().session()) else {
+            return;
         };
         let now = std::time::Instant::now();
-        let clicks = match self.last_click {
-            Some((at, id, point, count))
-                if id == button_id
-                    && now.saturating_duration_since(at)
+        let focus_generation = self.windows.focus_generation(pane).expect("bound pane");
+        let count = match self.last_click.get(&pane) {
+            Some(previous)
+                if previous.window == window
+                    && previous.focus_generation == focus_generation
+                    && previous.region == *region
+                    && previous.button == *button
+                    && now.saturating_duration_since(previous.at)
                         < std::time::Duration::from_millis(400)
-                    && (point.x.get() - position.x.get()).abs() <= 4.
-                    && (point.y.get() - position.y.get()).abs() <= 4. =>
+                    && (previous.position.x.get() - position.x.get()).abs() <= 4.
+                    && (previous.position.y.get() - position.y.get()).abs() <= 4. =>
             {
-                if count >= vivid_protocol::overlay::MAX_CLICKS {
+                if previous.count >= vivid_protocol::overlay::MAX_CLICKS {
                     1
                 } else {
-                    count + 1
+                    previous.count + 1
                 }
             }
             _ => 1,
         };
-        self.last_click = Some((now, button_id, position, clicks));
-        clicks
+        *clicks = count;
+        self.last_click.insert(
+            pane,
+            Click {
+                at: now,
+                window,
+                region: *region,
+                button: *button,
+                position: *position,
+                count,
+                focus_generation,
+            },
+        );
     }
 
-    /// Note a track's surface so a later vector record can be attributed to a window.
+    /// Learn a track's owning surface before its overlay window exists.
     pub(crate) fn note_track(
         &mut self,
         session_id: u64,
@@ -461,15 +649,23 @@ impl Overlays {
     ) {
         self.note_session(session_id);
         self.tracks
-            .insert((session_id, track_id), (context_id, surface_id));
+            .insert((session_id, context_id, track_id), surface_id);
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn track_window(&self, session_id: u64, track_id: u64) -> Option<SurfaceIdentity> {
-        let (context_id, surface_id) = *self.tracks.get(&(session_id, track_id))?;
+        let mut matches = self
+            .tracks
+            .iter()
+            .filter(|((session, _, track), _)| *session == session_id && *track == track_id);
+        let ((_, context_id, _), surface_id) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
         owner(session_id)
-            .context(context_id)
+            .context(*context_id)
             .ok()?
-            .surface(surface_id)
+            .surface(*surface_id)
             .ok()
     }
 
@@ -487,6 +683,9 @@ impl Overlays {
         let Ok(id) = request.address.identity(owner) else {
             return Err("invalid overlay window identity");
         };
+        if !self.input_enabled(session_id) && self.windows.set_owner_input(owner, false).is_err() {
+            return Err("overlay input owner capacity exhausted");
+        }
         let revision = if request.expected_revision == 0 {
             if self
                 .windows
@@ -574,25 +773,9 @@ impl Overlays {
                 options: window.options.clone(),
             },
             viewport: current.viewport,
-            focused: self.windows.focus() == Some(id),
+            focused: self.windows.focus_of(id) == Some(id),
             scene_revision: presented.map_or(0, |scene| scene.revision),
-            active: presented.map(|scene| Submission {
-                address: WindowAddress {
-                    context_id: query.context_id,
-                    surface_id: query.surface_id,
-                    generation: window.generation,
-                },
-                track_id: self
-                    .tracks
-                    .iter()
-                    .find(|((session, _), surface)| {
-                        *session == session_id && **surface == (query.context_id, query.surface_id)
-                    })
-                    .map_or(0, |((_, track), _)| *track),
-                channel_generation: 1,
-                epoch: 1,
-                revision: scene.revision,
-            }),
+            active: presented.map(|scene| scene.submission),
             viewport_revision: current.revision,
             accepted_revision: self.accepted.get(&id).copied().unwrap_or(0),
         };
@@ -619,6 +802,10 @@ impl Overlays {
         let Some(window) = self.windows.get(id) else {
             return Err("overlay window is absent");
         };
+        #[cfg(feature = "vector-render")]
+        if self.local_native() && !self.native_input_valid(id) {
+            return Err("native window has not been presented");
+        }
         if window.generation != request.address.generation {
             return Err("stale overlay window generation");
         }
@@ -631,7 +818,7 @@ impl Overlays {
     }
 
     /// Every window with a live semantic tree, in a stable order.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub(crate) fn windows_with_semantics(&self) -> Vec<(&SurfaceIdentity, &Semantics)> {
         self.semantics.iter().collect()
     }
@@ -643,6 +830,20 @@ impl Overlays {
         object_id: u64,
         payload: &PayloadMap,
     ) -> OverlayReply {
+        let request = self.validate_clipboard(session_id, object_id, payload)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.clipboard.push(request.text);
+        #[cfg(not(any(test, feature = "testing")))]
+        let _ = request;
+        Ok((messages::OK, Vec::new()))
+    }
+
+    pub(crate) fn validate_clipboard(
+        &self,
+        session_id: u64,
+        object_id: u64,
+        payload: &PayloadMap,
+    ) -> Result<Clipboard, &'static str> {
         let owner = owner(session_id);
         let Ok(request) = Clipboard::decode(object_id, &Value::Map(payload.clone())) else {
             return Err("invalid overlay clipboard request");
@@ -656,11 +857,48 @@ impl Overlays {
         if window.generation != request.address.generation {
             return Err("stale overlay window generation");
         }
+        if !self.input_enabled(session_id) {
+            return Err("overlay input lease is inactive");
+        }
+        #[cfg(feature = "vector-render")]
+        if !self.native_window_ready(id) {
+            return Err("native clipboard write requires displayed geometry");
+        }
         if !self.authorize_clipboard(session_id, id) {
             return Err("a clipboard write requires a focused window and a recent gesture in it");
         }
-        self.clipboard.push(request.text);
-        Ok((messages::OK, Vec::new()))
+        Ok(request)
+    }
+
+    pub(crate) fn clipboard_grant(&self, id: SurfaceIdentity) -> Option<(u64, std::time::Instant)> {
+        self.authorize_clipboard(id.context().session().session_id(), id)
+            .then_some(())?;
+        let pane = self.windows.pane(id.context().session())?;
+        let (_, at, generation) = self.last_gesture.get(&pane)?;
+        Some((*generation, *at))
+    }
+
+    pub(crate) fn clipboard_grant_current(
+        &self,
+        id: SurfaceIdentity,
+        window_generation: u64,
+        generation: u64,
+    ) -> bool {
+        #[cfg(feature = "vector-render")]
+        if !self.native_window_ready(id) {
+            return false;
+        }
+        self.windows
+            .pane(id.context().session())
+            .and_then(|pane| self.windows.focus_generation(pane))
+            == Some(generation)
+            && self.windows.input_eligible(id)
+            && self
+                .windows
+                .get(id)
+                .is_some_and(|window| window.generation == window_generation)
+            && self.input_enabled(id.context().session().session_id())
+            && self.authorize_clipboard(id.context().session().session_id(), id)
     }
 
     /// Shape a batch of text, or retain it, as a host with a font system would.
@@ -759,24 +997,89 @@ impl Overlays {
         if window.generation != request.address.generation {
             return Err("stale overlay window generation");
         }
+        if !self.input_enabled(session_id)
+            || !self.windows.input_eligible(id)
+            || self.windows.focus_of(id) != Some(id)
+        {
+            return Err("editor geometry requires eligible focused input");
+        }
+        #[cfg(feature = "vector-render")]
+        if !self.native_window_ready(id) {
+            return Err("editor geometry requires displayed native geometry");
+        }
         let Some(presented) = self.displayed.get(&id) else {
             return Err("no scene is displayed to describe a caret in");
         };
         if request.scene_revision != presented.revision {
             return Err("editor geometry must describe the displayed scene");
         }
-        self.editor_caret = Some((request.scene_revision, request.caret));
+        self.editor_carets.insert(
+            id,
+            (
+                request.scene_revision,
+                self.windows
+                    .pane(owner)
+                    .and_then(|pane| self.windows.focus_generation(pane))
+                    .expect("focused editor pane"),
+                request.caret,
+            ),
+        );
         Ok((messages::OK, Vec::new()))
     }
 
     /// Where the focused editor last placed its caret.
-    #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn editor_caret(&self) -> Option<(u64, Option<vivid_protocol::vector::Rect>)> {
-        self.editor_caret
+    #[cfg(any(test, feature = "testing", feature = "vector-render"))]
+    pub(crate) fn editor_caret(
+        &self,
+        pane: PaneId,
+    ) -> Option<(u64, Option<vivid_protocol::vector::Rect>)> {
+        let focused = self.windows.focus(pane)?;
+        #[cfg(feature = "vector-render")]
+        if !self.native_window_ready(focused) {
+            return None;
+        }
+        let value = self.editor_carets.get(&focused).copied()?;
+        (self.input_enabled(focused.context().session().session_id())
+            && self.windows.input_eligible(focused)
+            && self.windows.focus_generation(pane) == Some(value.1)
+            && self
+                .displayed
+                .get(&focused)
+                .is_some_and(|scene| scene.revision == value.0))
+        .then_some((value.0, value.2))
+    }
+
+    #[cfg(feature = "vector-render")]
+    pub(crate) fn native_editor_caret(&self, pane: PaneId) -> Option<[f64; 4]> {
+        let (_, caret) = self.editor_caret(pane)?;
+        let caret = caret?;
+        let id = self.windows.focus(pane)?;
+        let window = self.windows.get(id)?.options.bounds;
+        let viewport = self
+            .viewport_of(id.context().session().session_id())?
+            .viewport;
+        let left = (window.origin.x.get() + caret.origin.x.get())
+            .max(window.origin.x.get())
+            .max(0.);
+        let top = (window.origin.y.get() + caret.origin.y.get())
+            .max(window.origin.y.get())
+            .max(0.);
+        let right = (window.origin.x.get() + caret.origin.x.get() + caret.width.get())
+            .min(window.origin.x.get() + window.width.get())
+            .min(viewport.width.get());
+        let bottom = (window.origin.y.get() + caret.origin.y.get() + caret.height.get())
+            .min(window.origin.y.get() + window.height.get())
+            .min(viewport.height.get());
+        (right > left && bottom > top).then_some([
+            left / viewport.width.get(),
+            top / viewport.height.get(),
+            (right - left) / viewport.width.get(),
+            (bottom - top) / viewport.height.get(),
+        ])
     }
 
     /// Queue an action for the producer, as the accessibility adapter does.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub(crate) fn queue_accessibility(
         &mut self,
         window: SurfaceIdentity,
@@ -825,12 +1128,23 @@ impl Overlays {
     /// Whether a clipboard write from this window would be honored. This presenter applies the
     /// same rules the real host does, so a producer meets the same refusals here as live.
     pub(crate) fn authorize_clipboard(&self, _session_id: u64, id: SurfaceIdentity) -> bool {
-        if self.windows.get(id).is_none() || self.windows.focus() != Some(id) {
+        if self.windows.get(id).is_none() || self.windows.focus_of(id) != Some(id) {
             return false;
         }
-        match self.last_gesture {
-            Some((window, at)) => {
-                window == id && at.elapsed() <= vivid_protocol::overlay::MAX_CLIPBOARD_GESTURE_AGE
+        match self
+            .windows
+            .pane(id.context().session())
+            .and_then(|pane| self.last_gesture.get(&pane))
+            .copied()
+        {
+            Some((window, at, generation)) => {
+                window == id
+                    && self
+                        .windows
+                        .pane(id.context().session())
+                        .and_then(|pane| self.windows.focus_generation(pane))
+                        == Some(generation)
+                    && at.elapsed() <= vivid_protocol::overlay::MAX_CLIPBOARD_GESTURE_AGE
             }
             None => false,
         }
@@ -847,15 +1161,59 @@ impl Overlays {
         let Ok(renew) = Renew::decode(object_id, &Value::Map(payload.clone())) else {
             return Err("invalid overlay renewal");
         };
-        match self.lane_generation.get(&session_id) {
-            None => {
-                self.lane_generation
-                    .insert(session_id, renew.lane_generation);
-            }
-            Some(&generation) if generation == renew.lane_generation => {}
-            Some(_) => return Err("stale overlay lane generation"),
+        let Some(lease) = self.input_leases.get_mut(&session_id) else {
+            return Err("overlay input lane is revoked");
+        };
+        let now = std::time::Instant::now();
+        if lease.generation != renew.lane_generation
+            || lease.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Err("overlay input lane is stale or expired");
         }
+        let Some(deadline) = now.checked_add(std::time::Duration::from_micros(renew.watchdog_us))
+        else {
+            return Err("overlay watchdog deadline overflow");
+        };
+        self.windows
+            .set_owner_input(owner(session_id), true)
+            .map_err(|_| "overlay input owner could not be authorized")?;
+        lease.deadline = Some(deadline);
+        self.drain_events(owner(session_id));
         Ok((messages::OK, Vec::new()))
+    }
+
+    pub(crate) fn input_enabled(&self, session_id: u64) -> bool {
+        self.input_leases.get(&session_id).is_some_and(|lease| {
+            lease
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        })
+    }
+
+    #[cfg(feature = "vector-render")]
+    pub(crate) fn input_generation(&self, session_id: u64) -> Option<u64> {
+        self.input_enabled(session_id)
+            .then(|| self.input_leases[&session_id].generation)
+    }
+
+    pub(crate) fn expired_lanes(&self) -> Vec<u64> {
+        let now = std::time::Instant::now();
+        self.input_leases
+            .iter()
+            .filter(|(_, lease)| lease.deadline.is_some_and(|deadline| now >= deadline))
+            .map(|(owner, _)| *owner)
+            .collect()
+    }
+
+    pub(crate) fn close_lane(&mut self, session_id: u64) {
+        self.input_leases.remove(&session_id);
+        // No reservation is needed until this owner has actual window state.
+        if self.windows.has_owner(owner(session_id)) {
+            let _ = self.windows.set_owner_input(owner(session_id), false);
+            self.drain_events(owner(session_id));
+        }
+        self.last_pointer.remove(&session_id);
+        self.clear_owner_gesture(session_id);
     }
 
     pub(crate) fn capture(
@@ -864,6 +1222,9 @@ impl Overlays {
         object_id: u64,
         payload: &PayloadMap,
     ) -> OverlayReply {
+        if !self.input_enabled(session_id) {
+            return Err("overlay input lane is not renewed");
+        }
         let owner = owner(session_id);
         let Ok(capture) = Capture::decode(object_id, &Value::Map(payload.clone())) else {
             return Err("invalid overlay capture");
@@ -874,6 +1235,13 @@ impl Overlays {
         let Some(window) = self.windows.get(id) else {
             return Err("overlay window is absent");
         };
+        #[cfg(feature = "vector-render")]
+        if capture.capture
+            && self.local_native()
+            && (!self.native_input_valid(id) || !self.native_owner_ready(id))
+        {
+            return Err("native capture requires a presented scene");
+        }
         if window.generation != capture.address.generation
             || window.scene_revision != capture.scene_revision
         {
@@ -881,7 +1249,10 @@ impl Overlays {
         }
         if capture.capture {
             // A real presenter uses its own last observed pointer position, never the producer's.
-            if self.windows.capture_pointer(id, Point::default()).is_err() {
+            let Some(position) = self.last_pointer.get(&session_id).copied() else {
+                return Err("overlay capture requires an observed pointer");
+            };
+            if self.windows.capture_pointer(id, position).is_err() {
                 return Err("overlay capture was refused");
             }
         } else {
@@ -894,6 +1265,7 @@ impl Overlays {
 
     /// Accept one vector record. Returns false when the producer broke the channel's contract,
     /// which a real presenter answers by failing the channel rather than the request.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn media_record(
         &mut self,
         session_id: u64,
@@ -901,23 +1273,105 @@ impl Overlays {
         track_id: u64,
         body: &[u8],
     ) -> bool {
+        if !matches!(
+            record_type,
+            messages::VECTOR_FRAME | messages::VECTOR_ASSET | messages::VECTOR_ASSET_RELEASE
+        ) {
+            return true;
+        }
+        let Some(window) = self.track_window(session_id, track_id) else {
+            return false;
+        };
+        self.media_record_for(window, record_type, track_id, 1, body)
+    }
+
+    pub(crate) fn media_record_for(
+        &mut self,
+        window: SurfaceIdentity,
+        record_type: u16,
+        track_id: u64,
+        generation: u64,
+        body: &[u8],
+    ) -> bool {
+        let prior = self.channels.get(&(window, track_id)).copied().unwrap_or(0);
+        if generation == 0 || generation < prior {
+            return false;
+        }
+        if generation > prior {
+            self.channels.insert((window, track_id), generation);
+            self.assets.retain(|(owner, track, channel, _), _| {
+                *owner != window || *track != track_id || *channel == generation
+            });
+            self.highest_asset.retain(|(owner, track, channel), _| {
+                *owner != window || *track != track_id || *channel == generation
+            });
+        }
         match record_type {
-            messages::VECTOR_FRAME => self.vector_frame(session_id, track_id, body),
-            messages::VECTOR_ASSET => self.vector_asset(session_id, track_id, body),
-            messages::VECTOR_ASSET_RELEASE => self.release_asset(session_id, track_id, body),
+            messages::VECTOR_FRAME => self.vector_frame(window, track_id, generation, body),
+            messages::VECTOR_ASSET => self.vector_asset(window, track_id, generation, body),
+            messages::VECTOR_ASSET_RELEASE => {
+                self.release_asset(window, track_id, generation, body)
+            }
             _ => true,
         }
     }
 
-    fn vector_frame(&mut self, session_id: u64, track_id: u64, body: &[u8]) -> bool {
+    pub(crate) fn forget_track(&mut self, window: SurfaceIdentity, track_id: u64) {
+        self.channels.remove(&(window, track_id));
+        self.tracks.remove(&(
+            window.context().session().session_id(),
+            window.context().context_id(),
+            track_id,
+        ));
+        self.assets
+            .retain(|(owner, track, _, _), _| *owner != window || *track != track_id);
+        self.highest_asset
+            .retain(|(owner, track, _), _| *owner != window || *track != track_id);
+    }
+
+    pub(crate) fn close_surface(&mut self, window: SurfaceIdentity) {
+        self.windows
+            .close(window, vivid_protocol::overlay::DismissReason::Closed);
+        self.drain_events(owner(window.context().session().session_id()));
+        #[cfg(feature = "vector-render")]
+        self.prune_native();
+        self.displayed
+            .retain(|id, _| self.windows.get(*id).is_some());
+        self.editor_carets
+            .retain(|id, _| self.windows.get(*id).is_some());
+        self.accepted
+            .retain(|id, _| self.windows.get(*id).is_some());
+        self.semantics
+            .retain(|id, _| self.windows.get(*id).is_some());
+    }
+
+    fn vector_frame(
+        &mut self,
+        window: SurfaceIdentity,
+        track_id: u64,
+        channel_generation: u64,
+        body: &[u8],
+    ) -> bool {
+        let session_id = window.context().session().session_id();
         let Ok(frame) = Frame::decode(body) else {
             return false;
         };
         if frame.canvas.validate_with_limits(&self.limits).is_err() {
             return false;
         }
-        let Some(window) = self.track_window(session_id, track_id) else {
+        if self.windows.get(window).is_none() {
             return false;
+        }
+        let submission = Submission {
+            address: WindowAddress {
+                context_id: window.context().context_id(),
+                surface_id: window.surface_id(),
+                generation: self.windows.get(window).map_or(0, |value| value.generation),
+            },
+            track_id,
+            channel_generation,
+            epoch: frame.epoch,
+            revision: frame.revision,
         };
         // Revisions advance across every track a window owns, including one being primed.
         let accepted = self.accepted.entry(window).or_insert(0);
@@ -926,14 +1380,16 @@ impl Overlays {
         }
         *accepted = frame.revision;
 
+        #[cfg(feature = "vector-render")]
+        if self.native.is_some() {
+            return self.accept_native(window, track_id, channel_generation, frame);
+        }
+        #[cfg(not(feature = "vector-render"))]
+        let _ = channel_generation;
+
         // Anything the replacement supersedes resolves before the new scene publishes.
         if let Some(previous) = self.displayed.get(&window) {
-            self.resolve(
-                window,
-                track_id,
-                previous.revision,
-                PresentationOutcome::Superseded,
-            );
+            self.resolve(window, previous.submission, PresentationOutcome::Superseded);
         }
         let generation = self.windows.get(window).map_or(0, |w| w.generation);
         if self
@@ -945,20 +1401,17 @@ impl Overlays {
         }
         // A tree described the scene that was just replaced, so it no longer describes anything.
         self.semantics.remove(&window);
+        self.editor_carets.remove(&window);
         self.displayed.insert(
             window,
             PresentedScene {
                 window,
                 revision: frame.revision,
                 canvas: frame.canvas,
+                submission,
             },
         );
-        self.resolve(
-            window,
-            track_id,
-            frame.revision,
-            PresentationOutcome::Presented,
-        );
+        self.resolve(window, submission, PresentationOutcome::Presented);
         self.drain_events(owner(session_id));
         true
     }
@@ -966,25 +1419,11 @@ impl Overlays {
     fn resolve(
         &mut self,
         window: SurfaceIdentity,
-        track_id: u64,
-        revision: u64,
+        submission: Submission,
         outcome: PresentationOutcome,
     ) {
-        let Some(state) = self.windows.get(window) else {
-            return;
-        };
         let result = SubmissionOutcome {
-            submission: Submission {
-                address: WindowAddress {
-                    context_id: window.context().context_id(),
-                    surface_id: window.surface_id(),
-                    generation: state.generation,
-                },
-                track_id,
-                channel_generation: 1,
-                epoch: 1,
-                revision,
-            },
+            submission,
             outcome,
         };
         if let Ok(payload) = result.payload() {
@@ -999,7 +1438,13 @@ impl Overlays {
         }
     }
 
-    fn vector_asset(&mut self, session_id: u64, track_id: u64, body: &[u8]) -> bool {
+    fn vector_asset(
+        &mut self,
+        window: SurfaceIdentity,
+        track_id: u64,
+        generation: u64,
+        body: &[u8],
+    ) -> bool {
         if body.len() < 16 {
             return false;
         }
@@ -1017,24 +1462,34 @@ impl Overlays {
         }
         let highest = self
             .highest_asset
-            .entry((session_id, track_id))
+            .entry((window, track_id, generation))
             .or_insert(0);
         if id <= *highest {
             return false;
         }
         *highest = id;
-        self.assets
-            .insert((session_id, track_id, id), RetainedAsset { width, height });
+        self.assets.insert(
+            (window, track_id, generation, id),
+            RetainedAsset { width, height },
+        );
         true
     }
 
-    fn release_asset(&mut self, session_id: u64, track_id: u64, body: &[u8]) -> bool {
+    fn release_asset(
+        &mut self,
+        window: SurfaceIdentity,
+        track_id: u64,
+        generation: u64,
+        body: &[u8],
+    ) -> bool {
         let Ok(bytes) = <[u8; 8]>::try_from(body) else {
             return false;
         };
         let id = u64::from_be_bytes(bytes);
         // Displayed scenes keep their references; only future lookup is removed.
-        self.assets.remove(&(session_id, track_id, id)).is_some()
+        self.assets
+            .remove(&(window, track_id, generation, id))
+            .is_some()
     }
 
     // ---- session lifecycle ------------------------------------------------------------------
@@ -1043,27 +1498,32 @@ impl Overlays {
     /// as a producer disconnect must: an unrelated session that reused the same local context,
     /// surface, track, or asset numbers keeps its own state untouched.
     pub(crate) fn remove_session(&mut self, session_id: u64) {
+        self.channels
+            .retain(|(window, _), _| window.context().session().session_id() != session_id);
+        #[cfg(feature = "vector-render")]
+        if let Some(native) = &mut self.native {
+            native.remove_owner(session_id);
+        }
         let owner = owner(session_id);
         self.windows.revoke_owner(owner);
-        self.tracks.retain(|(session, _), _| *session != session_id);
+        self.tracks
+            .retain(|(session, _, _), _| *session != session_id);
         self.displayed
             .retain(|id, _| id.context().session().session_id() != session_id);
         self.accepted
             .retain(|id, _| id.context().session().session_id() != session_id);
         self.assets
-            .retain(|(session, _, _), _| *session != session_id);
+            .retain(|(window, _, _, _), _| window.context().session().session_id() != session_id);
         self.highest_asset
-            .retain(|(session, _), _| *session != session_id);
+            .retain(|(window, _, _), _| window.context().session().session_id() != session_id);
         self.semantics
             .retain(|id, _| id.context().session().session_id() != session_id);
-        if self
-            .last_gesture
-            .is_some_and(|(id, _)| id.context().session().session_id() == session_id)
-        {
-            self.last_gesture = None;
-        }
+        self.editor_carets
+            .retain(|id, _| id.context().session().session_id() != session_id);
+        self.clear_owner_gesture(session_id);
         self.pending.remove(&session_id);
-        self.lane_generation.remove(&session_id);
+        self.input_leases.remove(&session_id);
+        self.last_pointer.remove(&session_id);
         self.viewports.remove(&session_id);
         self.active_sessions.remove(&session_id);
     }
@@ -1072,9 +1532,9 @@ impl Overlays {
 
     /// The cursor the pointer currently calls for, through the same state machine a real host
     /// drives.
-    #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
-        self.windows.cursor()
+    #[cfg(feature = "testing")]
+    pub(crate) fn cursor(&self, pane: PaneId) -> Option<vivid_protocol::vector::CursorShape> {
+        self.windows.cursor(pane)
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -1088,14 +1548,14 @@ impl Overlays {
     }
 
     /// Clipboard text this presenter accepted, in acceptance order.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub(crate) fn clipboard(&self) -> &[String] {
         &self.clipboard
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn focused(&self) -> Option<SurfaceIdentity> {
-        self.windows.focus()
+    pub(crate) fn focused(&self, pane: PaneId) -> Option<SurfaceIdentity> {
+        self.windows.focus(pane)
     }
 
     /// One window's current bounds, mode, visibility, generation and revision, if it exists. Read
@@ -1130,9 +1590,20 @@ impl Overlays {
     /// rather than a position, so routing it for a pane that does not hold the focused window
     /// would deliver a keystroke to another pane's producer.
     pub(crate) fn focus_belongs_to(&self, sessions: &[u64]) -> bool {
-        self.windows
-            .focus()
-            .is_some_and(|id| sessions.contains(&id.context().session().session_id()))
+        let Some(pane) = self.windows.pane_of_sessions(sessions) else {
+            return false;
+        };
+        #[cfg(feature = "vector-render")]
+        if !self.native_ready(sessions) {
+            return false;
+        }
+        self.windows.focus(pane).is_some_and(|id| {
+            #[cfg(feature = "vector-render")]
+            if !self.native_input_valid(id) {
+                return false;
+            }
+            sessions.contains(&id.context().session().session_id())
+        })
     }
 
     /// Deliver a pointer event through the same hit test a real host performs, against the
@@ -1145,9 +1616,27 @@ impl Overlays {
         modifiers: u32,
         pressure: Option<vivid_protocol::vector::Scalar>,
     ) -> bool {
-        let clicks = self.count_clicks(position, button);
+        let Some(pane) = self.windows.pane_of_sessions(sessions) else {
+            return false;
+        };
+        #[cfg(feature = "vector-render")]
+        self.revoke_native_input(sessions);
+        for owner in sessions {
+            self.last_pointer.insert(*owner, position);
+        }
+        let clicks = 0;
+        #[cfg(feature = "vector-render")]
+        let native = self.native_hits(sessions);
+        #[cfg(feature = "vector-render")]
+        let scenes = if native.is_some() {
+            Vec::new()
+        } else {
+            self.scenes_of(sessions)
+        };
+        #[cfg(not(feature = "vector-render"))]
         let scenes = self.scenes_of(sessions);
         let consumed = self.windows.pointer(
+            pane,
             PointerReport {
                 position,
                 button,
@@ -1156,6 +1645,10 @@ impl Overlays {
                 pressure,
             },
             |id, point| {
+                #[cfg(feature = "vector-render")]
+                if let Some(native) = &native {
+                    return native.get(&id).and_then(|scene| scene.hit(point));
+                }
                 scenes
                     .iter()
                     .find(|scene| scene.window == id)
@@ -1165,10 +1658,7 @@ impl Overlays {
         if consumed && button.is_some_and(|(_, down)| down) {
             // Read after the dispatch: that is what settles which window the press reached. A
             // press that reached no window clears any gesture a producer might otherwise bank.
-            self.last_gesture = self
-                .windows
-                .hovered_window()
-                .map(|id| (id, std::time::Instant::now()));
+            self.record_gesture(pane, self.windows.hovered_window(pane));
         }
         self.drain_events_of(sessions);
         consumed
@@ -1181,10 +1671,31 @@ impl Overlays {
         scroll: Scroll,
         modifiers: u32,
     ) -> bool {
+        let Some(pane) = self.windows.pane_of_sessions(sessions) else {
+            return false;
+        };
+        #[cfg(feature = "vector-render")]
+        self.revoke_native_input(sessions);
+        #[cfg(feature = "vector-render")]
+        let native = self.native_hits(sessions);
+        #[cfg(feature = "vector-render")]
+        let scenes = if native.is_some() {
+            Vec::new()
+        } else {
+            self.scenes_of(sessions)
+        };
+        #[cfg(not(feature = "vector-render"))]
         let scenes = self.scenes_of(sessions);
         let consumed = self
             .windows
-            .wheel(position, scroll, modifiers, |id, point| {
+            .wheel(pane, position, scroll, modifiers, |id, point| {
+                #[cfg(feature = "vector-render")]
+                if let Some(native) = &native {
+                    return native
+                        .get(&id)
+                        .and_then(|scene| scene.hit(point))
+                        .map(|hit| (hit.id, hit.role));
+                }
                 scenes
                     .iter()
                     .find(|scene| scene.window == id)
@@ -1196,37 +1707,35 @@ impl Overlays {
     }
 
     pub(crate) fn keyboard(&mut self, sessions: &[u64], event: Event, escape: bool) -> bool {
+        let Some(pane) = self.windows.pane_of_sessions(sessions) else {
+            return false;
+        };
+        #[cfg(feature = "vector-render")]
+        self.revoke_native_input(sessions);
         if !self.focus_belongs_to(sessions) {
             return false;
         }
         if matches!(event, Event::Key { down: true, .. }) {
-            self.last_gesture = self
-                .windows
-                .focus()
-                .map(|id| (id, std::time::Instant::now()));
+            self.record_gesture(pane, self.windows.focus(pane));
         }
-        let consumed = self.windows.keyboard(event, escape);
+        let consumed = self.windows.keyboard(pane, event, escape);
         self.drain_events_of(sessions);
         consumed
     }
 
-    /// Tell one pane's windows that the pane gained or lost the terminal's focus.
-    ///
-    /// One host serves every pane, so the move only belongs to this pane when the focus it carries
-    /// does: losing focus is the pane that holds it, and regaining it is the pane whose window
-    /// would come back. Asking the state machine instead of tracking a second copy is what keeps a
-    /// pane from pulling another pane's window in or out of focus.
-    pub(crate) fn set_pane_focus(&mut self, sessions: &[u64], focused: bool) {
-        let moved = if focused {
-            self.windows.restorable_focus()
-        } else {
-            self.windows.focus()
-        };
-        if !moved.is_some_and(|id| sessions.contains(&id.context().session().session_id())) {
-            return;
+    /// Changes native focus only within the addressed pane.
+    pub(crate) fn set_pane_focus(&mut self, pane: PaneId, sessions: &[u64], focused: bool) {
+        if !focused {
+            self.last_click.remove(&pane);
+            self.last_gesture.remove(&pane);
         }
-        self.windows.set_pane_focus(focused);
+        self.windows.set_pane_focus(pane, focused);
         self.drain_events_of(sessions);
+    }
+    pub(crate) fn remove_pane(&mut self, pane: PaneId) {
+        self.windows.remove_pane(pane);
+        self.last_click.remove(&pane);
+        self.last_gesture.remove(&pane);
     }
 }
 
@@ -1302,6 +1811,9 @@ mod tests {
     }
 
     fn window(overlays: &mut Overlays, session_id: u64) -> SurfaceIdentity {
+        if overlays.windows.pane(owner(session_id)).is_none() {
+            overlays.bind_session(session_id, 1).unwrap();
+        }
         // Both owners deliberately name context 1, surface 1 and track 5.
         let id = owner(session_id).context(1).unwrap().surface(1).unwrap();
         overlays.note_track(session_id, 5, 1, 1);
@@ -1422,12 +1934,265 @@ mod tests {
     }
 
     #[test]
+    fn lease_requires_authenticated_renewal_and_expired_generations_cannot_reactivate() {
+        let mut overlays = Overlays::default();
+        overlays.bind_session(1, 1).unwrap();
+        let renew = |generation| {
+            Renew {
+                lane_generation: generation,
+                watchdog_us: 250_000,
+            }
+            .payload()
+            .unwrap()
+        };
+        overlays.open_lane(1, 7);
+        assert!(!overlays.input_enabled(1));
+        assert!(
+            overlays.expired_lanes().is_empty(),
+            "unrequested overlay input cannot expire shared desktop input"
+        );
+        assert!(overlays.renew(1, 0, &renew(8)).is_err());
+        assert!(overlays.renew(1, 0, &renew(7)).is_ok());
+        assert!(overlays.input_enabled(1));
+        overlays.input_leases.get_mut(&1).unwrap().deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert_eq!(overlays.expired_lanes(), vec![1]);
+        assert!(!overlays.input_enabled(1));
+        assert!(overlays.renew(1, 0, &renew(7)).is_err());
+        overlays.close_lane(1);
+        assert!(overlays.renew(1, 0, &renew(7)).is_err());
+        overlays.open_lane(1, 8);
+        assert!(!overlays.input_enabled(1));
+        assert!(overlays.renew(1, 0, &renew(8)).is_ok());
+    }
+
+    #[test]
+    fn relayed_window_focus_loss_preserves_pane_activation() {
+        let mut overlays = viewport();
+        let id = window(&mut overlays, 1);
+        overlays.open_lane(1, 1);
+        overlays
+            .renew(
+                1,
+                0,
+                &Renew {
+                    lane_generation: 1,
+                    watchdog_us: 5_000_000,
+                }
+                .payload()
+                .unwrap(),
+            )
+            .unwrap();
+        let input = |event| vivid_protocol::overlay::wire::InputEvent {
+            address: WindowAddress {
+                context_id: 1,
+                surface_id: 1,
+                generation: 1,
+            },
+            scene_revision: 0,
+            event,
+        };
+        assert!(overlays.relay_input(1, input(Event::Focus(true))));
+        assert_eq!(overlays.windows.focus(1), Some(id));
+        assert!(overlays.relay_input(1, input(Event::Focus(false))));
+        assert_eq!(overlays.windows.focus(1), None);
+        assert!(overlays.relay_input(1, input(Event::Focus(true))));
+        assert_eq!(overlays.windows.focus(1), Some(id));
+        overlays.set_pane_focus(1, &[1], false);
+        assert!(!overlays.relay_input(1, input(Event::Focus(true))));
+        assert_eq!(overlays.windows.focus(1), None);
+    }
+
+    #[test]
+    fn relayed_pointer_observations_are_translated_and_owned_for_capture() {
+        let mut overlays = viewport();
+        let a = window(&mut overlays, 1);
+        let b = window(&mut overlays, 2);
+        for session in [1, 2] {
+            assert!(overlays.media_record(session, messages::VECTOR_FRAME, 5, &hit_scene(1)));
+            overlays.open_lane(session, 1);
+            overlays
+                .renew(
+                    session,
+                    0,
+                    &Renew {
+                        lane_generation: 1,
+                        watchdog_us: 5_000_000,
+                    }
+                    .payload()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        overlays
+            .windows
+            .update(
+                a,
+                1,
+                1,
+                WindowOptions::new(
+                    Rect::new(30., 40., 100., 100.).unwrap(),
+                    WindowMode::Floating,
+                ),
+            )
+            .unwrap();
+        let pointer = |generation, x| vivid_protocol::overlay::wire::InputEvent {
+            address: WindowAddress {
+                context_id: 1,
+                surface_id: 1,
+                generation,
+            },
+            scene_revision: 1,
+            event: Event::Pointer {
+                position: Point::new(x, 6.).unwrap(),
+                region: 7,
+                button: Some((vivid_protocol::overlay::buttons::PRIMARY, true)),
+                modifiers: 0,
+                clicks: 1,
+                pressure: None,
+            },
+        };
+        let capture = Capture {
+            address: WindowAddress {
+                context_id: 1,
+                surface_id: 1,
+                generation: 1,
+            },
+            scene_revision: 1,
+            capture: true,
+        }
+        .payload()
+        .unwrap();
+        assert!(overlays.relay_input(1, pointer(1, 5.)));
+        assert_eq!(
+            overlays.last_pointer.get(&1),
+            Some(&Point::new(35., 46.).unwrap())
+        );
+        assert_eq!(overlays.last_pointer.get(&2), None);
+        assert!(overlays.capture(2, 1, &capture).is_err());
+        assert!(!overlays.relay_input(2, pointer(2, 99.)));
+        assert_eq!(overlays.last_pointer.get(&2), None);
+        assert!(overlays.relay_input(2, pointer(1, 8.)));
+        assert_eq!(
+            overlays.last_pointer.get(&2),
+            Some(&Point::new(8., 6.).unwrap())
+        );
+        assert!(overlays.capture(2, 1, &capture).is_ok());
+        overlays.remove_session(1);
+        assert_eq!(overlays.windows.captured_window(1), Some(b));
+        assert_eq!(
+            overlays.last_pointer.get(&2),
+            Some(&Point::new(8., 6.).unwrap())
+        );
+    }
+
+    #[test]
+    fn clipboard_gesture_cannot_survive_a_focus_round_trip() {
+        let mut overlays = viewport();
+        let a = window(&mut overlays, 1);
+        let b = window(&mut overlays, 2);
+        overlays.windows.request_focus(a).unwrap();
+        overlays.record_gesture(1, Some(a));
+        assert!(overlays.authorize_clipboard(1, a));
+        overlays.windows.request_focus(b).unwrap();
+        overlays.windows.request_focus(a).unwrap();
+        assert!(!overlays.authorize_clipboard(1, a));
+        overlays.record_gesture(1, Some(a));
+        assert!(overlays.authorize_clipboard(1, a));
+    }
+
+    #[test]
+    fn caret_metadata_and_focus_requests_are_scoped_to_the_authenticated_pane() {
+        let mut overlays = viewport();
+        overlays.remove_session(2);
+        overlays
+            .install_session_viewport(2, 2, sized(800., 600.))
+            .unwrap();
+        let a = window(&mut overlays, 1);
+        let b = window(&mut overlays, 2);
+        for (session, id, x) in [(1, a, 10.), (2, b, 20.)] {
+            overlays.open_lane(session, 1);
+            overlays
+                .renew(
+                    session,
+                    0,
+                    &Renew {
+                        lane_generation: 1,
+                        watchdog_us: 5_000_000,
+                    }
+                    .payload()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(overlays.media_record(session, messages::VECTOR_FRAME, 5, &hit_scene(1)));
+            overlays.windows.request_focus(id).unwrap();
+            overlays
+                .set_editor_geometry(
+                    session,
+                    1,
+                    &EditorGeometry {
+                        address: WindowAddress {
+                            context_id: 1,
+                            surface_id: 1,
+                            generation: 1,
+                        },
+                        scene_revision: 1,
+                        caret: Some(Rect::new(x, 5., 1., 10.).unwrap()),
+                    }
+                    .payload()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            overlays.editor_caret(1).unwrap().1.unwrap().origin.x.get(),
+            10.
+        );
+        assert_eq!(
+            overlays.editor_caret(2).unwrap().1.unwrap().origin.x.get(),
+            20.
+        );
+        overlays.set_pane_focus(1, &[1], false);
+        overlays.windows.request_focus(a).unwrap();
+        assert_eq!(overlays.editor_caret(1), None);
+        assert_eq!(
+            overlays.editor_caret(2).unwrap().1.unwrap().origin.x.get(),
+            20.
+        );
+        overlays.remove_session(1);
+        assert_eq!(
+            overlays.editor_caret(2).unwrap().1.unwrap().origin.x.get(),
+            20.
+        );
+    }
+
+    #[cfg(feature = "vector-render")]
+    #[test]
+    fn old_focus_cleanup_cannot_release_a_new_capture() {
+        let mut overlays = viewport();
+        let a = window(&mut overlays, 1);
+        let b = window(&mut overlays, 2);
+        overlays.windows.request_focus(a).unwrap();
+        let old = overlays.windows.focus_generation(1).unwrap();
+        overlays.windows.request_focus(b).unwrap();
+        overlays.windows.request_focus(a).unwrap();
+        overlays
+            .windows
+            .capture_pointer(a, Point::new(5., 5.).unwrap())
+            .unwrap();
+        overlays.native_cancel(a, old);
+        assert_eq!(overlays.windows.captured_window(1), Some(a));
+        overlays.native_cancel(a, overlays.windows.focus_generation(1).unwrap());
+        assert_eq!(overlays.windows.captured_window(1), None);
+    }
+
+    #[test]
     fn a_lane_that_opens_is_owed_the_environment_before_the_viewport() {
         // The spec requires an initial snapshot after lane authentication, and a producer that
         // adopts the host's font wants it before it lays anything out.
         let mut overlays = Overlays::default();
         overlays.install_viewport(1, 320., 240.);
-        overlays.open_lane(1);
+        overlays.open_lane(1, 1);
         let queued: Vec<u16> = overlays
             .take_pending(1)
             .into_iter()
@@ -1547,11 +2312,11 @@ mod tests {
             overlays.take_pending(2).is_empty(),
             "the other pane's owner hears nothing about it"
         );
-        assert_eq!(overlays.focused(), Some(first));
+        assert_eq!(overlays.focused(1), Some(first));
 
         assert!(overlays.pointer(&[2], position, press, 0, None));
         assert!(!overlays.take_pending(2).is_empty());
-        assert_eq!(overlays.focused(), Some(second));
+        assert_eq!(overlays.focused(1), Some(second));
 
         // A pane with no overlay window of its own consumes nothing at that same position.
         assert!(!overlays.pointer(&[3], position, press, 0, None));
@@ -1567,7 +2332,7 @@ mod tests {
         let position = Point::new(5., 5.).expect("position");
         let press = Some((vivid_protocol::overlay::buttons::PRIMARY, true));
         assert!(overlays.pointer(&[1], position, press, 0, None));
-        assert_eq!(overlays.focused(), Some(first));
+        assert_eq!(overlays.focused(1), Some(first));
 
         let key = Event::Key {
             physical: 0x04,
@@ -1588,6 +2353,10 @@ mod tests {
     #[test]
     fn a_pane_losing_the_terminal_focus_only_moves_its_own_window_and_can_get_it_back() {
         let mut overlays = viewport();
+        overlays.remove_session(2);
+        overlays
+            .install_session_viewport(2, 2, sized(800., 600.))
+            .unwrap();
         let first = window(&mut overlays, 1);
         window(&mut overlays, 2);
         assert!(overlays.media_record(1, messages::VECTOR_FRAME, 5, &hit_scene(1)));
@@ -1595,38 +2364,38 @@ mod tests {
         let position = Point::new(5., 5.).expect("position");
         let press = Some((vivid_protocol::overlay::buttons::PRIMARY, true));
         assert!(overlays.pointer(&[1], position, press, 0, None));
-        assert_eq!(overlays.focused(), Some(first));
+        assert_eq!(overlays.focused(1), Some(first));
 
         // The other pane is told it gained focus first, which is the order a focus move arrives in
         // when the gaining pane sorts ahead of the losing one.
-        overlays.set_pane_focus(&[2], true);
+        overlays.set_pane_focus(2, &[2], true);
         assert_eq!(
-            overlays.focused(),
+            overlays.focused(1),
             Some(first),
             "another pane gaining focus must not pull the focused window away from its owner"
         );
-        overlays.set_pane_focus(&[2], false);
+        overlays.set_pane_focus(2, &[2], false);
         assert_eq!(
-            overlays.focused(),
+            overlays.focused(1),
             Some(first),
             "nor may it push that window out of focus"
         );
 
-        overlays.set_pane_focus(&[1], false);
+        overlays.set_pane_focus(1, &[1], false);
         assert_eq!(
-            overlays.focused(),
+            overlays.focused(1),
             None,
             "the owning pane's loss reaches its window"
         );
-        overlays.set_pane_focus(&[2], true);
+        overlays.set_pane_focus(2, &[2], true);
         assert_eq!(
-            overlays.focused(),
+            overlays.focused(1),
             None,
             "an unrelated pane cannot claim the remembered focus"
         );
-        overlays.set_pane_focus(&[1], true);
+        overlays.set_pane_focus(1, &[1], true);
         assert_eq!(
-            overlays.focused(),
+            overlays.focused(1),
             Some(first),
             "the owning pane gets its window's focus back"
         );
@@ -1660,5 +2429,71 @@ mod tests {
         // The surviving owner can still commit a subsequent update.
         assert!(overlays.media_record(2, messages::VECTOR_FRAME, 5, &scene(0x00ff00ff, 2)));
         assert_eq!(overlays.accepted.get(&second), Some(&2));
+    }
+    #[test]
+    fn assets_use_complete_window_and_channel_namespaces_and_status_keeps_exact_submission() {
+        let mut overlays = Overlays::default();
+        let a = window(&mut overlays, 1);
+        let peer = window(&mut overlays, 2);
+        let b = owner(1).context(2).unwrap().surface(1).unwrap();
+        overlays.note_track(1, 5, 2, 1);
+        overlays
+            .windows
+            .create(
+                b,
+                1,
+                WindowOptions::new(Rect::new(0., 0., 100., 100.).unwrap(), WindowMode::Floating),
+            )
+            .unwrap();
+        for (id, width) in [(a, 2), (b, 3), (peer, 4)] {
+            assert!(overlays.media_record_for(
+                id,
+                messages::VECTOR_ASSET,
+                5,
+                1,
+                &asset(1, width, width)
+            ));
+        }
+        assert!(overlays.media_record_for(a, messages::VECTOR_ASSET, 5, 2, &asset(1, 5, 5)));
+        assert!(!overlays.media_record_for(a, messages::VECTOR_ASSET, 5, 1, &asset(2, 2, 2)));
+        assert_eq!(overlays.assets[&(b, 5, 1, 1)].width, 3);
+        assert_eq!(overlays.assets[&(peer, 5, 1, 1)].width, 4);
+        overlays.install_viewport(1, 100., 100.);
+        let frame = Frame {
+            epoch: 17,
+            revision: 1,
+            canvas: Canvas::new(),
+        }
+        .encode()
+        .unwrap();
+        assert!(overlays.media_record_for(a, messages::VECTOR_FRAME, 5, 2, &frame));
+        let (_, payload) = overlays
+            .status(
+                1,
+                1,
+                &Query {
+                    context_id: 1,
+                    surface_id: 1,
+                }
+                .payload()
+                .unwrap(),
+            )
+            .unwrap();
+        let status = Status::decode(owner(1), 1, &Value::Map(payload)).unwrap();
+        let submission = status.active.unwrap();
+        assert_eq!(
+            (
+                submission.track_id,
+                submission.channel_generation,
+                submission.epoch
+            ),
+            (5, 2, 17)
+        );
+        overlays.forget_track(a, 5);
+        assert!(overlays.media_record_for(a, messages::VECTOR_ASSET, 5, 1, &asset(1, 6, 6)));
+        overlays.close_surface(a);
+        assert!(!overlays.displayed.contains_key(&a));
+        assert_eq!(overlays.assets[&(b, 5, 1, 1)].width, 3);
+        assert_eq!(overlays.assets[&(peer, 5, 1, 1)].width, 4);
     }
 }

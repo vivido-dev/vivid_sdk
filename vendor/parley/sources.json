@@ -1,0 +1,41 @@
+{
+  "crate": "parley",
+  "version": "0.12.0",
+  "archive_sha256": "61bd0c0c1737f0b3d3726dc06b225083af213b61913e4fbae1670613a106c6ce",
+  "vcs_revision": "6e1143dda817360dd3a2a64f9133c6e5dfabd881",
+  "source": "https://static.crates.io/crates/parley/parley-0.12.0.crate",
+  "test_fixtures": {
+    "test-fonts/roboto_fonts/Roboto-Regular.ttf": {
+      "upstream_path": "parley_dev/assets/fonts/roboto_fonts/Roboto-Regular.ttf",
+      "sha256": "319cff6e7a31f0f2a41c475dca42890aa5d19fe16017e2290f8c1d4e14f76481"
+    },
+    "test-fonts/roboto_fonts/LICENSE-Roboto-Regular.txt": {
+      "upstream_path": "parley_dev/assets/fonts/roboto_fonts/LICENSE-Roboto-Regular.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "test-fonts/noto_fonts/NotoKufiArabic-Regular.otf": {
+      "upstream_path": "parley_dev/assets/fonts/noto_fonts/NotoKufiArabic-Regular.otf",
+      "sha256": "da737b6c2187af99294269aa5e439dca28c48e70f4a95755e705300931fa2540"
+    },
+    "test-fonts/noto_fonts/NotoKufiArabic-Regular-LICENSE.txt": {
+      "upstream_path": "parley_dev/assets/fonts/noto_fonts/NotoKufiArabic-Regular-LICENSE.txt",
+      "sha256": "fa27a4641d00020ca4522b71d7e9d2eddafcd5031a2e55b4cfb3eedfe33a865a"
+    },
+    "test-fonts/noto_color_emoji/NotoColorEmoji-Subset.ttf": {
+      "upstream_path": "parley_dev/assets/fonts/noto_color_emoji/NotoColorEmoji-Subset.ttf",
+      "sha256": "2f73ac6024e670d0c0f8d6efef912d7148ed4d1d8037a81daa1834c67b385688"
+    },
+    "test-fonts/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf": {
+      "upstream_path": "parley_dev/assets/fonts/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf",
+      "sha256": "de05883eb85eee6328c9150df552650dfa74656d934d5ef9be3bbe95b03b4b9c"
+    },
+    "test-fonts/noto_color_emoji/LICENSE.txt": {
+      "upstream_path": "parley_dev/assets/fonts/noto_color_emoji/LICENSE.txt",
+      "sha256": "573154bdf29cd5963f2be063be3dda0055904f2ad8228c0fd57948580d927ea2"
+    },
+    "test-fonts/noto_color_emoji/README.md": {
+      "upstream_path": "parley_dev/assets/fonts/noto_color_emoji/README.md",
+      "sha256": "0ed3c6a8a97087eaa404db9fea2199f21f96c9bd6d95db3a6a7a7ae56df6e467"
+    }
+  }
+}

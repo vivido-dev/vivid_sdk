@@ -259,6 +259,19 @@ impl PresenterConfig {
         }
     }
 
+    /// Creates a desktop presenter with authenticated physical input support.
+    ///
+    /// Input starts disabled. The host must acknowledge presentation and explicitly
+    /// select an eligible target through `VirtualVivid::set_desktop_input_target`.
+    /// Producers still request a fresh input epoch after every revocation.
+    pub fn desktop_with_input(media: MediaConfig, target: DesktopTarget) -> Self {
+        let mut config = Self::desktop(media, target);
+        config
+            .supported_profiles
+            .push(registry::DESKTOP_INPUT.into());
+        config
+    }
+
     pub fn with_resource_contract(mut self, contract: ResourceContract) -> Self {
         self.resource_contract = Some(contract);
         self

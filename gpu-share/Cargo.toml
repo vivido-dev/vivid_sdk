@@ -1,0 +1,24 @@
+[package]
+name = "vivid_gpu_share"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Bounded immutable native GPU frames for Vivid application hosts"
+
+[features]
+default = []
+gui = ["dep:gpui"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "metal", "wgsl"] }
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVReturn", "objc2", "objc2-metal"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLTexture", "MTLResource", "MTLPixelFormat", "MTLTypes"] }
+gpui = { path = "../gui/crates/gpui", optional = true, default-features = false }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+pollster = "0.4"
+
+[workspace]

@@ -8,7 +8,7 @@ use vivid_protocol::{
     vector::{self, AssetRelease, Brush, Command, Frame, ImageAsset},
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct VectorRetention {
     assets: BTreeMap<u64, Arc<[u8]>>,
     scene_assets: BTreeMap<u64, Arc<[u8]>>,
@@ -16,6 +16,10 @@ pub(super) struct VectorRetention {
 }
 
 impl VectorRetention {
+    #[cfg(feature = "vector-render")]
+    pub fn contains_asset(&self, id: u64) -> bool {
+        self.assets.contains_key(&id) || self.scene_assets.contains_key(&id)
+    }
     pub fn frame(&self) -> Option<Arc<[u8]>> {
         self.frame.clone()
     }

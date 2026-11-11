@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = [
+    "wayland-backend",
+    "wayland-client",
+    "wayland-server",
+    "wayland-protocols",
+    "wayland-protocols-wlr",
+    "wayland-protocols-misc",
+    "wayland-cursor",
+    "wayland-egl",
+]

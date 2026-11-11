@@ -1,0 +1,2294 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -369,8 +369,8 @@
+ dependencies = [
+  "calloop 0.13.0",
+  "rustix 0.38.44",
+- "wayland-backend",
+- "wayland-client",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
+ ]
+ 
+ [[package]]
+@@ -705,9 +705,9 @@
+ 
+ [[package]]
+ name = "dlib"
+-version = "0.5.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "330c60081dcc4c72131f8eb70510f1ac07223e5d4163db481a04a0befcffa412"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
+ dependencies = [
+  "libloading",
+ ]
+@@ -875,8 +875,8 @@
+  "drm-fourcc",
+  "gbm-sys",
+  "libc",
+- "wayland-backend",
+- "wayland-server",
++ "wayland-backend 0.3.10",
++ "wayland-server 0.31.9",
+ ]
+ 
+ [[package]]
+@@ -1942,9 +1942,9 @@
+ 
+ [[package]]
+ name = "quick-xml"
+-version = "0.37.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
++version = "0.41.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+ dependencies = [
+  "memchr",
+ ]
+@@ -2381,14 +2381,14 @@
+  "tracing",
+  "tracing-subscriber",
+  "udev",
+- "wayland-backend",
+- "wayland-client",
+- "wayland-cursor",
++ "wayland-backend 0.3.17",
++ "wayland-client 0.31.15",
++ "wayland-cursor 0.31.14",
+  "wayland-egl",
+- "wayland-protocols",
++ "wayland-protocols 0.32.13",
+  "wayland-protocols-misc",
+- "wayland-protocols-wlr",
+- "wayland-server",
++ "wayland-protocols-wlr 0.3.12",
++ "wayland-server 0.31.14",
+  "wayland-sys",
+  "winit",
+  "x11rb",
+@@ -2410,12 +2410,12 @@
+  "memmap2",
+  "rustix 0.38.44",
+  "thiserror 1.0.69",
+- "wayland-backend",
+- "wayland-client",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
+  "wayland-csd-frame",
+- "wayland-cursor",
+- "wayland-protocols",
+- "wayland-protocols-wlr",
++ "wayland-cursor 0.31.10",
++ "wayland-protocols 0.32.8",
++ "wayland-protocols-wlr 0.3.8",
+  "wayland-scanner",
+  "xkeysym",
+ ]
+@@ -2821,6 +2821,18 @@
+ ]
+ 
+ [[package]]
++name = "wayland-backend"
++version = "0.3.17"
++dependencies = [
++ "cc",
++ "downcast-rs",
++ "rustix 1.0.7",
++ "scoped-tls",
++ "smallvec",
++ "wayland-sys",
++]
++
++[[package]]
+ name = "wayland-client"
+ version = "0.31.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -2828,7 +2840,17 @@
+ dependencies = [
+  "bitflags 2.9.0",
+  "rustix 0.38.44",
+- "wayland-backend",
++ "wayland-backend 0.3.10",
++ "wayland-scanner",
++]
++
++[[package]]
++name = "wayland-client"
++version = "0.31.15"
++dependencies = [
++ "bitflags 2.9.0",
++ "rustix 1.0.7",
++ "wayland-backend 0.3.17",
+  "wayland-scanner",
+ ]
+ 
+@@ -2840,7 +2862,7 @@
+ dependencies = [
+  "bitflags 2.9.0",
+  "cursor-icon",
+- "wayland-backend",
++ "wayland-backend 0.3.10",
+ ]
+ 
+ [[package]]
+@@ -2850,17 +2872,24 @@
+ checksum = "a65317158dec28d00416cb16705934070aef4f8393353d41126c54264ae0f182"
+ dependencies = [
+  "rustix 0.38.44",
+- "wayland-client",
++ "wayland-client 0.31.10",
++ "xcursor",
++]
++
++[[package]]
++name = "wayland-cursor"
++version = "0.31.14"
++dependencies = [
++ "rustix 1.0.7",
++ "wayland-client 0.31.15",
+  "xcursor",
+ ]
+ 
+ [[package]]
+ name = "wayland-egl"
+ version = "0.32.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7dc56cc3ef057a5efb434e58a0712ea30d2823b736ba9faa4669854ac6454395"
+-dependencies = [
+- "wayland-backend",
++dependencies = [
++ "wayland-backend 0.3.17",
+  "wayland-sys",
+ ]
+ 
+@@ -2871,23 +2900,30 @@
+ checksum = "779075454e1e9a521794fed15886323ea0feda3f8b0fc1390f5398141310422a"
+ dependencies = [
+  "bitflags 2.9.0",
+- "wayland-backend",
+- "wayland-client",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
+  "wayland-scanner",
+- "wayland-server",
++]
++
++[[package]]
++name = "wayland-protocols"
++version = "0.32.13"
++dependencies = [
++ "bitflags 2.9.0",
++ "wayland-backend 0.3.17",
++ "wayland-scanner",
++ "wayland-server 0.31.14",
+ ]
+ 
+ [[package]]
+ name = "wayland-protocols-misc"
+-version = "0.3.8"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "635cf2968bd88599445b25a2eeef655d463bb04f9aed04e4bf8c2018f3d4fc41"
++version = "0.3.12"
+ dependencies = [
+  "bitflags 2.9.0",
+- "wayland-backend",
+- "wayland-protocols",
++ "wayland-backend 0.3.17",
++ "wayland-protocols 0.32.13",
+  "wayland-scanner",
+- "wayland-server",
++ "wayland-server 0.31.14",
+ ]
+ 
+ [[package]]
+@@ -2897,9 +2933,9 @@
+ checksum = "4fd38cdad69b56ace413c6bcc1fbf5acc5e2ef4af9d5f8f1f9570c0c83eae175"
+ dependencies = [
+  "bitflags 2.9.0",
+- "wayland-backend",
+- "wayland-client",
+- "wayland-protocols",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
++ "wayland-protocols 0.32.8",
+  "wayland-scanner",
+ ]
+ 
+@@ -2910,18 +2946,28 @@
+ checksum = "1cb6cdc73399c0e06504c437fe3cf886f25568dd5454473d565085b36d6a8bbf"
+ dependencies = [
+  "bitflags 2.9.0",
+- "wayland-backend",
+- "wayland-client",
+- "wayland-protocols",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
++ "wayland-protocols 0.32.8",
+  "wayland-scanner",
+- "wayland-server",
++]
++
++[[package]]
++name = "wayland-protocols-wlr"
++version = "0.3.12"
++dependencies = [
++ "bitflags 2.9.0",
++ "wayland-backend 0.3.17",
++ "wayland-protocols 0.32.13",
++ "wayland-scanner",
++ "wayland-server 0.31.14",
+ ]
+ 
+ [[package]]
+ name = "wayland-scanner"
+-version = "0.31.6"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "896fdafd5d28145fce7958917d69f2fd44469b1d4e861cb5961bcbeebc6d1484"
++version = "0.31.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
+ dependencies = [
+  "proc-macro2",
+  "quick-xml",
+@@ -2937,15 +2983,26 @@
+  "bitflags 2.9.0",
+  "downcast-rs",
+  "rustix 0.38.44",
+- "wayland-backend",
++ "wayland-backend 0.3.10",
+  "wayland-scanner",
+ ]
+ 
+ [[package]]
++name = "wayland-server"
++version = "0.31.14"
++dependencies = [
++ "bitflags 2.9.0",
++ "downcast-rs",
++ "rustix 1.0.7",
++ "wayland-backend 0.3.17",
++ "wayland-scanner",
++]
++
++[[package]]
+ name = "wayland-sys"
+-version = "0.31.6"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "dbcebb399c77d5aa9fa5db874806ee7b4eba4e73650948e8f93963f128896615"
++version = "0.31.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+ dependencies = [
+  "dlib",
+  "libc",
+@@ -3277,9 +3334,9 @@
+  "unicode-segmentation",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+- "wayland-backend",
+- "wayland-client",
+- "wayland-protocols",
++ "wayland-backend 0.3.10",
++ "wayland-client 0.31.10",
++ "wayland-protocols 0.32.8",
+  "wayland-protocols-plasma",
+  "web-sys",
+  "web-time",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -342,22 +342,27 @@
+ optional = true
+ 
+ [dependencies.wayland-backend]
++path = "../wayland/wayland-backend"
+ version = "0.3.10"
+ optional = true
+ 
+ [dependencies.wayland-client]
++path = "../wayland/wayland-client"
+ version = "0.31.10"
+ optional = true
+ 
+ [dependencies.wayland-cursor]
++path = "../wayland/wayland-cursor"
+ version = "0.31.10"
+ optional = true
+ 
+ [dependencies.wayland-egl]
++path = "../wayland/wayland-egl"
+ version = "0.32.7"
+ optional = true
+ 
+ [dependencies.wayland-protocols]
++path = "../wayland/wayland-protocols"
+ version = "0.32.8"
+ features = [
+     "unstable",
+@@ -367,16 +372,19 @@
+ optional = true
+ 
+ [dependencies.wayland-protocols-misc]
++path = "../wayland/wayland-protocols-misc"
+ version = "0.3.8"
+ features = ["server"]
+ optional = true
+ 
+ [dependencies.wayland-protocols-wlr]
++path = "../wayland/wayland-protocols-wlr"
+ version = "0.3.8"
+ features = ["server"]
+ optional = true
+ 
+ [dependencies.wayland-server]
++path = "../wayland/wayland-server"
+ version = "0.31.9"
+ optional = true
+ 
+--- a/benches/geometry.rs
++++ b/benches/geometry.rs
+@@ -17,9 +17,9 @@
+     let max_x = stage.w - element_size.w;
+     let max_y = stage.h - element_size.h;
+ 
+-    let mut rand = rand::thread_rng();
+-    let x = rand.gen_range(0..max_x);
+-    let y = rand.gen_range(0..max_y);
++    let mut rand = rand::rng();
++    let x = rand.random_range(0..max_x);
++    let y = rand.random_range(0..max_y);
+     let test_element = Rectangle::new((x, y).into(), element_size);
+ 
+     let x_min = (test_element.loc.x - element_size.w) + 1;
+@@ -33,8 +33,8 @@
+ 
+     let opaque_regions = (0..2048)
+         .map(|_| {
+-            let x = rand.gen_range(x_min..=x_max);
+-            let y = rand.gen_range(y_min..=y_max);
++            let x = rand.random_range(x_min..=x_max);
++            let y = rand.random_range(y_min..=y_max);
+             Rectangle::new((x, y).into(), element_size)
+         })
+         .collect::<Vec<_>>();
+--- a/examples/compositor.rs
++++ b/examples/compositor.rs
+@@ -23,11 +23,12 @@
+     }
+ 
+     fn commit(&mut self, surface: &WlSurface) {
+-        dbg!("Commit", surface);
++        tracing::debug!(?surface, "Commit");
+     }
+ }
+ 
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
++    tracing_subscriber::fmt::init();
+     let mut display: Display<App> = Display::new()?;
+     let dh = display.handle();
+ 
+@@ -41,7 +42,7 @@
+ 
+     loop {
+         if let Some(stream) = listener.accept().unwrap() {
+-            println!("Got a client: {:?}", stream);
++            tracing::info!(?stream, "Got a client");
+ 
+             let client = display
+                 .handle()
+@@ -61,11 +62,11 @@
+ }
+ impl ClientData for ClientState {
+     fn initialized(&self, _client_id: ClientId) {
+-        println!("initialized");
++        tracing::info!("initialized");
+     }
+ 
+     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
+-        println!("disconnected");
++        tracing::info!("disconnected");
+     }
+ }
+ 
+--- a/examples/seat.rs
++++ b/examples/seat.rs
+@@ -29,6 +29,7 @@
+ }
+ 
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
++    tracing_subscriber::fmt::init();
+     let mut display: Display<App> = Display::new()?;
+     let dh = display.handle();
+ 
+@@ -50,7 +51,7 @@
+ 
+     loop {
+         if let Some(stream) = listener.accept().unwrap() {
+-            println!("Got a client: {:?}", stream);
++            tracing::info!(?stream, "Got a client");
+ 
+             let client = display
+                 .handle()
+@@ -84,11 +85,11 @@
+ struct ClientState(CompositorClientState);
+ impl ClientData for ClientState {
+     fn initialized(&self, _client_id: ClientId) {
+-        println!("initialized");
++        tracing::info!("initialized");
+     }
+ 
+     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
+-        println!("disconnected");
++        tracing::info!("disconnected");
+     }
+ }
+ 
+--- a/src/backend/egl/ffi.rs
++++ b/src/backend/egl/ffi.rs
+@@ -234,7 +234,7 @@
+     }
+ 
+     mod wayland_storage {
+-        use super::{FnPtr, __gl_imports::raw};
++        use super::{__gl_imports::raw, FnPtr};
+         pub static mut BindWaylandDisplayWL: FnPtr = FnPtr {
+             f: super::missing_fn_panic as *const raw::c_void,
+             is_loaded: false,
+@@ -255,8 +255,8 @@
+ 
+     #[allow(non_snake_case)]
+     pub mod DebugMessageControlKHR {
++        use super::__gl_imports::raw;
+         use super::FnPtr;
+-        use super::__gl_imports::raw;
+         use super::{metaloadfn, wayland_storage};
+ 
+         #[inline]
+@@ -279,7 +279,7 @@
+ 
+     #[allow(non_snake_case)]
+     pub mod BindWaylandDisplayWL {
+-        use super::{FnPtr, __gl_imports::raw, metaloadfn, wayland_storage};
++        use super::{__gl_imports::raw, metaloadfn, wayland_storage, FnPtr};
+ 
+         #[inline]
+         #[allow(dead_code)]
+@@ -301,7 +301,7 @@
+ 
+     #[allow(non_snake_case)]
+     pub mod UnbindWaylandDisplayWL {
+-        use super::{FnPtr, __gl_imports::raw, metaloadfn, wayland_storage};
++        use super::{__gl_imports::raw, metaloadfn, wayland_storage, FnPtr};
+ 
+         #[inline]
+         #[allow(dead_code)]
+@@ -323,7 +323,7 @@
+ 
+     #[allow(non_snake_case)]
+     pub mod QueryWaylandBufferWL {
+-        use super::{FnPtr, __gl_imports::raw, metaloadfn, wayland_storage};
++        use super::{__gl_imports::raw, metaloadfn, wayland_storage, FnPtr};
+ 
+         #[inline]
+         #[allow(dead_code)]
+--- a/src/backend/renderer/element/memory.rs
++++ b/src/backend/renderer/element/memory.rs
+@@ -341,19 +341,10 @@
+ }
+ 
+ /// A memory backed render buffer
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, Default)]
+ pub struct MemoryRenderBuffer {
+     id: Id,
+     inner: Arc<Mutex<MemoryRenderBufferInner>>,
+-}
+-
+-impl Default for MemoryRenderBuffer {
+-    fn default() -> Self {
+-        Self {
+-            id: Id::new(),
+-            inner: Default::default(),
+-        }
+-    }
+ }
+ 
+ impl MemoryRenderBuffer {
+--- a/src/backend/renderer/element/mod.rs
++++ b/src/backend/renderer/element/mod.rs
+@@ -68,6 +68,12 @@
+ impl Drop for ExternalId {
+     fn drop(&mut self) {
+         external_id::remove(self.0);
++    }
++}
++
++impl Default for Id {
++    fn default() -> Self {
++        Self::new()
+     }
+ }
+ 
+--- a/src/backend/renderer/element/solid.rs
++++ b/src/backend/renderer/element/solid.rs
+@@ -55,23 +55,12 @@
+ use super::{AsRenderElements, Element, Id, Kind, RenderElement};
+ 
+ /// A single color buffer
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, Default)]
+ pub struct SolidColorBuffer {
+     id: Id,
+     size: Size<i32, Logical>,
+     commit: CommitCounter,
+     color: Color32F,
+-}
+-
+-impl Default for SolidColorBuffer {
+-    fn default() -> Self {
+-        Self {
+-            id: Id::new(),
+-            size: Default::default(),
+-            commit: Default::default(),
+-            color: Default::default(),
+-        }
+-    }
+ }
+ 
+ impl SolidColorBuffer {
+--- a/src/input/keyboard/mod.rs
++++ b/src/input/keyboard/mod.rs
+@@ -12,7 +12,7 @@
+     sync::{Arc, Mutex},
+ };
+ use thiserror::Error;
+-use tracing::{debug, error, info, info_span, instrument, trace};
++use tracing::{debug, info, info_span, instrument, trace};
+ 
+ use xkbcommon::xkb::ffi::XKB_STATE_LAYOUT_EFFECTIVE;
+ pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
+@@ -1364,6 +1364,7 @@
+         } else if let Some((old_focus, _)) = self.inner.focus.take() {
+             trace!("Focus unset");
+             old_focus.leave(self.seat, data, serial);
++            data.focus_changed(self.seat, None);
+         }
+     }
+ }
+--- a/src/utils/serial.rs
++++ b/src/utils/serial.rs
+@@ -22,11 +22,7 @@
+ impl PartialOrd for Serial {
+     #[inline]
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        let distance = if self.0 > other.0 {
+-            self.0 - other.0
+-        } else {
+-            other.0 - self.0
+-        };
++        let distance = self.0.abs_diff(other.0);
+         if distance < u32::MAX / 2 {
+             self.0.partial_cmp(&other.0)
+         } else {
+--- a/src/wayland/commit_timing/mod.rs
++++ b/src/wayland/commit_timing/mod.rs
+@@ -385,11 +385,7 @@
+         let deadline = deadline.into();
+ 
+         let num_barriers = self.barriers.len();
+-        loop {
+-            let Some(barrier) = self.barriers.peek() else {
+-                break;
+-            };
+-
++        while let Some(barrier) = self.barriers.peek() {
+             if barrier.timestamp > deadline {
+                 break;
+             }
+--- a/src/wayland/compositor/cache.rs
++++ b/src/wayland/compositor/cache.rs
+@@ -81,6 +81,12 @@
+ }
+ 
+ impl<T> CachedState<T> {
++    pub(crate) fn total(&self, count: impl Fn(&T) -> usize) -> Option<usize> {
++        std::iter::once(&self.pending)
++            .chain(self.cache.iter().map(|(_, state)| state))
++            .chain(std::iter::once(&self.current))
++            .try_fold(0usize, |total, state| total.checked_add(count(state)))
++    }
+     /// Access the current state for `T`
+     pub fn current(&mut self) -> &mut T {
+         &mut self.current
+@@ -90,9 +96,23 @@
+     pub fn pending(&mut self) -> &mut T {
+         &mut self.pending
+     }
++
++    /// Override pending, committed and current snapshots of this state.
++    ///
++    /// This is useful when the lifetime of a state is controlled by another
++    /// object's commit, so already committed snapshots must not restore stale
++    /// values when they are applied later.
++    pub(crate) fn override_all(&mut self, mut update: impl FnMut(&mut T)) {
++        update(&mut self.pending);
++        for (_, state) in &mut self.cache {
++            update(state);
++        }
++        update(&mut self.current);
++    }
+ }
+ 
+ trait Cache: Downcast {
++    fn can_commit(&self, commit_id: Serial, limit: std::num::NonZeroUsize) -> bool;
+     fn commit(&self, commit_id: Option<Serial>, dh: &DisplayHandle);
+     fn apply_state(&self, commit_id: Serial, dh: &DisplayHandle);
+ }
+@@ -100,6 +120,10 @@
+ impl_downcast!(Cache);
+ 
+ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
++    fn can_commit(&self, commit_id: Serial, limit: std::num::NonZeroUsize) -> bool {
++        let state = self.lock().unwrap();
++        state.cache.len() < limit.get() || state.cache.back().is_some_and(|(id, _)| *id == commit_id)
++    }
+     fn commit(&self, commit_id: Option<Serial>, dh: &DisplayHandle) {
+         let mut guard = self.lock().unwrap();
+         let me = &mut *guard;
+@@ -160,6 +184,9 @@
+ }
+ 
+ impl MultiCache {
++    pub(crate) fn can_commit(&self, commit_id: Serial, limit: std::num::NonZeroUsize) -> bool {
++        self.caches.iter().all(|cache| cache.can_commit(commit_id, limit))
++    }
+     pub(crate) fn new() -> Self {
+         Self {
+             caches: appendlist::AppendList::new(),
+--- a/src/wayland/compositor/handlers.rs
++++ b/src/wayland/compositor/handlers.rs
+@@ -96,6 +96,10 @@
+                     id,
+                     RegionUserData {
+                         inner: Default::default(),
++                        limit: state
++                            .compositor_state()
++                            .limits
++                            .map(|limits| limits.region_rectangles),
+                     },
+                 );
+             }
+@@ -146,6 +150,24 @@
+         into.frame_callbacks.extend(self.frame_callbacks);
+         into.client_scale = self.client_scale;
+     }
++}
++
++// Count every retained frontend snapshot before changing pending state. Merging
++// commits moves these payloads, so it cannot multiply their aggregate charge.
++fn retain_surface_payload(
++    surface: &WlSurface,
++    limit: Option<std::num::NonZeroUsize>,
++    count: impl Fn(&SurfaceAttributes) -> usize,
++    append: impl FnOnce(&mut SurfaceAttributes),
++) -> bool {
++    PrivateSurfaceData::with_states(surface, |states| {
++        let mut cached = states.cached_state.get::<SurfaceAttributes>();
++        if limit.is_some_and(|limit| !cached.total(count).is_some_and(|total| total < limit.get())) {
++            return false;
++        }
++        append(cached.pending());
++        true
++    })
+ }
+ 
+ /// User data for WlSurface
+@@ -212,31 +234,43 @@
+             }
+             wl_surface::Request::Damage { x, y, width, height } => {
+                 let client_scale = state.client_compositor_state(client).client_scale();
+-                PrivateSurfaceData::with_states(surface, |states| {
+-                    states
+-                        .cached_state
+-                        .get::<SurfaceAttributes>()
+-                        .pending()
+-                        .damage
+-                        .push(Damage::Surface(
+-                            Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
+-                                .to_f64()
+-                                .to_logical(client_scale)
+-                                .to_i32_round(),
+-                        ));
+-                });
++                let limit = state
++                    .compositor_state()
++                    .limits
++                    .map(|limits| limits.damage_rectangles);
++                let damage = Damage::Surface(
++                    Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
++                        .to_f64()
++                        .to_logical(client_scale)
++                        .to_i32_round(),
++                );
++                if !retain_surface_payload(
++                    surface,
++                    limit,
++                    |attrs| attrs.damage.len(),
++                    |attrs| attrs.damage.push(damage),
++                ) {
++                    crate::wayland::resource_quota_exceeded(client, handle, "hosted damage quota exceeded");
++                }
+             }
+             wl_surface::Request::Frame { callback } => {
+                 let callback = data_init.init(callback, ());
+-
+-                PrivateSurfaceData::with_states(surface, |states| {
+-                    states
+-                        .cached_state
+-                        .get::<SurfaceAttributes>()
+-                        .pending()
+-                        .frame_callbacks
+-                        .push(callback.clone());
+-                });
++                let limit = state
++                    .compositor_state()
++                    .limits
++                    .map(|limits| limits.frame_callbacks);
++                if !retain_surface_payload(
++                    surface,
++                    limit,
++                    |attrs| attrs.frame_callbacks.len(),
++                    |attrs| attrs.frame_callbacks.push(callback),
++                ) {
++                    crate::wayland::resource_quota_exceeded(
++                        client,
++                        handle,
++                        "hosted pending callback quota exceeded",
++                    );
++                }
+             }
+             wl_surface::Request::SetOpaqueRegion { region } => {
+                 let attributes = region.map(|r| {
+@@ -287,6 +321,8 @@
+                             .pending()
+                             .buffer_transform = transform;
+                     });
++                } else {
++                    surface.post_error(wl_surface::Error::InvalidTransform, "Unknown buffer transform");
+                 }
+             }
+             wl_surface::Request::SetBufferScale { scale } => {
+@@ -306,18 +342,19 @@
+                 if width < 0 || height < 0 {
+                     return;
+                 }
+-
+-                PrivateSurfaceData::with_states(surface, |states| {
+-                    states
+-                        .cached_state
+-                        .get::<SurfaceAttributes>()
+-                        .pending()
+-                        .damage
+-                        .push(Damage::Buffer(Rectangle::new(
+-                            (x, y).into(),
+-                            (width, height).into(),
+-                        )))
+-                });
++                let damage = Damage::Buffer(Rectangle::new((x, y).into(), (width, height).into()));
++                let limit = state
++                    .compositor_state()
++                    .limits
++                    .map(|limits| limits.damage_rectangles);
++                if !retain_surface_payload(
++                    surface,
++                    limit,
++                    |attrs| attrs.damage.len(),
++                    |attrs| attrs.damage.push(damage),
++                ) {
++                    crate::wayland::resource_quota_exceeded(client, handle, "hosted damage quota exceeded");
++                }
+             }
+             wl_surface::Request::Offset { x, y } => {
+                 let client_scale = state.client_compositor_state(client).client_scale();
+@@ -377,6 +414,7 @@
+ #[derive(Debug)]
+ pub struct RegionUserData {
+     pub(crate) inner: Mutex<RegionAttributes>,
++    limit: Option<std::num::NonZeroUsize>,
+ }
+ 
+ impl<D> Dispatch<WlRegion, RegionUserData, D> for CompositorState
+@@ -390,10 +428,23 @@
+         _resource: &WlRegion,
+         request: wl_region::Request,
+         data: &RegionUserData,
+-        _dhandle: &DisplayHandle,
++        dhandle: &DisplayHandle,
+         _init: &mut wayland_server::DataInit<'_, D>,
+     ) {
+         let mut guard = data.inner.lock().unwrap();
++        if matches!(
++            request,
++            wl_region::Request::Add { .. } | wl_region::Request::Subtract { .. }
++        ) && data.limit.is_some_and(|limit| guard.rects.len() >= limit.get())
++        {
++            drop(guard);
++            crate::wayland::resource_quota_exceeded(
++                client,
++                dhandle,
++                "hosted region operation quota exceeded",
++            );
++            return;
++        }
+         let client_scale = state.client_compositor_state(client).client_scale();
+ 
+         match request {
+@@ -467,7 +518,7 @@
+                     return;
+                 }
+ 
+-                data_init.init(
++                let role = data_init.init(
+                     id,
+                     SubsurfaceUserData {
+                         surface: surface.clone(),
+@@ -477,6 +528,19 @@
+                 super::with_states(&surface, |states| {
+                     states.data_map.insert_if_missing_threadsafe(SubsurfaceState::new)
+                 });
++
++                // Association exists immediately for protocol requests, but its
++                // visual membership becomes current with the parent's commit.
++                let admitted = PrivateSurfaceData::with_states(&parent, |states| {
++                    states
++                        .cached_state
++                        .get::<ParentCommitSubsurfaceState>()
++                        .pending()
++                        .set_position(&role, &surface, &parent, (0, 0).into())
++                });
++                if !admitted {
++                    parent_order_limit(&surface, _dh);
++                }
+ 
+                 state.new_subsurface(&surface, &parent);
+             }
+@@ -508,13 +572,221 @@
+     /// Location of the top-left corner of this subsurface
+     /// relative to its parent coordinate space
+     pub location: Point<i32, Logical>,
++    /// Whether a parent commit has applied this role's visual membership.
++    ///
++    /// Hosts must exclude this subsurface and its children until this is true.
++    pub parent_committed: bool,
++}
++
++#[derive(Debug, Default)]
++struct ParentCommitSubsurfaceState {
++    positions: Vec<PendingSubsurfacePosition>,
++}
++
++#[derive(Debug)]
++struct PendingSubsurfacePosition {
++    subsurface: wayland_server::Weak<WlSubsurface>,
++    surface: wayland_server::Weak<WlSurface>,
++    parent: wayland_server::Weak<WlSurface>,
++    location: Point<i32, Logical>,
++}
++
++impl ParentCommitSubsurfaceState {
++    fn set_position(
++        &mut self,
++        subsurface: &WlSubsurface,
++        surface: &WlSurface,
++        parent: &WlSurface,
++        location: Point<i32, Logical>,
++    ) -> bool {
++        let position = PendingSubsurfacePosition {
++            subsurface: subsurface.downgrade(),
++            surface: surface.downgrade(),
++            parent: parent.downgrade(),
++            location,
++        };
++        if let Some(pending) = self
++            .positions
++            .iter_mut()
++            .find(|pending| pending.surface == *surface)
++        {
++            *pending = position;
++        } else {
++            self.positions.retain(|pending| {
++                pending.subsurface.upgrade().is_ok()
++                    && pending.surface.upgrade().is_ok()
++                    && pending.parent.upgrade().is_ok()
++            });
++            if self.positions.len() >= MAX_PARENT_POSITION_CHANGES {
++                return false;
++            }
++            self.positions.push(position);
++        }
++        true
++    }
++}
++
++impl Cacheable for ParentCommitSubsurfaceState {
++    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
++        Self {
++            positions: std::mem::take(&mut self.positions),
++        }
++    }
++
++    fn merge_into(self, _into: &mut Self, _dh: &DisplayHandle) {
++        for position in self.positions {
++            let PendingSubsurfacePosition {
++                subsurface,
++                surface,
++                parent,
++                location,
++            } = position;
++            if subsurface.upgrade().is_err() {
++                continue;
++            }
++            let Ok(surface) = surface.upgrade() else {
++                continue;
++            };
++            let Ok(parent) = parent.upgrade() else {
++                continue;
++            };
++            if PrivateSurfaceData::get_parent(&surface).as_ref() != Some(&parent) {
++                continue;
++            }
++            PrivateSurfaceData::with_states(&surface, |state| {
++                let mut state = state.cached_state.get::<SubsurfaceCachedState>();
++                state.override_all(|state| {
++                    state.location = location;
++                    state.parent_committed = true;
++                });
++            });
++        }
++    }
+ }
+ 
+ impl Default for SubsurfaceCachedState {
+     fn default() -> Self {
+         SubsurfaceCachedState {
+             location: (0, 0).into(),
+-        }
++            parent_committed: false,
++        }
++    }
++}
++
++// Parent-surface state is applied with the parent's transaction, independent
++// of the child's buffer synchronization mode. Keep weak, generation-qualified
++// resources so queued changes cannot affect a replacement role or surface.
++const MAX_PARENT_ORDER_CHANGES: usize = 256;
++const MAX_PARENT_POSITION_CHANGES: usize = 256;
++
++#[derive(Debug)]
++struct ParentOrder {
++    role: wayland_server::Weak<WlSubsurface>,
++    surface: wayland_server::Weak<WlSurface>,
++    sibling: wayland_server::Weak<WlSurface>,
++    above: bool,
++}
++
++#[derive(Debug, Default)]
++struct ParentOrders(Vec<ParentOrder>);
++
++impl Cacheable for ParentOrders {
++    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
++        std::mem::take(self)
++    }
++    fn merge_into(self, into: &mut Self, dh: &DisplayHandle) {
++        if into
++            .0
++            .len()
++            .checked_add(self.0.len())
++            .map_or(true, |count| count > MAX_PARENT_ORDER_CHANGES)
++        {
++            if let Some(surface) = self.0.first().and_then(|order| order.surface.upgrade().ok()) {
++                parent_order_limit(&surface, dh);
++            }
++            return;
++        }
++        into.0.extend(self.0);
++    }
++}
++
++fn parent_order_limit(surface: &WlSurface, dh: &DisplayHandle) {
++    if let Some(client) = surface.client() {
++        client.kill(
++            dh,
++            wayland_server::backend::protocol::ProtocolError {
++                // wl_display.error.no_memory; wl_display is backend-owned.
++                code: 2,
++                object_id: 1,
++                object_interface: "wl_display".into(),
++                message: "parent surface state budget exceeded".into(),
++            },
++        );
++    }
++}
++
++fn schedule_parent_order(
++    _client: &wayland_server::Client,
++    dh: &DisplayHandle,
++    role: &WlSubsurface,
++    surface: &WlSurface,
++    sibling: &WlSurface,
++    above: bool,
++) {
++    let Some(parent) = PrivateSurfaceData::get_parent(surface) else {
++        return;
++    };
++    if surface == sibling
++        || (sibling != &parent && PrivateSurfaceData::get_parent(sibling).as_ref() != Some(&parent))
++    {
++        role.post_error(
++            wl_subsurface::Error::BadSurface,
++            "Provided surface is not a sibling or parent.",
++        );
++        return;
++    }
++    let admitted = PrivateSurfaceData::with_states(&parent, |states| {
++        let mut cached = states.cached_state.get::<ParentOrders>();
++        let pending = cached.pending();
++        if pending.0.len() >= MAX_PARENT_ORDER_CHANGES {
++            return false;
++        }
++        pending.0.push(ParentOrder {
++            role: role.downgrade(),
++            surface: surface.downgrade(),
++            sibling: sibling.downgrade(),
++            above,
++        });
++        true
++    });
++    if !admitted {
++        parent_order_limit(surface, dh);
++    }
++}
++
++pub(super) fn apply_parent_order(parent: &WlSurface) {
++    let orders = PrivateSurfaceData::with_states(parent, |states| {
++        std::mem::take(&mut states.cached_state.get::<ParentOrders>().current().0)
++    });
++    for order in orders {
++        if order.role.upgrade().is_err() {
++            continue;
++        }
++        let (Ok(surface), Ok(sibling)) = (order.surface.upgrade(), order.sibling.upgrade()) else {
++            continue;
++        };
++        if PrivateSurfaceData::get_parent(&surface).as_ref() != Some(parent) {
++            continue;
++        }
++        let _ = PrivateSurfaceData::reorder(
++            &surface,
++            if order.above {
++                Location::After
++            } else {
++                Location::Before
++            },
++            &sibling,
++        );
+     }
+ }
+ 
+@@ -522,11 +794,13 @@
+     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+         Self {
+             location: self.location,
++            parent_committed: self.parent_committed,
+         }
+     }
+ 
+     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+         into.location = self.location;
++        into.parent_committed = self.parent_committed;
+     }
+ }
+ 
+@@ -579,32 +853,29 @@
+         match request {
+             wl_subsurface::Request::SetPosition { x, y } => {
+                 let client_scale = state.client_compositor_state(client).client_scale();
+-                PrivateSurfaceData::with_states(&data.surface, |state| {
++                let location = Point::<i32, Client>::from((x, y))
++                    .to_f64()
++                    .to_logical(client_scale)
++                    .to_i32_round();
++                let Some(parent) = PrivateSurfaceData::get_parent(&data.surface) else {
++                    return;
++                };
++                let admitted = PrivateSurfaceData::with_states(&parent, |state| {
+                     state
+                         .cached_state
+-                        .get::<SubsurfaceCachedState>()
++                        .get::<ParentCommitSubsurfaceState>()
+                         .pending()
+-                        .location = Point::<i32, Client>::from((x, y))
+-                        .to_f64()
+-                        .to_logical(client_scale)
+-                        .to_i32_round();
+-                })
++                        .set_position(subsurface, &data.surface, &parent, location)
++                });
++                if !admitted {
++                    parent_order_limit(&data.surface, _dh);
++                }
+             }
+             wl_subsurface::Request::PlaceAbove { sibling } => {
+-                if let Err(()) = PrivateSurfaceData::reorder(&data.surface, Location::After, &sibling) {
+-                    subsurface.post_error(
+-                        wl_subsurface::Error::BadSurface,
+-                        "Provided surface is not a sibling or parent.",
+-                    )
+-                }
++                schedule_parent_order(client, _dh, subsurface, &data.surface, &sibling, true);
+             }
+             wl_subsurface::Request::PlaceBelow { sibling } => {
+-                if let Err(()) = PrivateSurfaceData::reorder(&data.surface, Location::Before, &sibling) {
+-                    subsurface.post_error(
+-                        wl_subsurface::Error::BadSurface,
+-                        "Provided surface is not a sibling or parent.",
+-                    )
+-                }
++                schedule_parent_order(client, _dh, subsurface, &data.surface, &sibling, false);
+             }
+             wl_subsurface::Request::SetSync => PrivateSurfaceData::with_states(&data.surface, |state| {
+                 state
+@@ -614,14 +885,20 @@
+                     .sync
+                     .store(true, Ordering::Release);
+             }),
+-            wl_subsurface::Request::SetDesync => PrivateSurfaceData::with_states(&data.surface, |state| {
+-                state
+-                    .data_map
+-                    .get::<SubsurfaceState>()
+-                    .unwrap()
+-                    .sync
+-                    .store(false, Ordering::Release);
+-            }),
++            wl_subsurface::Request::SetDesync => {
++                let was_sync = is_effectively_sync(&data.surface);
++                PrivateSurfaceData::with_states(&data.surface, |state| {
++                    state
++                        .data_map
++                        .get::<SubsurfaceState>()
++                        .unwrap()
++                        .sync
++                        .store(false, Ordering::Release);
++                });
++                if was_sync {
++                    PrivateSurfaceData::desynchronize(&data.surface, _dh, state);
++                }
++            }
+             wl_subsurface::Request::Destroy => {
+                 // Our destructor already handles it
+             }
+@@ -630,12 +907,14 @@
+     }
+ 
+     fn destroyed(
+-        _state: &mut D,
++        state: &mut D,
+         _client_id: wayland_server::backend::ClientId,
+         _object: &WlSubsurface,
+         data: &SubsurfaceUserData,
+     ) {
++        let parent = PrivateSurfaceData::get_parent(&data.surface);
+         PrivateSurfaceData::unset_parent(&data.surface);
++        state.subsurface_destroyed(&data.surface, parent.as_ref());
+         PrivateSurfaceData::with_states(&data.surface, |state| {
+             state
+                 .data_map
+@@ -645,8 +924,7 @@
+                 .store(true, Ordering::Release);
+ 
+             let mut guard = state.cached_state.get::<SubsurfaceCachedState>();
+-            *guard.pending() = Default::default();
+-            *guard.current() = Default::default();
++            guard.override_all(|state| *state = Default::default());
+         });
+     }
+ }
+--- a/src/wayland/compositor/mod.rs
++++ b/src/wayland/compositor/mod.rs
+@@ -586,6 +586,9 @@
+         let _ = parent;
+     }
+ 
++    /// A subsurface role was destroyed without necessarily destroying its surface.
++    fn subsurface_destroyed(&mut self, _surface: &WlSurface, _parent: Option<&WlSurface>) {}
++
+     /// Surface commit handler
+     ///
+     /// This is called when any changed state from a commit actually becomes visible.
+@@ -608,6 +611,26 @@
+     compositor: GlobalId,
+     subcompositor: GlobalId,
+     surfaces: Vec<WlSurface>,
++    limits: Option<CompositorLimits>,
++}
++
++/// Admission ceilings for retained frontend state.
++///
++/// These limits apply before request payloads or commit snapshots are retained.
++/// Damage and callback counts include pending, cached and current frontend states
++/// of one surface. Region operations count additions and subtractions together.
++/// Queued snapshots are bounded separately for each cached state type and surface.
++/// They do not include resources already transferred to the compositor application.
++#[derive(Clone, Copy, Debug)]
++pub struct CompositorLimits {
++    /// Maximum rectangle operations retained by one region.
++    pub region_rectangles: std::num::NonZeroUsize,
++    /// Maximum retained damage rectangles across one surface's frontend states.
++    pub damage_rectangles: std::num::NonZeroUsize,
++    /// Maximum retained frame callbacks across one surface's frontend states.
++    pub frame_callbacks: std::num::NonZeroUsize,
++    /// Maximum queued commit snapshots per surface and cached state type.
++    pub cached_states: std::num::NonZeroUsize,
+ }
+ 
+ /// Per-client state of a compositor
+@@ -670,6 +693,19 @@
+ }
+ 
+ impl CompositorState {
++    /// Creates version 5 compositor globals with frontend admission limits.
++    ///
++    /// Unlike [`Self::new`], this bounds uncommitted request payloads and queued
++    /// snapshots before allocation. Overflow posts the core no-memory error and
++    /// disconnects only the offending client.
++    pub fn with_limits<D>(display: &DisplayHandle, limits: CompositorLimits) -> Self
++    where
++        D: GlobalDispatch<WlCompositor, ()> + GlobalDispatch<WlSubcompositor, ()> + 'static,
++    {
++        let mut state = Self::new::<D>(display);
++        state.limits = Some(limits);
++        state
++    }
+     /// Create new [`wl_compositor`] version 5 and [`wl_subcompositor`] globals.
+     ///
+     /// It returns the two global handles, in case you wish to remove these globals from
+@@ -709,6 +745,7 @@
+             compositor,
+             subcompositor,
+             surfaces: Vec::new(),
++            limits: None,
+         }
+     }
+ 
+--- a/src/wayland/compositor/transaction.rs
++++ b/src/wayland/compositor/transaction.rs
+@@ -259,15 +259,19 @@
+     }
+ 
+     pub(crate) fn apply<C: CompositorHandler + 'static>(self, dh: &DisplayHandle, state: &mut C) {
+-        for (surface, id) in self.surfaces {
+-            let Ok(surface) = surface.upgrade() else {
+-                continue;
+-            };
+-
+-            PrivateSurfaceData::with_states(&surface, |states| {
+-                states.cached_state.apply_state(id, dh);
+-            });
+-
++        let surfaces = self
++            .surfaces
++            .into_iter()
++            .filter_map(|(surface, id)| surface.upgrade().ok().map(|surface| (surface, id)))
++            .collect::<Vec<_>>();
++        // Apply the complete transaction before observers inspect any surface.
++        for (surface, id) in &surfaces {
++            PrivateSurfaceData::with_states(surface, |states| states.cached_state.apply_state(*id, dh));
++        }
++        for (surface, _) in &surfaces {
++            super::handlers::apply_parent_order(surface);
++        }
++        for (surface, _) in surfaces {
+             PrivateSurfaceData::invoke_post_commit_hooks::<C>(state, dh, &surface);
+ 
+             tracing::trace!("Calling user implementation for wl_surface.commit");
+--- a/src/wayland/compositor/tree.rs
++++ b/src/wayland/compositor/tree.rs
+@@ -255,35 +255,29 @@
+         }
+     }
+ 
+-    fn commit_sync_surface_tree(
+-        surface: &WlSurface,
+-        parent_transaction: &PendingTransaction,
+-        dh: &DisplayHandle,
+-    ) {
+-        let children = PrivateSurfaceData::get_children(surface);
+-        let mut my_data = Self::lock_user_data(surface);
+-
+-        for child in children {
+-            Self::commit_sync_surface_tree(&child, &my_data.pending_transaction, dh);
+-        }
+-
+-        let current_txid = my_data.current_txid;
+-        my_data.public_data.cached_state.commit(Some(current_txid), dh);
+-        my_data
+-            .pending_transaction
+-            .insert_state(surface.clone(), current_txid);
+-
+-        let child_tx = std::mem::take(&mut my_data.pending_transaction);
+-        child_tx.merge_into(parent_transaction);
+-        my_data.current_txid.0 = my_data.current_txid.0.wrapping_add(1);
+-    }
+-
+     pub fn commit<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
++        let limits = state.compositor_state().limits;
+         let is_sync = is_effectively_sync(surface);
+         let children = PrivateSurfaceData::get_children(surface);
+         let mut my_data = Self::lock_user_data(surface);
+         // commit our state
+         let current_txid = my_data.current_txid;
++        if limits.is_some_and(|limits| {
++            !my_data
++                .public_data
++                .cached_state
++                .can_commit(current_txid, limits.cached_states)
++        }) {
++            drop(my_data);
++            if let Some(client) = surface.client() {
++                crate::wayland::resource_quota_exceeded(
++                    &client,
++                    dh,
++                    "hosted cached surface state quota exceeded",
++                );
++            }
++            return;
++        }
+         my_data.public_data.cached_state.commit(Some(current_txid), dh);
+         // take all our children state into our pending transaction
+         for child in children {
+@@ -297,40 +291,54 @@
+                 .map(|s| s.sync.load(Ordering::Acquire))
+                 .unwrap_or(false);
+ 
+-            // if we are not sync, but the child is we also have to commit the complete child surface tree
+-            if !is_sync && is_child_sync {
+-                std::mem::drop(child_data);
+-                Self::commit_sync_surface_tree(&child, &my_data.pending_transaction, dh);
+-            } else if is_sync || is_child_sync {
++            // Only take explicit commits from direct children. Each child's
++            // commit already captured the eligible descendants at that moment.
++            // Recursing here would bypass an uncommitted intermediate parent.
++            if is_sync || is_child_sync {
+                 let child_tx = std::mem::take(&mut child_data.pending_transaction);
+                 child_tx.merge_into(&my_data.pending_transaction);
+-                child_data.current_txid.0 = child_data.current_txid.0.wrapping_add(1);
+             }
+         }
+         my_data
+             .pending_transaction
+             .insert_state(surface.clone(), current_txid);
+         my_data.current_txid.0 = my_data.current_txid.0.wrapping_add(1);
++        std::mem::drop(my_data);
+         if !is_sync {
+-            let client = match surface.client() {
+-                Some(client) => client,
+-                None => return,
+-            };
+-            // if we are not sync, add the transaction to the queue
+-            let tx = std::mem::take(&mut my_data.pending_transaction);
+-            let mut queue_guard = state.client_compositor_state(&client).queue.lock().unwrap();
+-            let queue = queue_guard.get_or_insert_with(TransactionQueue::default);
+-            queue.append(tx.finalize());
+-            // release the mutex, as applying the transaction will try to lock it
+-            std::mem::drop(my_data);
+-            // trigger the queue
+-            let transactions = queue.take_ready();
+-            // release the queue lock
+-            std::mem::drop(queue_guard);
+-            // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
+-            for transaction in transactions {
+-                transaction.apply(dh, state)
+-            }
++            Self::apply_pending(surface, dh, state);
++        }
++    }
++
++    /// Releases committed caches when a subtree becomes effectively desynchronized.
++    pub fn desynchronize<C: CompositorHandler + 'static>(
++        surface: &WlSurface,
++        dh: &DisplayHandle,
++        state: &mut C,
++    ) {
++        if is_effectively_sync(surface) {
++            return;
++        }
++        let children = Self::get_children(surface);
++        Self::apply_pending(surface, dh, state);
++        for child in children {
++            Self::desynchronize(&child, dh, state);
++        }
++    }
++
++    fn apply_pending<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
++        let Some(client) = surface.client() else {
++            return;
++        };
++        // Take only cached transactions, never uncommitted pending surface state.
++        let tx = std::mem::take(&mut Self::lock_user_data(surface).pending_transaction);
++        let mut queue_guard = state.client_compositor_state(&client).queue.lock().unwrap();
++        let queue = queue_guard.get_or_insert_with(TransactionQueue::default);
++        queue.append(tx.finalize());
++        let transactions = queue.take_ready();
++        // Observers can commit or clear blockers, so all locks must be released.
++        std::mem::drop(queue_guard);
++        for transaction in transactions {
++            transaction.apply(dh, state)
+         }
+     }
+ 
+--- a/src/wayland/cursor_shape.rs
++++ b/src/wayland/cursor_shape.rs
+@@ -98,9 +98,11 @@
+ //! delegate_cursor_shape!(State);
+ //! ```
+ 
+-use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Request as ShapeRequest;
+ use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Shape;
+ use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 as CursorShapeDevice;
++use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
++    Error as ShapeError, Request as ShapeRequest,
++};
+ use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::Request as ManagerRequest;
+ use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 as CursorShapeManager;
+ use wayland_protocols::wp::tablet::zv2::server::zwp_tablet_tool_v2::ZwpTabletToolV2;
+@@ -258,6 +260,10 @@
+                 serial,
+                 shape: WEnum::Value(shape),
+             } => {
++                if resource.version() < 2 && matches!(shape, Shape::DndAsk | Shape::AllResize) {
++                    resource.post_error(ShapeError::InvalidShape, "cursor shape requires version two");
++                    return;
++                }
+                 match &data.0 {
+                     CursorShapeDeviceUserDataInner::Pointer { seat } => {
+                         let Some(seat) = seat.upgrade() else {
+@@ -269,6 +275,18 @@
+                             // the wp_cursor_shape_device_v1 object becomes inert.
+                             return;
+                         };
++
++                        // The shape protocol requires the latest enter serial
++                        // even when the core cursor helper would allow a grab.
++                        if !handle
++                            .wl_pointer
++                            .last_enter
++                            .lock()
++                            .unwrap()
++                            .is_some_and(|last| last == Serial(serial))
++                        {
++                            return;
++                        }
+ 
+                         if !allow_setting_cursor(&handle, Serial(serial), &resource.id()) {
+                             return;
+@@ -307,7 +325,7 @@
+                 }
+             }
+             ShapeRequest::SetShape { .. } => {
+-                // Ignore unknown shapes.
++                resource.post_error(ShapeError::InvalidShape, "invalid cursor shape");
+             }
+             ShapeRequest::Destroy => {}
+             _ => unreachable!(),
+--- a/src/wayland/mod.rs
++++ b/src/wayland/mod.rs
+@@ -89,3 +89,37 @@
+ pub mod xwayland_keyboard_grab;
+ #[cfg(feature = "xwayland")]
+ pub mod xwayland_shell;
++
++pub(crate) fn resource_quota_exceeded(
++    client: &wayland_server::Client,
++    display: &wayland_server::DisplayHandle,
++    message: &'static str,
++) {
++    // wl_display is backend-owned rather than a generated server resource.
++    // kill_client alone does not send the supplied error on the Rust backend.
++    let backend = display.backend_handle();
++    let mut core = None;
++    let _ = backend.with_all_objects_for(client.id(), |object| {
++        if object.protocol_id() == 1 {
++            core = Some(object);
++        }
++    });
++    if let Some(core) = core {
++        backend.post_error(
++            core,
++            2, // wl_display.error.no_memory
++            std::ffi::CString::new(message).expect("static error has no NUL"),
++        );
++    } else {
++        // The system backend does not enumerate backend-owned resources.
++        client.kill(
++            display,
++            wayland_server::backend::protocol::ProtocolError {
++                code: 2,
++                object_id: 1,
++                object_interface: "wl_display".into(),
++                message: message.into(),
++            },
++        );
++    }
++}
+--- a/src/wayland/seat/keyboard.rs
++++ b/src/wayland/seat/keyboard.rs
+@@ -1,6 +1,6 @@
+ use std::fmt;
+ 
+-use tracing::{error, instrument, trace, warn};
++use tracing::{instrument, trace, warn};
+ use wayland_server::{
+     backend::{ClientId, ObjectId},
+     protocol::{
+--- a/src/wayland/selection/data_device/device.rs
++++ b/src/wayland/selection/data_device/device.rs
+@@ -68,6 +68,12 @@
+                 serial,
+             } => {
+                 let serial = Serial::from(serial);
++                if !handler.allow_drag(client, &seat, serial) {
++                    if let Some(source) = source {
++                        source.cancelled();
++                    }
++                    return;
++                }
+                 if let Some(pointer) = seat.get_pointer() {
+                     if pointer.has_grab(serial) {
+                         if let Some(ref icon) = icon {
+@@ -115,7 +121,10 @@
+                 }
+                 debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
+             }
+-            wl_data_device::Request::SetSelection { source, .. } => {
++            wl_data_device::Request::SetSelection { source, serial } => {
++                if !handler.allow_selection(SelectionTarget::Clipboard, client, &seat, Serial::from(serial)) {
++                    return;
++                }
+                 let seat_data = match seat.get_keyboard() {
+                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
+                         .user_data()
+--- a/src/wayland/selection/data_device/dnd_grab.rs
++++ b/src/wayland/selection/data_device/dnd_grab.rs
+@@ -174,18 +174,20 @@
+                         let handle = self.dh.backend_handle();
+ 
+                         // create a data offer
+-                        let offer = handle
+-                            .create_object::<D>(
+-                                client.id(),
+-                                WlDataOffer::interface(),
+-                                device.version(),
+-                                Arc::new(DndDataOffer {
+-                                    offer_data: offer_data.clone(),
+-                                    source: source.clone(),
+-                                }),
+-                            )
+-                            .unwrap();
+-                        let offer = WlDataOffer::from_id(&self.dh, offer).unwrap();
++                        let Ok(offer) = handle.create_object::<D>(
++                            client.id(),
++                            WlDataOffer::interface(),
++                            device.version(),
++                            Arc::new(DndDataOffer {
++                                offer_data: offer_data.clone(),
++                                source: source.clone(),
++                            }),
++                        ) else {
++                            continue;
++                        };
++                        let Ok(offer) = WlDataOffer::from_id(&self.dh, offer) else {
++                            continue;
++                        };
+ 
+                         // advertize the offer to the client
+                         device.data_offer(&offer);
+--- a/src/wayland/selection/data_device/mod.rs
++++ b/src/wayland/selection/data_device/mod.rs
+@@ -114,6 +114,11 @@
+ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + ServerDndGrabHandler {
+     /// [DataDeviceState] getter
+     fn data_device_state(&self) -> &DataDeviceState;
++
++    /// Checks compositor policy before installing a client drag grab.
++    fn allow_drag(&mut self, _client: &Client, _seat: &Seat<Self>, _serial: Serial) -> bool {
++        true
++    }
+ 
+     /// Action chooser for DnD negociation
+     fn action_choice(&mut self, available: DndAction, preferred: DndAction) -> DndAction {
+@@ -488,7 +493,14 @@
+                                 .user_data()
+                                 .get::<RefCell<SeatData<D::SelectionUserData>>>()
+                                 .unwrap();
+-                            seat_data.borrow_mut().add_device(device);
++                            let mut seat_data = seat_data.borrow_mut();
++                            seat_data.add_device(device.clone());
++                            seat_data.send_selection::<D>(
++                                _dhandle,
++                                crate::wayland::selection::SelectionTarget::Clipboard,
++                                Some(&device),
++                                false,
++                            );
+                         }
+                         None => {
+                             error!(client = ?client, data_device = ?id, "Unmanaged seat given to a data device.");
+--- a/src/wayland/selection/data_device/server_dnd_grab.rs
++++ b/src/wayland/selection/data_device/server_dnd_grab.rs
+@@ -161,19 +161,21 @@
+                         None => continue,
+                     };
+                     // create a data offer
+-                    let offer = handle
+-                        .create_object::<D>(
+-                            client.id(),
+-                            WlDataOffer::interface(),
+-                            device.version(),
+-                            Arc::new(ServerDndData {
+-                                metadata: self.metadata.clone(),
+-                                offer_data: offer_data.clone(),
+-                                wl_seat,
+-                            }),
+-                        )
+-                        .unwrap();
+-                    let offer = WlDataOffer::from_id(&self.dh, offer).unwrap();
++                    let Ok(offer) = handle.create_object::<D>(
++                        client.id(),
++                        WlDataOffer::interface(),
++                        device.version(),
++                        Arc::new(ServerDndData {
++                            metadata: self.metadata.clone(),
++                            offer_data: offer_data.clone(),
++                            wl_seat,
++                        }),
++                    ) else {
++                        continue;
++                    };
++                    let Ok(offer) = WlDataOffer::from_id(&self.dh, offer) else {
++                        continue;
++                    };
+ 
+                     // advertize the offer to the client
+                     device.data_offer(&offer);
+--- a/src/wayland/selection/data_device/source.rs
++++ b/src/wayland/selection/data_device/source.rs
+@@ -53,7 +53,7 @@
+     D: 'static,
+ {
+     fn request(
+-        _state: &mut D,
++        state: &mut D,
+         _client: &wayland_server::Client,
+         _resource: &WlDataSource,
+         request: wl_data_source::Request,
+@@ -65,6 +65,13 @@
+ 
+         match request {
+             wl_data_source::Request::Offer { mime_type } => {
++                if !state.allow_mime_type(&mime_type, data.mime_types.len()) {
++                    _resource.post_error(
++                        wl_data_source::Error::InvalidSource,
++                        "Selection format budget exceeded.",
++                    );
++                    return;
++                }
+                 data.mime_types.push(mime_type);
+             }
+             wl_data_source::Request::SetActions { dnd_actions } => match dnd_actions {
+--- a/src/wayland/selection/mod.rs
++++ b/src/wayland/selection/mod.rs
+@@ -31,6 +31,22 @@
+ pub trait SelectionHandler: Sized + SeatHandler {
+     /// UserData attached to server-side selections.
+     type SelectionUserData: Clone + Send + Sync + 'static;
++
++    /// Checks a selection input serial before replacing the current source.
++    fn allow_selection(
++        &mut self,
++        _ty: SelectionTarget,
++        _client: &wayland_server::Client,
++        _seat: &Seat<Self>,
++        _serial: crate::utils::Serial,
++    ) -> bool {
++        true
++    }
++
++    /// Bounds offered MIME metadata before storing another entry.
++    fn allow_mime_type(&mut self, _mime: &str, _offered: usize) -> bool {
++        true
++    }
+ 
+     /// A client has set the selection
+     #[allow(unused_variables)]
+--- a/src/wayland/selection/offer.rs
++++ b/src/wayland/selection/offer.rs
+@@ -70,7 +70,7 @@
+         device: &SelectionDevice,
+         client_id: ClientId,
+         data: OfferReplySource<D::SelectionUserData>,
+-    ) -> Self
++    ) -> Option<Self>
+     where
+         D: SelectionHandler + 'static,
+     {
+@@ -94,18 +94,18 @@
+ 
+         let offer = backend
+             .create_object::<D>(client_id, interface, device.version(), data)
+-            .unwrap();
++            .ok()?;
+ 
+-        match device_kind {
+-            DataDeviceKind::Core => Self::DataDevice(WlDataOffer::from_id(dh, offer).unwrap()),
+-            DataDeviceKind::Primary => Self::Primary(PrimaryOffer::from_id(dh, offer).unwrap()),
++        Some(match device_kind {
++            DataDeviceKind::Core => Self::DataDevice(WlDataOffer::from_id(dh, offer).ok()?),
++            DataDeviceKind::Primary => Self::Primary(PrimaryOffer::from_id(dh, offer).ok()?),
+             DataDeviceKind::WlrDataControl => {
+-                Self::WlrDataControl(ZwlrDataControlOfferV1::from_id(dh, offer).unwrap())
++                Self::WlrDataControl(ZwlrDataControlOfferV1::from_id(dh, offer).ok()?)
+             }
+             DataDeviceKind::ExtDataControl => {
+-                Self::ExtDataControl(ExtDataControlOfferV1::from_id(dh, offer).unwrap())
++                Self::ExtDataControl(ExtDataControlOfferV1::from_id(dh, offer).ok()?)
+             }
+-        }
++        })
+     }
+ 
+     pub fn offer(&self, mime_type: String) {
+--- a/src/wayland/selection/primary_selection/device.rs
++++ b/src/wayland/selection/primary_selection/device.rs
+@@ -51,7 +51,10 @@
+         };
+ 
+         match request {
+-            primary_device::Request::SetSelection { source, .. } => {
++            primary_device::Request::SetSelection { source, serial } => {
++                if !handler.allow_selection(SelectionTarget::Primary, client, &seat, serial.into()) {
++                    return;
++                }
+                 let seat_data = match seat.get_keyboard() {
+                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
+                         .user_data()
+--- a/src/wayland/selection/primary_selection/source.rs
++++ b/src/wayland/selection/primary_selection/source.rs
+@@ -52,6 +52,10 @@
+ 
+         match request {
+             primary_source::Request::Offer { mime_type } => {
++                if !state.allow_mime_type(&mime_type, data.mime_types.len()) {
++                    _resource.post_error(0u32, "Selection format budget exceeded.");
++                    return;
++                }
+                 data.mime_types.push(mime_type);
+             }
+             primary_source::Request::Destroy => {}
+--- a/src/wayland/selection/seat_data.rs
++++ b/src/wayland/selection/seat_data.rs
+@@ -215,7 +215,10 @@
+                         None => continue,
+                     };
+ 
+-                    let offer = SelectionOffer::new::<D>(dh, device, client_id, selection.clone());
++                    let Some(offer) = SelectionOffer::new::<D>(dh, device, client_id, selection.clone())
++                    else {
++                        continue;
++                    };
+ 
+                     device.offer(&offer);
+ 
+--- a/src/wayland/selection/source.rs
++++ b/src/wayland/selection/source.rs
+@@ -22,6 +22,16 @@
+ }
+ 
+ impl SelectionSource {
++    /// Requests a supported format from this exact live source.
++    ///
++    /// Returns false and closes the descriptor if the source or format is invalid.
++    pub fn request_data(&self, mime_type: String, fd: OwnedFd) -> bool {
++        if !self.provider.alive() || !self.provider.contains_mime_type(&mime_type) {
++            return false;
++        }
++        self.provider.send(mime_type, fd);
++        true
++    }
+     /// Mime types associated with the source.
+     pub fn mime_types(&self) -> Vec<String> {
+         self.provider.mime_types()
+--- a/src/wayland/shell/xdg/handlers/surface.rs
++++ b/src/wayland/shell/xdg/handlers/surface.rs
+@@ -160,6 +160,14 @@
+                     .lock()
+                     .unwrap();
+ 
++                let Some(geometry) = positioner_data.checked_geometry() else {
++                    data.wm_base.post_error(
++                        xdg_wm_base::Error::InvalidPositioner,
++                        "Incomplete or unrepresentable popup positioner.",
++                    );
++                    return;
++                };
++
+                 let parent_surface = parent.map(|parent| {
+                     let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
+                     parent_data.wl_surface.clone()
+@@ -173,7 +181,7 @@
+                     parent: parent_surface,
+                     server_pending: Some(PopupState {
+                         // Set the positioner data as the popup geometry
+-                        geometry: positioner_data.get_geometry(),
++                        geometry,
+                         positioner: positioner_data,
+                     }),
+                     ..Default::default()
+--- a/src/wayland/shell/xdg/mod.rs
++++ b/src/wayland/shell/xdg/mod.rs
+@@ -543,6 +543,66 @@
+ }
+ 
+ impl PositionerState {
++    /// Calculates complete, representable popup geometry without signed overflow.
++    pub(crate) fn checked_geometry(&self) -> Option<Rectangle<i32, Logical>> {
++        if self.rect_size.w <= 0
++            || self.rect_size.h <= 0
++            || self.anchor_rect.size.w <= 0
++            || self.anchor_rect.size.h <= 0
++        {
++            return None;
++        }
++        let axis = |offset: i32,
++                    anchor: i32,
++                    extent: i32,
++                    size: i32,
++                    low_anchor: bool,
++                    high_anchor: bool,
++                    low_gravity: bool,
++                    high_gravity: bool| {
++            let anchor_offset = if low_anchor {
++                0
++            } else if high_anchor {
++                extent
++            } else {
++                extent / 2
++            };
++            let gravity_offset = if low_gravity {
++                size
++            } else if high_gravity {
++                0
++            } else {
++                size / 2
++            };
++            let point =
++                i64::from(offset) + i64::from(anchor) + i64::from(anchor_offset) - i64::from(gravity_offset);
++            let point = i32::try_from(point).ok()?;
++            point.checked_add(size)?;
++            Some(point)
++        };
++        let x = axis(
++            self.offset.x,
++            self.anchor_rect.loc.x,
++            self.anchor_rect.size.w,
++            self.rect_size.w,
++            self.anchor_has_edge(xdg_positioner::Anchor::Left),
++            self.anchor_has_edge(xdg_positioner::Anchor::Right),
++            self.gravity_has_edge(xdg_positioner::Gravity::Left),
++            self.gravity_has_edge(xdg_positioner::Gravity::Right),
++        )?;
++        let y = axis(
++            self.offset.y,
++            self.anchor_rect.loc.y,
++            self.anchor_rect.size.h,
++            self.rect_size.h,
++            self.anchor_has_edge(xdg_positioner::Anchor::Top),
++            self.anchor_has_edge(xdg_positioner::Anchor::Bottom),
++            self.gravity_has_edge(xdg_positioner::Gravity::Top),
++            self.gravity_has_edge(xdg_positioner::Gravity::Bottom),
++        )?;
++        Some(Rectangle::new((x, y).into(), self.rect_size))
++    }
++
+     pub(crate) fn anchor_has_edge(&self, edge: xdg_positioner::Anchor) -> bool {
+         match edge {
+             xdg_positioner::Anchor::Top => {
+@@ -1950,6 +2010,14 @@
+                 .lock()
+                 .unwrap();
+             data.initial_configure_sent = false;
++            data.configured = false;
++            data.configure_serial = None;
++            data.current_serial = None;
++            data.last_acked = None;
++            data.pending_configures.clear();
++            data.server_pending = None;
++            data.committed = false;
++            data.has_buffer = false;
+         });
+     }
+ 
+--- a/src/wayland/shm/handlers.rs
++++ b/src/wayland/shm/handlers.rs
+@@ -49,12 +49,12 @@
+     D: Dispatch<WlShm, ()> + Dispatch<WlShmPool, ShmPoolUserData> + ShmHandler + 'static,
+ {
+     fn request(
+-        _state: &mut D,
+-        _client: &wayland_server::Client,
++        state: &mut D,
++        client: &wayland_server::Client,
+         shm: &WlShm,
+         request: wl_shm::Request,
+         _data: &(),
+-        _dh: &DisplayHandle,
++        dh: &DisplayHandle,
+         data_init: &mut DataInit<'_, D>,
+     ) {
+         use wl_shm::{Error, Request};
+@@ -70,7 +70,20 @@
+             return;
+         }
+ 
+-        let mmap_pool = match Pool::new(fd, NonZeroUsize::try_from(size as usize).unwrap()) {
++        let budget = match state
++            .shm_state()
++            .budget
++            .as_ref()
++            .map(|budget| budget.pool(size as usize))
++        {
++            Some(Some(budget)) => Some(budget),
++            Some(None) => {
++                quota_exceeded(client, dh);
++                return;
++            }
++            None => None,
++        };
++        let mmap_pool = match Pool::with_budget(fd, NonZeroUsize::try_from(size as usize).unwrap(), budget) {
+             Ok(p) => p,
+             Err(fd) => {
+                 shm.post_error(
+@@ -104,11 +117,11 @@
+ {
+     fn request(
+         state: &mut D,
+-        _client: &wayland_server::Client,
++        client: &wayland_server::Client,
+         pool: &WlShmPool,
+         request: wl_shm_pool::Request,
+         data: &ShmPoolUserData,
+-        _dh: &DisplayHandle,
++        dh: &DisplayHandle,
+         data_init: &mut DataInit<'_, D>,
+     ) {
+         use self::wl_shm_pool::Request;
+@@ -163,6 +176,14 @@
+                             return;
+                         }
+ 
++                        let budget = match state.shm_state().budget.as_ref().map(|budget| budget.buffer()) {
++                            Some(Some(budget)) => Some(budget),
++                            Some(None) => {
++                                quota_exceeded(client, dh);
++                                return;
++                            }
++                            None => None,
++                        };
+                         let data = ShmBufferUserData {
+                             pool: arc_pool.clone(),
+                             data: BufferData {
+@@ -173,6 +194,7 @@
+                                 format,
+                             },
+                             destruction_hooks: Default::default(),
++                            _budget: budget,
+                         };
+ 
+                         data_init.init(buffer, data);
+@@ -190,6 +212,7 @@
+             Request::Resize { size } => {
+                 if size <= 0 {
+                     pool.post_error(wl_shm::Error::InvalidFd, "invalid wl_shm_pool size");
++                    return;
+                 }
+ 
+                 if let Err(err) = arc_pool.resize(NonZeroUsize::try_from(size as usize).unwrap()) {
+@@ -201,6 +224,9 @@
+                         ResizeError::MremapFailed => {
+                             pool.post_error(wl_shm::Error::InvalidFd, "mremap failed");
+                         }
++                        ResizeError::LimitExceeded => {
++                            quota_exceeded(client, dh);
++                        }
+                     }
+                 }
+             }
+@@ -210,6 +236,10 @@
+             _ => unreachable!(),
+         }
+     }
++}
++
++fn quota_exceeded(client: &wayland_server::Client, display: &DisplayHandle) {
++    crate::wayland::resource_quota_exceeded(client, display, "hosted SHM resource quota exceeded");
+ }
+ 
+ impl<D> Dispatch<wl_buffer::WlBuffer, ShmBufferUserData, D> for ShmState
+@@ -245,3 +275,52 @@
+         data.buffer_destroyed(buffer);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        io::{Read as _, Write as _},
++        os::unix::net::UnixStream,
++        sync::atomic::{AtomicBool, Ordering},
++        time::Duration,
++    };
++    use wayland_server::backend::{ClientData, DisconnectReason};
++
++    #[derive(Default)]
++    struct Status(AtomicBool);
++    impl ClientData for Status {
++        fn disconnected(&self, _: ClientId, reason: DisconnectReason) {
++            if let DisconnectReason::ProtocolError(error) = reason {
++                self.0
++                    .store(error.code == 2 && error.object_id == 1, Ordering::Release);
++            }
++        }
++    }
++
++    #[test]
++    fn quota_error_retires_its_exact_client_and_preserves_a_peer_with_the_same_core_id() {
++        let mut display = wayland_server::Display::<()>::new().unwrap();
++        let mut handle = display.handle();
++        let (a, _peer_a) = UnixStream::pair().unwrap();
++        let first = Arc::new(Status::default());
++        let client = handle.insert_client(a, first.clone()).unwrap();
++        let (b, mut peer_b) = UnixStream::pair().unwrap();
++        peer_b.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
++        let second = Arc::new(Status::default());
++        let peer = handle.insert_client(b, second.clone()).unwrap();
++        quota_exceeded(&client, &handle);
++        assert!(first.0.load(Ordering::Acquire));
++        assert!(!second.0.load(Ordering::Acquire));
++        assert!(handle.backend_handle().get_client_data(peer.id()).is_ok());
++        // Both clients use wl_display@1; the surviving client still completes sync.
++        let request = [1u32, 12u32 << 16, 2u32]
++            .into_iter()
++            .flat_map(u32::to_ne_bytes)
++            .collect::<Vec<_>>();
++        peer_b.write_all(&request).unwrap();
++        display.dispatch_clients(&mut ()).unwrap();
++        display.flush_clients().unwrap();
++        assert!(peer_b.read(&mut [0; 64]).unwrap() > 0);
++    }
++}
+--- a/src/wayland/shm/mod.rs
++++ b/src/wayland/shm/mod.rs
+@@ -112,7 +112,11 @@
+ };
+ 
+ mod handlers;
++mod limits;
+ mod pool;
++
++#[doc(inline)]
++pub use limits::ShmLimits;
+ 
+ use crate::{
+     backend::allocator::format::get_bpp,
+@@ -128,6 +132,7 @@
+ pub struct ShmState {
+     formats: HashSet<wl_shm::Format>,
+     shm: GlobalId,
++    budget: Option<Arc<limits::Quota>>,
+ }
+ 
+ impl ShmState {
+@@ -156,7 +161,35 @@
+ 
+         let shm = display.create_global::<D, WlShm, _>(2, ());
+ 
+-        ShmState { formats, shm }
++        ShmState {
++            formats,
++            shm,
++            budget: None,
++        }
++    }
++
++    /// Creates a SHM global with shared storage and buffer limits.
++    ///
++    /// Charges cover every client of this global and outlive destroyed pool
++    /// resources while buffers retain their storage. Bounded storage is unmapped
++    /// and closed synchronously on its owning thread, avoiding the global drop
++    /// queue. Create this global on a worker if that cleanup must not block GUI work.
++    pub fn with_limits<D>(
++        display: &DisplayHandle,
++        formats: impl IntoIterator<Item = wl_shm::Format>,
++        limits: ShmLimits,
++    ) -> ShmState
++    where
++        D: GlobalDispatch<WlShm, ()>
++            + Dispatch<WlShm, ()>
++            + Dispatch<WlShmPool, ShmPoolUserData>
++            + BufferHandler
++            + ShmHandler
++            + 'static,
++    {
++        let mut state = Self::new::<D>(display, formats);
++        state.budget = Some(limits::Quota::new(limits));
++        state
+     }
+ 
+     /// Returns the id of the [`WlShm`] global.
+@@ -478,6 +511,7 @@
+     pub(crate) pool: Arc<Pool>,
+     pub(crate) data: BufferData,
+     destruction_hooks: Mutex<Vec<Hook<DestructionHook>>>,
++    _budget: Option<limits::BufferPermit>,
+ }
+ 
+ impl ShmBufferUserData {
+--- a/src/wayland/shm/pool.rs
++++ b/src/wayland/shm/pool.rs
+@@ -54,6 +54,8 @@
+ struct InnerPool {
+     map: RwLock<MemMap>,
+     fd: OwnedFd,
++    // Drop the charge after the actual mapping and descriptor, not the wl_shm_pool resource.
++    budget: Option<super::limits::PoolPermit>,
+ }
+ 
+ // SAFETY: The memmap is owned by the pool and content is only accessible via a reference.
+@@ -64,6 +66,7 @@
+ pub enum ResizeError {
+     InvalidSize,
+     MremapFailed,
++    LimitExceeded,
+ }
+ 
+ impl InnerPool {
+@@ -79,6 +82,7 @@
+         Ok(InnerPool {
+             map: RwLock::new(memmap),
+             fd,
++            budget: None,
+         })
+     }
+ 
+@@ -89,12 +93,22 @@
+         if oldsize > usize::from(newsize) {
+             return Err(ResizeError::InvalidSize);
+         }
++
++        let growth = self
++            .budget
++            .as_ref()
++            .map(|budget| budget.grow(newsize.get()).ok_or(ResizeError::LimitExceeded))
++            .transpose()?;
+ 
+         trace!(fd = ?self.fd, oldsize = oldsize, newsize = ?newsize, "Resizing shm pool");
+         guard.remap(self.fd.as_fd(), newsize).map_err(|()| {
+             debug!(fd = ?self.fd, oldsize = oldsize, newsize = ?newsize, "SHM pool resize failed");
+             ResizeError::MremapFailed
+-        })
++        })?;
++        if let Some(growth) = growth {
++            growth.commit();
++        }
++        Ok(())
+     }
+ 
+     pub fn size(&self) -> usize {
+@@ -177,6 +191,16 @@
+         InnerPool::new(fd, size).map(|p| Self { inner: Some(p) })
+     }
+ 
++    pub(super) fn with_budget(
++        fd: OwnedFd,
++        size: NonZeroUsize,
++        budget: Option<super::limits::PoolPermit>,
++    ) -> Result<Self, OwnedFd> {
++        let mut pool = Self::new(fd, size)?;
++        pool.inner.as_mut().unwrap().budget = budget;
++        Ok(pool)
++    }
++
+     pub fn resize(&self, newsize: NonZeroUsize) -> Result<(), ResizeError> {
+         self.inner.as_ref().unwrap().resize(newsize)
+     }
+@@ -196,7 +220,14 @@
+ 
+ impl Drop for Pool {
+     fn drop(&mut self) {
+-        let _ = DROP_THIS.send(self.inner.take().unwrap());
++        let inner = self.inner.take().unwrap();
++        if inner.budget.is_some() {
++            // A bounded host retires storage on its worker before releasing capacity.
++            // Its pools must not accumulate in the global unbounded destruction queue.
++            drop(inner);
++        } else {
++            let _ = DROP_THIS.send(inner);
++        }
+     }
+ }
+ 
+@@ -300,7 +331,7 @@
+             // We use `mem::zeroed()` because regular struct init as well as struct update syntax require all fields to be public
+             // and libc does not guarantee that for all targets
+             let mut action: libc::sigaction = mem::zeroed();
+-            action.sa_sigaction = sigbus_handler as _;
++            action.sa_sigaction = sigbus_handler as *const () as _;
+             action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+ 
+             let mut old_action = mem::zeroed();
+--- a/src/wayland/viewporter/mod.rs
++++ b/src/wayland/viewporter/mod.rs
+@@ -354,6 +354,14 @@
+ /// If the viewport violates any protocol checks a protocol error will be raised and `false`
+ /// is returned.
+ pub fn ensure_viewport_valid(states: &SurfaceData, buffer_size: Size<i32, Logical>) -> bool {
++    ensure_viewport_valid_f64(states, buffer_size.to_f64())
++}
++
++/// Validates a viewport against the exact, possibly fractional, surface buffer size.
++///
++/// Use this after integer buffer scaling and before applying viewport cropping.
++/// Invalid source bounds post the viewport's `out_of_buffer` protocol error.
++pub fn ensure_viewport_valid_f64(states: &SurfaceData, buffer_size: Size<f64, Logical>) -> bool {
+     states
+         .data_map
+         .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
+@@ -368,7 +376,7 @@
+         let mut guard = states.cached_state.get::<ViewportCachedState>();
+         let state = guard.current();
+ 
+-        let buffer_rect = Rectangle::from_size(buffer_size.to_f64());
++        let buffer_rect = Rectangle::from_size(buffer_size);
+         let src = state.src.unwrap_or(buffer_rect);
+         let valid = buffer_rect.contains_rect(src);
+         if !valid {
+@@ -376,7 +384,7 @@
+                 viewport.post_error(
+                     wp_viewport::Error::OutOfBuffer as u32,
+                     format!(
+-                        "source rectangle x={},y={},w={},h={} extends outside of the content area x={},y={},w={},h={}", 
++                        "source rectangle x={},y={},w={},h={} extends outside of the content area x={},y={},w={},h={}",
+                         src.loc.x, src.loc.y, src.size.w, src.size.h,
+                         buffer_rect.loc.x, buffer_rect.loc.y, buffer_rect.size.w, buffer_rect.size.h),
+                 );
