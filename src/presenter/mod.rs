@@ -46,6 +46,8 @@ pub use service::native_vector::{
 };
 #[doc(inline)]
 pub use service::overlay_clipboard::OverlayClipboardWrite;
+#[doc(inline)]
+pub use service::overlay_focus::{OverlayFocusRequest, OverlayFocusRoute};
 pub use service::{
     AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
     KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, OverlayDocumentTarget,

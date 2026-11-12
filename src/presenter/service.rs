@@ -33,6 +33,8 @@ pub mod native_vector;
 mod native_video;
 #[path = "overlay_clipboard.rs"]
 pub(crate) mod overlay_clipboard;
+#[path = "overlay_focus.rs"]
+pub(crate) mod overlay_focus;
 #[path = "overlay_tasks.rs"]
 mod overlay_tasks;
 #[path = "session_status.rs"]
@@ -4750,17 +4752,23 @@ fn dispatch_control_for_connection(
     #[cfg(feature = "vector-video")]
     native_video::tick(&mut state);
     admit_session_post_hello(&mut state, session_id);
+    let relay_focus = record.record_type == messages::OVERLAY_ACTION
+        && state.overlay_relay.focus_route.is_some()
+        && vivid_protocol::overlay::wire::Action::decode(record.object_id, &value).is_ok_and(
+            |action| action.action == vivid_protocol::overlay::wire::WindowAction::Focus,
+        );
     if state.overlay_relay.enabled
-        && matches!(
-            record.record_type,
-            messages::MEASURE_OVERLAY_TEXT
-                | messages::MEASURE_OVERLAY_TEXT_BATCH
-                | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
-                | messages::SET_OVERLAY_EDITOR
-                | messages::SET_OVERLAY_TEXT_CONTEXT
-                | messages::SET_OVERLAY_CLIPBOARD
-                | messages::SET_OVERLAY_SEMANTICS
-        )
+        && (relay_focus
+            || matches!(
+                record.record_type,
+                messages::MEASURE_OVERLAY_TEXT
+                    | messages::MEASURE_OVERLAY_TEXT_BATCH
+                    | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
+                    | messages::SET_OVERLAY_EDITOR
+                    | messages::SET_OVERLAY_TEXT_CONTEXT
+                    | messages::SET_OVERLAY_CLIPBOARD
+                    | messages::SET_OVERLAY_SEMANTICS
+            ))
     {
         use vivid_protocol::overlay::wire::text::styled::{MeasureBatch, ReleaseLayouts};
         if state.overlay_relay.local_host_claimed && !state.overlay_relay.local_host_available {
@@ -4772,6 +4780,7 @@ fn dispatch_control_for_connection(
             ));
         }
         let profile = match record.record_type {
+            messages::OVERLAY_ACTION => registry::TERMINAL_OVERLAY,
             messages::SET_OVERLAY_EDITOR | messages::MEASURE_OVERLAY_TEXT => registry::OVERLAY_TEXT,
             messages::SET_OVERLAY_TEXT_CONTEXT => registry::OVERLAY_EDITOR,
             messages::SET_OVERLAY_CLIPBOARD => registry::OVERLAY_CLIPBOARD,
@@ -4789,6 +4798,15 @@ fn dispatch_control_for_connection(
         }
         let mut clipboard = None;
         let address = match record.record_type {
+            messages::OVERLAY_ACTION => {
+                let query = vivid_protocol::overlay::wire::Action::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad("invalid focus request"))?;
+                state
+                    .overlays
+                    .validate_focus_request(session_id, query)
+                    .map_err(ControlError::state)?;
+                query.address
+            }
             messages::MEASURE_OVERLAY_TEXT => {
                 vivid_protocol::overlay::wire::text::MeasureText::decode(record.object_id, &value)
                     .map_err(|_| ControlError::bad("invalid text measurement request"))?
@@ -4958,6 +4976,20 @@ fn dispatch_control_for_connection(
             .checked_add(1)
             .ok_or_else(|| ControlError::state("overlay host request ID exhausted"))?;
         state.overlay_relay.next_id = id;
+        let host_request = super::OverlayHostRequest {
+            id,
+            surface: BridgeSurfaceKey {
+                producer: session_id,
+                context: address.context_id,
+                surface: address.surface_id,
+            },
+            record_type: record.record_type,
+            body: record.body.clone(),
+            layout_ids: retained_layouts.iter().map(|layout| layout.id).collect(),
+        };
+        let focus = relay_focus
+            .then(|| overlay_focus::Grant::capture(&state, &host_request))
+            .transpose()?;
         state.overlay_relay.reservations.insert(
             id,
             (
@@ -4978,20 +5010,10 @@ fn dispatch_control_for_connection(
         if let Some(clipboard) = clipboard {
             state.overlay_relay.clipboard.insert(id, clipboard);
         }
-        state
-            .overlay_relay
-            .queued
-            .push_back(super::OverlayHostRequest {
-                id,
-                surface: BridgeSurfaceKey {
-                    producer: session_id,
-                    context: address.context_id,
-                    surface: address.surface_id,
-                },
-                record_type: record.record_type,
-                body: record.body.clone(),
-                layout_ids: retained_layouts.iter().map(|layout| layout.id).collect(),
-            });
+        if let Some(grant) = focus {
+            state.overlay_relay.focus.insert(id, grant);
+        }
+        state.overlay_relay.queued.push_back(host_request);
         let wakeup = state.media_wakeup.clone();
         drop(state);
         if let Some(wakeup) = wakeup {
@@ -5003,6 +5025,7 @@ fn dispatch_control_for_connection(
         state.overlay_relay.pending.remove(&id);
         state.overlay_relay.reservations.remove(&id);
         state.overlay_relay.clipboard.remove(&id);
+        state.overlay_relay.focus.remove(&id);
         state
             .overlay_relay
             .queued
@@ -5030,7 +5053,18 @@ fn dispatch_control_for_connection(
         }
         let response = messages::decode_control(&body)
             .map_err(|_| ControlError::bad("invalid outer overlay reply"))?;
-        if let Some(query) = measurement {
+        if relay_focus {
+            if !response.payload.is_empty() {
+                return Err(ControlError::bad("invalid focus acknowledgement"));
+            }
+            let action = vivid_protocol::overlay::wire::Action::decode(record.object_id, &value)
+                .map_err(|_| ControlError::bad("invalid focus request"))?;
+            state
+                .overlays
+                .acknowledge_focus_request(session_id, action)
+                .map_err(ControlError::state)?;
+            advance_projection(&mut state);
+        } else if let Some(query) = measurement {
             let answer = vivid_protocol::overlay::wire::text::styled::BatchMeasured::decode(
                 address,
                 &Value::Map(response.payload.clone()),
@@ -8701,6 +8735,7 @@ fn cancel_overlay_host_requests(state: &mut State, matches: impl Fn(BridgeSurfac
         state.overlay_relay.pending.remove(id);
         state.overlay_relay.reservations.remove(id);
         state.overlay_relay.clipboard.remove(id);
+        state.overlay_relay.focus.remove(id);
     }
     state
         .overlay_relay

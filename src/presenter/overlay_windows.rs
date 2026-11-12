@@ -137,6 +137,14 @@ impl PaneWindows {
         self.for_owner_mut(id.context().session())?
             .request_focus(id)
     }
+    pub fn acknowledge_focus_action(
+        &mut self,
+        owner: SessionIdentity,
+        action: wire::Action,
+    ) -> Result<u64, InvalidScene> {
+        self.for_owner_mut(owner)?
+            .acknowledge_focus_action(owner, action)
+    }
     pub fn clear_focus(&mut self, id: SurfaceIdentity) {
         if let Ok(windows) = self.for_owner_mut(id.context().session()) {
             windows.clear_focus(id);
@@ -160,6 +168,10 @@ impl PaneWindows {
     pub fn input_eligible(&self, id: SurfaceIdentity) -> bool {
         self.for_owner(id.context().session())
             .is_some_and(|windows| windows.input_eligible(id))
+    }
+    pub fn focus_eligible(&self, id: SurfaceIdentity) -> bool {
+        self.for_owner(id.context().session())
+            .is_some_and(|windows| windows.focus_eligible(id))
     }
     pub fn set_owner_input(
         &mut self,

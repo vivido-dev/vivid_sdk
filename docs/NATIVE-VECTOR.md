@@ -479,6 +479,13 @@ Physical input sources, candidate menus, OS secure-input behavior, VoiceOver,
 non-macOS platforms and production mux/GUI relay integration remain unrun gates.
 The opt-in gateway core separately passes two-hop transport and native presenter API
 checks; these do not exercise GPU submission through the gateway frontend.
+The compositor's separate [focus follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
+uses an explicitly bound focus route with headless Metal and simulated GUI frame
+completions. Its peer receives keyboard/editor focus from the producer request,
+without a pointer gesture. The physical host remains authoritative; the SDK
+acknowledges the independent inner window revision without creating a focus grant.
+See [producer focus forwarding](../../vivid_gateway/README.md#producer-focus-forwarding)
+for original-session admission, cancellation and the remaining production gates.
 `timed-media-sync-v1` remains withheld.
 
 ## Live video

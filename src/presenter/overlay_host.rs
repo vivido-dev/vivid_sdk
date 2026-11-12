@@ -720,6 +720,52 @@ impl Overlays {
             .map_err(|_| "overlay window reply could not be encoded")
     }
 
+    pub(crate) fn validate_focus_request(
+        &self,
+        session_id: u64,
+        action: Action,
+    ) -> Result<(), &'static str> {
+        let id = action
+            .address
+            .identity(owner(session_id))
+            .map_err(|_| "invalid focus owner")?;
+        let window = self.windows.get(id).ok_or("focus window is absent")?;
+        if action.action != vivid_protocol::overlay::wire::WindowAction::Focus
+            || window.generation != action.address.generation
+            || window.revision != action.expected_revision
+            || action.expected_revision.checked_add(1).is_none()
+            || !window.options.visible
+            || !self.windows.focus_eligible(id)
+            || !self.input_enabled(session_id)
+        {
+            return Err("focus window or input scope is stale");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge_focus_request(
+        &mut self,
+        session_id: u64,
+        action: Action,
+    ) -> Result<(), &'static str> {
+        self.windows
+            .acknowledge_focus_action(owner(session_id), action)
+            .map(|_| ())
+            .map_err(|_| "focus acknowledgement is stale")
+    }
+
+    pub(crate) fn retire_relay_focus(&mut self, sessions: &[u64]) {
+        for session in sessions {
+            if let Some(pane) = self.windows.pane(owner(*session))
+                && let Some(id) = self.windows.focus(pane)
+                && id.context().session().session_id() == *session
+            {
+                self.windows.clear_focus(id);
+            }
+        }
+        self.drain_events_of(sessions);
+    }
+
     pub(crate) fn action(
         &mut self,
         session_id: u64,
