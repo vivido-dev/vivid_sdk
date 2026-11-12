@@ -48,7 +48,7 @@ pub(crate) use editor::Stamp as EditorStamp;
 #[path = "overlay_windows.rs"]
 mod pane_windows;
 use pane_windows::PaneWindows as Windows;
-use vivid_protocol::vector::{Canvas, Frame, Limits, Point, Scalar};
+use vivid_protocol::vector::{Canvas, Frame, Limits, Point, Rect, Scalar};
 
 /// A display list the presenter accepted, with the identity a real host would key it by.
 #[derive(Debug, Clone)]
@@ -482,6 +482,11 @@ impl Overlays {
         {
             return false;
         }
+        if let Event::Dismissed(reason) = input.event {
+            self.windows.close(id, reason);
+            self.drain_events(owner(session));
+            return true;
+        }
         if matches!(
             input.event,
             Event::Pointer { .. }
@@ -720,7 +725,7 @@ impl Overlays {
             .map_err(|_| "overlay window reply could not be encoded")
     }
 
-    pub(crate) fn validate_focus_request(
+    pub(crate) fn validate_action_request(
         &self,
         session_id: u64,
         action: Action,
@@ -728,30 +733,66 @@ impl Overlays {
         let id = action
             .address
             .identity(owner(session_id))
-            .map_err(|_| "invalid focus owner")?;
-        let window = self.windows.get(id).ok_or("focus window is absent")?;
-        if action.action != vivid_protocol::overlay::wire::WindowAction::Focus
-            || window.generation != action.address.generation
+            .map_err(|_| "invalid action owner")?;
+        let window = self.windows.get(id).ok_or("action window is absent")?;
+        let input = matches!(
+            action.action,
+            vivid_protocol::overlay::wire::WindowAction::Focus
+                | vivid_protocol::overlay::wire::WindowAction::Raise
+                | vivid_protocol::overlay::wire::WindowAction::Lower
+        );
+        if window.generation != action.address.generation
             || window.revision != action.expected_revision
-            || action.expected_revision.checked_add(1).is_none()
-            || !window.options.visible
-            || !self.windows.focus_eligible(id)
-            || !self.input_enabled(session_id)
+            || (action.action != vivid_protocol::overlay::wire::WindowAction::Close
+                && action.expected_revision.checked_add(1).is_none())
+            || !self.windows.action_eligible(id, action.action)
+            || (input && !self.input_enabled(session_id))
         {
-            return Err("focus window or input scope is stale");
+            return Err("action window or input scope is stale");
         }
         Ok(())
     }
 
-    pub(crate) fn acknowledge_focus_request(
+    pub(crate) fn acknowledge_action_request(
         &mut self,
         session_id: u64,
         action: Action,
+        bounds: Option<Rect>,
+        closed_observed: bool,
     ) -> Result<(), &'static str> {
+        if closed_observed && action.action == vivid_protocol::overlay::wire::WindowAction::Close {
+            let id = action
+                .address
+                .identity(owner(session_id))
+                .map_err(|_| "invalid action owner")?;
+            return if self.windows.get(id).is_none() {
+                Ok(())
+            } else {
+                Err("dismissed window was replaced")
+            };
+        }
         self.windows
-            .acknowledge_focus_action(owner(session_id), action)
-            .map(|_| ())
-            .map_err(|_| "focus acknowledgement is stale")
+            .acknowledge_relayed_action(owner(session_id), action, bounds)
+            .map_err(|_| "window-action acknowledgement is stale")?;
+        self.drain_events(owner(session_id));
+        Ok(())
+    }
+
+    pub(crate) fn action_viewport_revision(&self, session: u64) -> Option<u64> {
+        Some(self.viewport_of(session)?.revision)
+    }
+
+    pub(crate) fn centered_action_bounds(&self, session: u64, action: Action) -> Option<Rect> {
+        let id = action.address.identity(owner(session)).ok()?;
+        let bounds = self.windows.get(id)?.options.bounds;
+        let viewport = self.viewport_of(session)?.viewport;
+        Rect::new(
+            ((viewport.width.get() - bounds.width.get()) / 2.).max(0.),
+            ((viewport.height.get() - bounds.height.get()) / 2.).max(0.),
+            bounds.width.get(),
+            bounds.height.get(),
+        )
+        .ok()
     }
 
     pub(crate) fn retire_relay_focus(&mut self, sessions: &[u64]) {

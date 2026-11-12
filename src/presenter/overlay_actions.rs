@@ -1,9 +1,10 @@
-//! Original-session admission for producer focus requests through an explicit relay.
+//! Original-session admission for producer window actions through an explicit relay.
 
 // Rust guideline compliant 2026-10-07
 use super::*;
 use std::sync::Weak;
-use vivid_protocol::overlay::wire::Action;
+use vivid_protocol::overlay::wire::{Action, WindowAction, WindowAddress};
+use vivid_protocol::vector::Rect;
 
 // The correlated host RPC already has the same ten-second deadline.
 const LIFETIME: Duration = Duration::from_secs(10);
@@ -12,10 +13,14 @@ pub(crate) struct Grant {
     route: Weak<AtomicBool>,
     request: super::super::OverlayHostRequest,
     writer: Weak<Writer>,
-    lane: Weak<Writer>,
-    lane_generation: u64,
+    lane: Option<(Weak<Writer>, u64)>,
     resume: u64,
     started: Instant,
+    action: Action,
+    viewport_revision: Option<u64>,
+    pub(super) centered_bounds: Option<Rect>,
+    pub(super) claimed: bool,
+    pub(super) closed_observed: bool,
 }
 
 impl Grant {
@@ -25,109 +30,153 @@ impl Grant {
     ) -> Result<Self, ControlError> {
         let route = state
             .overlay_relay
-            .focus_route
+            .action_route
             .as_ref()
             .and_then(Weak::upgrade)
             .filter(|route| route.load(Ordering::Acquire))
-            .ok_or_else(|| ControlError::state("focus relay is unavailable"))?;
+            .ok_or_else(|| ControlError::state("window-action relay is unavailable"))?;
         let session = &state.sessions[&request.surface.producer];
-        let lane = session
-            .overlay_lane
-            .as_ref()
-            .filter(|lane| !lane.is_closed())
-            .ok_or_else(|| ControlError::state("focus input lane is unavailable"))?;
-        let lane_generation = state
-            .overlays
-            .input_generation(request.surface.producer)
-            .ok_or_else(|| ControlError::state("focus input lane is expired"))?;
+        let envelope = messages::decode_control(&request.body)
+            .map_err(|_| ControlError::bad("invalid window action"))?;
+        let action = Action::decode(request.surface.surface, &Value::Map(envelope.payload))
+            .map_err(|_| ControlError::bad("invalid window action"))?;
+        let lane = if matches!(
+            action.action,
+            WindowAction::Focus | WindowAction::Raise | WindowAction::Lower
+        ) {
+            let lane = session
+                .overlay_lane
+                .as_ref()
+                .filter(|lane| !lane.is_closed())
+                .ok_or_else(|| ControlError::state("action input lane is unavailable"))?;
+            Some((
+                Arc::downgrade(lane),
+                state
+                    .overlays
+                    .input_generation(request.surface.producer)
+                    .ok_or_else(|| ControlError::state("action input lane is expired"))?,
+            ))
+        } else {
+            None
+        };
+        let centered_bounds = if action.action == WindowAction::Center {
+            Some(
+                state
+                    .overlays
+                    .centered_action_bounds(request.surface.producer, action)
+                    .ok_or_else(|| ControlError::state("center viewport is unavailable"))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             route: Arc::downgrade(&route),
             request: request.clone(),
             writer: Arc::downgrade(&session.writer),
-            lane: Arc::downgrade(lane),
-            lane_generation,
+            lane,
             resume: session.resume_generation,
             started: Instant::now(),
+            action,
+            viewport_revision: centered_bounds.and_then(|_| {
+                state
+                    .overlays
+                    .action_viewport_revision(request.surface.producer)
+            }),
+            centered_bounds,
+            claimed: false,
+            closed_observed: false,
         })
+    }
+
+    pub(super) fn observe_close(&mut self, surface: BridgeSurfaceKey, address: WindowAddress) {
+        if self.claimed
+            && self.action.action == WindowAction::Close
+            && self.request.surface == surface
+            && self.action.address == address
+        {
+            self.closed_observed = true;
+        }
     }
 }
 
-/// An exclusive, original-presenter route for producer-requested window focus.
+/// An exclusive, original-presenter route for producer-requested window actions.
 ///
-/// Off by default. Dropping the route cancels pending focus requests; subsequent
+/// Off by default. Dropping the route cancels pending window actions; subsequent
 /// requests fail closed until another route attaches. This does not activate a
-/// native pane or grant input. The physical host decides focus and returns events.
-pub struct OverlayFocusRoute {
+/// native pane or grant input. Focus, raise, lower, center and close use the existing
+/// window-action contract. The physical host decides focus and returns events.
+pub struct OverlayActionRoute {
     state: Weak<Mutex<State>>,
     scope: Arc<AtomicBool>,
 }
 
-/// A one-shot focus admission tied to its original route and authenticated request.
+/// A one-shot window-action admission tied to its original route and authenticated request.
 ///
 /// Neither serializable nor retargetable. Claim immediately before dispatching the
 /// already-remapped physical request. Admission precedes any concurrent retirement;
 /// an admitted RPC may finish later, but must never be retried against a new route.
-pub struct OverlayFocusRequest {
+pub struct OverlayActionRequest {
     state: Weak<Mutex<State>>,
     scope: Weak<AtomicBool>,
     request: super::super::OverlayHostRequest,
 }
 
-impl std::fmt::Debug for OverlayFocusRoute {
+impl std::fmt::Debug for OverlayActionRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OverlayFocusRoute").finish_non_exhaustive()
+        f.debug_struct("OverlayActionRoute").finish_non_exhaustive()
     }
 }
-impl std::fmt::Debug for OverlayFocusRequest {
+impl std::fmt::Debug for OverlayActionRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OverlayFocusRequest")
+        f.debug_struct("OverlayActionRequest")
             .finish_non_exhaustive()
     }
 }
 
 impl VirtualVivid {
-    /// Attaches one exclusive relay for existing producer window-focus actions.
+    /// Attaches one exclusive relay for existing producer window actions.
     ///
-    /// Enable host relaying first. The caller must remap and service focus RPCs,
+    /// Enable host relaying first. The caller must remap and service window-action RPCs,
     /// and relay physical input/focus events back to this original presenter.
+    /// Center captures the original pane viewport; close retires its window group.
     /// Legacy hosts that do not attach keep their existing local action behavior.
     ///
     /// # Errors
     /// Returns `Unsupported` for local native hosts or disabled relaying, and
-    /// `AlreadyExists` when another live focus route is already attached.
-    pub fn attach_overlay_focus_relay(&self) -> io::Result<OverlayFocusRoute> {
+    /// `AlreadyExists` when another live action route is already attached.
+    pub fn attach_overlay_action_relay(&self) -> io::Result<OverlayActionRoute> {
         let mut state = lock(&self.state);
         if !state.overlay_relay.enabled || state.overlay_relay.local_host_claimed {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "focus requires a terminating relay",
+                "window actions require a terminating relay",
             ));
         }
         if state
             .overlay_relay
-            .focus_route
+            .action_route
             .as_ref()
             .and_then(Weak::upgrade)
             .is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "focus relay is already attached",
+                "window-action relay is already attached",
             ));
         }
         let scope = Arc::new(AtomicBool::new(true));
-        state.overlay_relay.focus_route = Some(Arc::downgrade(&scope));
-        Ok(OverlayFocusRoute {
+        state.overlay_relay.action_route = Some(Arc::downgrade(&scope));
+        Ok(OverlayActionRoute {
             state: Arc::downgrade(&self.state),
             scope,
         })
     }
 }
 
-impl OverlayFocusRoute {
+impl OverlayActionRoute {
     /// Pins a request to this route without consuming its one-shot admission.
-    pub fn request(&self, request: &super::super::OverlayHostRequest) -> OverlayFocusRequest {
-        OverlayFocusRequest {
+    pub fn request(&self, request: &super::super::OverlayHostRequest) -> OverlayActionRequest {
+        OverlayActionRequest {
             state: self.state.clone(),
             scope: Arc::downgrade(&self.scope),
             request: request.clone(),
@@ -143,13 +192,13 @@ impl OverlayFocusRoute {
             let mut state = lock(&state);
             retire(&mut state, &self.scope);
             self.scope = Arc::new(AtomicBool::new(true));
-            state.overlay_relay.focus_route = Some(Arc::downgrade(&self.scope));
+            state.overlay_relay.action_route = Some(Arc::downgrade(&self.scope));
         }
     }
 
     /// Returns an idempotent cancellation hook without extending the route lifetime.
     ///
-    /// Cancelling refuses future focus admission and releases original pending
+    /// Cancelling refuses future window-action admission and releases original pending
     /// requests. Drop the route before attaching another one.
     pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
         let state = self.state.clone();
@@ -162,7 +211,7 @@ impl OverlayFocusRoute {
     }
 }
 
-impl Drop for OverlayFocusRoute {
+impl Drop for OverlayActionRoute {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
             retire(&mut lock(&state), &self.scope);
@@ -174,7 +223,7 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
     scope.store(false, Ordering::Release);
     if state
         .overlay_relay
-        .focus_route
+        .action_route
         .as_ref()
         .and_then(Weak::upgrade)
         .is_some_and(|current| Arc::ptr_eq(&current, scope))
@@ -185,7 +234,7 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
     }
     let ids: HashSet<_> = state
         .overlay_relay
-        .focus
+        .actions
         .iter()
         .filter_map(|(id, grant)| {
             grant
@@ -196,7 +245,7 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
         })
         .collect();
     for id in &ids {
-        state.overlay_relay.focus.remove(id);
+        state.overlay_relay.actions.remove(id);
         state.overlay_relay.pending.remove(id);
         state.overlay_relay.reservations.remove(id);
     }
@@ -206,11 +255,29 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
         .retain(|request| !ids.contains(&request.id));
 }
 
-impl OverlayFocusRequest {
-    /// Consumes admission after checking the original request, owner, writer and input lane.
+impl OverlayActionRequest {
+    /// Returns the captured original-pane rectangle for a Center request.
+    pub fn centered_bounds(&self) -> Option<Rect> {
+        let state = self.state.upgrade()?;
+        let scope = self.scope.upgrade()?;
+        let state = lock(&state);
+        let grant = state.overlay_relay.actions.get(&self.request.id)?;
+        (scope.load(Ordering::Acquire)
+            && grant.request == self.request
+            && grant
+                .route
+                .upgrade()
+                .is_some_and(|route| Arc::ptr_eq(&route, &scope)))
+        .then_some(grant.centered_bounds)
+        .flatten()
+    }
+    /// Consumes admission after checking the original request and authenticated owner.
     ///
     /// Returns false for altered, duplicate, expired, retired or replaced requests.
-    /// This authorizes one dispatch, not its outcome or any subsequent input.
+    /// Focus, raise and lower also require their original canonical input lane.
+    /// Center rechecks the captured viewport revision. Close requires window control
+    /// authority and no input grant. This authorizes one dispatch, not its outcome
+    /// or any subsequent input.
     pub fn claim(self) -> bool {
         let (Some(state), Some(scope)) = (self.state.upgrade(), self.scope.upgrade()) else {
             return false;
@@ -220,13 +287,14 @@ impl OverlayFocusRequest {
         if !scope.load(Ordering::Acquire) {
             return false;
         }
-        let Some(grant) = state.overlay_relay.focus.get(&self.request.id) else {
+        let Some(grant) = state.overlay_relay.actions.get(&self.request.id) else {
             return false;
         };
         let Some(session) = state.sessions.get(&self.request.surface.producer) else {
             return false;
         };
         if grant.request != self.request
+            || grant.claimed
             || grant.started.elapsed() >= LIFETIME
             || !state.overlay_relay.pending.contains_key(&self.request.id)
             || !grant
@@ -239,16 +307,23 @@ impl OverlayFocusRequest {
                 .writer
                 .upgrade()
                 .is_some_and(|writer| Arc::ptr_eq(&writer, &session.writer) && !writer.is_closed())
-            || !grant.lane.upgrade().is_some_and(|lane| {
-                session
-                    .overlay_lane
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(&lane, current) && !lane.is_closed())
+            || grant.lane.as_ref().is_some_and(|(lane, generation)| {
+                !lane.upgrade().is_some_and(|lane| {
+                    session
+                        .overlay_lane
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(&lane, current) && !lane.is_closed())
+                }) || state
+                    .overlays
+                    .input_generation(self.request.surface.producer)
+                    != Some(*generation)
             })
-            || state
-                .overlays
-                .input_generation(self.request.surface.producer)
-                != Some(grant.lane_generation)
+            || grant.viewport_revision.is_some_and(|revision| {
+                state
+                    .overlays
+                    .action_viewport_revision(self.request.surface.producer)
+                    != Some(revision)
+            })
         {
             return false;
         }
@@ -271,12 +346,17 @@ impl OverlayFocusRequest {
                 .is_none_or(|surface| surface.state.generation.get() != action.address.generation)
             || state
                 .overlays
-                .validate_focus_request(self.request.surface.producer, action)
+                .validate_action_request(self.request.surface.producer, action)
                 .is_err()
         {
             return false;
         }
-        state.overlay_relay.focus.remove(&self.request.id);
+        state
+            .overlay_relay
+            .actions
+            .get_mut(&self.request.id)
+            .expect("validated action admission")
+            .claimed = true;
         true
     }
 }

@@ -137,13 +137,14 @@ impl PaneWindows {
         self.for_owner_mut(id.context().session())?
             .request_focus(id)
     }
-    pub fn acknowledge_focus_action(
+    pub fn acknowledge_relayed_action(
         &mut self,
         owner: SessionIdentity,
         action: wire::Action,
-    ) -> Result<u64, InvalidScene> {
+        bounds: Option<vivid_protocol::vector::Rect>,
+    ) -> Result<Option<u64>, InvalidScene> {
         self.for_owner_mut(owner)?
-            .acknowledge_focus_action(owner, action)
+            .acknowledge_relayed_action(owner, action, bounds)
     }
     pub fn clear_focus(&mut self, id: SurfaceIdentity) {
         if let Ok(windows) = self.for_owner_mut(id.context().session()) {
@@ -169,9 +170,9 @@ impl PaneWindows {
         self.for_owner(id.context().session())
             .is_some_and(|windows| windows.input_eligible(id))
     }
-    pub fn focus_eligible(&self, id: SurfaceIdentity) -> bool {
+    pub fn action_eligible(&self, id: SurfaceIdentity, action: wire::WindowAction) -> bool {
         self.for_owner(id.context().session())
-            .is_some_and(|windows| windows.focus_eligible(id))
+            .is_some_and(|windows| windows.action_eligible(id, action))
     }
     pub fn set_owner_input(
         &mut self,

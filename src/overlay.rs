@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Duration;
 
@@ -82,6 +83,23 @@ pub struct OverlayWindow {
     input: Weak<OverlayInputLane>,
     address: WindowAddress,
     state: Mutex<WindowState>,
+    life: Arc<WindowLife>,
+}
+
+#[derive(Debug)]
+struct WindowLife {
+    dismissed: AtomicBool,
+    parent: Option<Arc<WindowLife>>,
+    depth: usize,
+}
+impl WindowLife {
+    fn is_dismissed(&self) -> bool {
+        self.dismissed.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_dismissed())
+    }
 }
 
 #[derive(Debug)]
@@ -240,6 +258,10 @@ impl OverlaySession {
         options: OverlayWindowOptions,
         parent: Option<&OverlayWindow>,
     ) -> io::Result<OverlayWindow> {
+        let depth = parent
+            .map_or(Some(1), |parent| parent.life.depth.checked_add(1))
+            .filter(|depth| *depth <= vivid_protocol::overlay::MAX_WINDOWS_PER_OWNER)
+            .ok_or_else(|| invalid_input("overlay parent depth exceeds window limit"))?;
         options.bounds.validate().map_err(io::Error::other)?;
         let width = options.bounds.width.get().ceil();
         let height = options.bounds.height.get().ceil();
@@ -255,7 +277,7 @@ impl OverlaySession {
         window_options.validate().map_err(io::Error::other)?;
         if let Some(parent) = parent {
             let state = lock(&parent.state, "overlay parent")?;
-            if state.closed {
+            if state.closed || parent.life.is_dismissed() {
                 return Err(closed());
             }
             window_options.parent = Some(state.window.address.identity(owner(session))?);
@@ -332,6 +354,11 @@ impl OverlaySession {
                     assets: BTreeSet::new(),
                     layouts: BTreeSet::new(),
                 }),
+                life: Arc::new(WindowLife {
+                    dismissed: AtomicBool::new(false),
+                    parent: parent.map(|window| Arc::clone(&window.life)),
+                    depth,
+                }),
             })
         })();
         if result.is_err() {
@@ -354,7 +381,15 @@ impl OverlaySession {
         if !Weak::ptr_eq(&window.session, &Arc::downgrade(&self.session)) {
             return Ok(false);
         }
-        Ok(window.address == event.address)
+        let matches = window.address == event.address;
+        if matches && matches!(event.event, Event::Dismissed(_)) {
+            window.life.dismissed.store(true, Ordering::Release);
+        }
+        let revocation = matches!(
+            event.event,
+            Event::Dismissed(_) | Event::Cancel | Event::Focus(false)
+        );
+        Ok(matches && (revocation || !window.life.is_dismissed()))
     }
 
     /// Matches a document edit to this session's exact current window address.
@@ -365,7 +400,8 @@ impl OverlaySession {
     ) -> io::Result<bool> {
         Ok(
             Weak::ptr_eq(&window.session, &Arc::downgrade(&self.session))
-                && window.address == event.address,
+                && window.address == event.address
+                && !window.life.is_dismissed(),
         )
     }
 
@@ -647,11 +683,19 @@ impl OverlayWindow {
         &self,
         f: impl FnOnce(&mut Session, &mut WindowState) -> io::Result<T>,
     ) -> io::Result<T> {
+        self.with_state_checked(false, f)
+    }
+
+    fn with_state_checked<T>(
+        &self,
+        allow_dismissed: bool,
+        f: impl FnOnce(&mut Session, &mut WindowState) -> io::Result<T>,
+    ) -> io::Result<T> {
         let shared = self.session.upgrade().ok_or_else(closed)?;
         let mut session = lock(&shared, "overlay session")?;
         let session = session.as_mut().ok_or_else(closed)?;
         let mut state = lock(&self.state, "overlay window")?;
-        if state.closed {
+        if state.closed || (!allow_dismissed && self.life.is_dismissed()) {
             return Err(closed());
         }
         f(session, &mut state)
@@ -864,6 +908,18 @@ impl OverlayWindow {
         self.action(WindowAction::Lower)
     }
 
+    /// Requests host dismissal of this window and its descendants.
+    ///
+    /// Retained surfaces remain producer-owned; release them with `close` after
+    /// dismissal. This uses the existing revision-checked window Close action.
+    /// An acknowledged close fences further submissions from the whole group.
+    ///
+    /// # Errors
+    /// Returns an error for a closed session or window, stale revision, or host refusal.
+    pub fn request_close(&self) -> io::Result<()> {
+        self.action(WindowAction::Close)
+    }
+
     fn action(&self, action: WindowAction) -> io::Result<()> {
         self.with_state(|session, state| {
             refresh(session, state)?;
@@ -878,7 +934,11 @@ impl OverlayWindow {
                 action.payload()?,
                 &RequestMetadata::default(),
             )?;
-            refresh(session, state)?;
+            if action.action == WindowAction::Close {
+                self.life.dismissed.store(true, Ordering::Release);
+            } else {
+                refresh(session, state)?;
+            }
             Ok(())
         })
     }
@@ -892,7 +952,7 @@ impl OverlayWindow {
 
     /// Close this window and its child popups, then release its surface and retained resources.
     pub fn close(&self) -> io::Result<()> {
-        self.with_state(|session, state| {
+        self.with_state_checked(true, |session, state| {
             // Destroying the surface also closes a window already dismissed by the host.
             let eos = if state.active {
                 state.channel.eos().map(|_| ())
@@ -902,6 +962,7 @@ impl OverlayWindow {
             let destroy = session.destroy_surface(&state.surface, &RequestMetadata::default());
             if destroy.is_ok() {
                 state.closed = true;
+                self.life.dismissed.store(true, Ordering::Release);
             }
             destroy.and(eos)
         })

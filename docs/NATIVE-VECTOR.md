@@ -480,12 +480,19 @@ non-macOS platforms and production mux/GUI relay integration remain unrun gates.
 The opt-in gateway core separately passes two-hop transport and native presenter API
 checks; these do not exercise GPU submission through the gateway frontend.
 The compositor's separate [focus follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
-uses an explicitly bound focus route with headless Metal and simulated GUI frame
+uses an explicitly bound window-action route with headless Metal and simulated GUI frame
 completions. Its peer receives keyboard/editor focus from the producer request,
 without a pointer gesture. The physical host remains authoritative; the SDK
 acknowledges the independent inner window revision without creating a focus grant.
-See [producer focus forwarding](../../vivid_gateway/README.md#producer-focus-forwarding)
+See [producer window-action forwarding](../../vivid_gateway/README.md#producer-window-action-forwarding)
 for original-session admission, cancellation and the remaining production gates.
+The [window-action follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-actions-macos.json)
+adds raise/lower stacking without focus changes, pane-relative translated center,
+parent/child close and same-ID peer isolation. The SDK API is now
+`attach_overlay_action_relay` with `OverlayActionRoute`/`OverlayActionRequest`,
+replacing the focus-only names. Producer `request_close` dismisses the group and
+fences its submissions; `close` still releases retained resources after dismissal.
+The route reuses Vivid 1.5 actions and introduces no wire or registry changes.
 `timed-media-sync-v1` remains withheld.
 
 ## Live video

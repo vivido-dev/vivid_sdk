@@ -43,12 +43,13 @@ impl Session {
                     messages::OVERLAY_STATUS,
                 ),
                 messages::OVERLAY_ACTION => {
-                    let action = Action::decode(object, &Value::Map(payload.clone()))?;
-                    if action.action != WindowAction::Focus {
-                        return Err(invalid_input("host action handle supports focus only"));
-                    }
+                    Action::decode(object, &Value::Map(payload.clone()))?;
                     (vivid_protocol::registry::TERMINAL_OVERLAY, messages::OK)
                 }
+                messages::SET_OVERLAY_WINDOW => (
+                    vivid_protocol::registry::TERMINAL_OVERLAY,
+                    messages::OVERLAY_WINDOW_READY,
+                ),
                 messages::MEASURE_OVERLAY_TEXT => (
                     vivid_protocol::registry::OVERLAY_TEXT,
                     messages::OVERLAY_TEXT_MEASURED,
