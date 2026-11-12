@@ -211,10 +211,32 @@ older than 500 ms. Invalid frames or channel loss disable the service; a produce
 that negotiated it stops rather than inserting fallback US text. A legacy producer
 without this optional service retains the existing physical-input backend.
 
-Host native queries expose only the local preedit and clipped candidate rectangle.
-Committed producer document text never crosses this channel. Absolute replacement
-is supported within composition; surrounding-document queries/selection/replacement,
-text-assistance preferences and OS secure-input mode are separate work. Native
+By default, native queries expose only local preedit and candidate geometry.
+Applications opt into document editing with `EntityInputHandler::hosted_text_context`
+(or `InputHandler` for custom handlers). Return a `HostedTextContext` containing
+at most 4,096 UTF-8 bytes of committed text, excluding preedit and including the
+complete current selection. Cursor/anchor use excerpt byte offsets; the excerpt's
+producer-local UTF-16 offset remains in the producer. Opt-in handlers must implement
+`set_selected_text_range` and accept explicit UTF-16 replacement ranges in their
+ordinary text/mark callbacks. Host queries use virtual
+coordinates beginning at zero, independently of the full document's size.
+Sensitive fields must return empty text, zero offsets/selection and `sensitive=true`;
+they expose only composition and refuse absolute document edits. This masking
+contract does not enable OS secure-input mode.
+
+The private IME service is version 2; mismatched versions close the channel.
+This changes no Vivid wire assignment or profile. Snapshots carry a monotonic
+revision within each editor incarnation. Absolute selection/replacement requires
+the exact revision, valid UTF-8 boundaries and a replacement covering the current
+selection. The final GUI boundary rechecks the exact application excerpt, including
+its producer-local offset, before converting to UTF-16. Each queued operation
+resamples context; stale absolute operations are discarded. Relative typing can
+follow earlier ordered native commits. Export-mode or sensitivity changes retire
+the editor even when application notifications are missing. Native callbacks wait
+for the producer's new revision before another absolute edit; preedit remains
+local for immediate native queries. Raster and vector hosts share this checked
+coordinate handling. Text-assistance preferences remain separate work.
+Native
 printable-key callbacks supply text without producer-side duplicate insertion.
 A field begins native insertion after a current eligibility snapshot reaches the
 host. Transition callbacks may be rejected while it refreshes; rapid field changes
@@ -228,7 +250,8 @@ The compositor's `--sdk-editor` child demonstrates a bounded text model. Develop
 `--remote-ime-render-check OUTPUT` uses actual independent GUI processes and Metal
 rendering with simulated native composition callbacks. Set
 `VIVID_COMPOSITOR_CHECK_LEASE=1` for the lease-resume variant. These checks cover
-Unicode composition/commit, candidate bounds, focus return, reconnect and peer
+Unicode composition/commit, surrounding text, selection/replacement, candidate
+bounds, focus return, reconnect and peer
 cleanup. Physical macOS input sources/candidate menus, OS secure-input behavior,
 other platforms/devices and sustained input-method performance remain unrun gates.
 

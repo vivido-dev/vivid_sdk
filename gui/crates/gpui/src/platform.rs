@@ -2235,26 +2235,49 @@ impl PlatformInputHandler {
         !window.has_pending_keystrokes() && self.handler.prefers_ime_for_printable_keys(window, cx)
     }
 
-    pub(crate) fn dispatch_hosted_composition(
+    pub(crate) fn hosted_text_context(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<crate::HostedTextContext> {
+        self.handler.hosted_text_context(window, cx)
+    }
+
+    pub(crate) fn dispatch_hosted_edit(
         &mut self,
         target: &crate::HostedTextTarget,
-        commit: Option<&str>,
-        preedit: &str,
-        selection: Option<Range<usize>>,
+        edit: &crate::HostedTextEdit<'_>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(commit) = commit {
-            self.handler.replace_text_in_range(None, commit, window, cx);
+        if let Some(range) = &edit.document_selection {
+            // Selection is one handler operation. An intervening unmark callback
+            // could commit text and invalidate the excerpt coordinates we checked.
+            self.handler
+                .set_selected_text_range(range.clone(), window, cx);
+            return;
+        }
+        if let Some(commit) = edit.commit {
+            self.handler
+                .replace_text_in_range(edit.replacement.clone(), commit, window, cx);
         }
         if !window.hosted_text_target_live(target) {
             return;
         }
-        if preedit.is_empty() {
+        if edit.preedit.is_empty() {
             self.handler.unmark_text(window, cx);
         } else {
-            self.handler
-                .replace_and_mark_text_in_range(None, preedit, selection, window, cx);
+            self.handler.replace_and_mark_text_in_range(
+                if edit.commit.is_none() {
+                    edit.replacement.clone()
+                } else {
+                    None
+                },
+                edit.preedit,
+                edit.selection.clone(),
+                window,
+                cx,
+            );
         }
     }
 
@@ -2527,6 +2550,20 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<usize>;
+
+    /// Explicitly exports a bounded excerpt for independently hosted native editing.
+    ///
+    /// The default exports no document. Return committed text excluding preedit,
+    /// with the complete current selection and producer-local UTF-16 offset.
+    /// Protected fields must return a masked sensitive context. Call window text
+    /// or selection notifications whenever external edits change this context.
+    fn hosted_text_context(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<crate::HostedTextContext> {
+        None
+    }
 
     /// Set the range of the user's currently selected text.
     ///

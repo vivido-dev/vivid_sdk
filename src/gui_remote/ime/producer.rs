@@ -4,7 +4,7 @@
 use super::*;
 #[cfg(test)]
 mod tests;
-use crate::gui::{App, HostedTextTarget, Window};
+use crate::gui::{App, HostedTextContext, HostedTextEdit, HostedTextTarget, Window};
 
 pub(crate) struct Producer {
     state: Arc<State>,
@@ -15,6 +15,8 @@ pub(crate) struct Producer {
     reset: u64,
     tag: Option<Binding>,
     marked: bool,
+    document: Option<HostedTextContext>,
+    revision: u64,
 }
 impl Producer {
     pub(in crate::gui_remote) fn from_env() -> io::Result<(Self, Option<Service>)> {
@@ -58,6 +60,8 @@ impl Producer {
                 reset: 0,
                 tag: None,
                 marked: false,
+                document: None,
+                revision: 0,
             },
             service,
         ))
@@ -74,6 +78,24 @@ impl Producer {
         }
         self.marked = false;
         self.target = None;
+        self.document = None;
+        self.revision = 0;
+    }
+    fn observe(&mut self, document: Option<HostedTextContext>) -> io::Result<()> {
+        if self.document != document {
+            self.revision = self.revision.checked_add(1).ok_or_else(invalid)?;
+            self.document = document;
+        }
+        Ok(())
+    }
+    fn snapshot(&self) -> Option<Document> {
+        self.document.as_ref().map(|d| Document {
+            revision: self.revision,
+            text: d.text.clone(),
+            cursor: d.cursor,
+            anchor: d.anchor,
+            sensitive: d.sensitive,
+        })
     }
     pub(in crate::gui_remote) fn pump(
         &mut self,
@@ -122,20 +144,42 @@ impl Producer {
             .target
             .as_ref()
             .zip(current.as_ref())
-            .is_some_and(|(a, b)| a.same_editor(&b.target))
+            .is_some_and(|(a, b)| {
+                a.same_editor(&b.target)
+                    && self.document.as_ref().map(|d| d.sensitive)
+                        == b.document.as_ref().map(|d| d.sensitive)
+            })
         {
             self.cancel(window, cx);
             bound.jobs.clear();
             bound.snapshot = None;
-            self.target = current.map(|s| s.target);
+            self.target = current.as_ref().map(|s| s.target.clone());
             if self.target.is_some() {
                 self.editor = self.editor.checked_add(1).ok_or_else(invalid)?;
             }
         }
+        self.observe(current.and_then(|s| s.document))?;
         for _ in 0..INPUT_CAPACITY {
             let Some(job) = bound.jobs.pop_front() else {
                 break;
             };
+            let current = window.hosted_text_state(cx);
+            if !self
+                .target
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(a, b)| {
+                    a.same_editor(&b.target)
+                        && self.document.as_ref().map(|d| d.sensitive)
+                            == b.document.as_ref().map(|d| d.sensitive)
+                })
+            {
+                self.cancel(window, cx);
+                bound.jobs.clear();
+                bound.snapshot = None;
+                break;
+            }
+            self.observe(current.and_then(|s| s.document))?;
             let Some(target) = &self.target else {
                 continue;
             };
@@ -147,64 +191,90 @@ impl Producer {
                 continue;
             }
             operation.edit.validate()?;
-            let selection = operation
-                .edit
-                .selection
-                .map(|(a, b)| a as usize..b as usize);
-            if window.dispatch_hosted_composition(
-                target,
-                operation.edit.commit.as_deref(),
-                &operation.edit.preedit,
-                selection,
-                cx,
-            ) {
-                self.marked = !operation.edit.preedit.is_empty();
+            if !operation.edit.matches(self.snapshot().as_ref()) {
+                continue;
+            }
+            let edit = operation.edit;
+            let selection = edit.selection.map(|(a, b)| a as usize..b as usize);
+            let applied = if edit.absolute() {
+                let Some(document) = &self.document else {
+                    continue;
+                };
+                window.dispatch_hosted_document(
+                    target,
+                    document,
+                    &HostedTextEdit {
+                        commit: edit.commit.as_deref(),
+                        preedit: &edit.preedit,
+                        selection,
+                        replacement: edit.replacement.map(|(a, b)| a as usize..b as usize),
+                        document_selection: edit
+                            .document_selection
+                            .map(|(a, b)| a as usize..b as usize),
+                    },
+                    cx,
+                )
+            } else {
+                window.dispatch_hosted_composition(
+                    target,
+                    edit.commit.as_deref(),
+                    &edit.preedit,
+                    selection,
+                    cx,
+                )
+            };
+            if applied {
+                self.marked = !edit.preedit.is_empty();
             }
         }
-        let current = window.hosted_text_state(cx);
-        // A callback may have changed fields. Never publish the old target's
-        // identity with another field's geometry; the next turn installs it.
-        bound.snapshot = current
-            .filter(|s| {
-                self.target
-                    .as_ref()
-                    .is_some_and(|old| old.same_editor(&s.target))
-            })
-            .map(|s| {
-                let size = window.viewport_size();
-                let w = f64::from(f32::from(size.width));
-                let h = f64::from(f32::from(size.height));
-                let caret = s.caret.and_then(|r| {
-                    let x = f64::from(f32::from(r.origin.x));
-                    let y = f64::from(f32::from(r.origin.y));
-                    let rw = f64::from(f32::from(r.size.width));
-                    let rh = f64::from(f32::from(r.size.height));
-                    if ![x, y, rw, rh, w, h].iter().all(|n| n.is_finite())
-                        || w <= 0.
-                        || h <= 0.
-                        || rw < 0.
-                        || rh < 0.
-                    {
-                        return None;
-                    }
-                    let left = x.clamp(0., w);
-                    let top = y.clamp(0., h);
-                    Some([
-                        left / w,
-                        top / h,
-                        ((x + rw).clamp(left, w) - left) / w,
-                        ((y + rh).clamp(top, h) - top) / h,
-                    ])
-                });
-                (
-                    Native {
-                        editor: self.editor,
-                        reset: input.reset,
-                        caret,
-                    },
-                    Instant::now(),
-                )
+        // A callback may change focus or export policy. Do not publish its new
+        // contents under the old editor; the next pump retires that incarnation.
+        let current = window.hosted_text_state(cx).filter(|s| {
+            self.target
+                .as_ref()
+                .is_some_and(|old| old.same_editor(&s.target))
+                && self.document.as_ref().map(|d| d.sensitive)
+                    == s.document.as_ref().map(|d| d.sensitive)
+        });
+        if let Some(current) = &current {
+            self.observe(current.document.clone())?;
+        }
+        bound.snapshot = current.map(|s| {
+            let size = window.viewport_size();
+            let w = f64::from(f32::from(size.width));
+            let h = f64::from(f32::from(size.height));
+            let caret = s.caret.and_then(|r| {
+                let x = f64::from(f32::from(r.origin.x));
+                let y = f64::from(f32::from(r.origin.y));
+                let rw = f64::from(f32::from(r.size.width));
+                let rh = f64::from(f32::from(r.size.height));
+                if ![x, y, rw, rh, w, h].iter().all(|n| n.is_finite())
+                    || w <= 0.
+                    || h <= 0.
+                    || rw < 0.
+                    || rh < 0.
+                {
+                    return None;
+                }
+                let left = x.clamp(0., w);
+                let top = y.clamp(0., h);
+                Some([
+                    left / w,
+                    top / h,
+                    ((x + rw).clamp(left, w) - left) / w,
+                    ((y + rh).clamp(top, h) - top) / h,
+                ])
             });
+            (
+                Native {
+                    editor: self.editor,
+                    reset: input.reset,
+                    caret,
+                    document: self.snapshot(),
+                },
+                Instant::now(),
+            )
+        });
         Ok(())
     }
 }
@@ -216,7 +286,7 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
     local::send(
         &mut stream,
         &Message::Hello {
-            version: 1,
+            version: VERSION,
             owner: *secret,
         },
         1024,
@@ -224,7 +294,7 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
     )?;
     if !matches!(
         local::receive::<Message>(&mut stream, 1024, end)?,
-        Message::Ready { version: 1 }
+        Message::Ready { version: VERSION }
     ) {
         return Err(invalid());
     }
@@ -263,9 +333,10 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
             if let Some(operation) = edit {
                 operation.edit.validate()?;
                 if binding.is_some()
-                    && bound.snapshot.is_some_and(|(s, at)| {
+                    && bound.snapshot.as_ref().is_some_and(|(s, at)| {
                         s.editor == operation.editor
                             && s.reset == operation.reset
+                            && operation.edit.matches(s.document.as_ref())
                             && at.elapsed() <= Duration::from_millis(500)
                     })
                 {
@@ -280,8 +351,9 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
             }
             bound
                 .snapshot
+                .as_ref()
                 .filter(|(_, at)| at.elapsed() <= Duration::from_millis(500))
-                .map(|(s, _)| s)
+                .map(|(s, _)| s.clone())
         };
         local::send(
             &mut stream,

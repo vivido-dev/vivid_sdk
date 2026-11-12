@@ -105,6 +105,15 @@ pub trait EntityInputHandler: 'static + Sized {
         cx: &mut Context<Self>,
     ) -> Option<usize>;
 
+    /// See [`InputHandler::hosted_text_context`] for bounded, opt-in document export.
+    fn hosted_text_context(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<crate::HostedTextContext> {
+        None
+    }
+
     /// See [`InputHandler::set_selected_text_range`] for details
     fn set_selected_text_range(
         &mut self,
@@ -280,6 +289,15 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         self.view.update(cx, |view, cx| {
             view.character_index_for_point(point, window, cx)
         })
+    }
+
+    fn hosted_text_context(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<crate::HostedTextContext> {
+        self.view
+            .update(cx, |view, cx| view.hosted_text_context(window, cx))
     }
 
     fn set_selected_text_range(

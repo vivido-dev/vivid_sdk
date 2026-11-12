@@ -13,6 +13,7 @@ use vivid_protocol::{revision::SurfaceGeneration, time::Monotonic};
 struct Reports {
     commits: Vec<String>,
     preedit: String,
+    document: Option<HostedTextContext>,
 }
 struct Field {
     focus: FocusHandle,
@@ -35,6 +36,26 @@ impl Render for Field {
     }
 }
 impl EntityInputHandler for Field {
+    fn hosted_text_context(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<HostedTextContext> {
+        self.reports.borrow().document.clone()
+    }
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if let Some(document) = &mut self.reports.borrow_mut().document {
+            let offset = document.offset_utf16 as usize;
+            // This fixture uses ASCII for mutation; Unicode conversion is covered by GPUI.
+            document.anchor = (range.start - offset) as u32;
+            document.cursor = (range.end - offset) as u32;
+        }
+    }
     fn text_for_range(
         &mut self,
         _: Range<usize>,
@@ -152,6 +173,8 @@ fn producer(input: &Injection) -> Producer {
         reset: 0,
         tag: None,
         marked: false,
+        document: None,
+        revision: 0,
     }
 }
 fn queue(producer: &Producer, edit: Edit, end: Instant) {
@@ -257,4 +280,107 @@ fn queued_native_edits_recheck_revocation_and_expiry_without_cancelling_a_peer()
     })
     .unwrap();
     assert!(reports[1].borrow().preedit.is_empty());
+}
+
+#[test]
+fn queued_absolute_edits_recheck_document_revision_and_sensitive_mode_per_owner() {
+    let mut cx = TestAppContext::single();
+    let reports = [0, 1].map(|_| {
+        Rc::new(RefCell::new(Reports {
+            document: Some(HostedTextContext {
+                text: "abcd".into(),
+                cursor: 4,
+                anchor: 4,
+                offset_utf16: 100,
+                sensitive: false,
+            }),
+            ..Default::default()
+        }))
+    });
+    let windows = reports.each_ref().map(|reports| {
+        cx.add_window(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Field {
+                focus,
+                reports: reports.clone(),
+            }
+        })
+    });
+    let inputs = [input(), input()];
+    let mut producers = [producer(&inputs[0]), producer(&inputs[1])];
+    for i in 0..2 {
+        cx.update_window(windows[i].into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            producers[i].pump(&inputs[i], window, cx).unwrap();
+        })
+        .unwrap();
+        queue(
+            &producers[i],
+            Edit {
+                revision: Some(1),
+                document_selection: Some((0, 2)),
+                ..Default::default()
+            },
+            Instant::now() + BUDGET,
+        );
+        queue(
+            &producers[i],
+            Edit {
+                revision: Some(1),
+                replacement: Some((0, 4)),
+                commit: Some("stale".into()),
+                ..Default::default()
+            },
+            Instant::now() + BUDGET,
+        );
+        queue(
+            &producers[i],
+            Edit {
+                revision: Some(1),
+                commit: Some("relative".into()),
+                ..Default::default()
+            },
+            Instant::now() + BUDGET,
+        );
+    }
+    for i in 0..2 {
+        cx.update_window(windows[i].into(), |_, window, cx| {
+            producers[i].pump(&inputs[i], window, cx).unwrap()
+        })
+        .unwrap();
+        assert_eq!(reports[i].borrow().commits, ["relative"]);
+        assert_eq!(producers[i].revision, 2);
+    }
+    let old = producers[0].editor;
+    reports[0].borrow_mut().document = Some(HostedTextContext {
+        text: String::new(),
+        cursor: 0,
+        anchor: 0,
+        offset_utf16: 0,
+        sensitive: true,
+    });
+    for p in &producers {
+        queue(
+            p,
+            Edit {
+                commit: Some("late".into()),
+                ..Default::default()
+            },
+            Instant::now() + BUDGET,
+        );
+    }
+    for i in 0..2 {
+        cx.update_window(windows[i].into(), |_, window, cx| {
+            producers[i].pump(&inputs[i], window, cx).unwrap()
+        })
+        .unwrap();
+    }
+    assert!(
+        producers[0].editor > old,
+        "mode changes retire callbacks even without app notification"
+    );
+    assert_eq!(reports[0].borrow().commits, ["relative"]);
+    assert_eq!(reports[1].borrow().commits, ["relative", "late"]);
+    assert!(producers[0].snapshot().unwrap().text.is_empty());
 }

@@ -15,6 +15,8 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+// Private service version; independent of the Vivid wire protocol.
+const VERSION: u32 = 2;
 const ENDPOINT: &str = "VIVID_GUI_IME_ENDPOINT";
 const OWNER: &str = "VIVID_GUI_IME_OWNER";
 const POLL: Duration = Duration::from_millis(10);
@@ -51,6 +53,12 @@ pub struct Edit {
     pub preedit: String,
     /// Ordered UTF-8 byte offsets within preedit, or no visible selection.
     pub selection: Option<(u32, u32)>,
+    /// Snapshot revision for document operations; absent for composition-only editors.
+    pub revision: Option<u64>,
+    /// Ordered excerpt UTF-8 replacement covering the current selection.
+    pub replacement: Option<(u32, u32)>,
+    /// Standalone ordered excerpt UTF-8 selection.
+    pub document_selection: Option<(u32, u32)>,
 }
 impl fmt::Debug for Edit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,6 +75,21 @@ impl Edit {
             .as_ref()
             .is_some_and(|s| s.len() > MAX_TEXT_BYTES)
             || self.preedit.len() > MAX_TEXT_BYTES
+            || self.revision == Some(0)
+            || ((self.replacement.is_some() || self.document_selection.is_some())
+                && self.revision.is_none())
+            || self
+                .replacement
+                .is_some_and(|(a, b)| a > b || b as usize > MAX_TEXT_BYTES)
+            || self
+                .document_selection
+                .is_some_and(|(a, b)| a > b || b as usize > MAX_TEXT_BYTES)
+            || (self.document_selection.is_some()
+                && (self.commit.is_some()
+                    || !self.preedit.is_empty()
+                    || self.selection.is_some()
+                    || self.replacement.is_some()))
+            || (self.replacement.is_some() && self.commit.is_none() && self.preedit.is_empty())
             || self.selection.is_some_and(|(a, b)| {
                 a > b
                     || !self.preedit.is_char_boundary(a as usize)
@@ -77,6 +100,67 @@ impl Edit {
         }
         Ok(())
     }
+    fn absolute(&self) -> bool {
+        self.replacement.is_some() || self.document_selection.is_some()
+    }
+    fn matches(&self, document: Option<&Document>) -> bool {
+        match (self.revision, document) {
+            (None, _) => !self.absolute(),
+            (Some(revision), Some(document)) => {
+                revision <= document.revision
+                    && (!self.absolute()
+                        || (revision == document.revision
+                            && !document.sensitive
+                            && self
+                                .replacement
+                                .iter()
+                                .chain(self.document_selection.iter())
+                                .all(|&(a, b)| {
+                                    document.text.is_char_boundary(a as usize)
+                                        && document.text.is_char_boundary(b as usize)
+                                })
+                            && self.replacement.is_none_or(|(a, b)| {
+                                a <= document.cursor.min(document.anchor)
+                                    && b >= document.cursor.max(document.anchor)
+                            })))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A revision-scoped bounded excerpt, deliberately excluding producer-local offsets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Document {
+    /// Monotonic nonzero revision within the current editor incarnation.
+    pub revision: u64,
+    /// At most 4096 UTF-8 bytes of committed text, excluding preedit.
+    pub text: String,
+    /// Active endpoint in excerpt UTF-8 bytes.
+    pub cursor: u32,
+    /// Fixed endpoint in excerpt UTF-8 bytes.
+    pub anchor: u32,
+    /// Masked fields expose no committed text or absolute editing authority.
+    pub sensitive: bool,
+}
+impl fmt::Debug for Document {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Document")
+            .field("revision", &self.revision)
+            .field("bytes", &self.text.len())
+            .field("sensitive", &self.sensitive)
+            .finish_non_exhaustive()
+    }
+}
+impl Document {
+    fn valid(&self) -> bool {
+        self.revision != 0
+            && self.text.len() <= MAX_TEXT_BYTES
+            && self.text.is_char_boundary(self.cursor as usize)
+            && self.text.is_char_boundary(self.anchor as usize)
+            && (!self.sensitive || (self.text.is_empty() && self.cursor == 0 && self.anchor == 0))
+    }
 }
 
 /// An immutable editor destination belonging to one private process channel.
@@ -84,7 +168,7 @@ impl Edit {
 pub struct Target {
     state: Arc<State>,
     generation: u64,
-    context: Native,
+    context: (u64, u64),
 }
 impl fmt::Debug for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,8 +180,8 @@ impl Target {
     pub fn same_editor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
             && self.generation == other.generation
-            && self.context.editor == other.context.editor
-            && self.context.reset == other.context.reset
+            && self.context.0 == other.context.0
+            && self.context.1 == other.context.1
     }
 }
 /// Cached eligibility and pane-normalized native candidate rectangle.
@@ -107,18 +191,22 @@ pub struct Editor {
     pub target: Target,
     /// Clipped rectangle normalized to the producer canvas, when available.
     pub caret: Option<[f64; 4]>,
+    /// Only present when the producer explicitly exports document context.
+    pub document: Option<Document>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Native {
     editor: u64,
     reset: u64,
     caret: Option<[f64; 4]>,
+    document: Option<Document>,
 }
 impl Native {
-    fn valid(self) -> bool {
+    fn valid(&self) -> bool {
         self.editor != 0
+            && self.document.as_ref().is_none_or(Document::valid)
             && self.caret.is_none_or(|r| {
                 r.iter().all(|n| n.is_finite() && (0.0..=1.0).contains(n))
                     && r[0] + r[2] <= 1.0 + f64::EPSILON
@@ -166,6 +254,7 @@ struct Bound {
     snapshot: Option<(Native, Instant)>,
     jobs: VecDeque<Job>,
     floor: (u64, u64),
+    last_editor: Option<Native>,
 }
 impl Default for Bound {
     fn default() -> Self {
@@ -175,6 +264,7 @@ impl Default for Bound {
             snapshot: None,
             jobs: VecDeque::new(),
             floor: (0, 0),
+            last_editor: None,
         }
     }
 }
@@ -189,6 +279,7 @@ impl State {
         self.stopped.store(true, Ordering::Release);
         let mut bound = self.bound.lock().expect("composition mutex");
         bound.snapshot = None;
+        bound.last_editor = None;
         bound.jobs.clear();
         drop(bound);
         if let Some(stream) = self.stream.lock().expect("composition stream mutex").take() {
@@ -273,6 +364,7 @@ impl Host {
             bound.generation = next;
             bound.tag = tag;
             bound.snapshot = None;
+            bound.last_editor = None;
             bound.jobs.clear();
         }
     }
@@ -282,7 +374,7 @@ impl Host {
         if self.state.stopped.load(Ordering::Acquire) || bound.tag.is_none() {
             return None;
         }
-        let (context, at) = bound.snapshot?;
+        let (context, at) = bound.snapshot.as_ref()?;
         // A stalled GUI/worker must not keep native input eligibility indefinitely.
         if at.elapsed() > Duration::from_millis(500) {
             return None;
@@ -291,9 +383,10 @@ impl Host {
             target: Target {
                 state: self.state.clone(),
                 generation: bound.generation,
-                context,
+                context: (context.editor, context.reset),
             },
             caret: context.caret,
+            document: context.document.clone(),
         })
     }
     /// Queues composition only for the original still-live editor destination.
@@ -307,19 +400,23 @@ impl Host {
             || self.state.stopped.load(Ordering::Acquire)
             || bound.tag.is_none()
             || bound.generation != target.generation
-            || !bound.snapshot.is_some_and(|(s, at)| {
-                s.editor == target.context.editor
-                    && s.reset == target.context.reset
+            || !bound.snapshot.as_ref().is_some_and(|(s, at)| {
+                s.editor == target.context.0
+                    && s.reset == target.context.1
+                    && edit.matches(s.document.as_ref())
                     && at.elapsed() <= Duration::from_millis(500)
             })
         {
             return Ok(false);
         }
         if let Some(last) = bound.jobs.back_mut()
-            && last.operation.editor == target.context.editor
-            && last.operation.reset == target.context.reset
+            && last.operation.editor == target.context.0
+            && last.operation.reset == target.context.1
             && last.operation.edit.commit.is_none()
             && edit.commit.is_none()
+            && !last.operation.edit.absolute()
+            && !edit.absolute()
+            && last.operation.edit.revision == edit.revision
         {
             last.operation.edit = edit.clone();
             last.end = Instant::now() + BUDGET;
@@ -330,8 +427,8 @@ impl Host {
         }
         bound.jobs.push_back(Job {
             operation: Operation {
-                editor: target.context.editor,
-                reset: target.context.reset,
+                editor: target.context.0,
+                reset: target.context.1,
                 edit: edit.clone(),
             },
             end: Instant::now() + BUDGET,
@@ -381,11 +478,11 @@ fn serve(listener: LocalListener, owner: &[u8; 16], state: &State) -> io::Result
         }
     };
     state.install(&stream)?;
-    if !matches!(local::receive::<Message>(&mut stream,1024,end)?, Message::Hello { version:1, owner: got } if vivid_protocol::auth::verify_tag(owner,&got))
+    if !matches!(local::receive::<Message>(&mut stream,1024,end)?, Message::Hello { version:VERSION, owner: got } if vivid_protocol::auth::verify_tag(owner,&got))
     {
         return Err(invalid());
     }
-    local::send(&mut stream, &Message::Ready { version: 1 }, 1024, end)?;
+    local::send(&mut stream, &Message::Ready { version: VERSION }, 1024, end)?;
     let mut id = 1u64;
     while !state.stopped.load(Ordering::Acquire) {
         let (generation, tag, edit) = {
@@ -421,17 +518,36 @@ fn serve(listener: LocalListener, owner: &[u8; 16], state: &State) -> io::Result
         if got != id
             || scope != generation
             || reply_tag != tag
-            || editor.is_some_and(|s: Native| !s.valid())
+            || editor.as_ref().is_some_and(|s: &Native| !s.valid())
         {
             return Err(invalid());
         }
         let mut bound = state.bound.lock().expect("composition mutex");
         if bound.generation == generation && bound.tag == tag {
-            if let Some(context) = editor {
+            if let Some(context) = &editor {
                 if context.editor < bound.floor.0 || context.reset < bound.floor.1 {
                     return Err(invalid());
                 }
+                if let Some(old) = &bound.last_editor
+                    && old.editor == context.editor
+                    && old.reset == context.reset
+                    && (old.document.is_some() != context.document.is_some()
+                        || old
+                            .document
+                            .as_ref()
+                            .zip(context.document.as_ref())
+                            .is_some_and(|(a, b)| {
+                                a.sensitive != b.sensitive
+                                    || b.revision < a.revision
+                                    || (a.revision == b.revision && a != b)
+                            }))
+                {
+                    return Err(invalid());
+                }
                 bound.floor = (context.editor, context.reset);
+                // Retain one bounded context across temporary ineligibility so
+                // an absent snapshot cannot reset revision or export-policy checks.
+                bound.last_editor = Some(context.clone());
             }
             bound.snapshot = tag.and(editor).map(|s| (s, Instant::now()));
         }

@@ -19,7 +19,7 @@ fn connect(host: &Host) -> LocalStream {
     local::send(
         &mut stream,
         &Message::Hello {
-            version: 1,
+            version: VERSION,
             owner: *host.owner,
         },
         1024,
@@ -28,7 +28,7 @@ fn connect(host: &Host) -> LocalStream {
     .unwrap();
     assert!(matches!(
         local::receive(&mut stream, 1024, end).unwrap(),
-        Message::Ready { version: 1 }
+        Message::Ready { version: VERSION }
     ));
     stream
 }
@@ -85,9 +85,10 @@ fn owner_private_targets_reject_foreign_focus_round_trips_and_stale_editors() {
         editor: 1,
         reset: 1,
         caret: Some([0.1, 0.2, 0.01, 0.1]),
+        document: None,
     };
-    reply(&mut one, Some(context));
-    reply(&mut two, Some(context));
+    reply(&mut one, Some(context.clone()));
+    reply(&mut two, Some(context.clone()));
     wait(|| a.editor().is_some() && b.editor().is_some());
     let old = a.editor().unwrap().target;
     let peer = b.editor().unwrap().target;
@@ -103,7 +104,7 @@ fn owner_private_targets_reject_foreign_focus_round_trips_and_stale_editors() {
     // The host may already have started one tick. A superseded reply cannot
     // install context in the new binding generation.
     for _ in 0..3 {
-        reply(&mut one, Some(context));
+        reply(&mut one, Some(context.clone()));
         if a.editor().is_some() {
             break;
         }
@@ -113,7 +114,7 @@ fn owner_private_targets_reject_foreign_focus_round_trips_and_stale_editors() {
     assert!(b.dispatch(&peer, &edit).unwrap());
     let mut got = None;
     for _ in 0..3 {
-        let op = reply(&mut two, Some(context));
+        let op = reply(&mut two, Some(context.clone()));
         if op.is_some() {
             got = op;
             break;
@@ -147,8 +148,9 @@ fn native_admission_bounds_text_ranges_and_queue_capacity_before_copying() {
         editor: 1,
         reset: 1,
         caret: None,
+        document: None,
     };
-    reply(&mut stream, Some(context));
+    reply(&mut stream, Some(context.clone()));
     wait(|| host.editor().is_some());
     let target = host.editor().unwrap().target;
     assert!(
@@ -237,6 +239,7 @@ fn malformed_native_geometry_or_owner_authentication_closes_only_its_channel() {
             editor: 1,
             reset: 1,
             caret: Some([0., 0., 2., 1.]),
+            document: None,
         }),
     );
     wait(|| host.state.stopped.load(Ordering::Acquire));
@@ -247,8 +250,111 @@ fn malformed_native_geometry_or_owner_authentication_closes_only_its_channel() {
     local::send(
         &mut stream,
         &Message::Hello {
-            version: 1,
+            version: VERSION,
             owner: [0; 16],
+        },
+        1024,
+        Instant::now() + BUDGET,
+    )
+    .unwrap();
+    assert!(local::receive::<Message>(&mut stream, 1024, Instant::now() + BUDGET).is_err());
+    wait(|| host.state.stopped.load(Ordering::Acquire));
+    drop(service);
+}
+
+#[test]
+fn document_edits_require_exact_revisions_and_masked_fields_never_export_secrets() {
+    let document = Document {
+        revision: 2,
+        text: "a😀éz".into(),
+        cursor: 7,
+        anchor: 5,
+        sensitive: false,
+    };
+    let mut edit = Edit {
+        revision: Some(2),
+        replacement: Some((1, 7)),
+        commit: Some("文".into()),
+        ..Default::default()
+    };
+    assert!(document.valid());
+    assert!(edit.matches(Some(&document)));
+    edit.revision = Some(1);
+    assert!(!edit.matches(Some(&document)));
+    edit.replacement = None;
+    assert!(
+        edit.matches(Some(&document)),
+        "relative typing survives own earlier commits"
+    );
+    edit.revision = Some(3);
+    assert!(!edit.matches(Some(&document)));
+    edit.revision = Some(2);
+    edit.replacement = Some((2, 7));
+    assert!(!edit.matches(Some(&document)), "split UTF-8 boundary");
+    edit.replacement = Some((0, 5));
+    assert!(!edit.matches(Some(&document)), "must cover full selection");
+    let masked = Document {
+        revision: 1,
+        text: String::new(),
+        cursor: 0,
+        anchor: 0,
+        sensitive: true,
+    };
+    assert!(masked.valid());
+    edit.revision = Some(1);
+    edit.replacement = Some((0, 0));
+    assert!(!edit.matches(Some(&masked)));
+    assert!(
+        !Document {
+            sensitive: true,
+            ..document.clone()
+        }
+        .valid()
+    );
+    assert!(
+        !Document {
+            text: "x".repeat(MAX_TEXT_BYTES + 1),
+            ..document.clone()
+        }
+        .valid()
+    );
+    assert!(!format!("{document:?}").contains("a😀éz"));
+    assert!(!format!("{edit:?}").contains("文"));
+}
+
+#[test]
+fn absent_snapshots_cannot_reset_document_revision_or_service_version() {
+    let dir = directory();
+    let (host, service) = Host::bind(&dir.path().join("revision")).unwrap();
+    host.set_binding(Some(tag()));
+    let mut stream = connect(&host);
+    let mut native = Native {
+        editor: 1,
+        reset: 1,
+        caret: None,
+        document: Some(Document {
+            revision: 2,
+            text: "document".into(),
+            cursor: 8,
+            anchor: 8,
+            sensitive: false,
+        }),
+    };
+    reply(&mut stream, Some(native.clone()));
+    wait(|| host.editor().is_some());
+    reply(&mut stream, None);
+    wait(|| host.editor().is_none());
+    native.document.as_mut().unwrap().revision = 1;
+    reply(&mut stream, Some(native));
+    wait(|| host.state.stopped.load(Ordering::Acquire));
+    drop(service);
+    let (host, service) = Host::bind(&dir.path().join("version")).unwrap();
+    let mut stream = LocalStream::connect(&host.endpoint).unwrap();
+    local::send(
+        &mut stream,
+        &Message::Hello {
+            version: 1,
+            owner: *host.owner,
         },
         1024,
         Instant::now() + BUDGET,

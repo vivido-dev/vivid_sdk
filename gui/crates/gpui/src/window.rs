@@ -29,7 +29,7 @@ use crate::{
 
 #[path = "window/hosted_text.rs"]
 mod hosted_text;
-pub use hosted_text::{HostedTextState, HostedTextTarget};
+pub use hosted_text::{HostedTextContext, HostedTextEdit, HostedTextState, HostedTextTarget};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
