@@ -29,7 +29,8 @@ pub(super) fn defer(
 ) -> Result<bool, ControlError> {
     if !matches!(
         record.record_type,
-        messages::MEASURE_OVERLAY_TEXT
+        messages::OVERLAY_ACTION
+            | messages::MEASURE_OVERLAY_TEXT
             | messages::MEASURE_OVERLAY_TEXT_BATCH
             | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
             | messages::SET_OVERLAY_EDITOR
@@ -40,7 +41,10 @@ pub(super) fn defer(
         return Ok(false);
     }
     let mut state = lock(shared);
-    if !state.overlay_relay.enabled {
+    if !state.overlay_relay.enabled
+        || (record.record_type == messages::OVERLAY_ACTION
+            && state.overlay_relay.action_route.is_none())
+    {
         return Ok(false);
     }
     if state.overlay_relay.local_host_claimed && !state.overlay_relay.local_host_available {

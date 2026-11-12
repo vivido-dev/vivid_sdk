@@ -24,6 +24,14 @@ pub(crate) struct Grant {
 }
 
 impl Grant {
+    pub(super) fn deadline(&self) -> Instant {
+        self.started + LIFETIME
+    }
+
+    pub(super) fn expired(&self) -> bool {
+        self.started.elapsed() >= LIFETIME
+    }
+
     pub(super) fn capture(
         state: &State,
         request: &super::super::OverlayHostRequest,
@@ -256,6 +264,32 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
 }
 
 impl OverlayActionRequest {
+    /// Checks whether this receipt still awaits dispatch before its original deadline.
+    ///
+    /// This non-consuming queue check grants no authority. Call `claim` immediately
+    /// before physical mutation to recheck the complete authenticated scope.
+    pub fn is_pending(&self) -> bool {
+        let (Some(state), Some(scope)) = (self.state.upgrade(), self.scope.upgrade()) else {
+            return false;
+        };
+        let state = lock(&state);
+        scope.load(Ordering::Acquire)
+            && state.overlay_relay.pending.contains_key(&self.request.id)
+            && state
+                .overlay_relay
+                .actions
+                .get(&self.request.id)
+                .is_some_and(|grant| {
+                    !grant.claimed
+                        && !grant.expired()
+                        && grant.request == self.request
+                        && grant
+                            .route
+                            .upgrade()
+                            .is_some_and(|route| Arc::ptr_eq(&route, &scope))
+                })
+    }
+
     /// Returns the captured original-pane rectangle for a Center request.
     pub fn centered_bounds(&self) -> Option<Rect> {
         let state = self.state.upgrade()?;
@@ -295,7 +329,7 @@ impl OverlayActionRequest {
         };
         if grant.request != self.request
             || grant.claimed
-            || grant.started.elapsed() >= LIFETIME
+            || grant.expired()
             || !state.overlay_relay.pending.contains_key(&self.request.id)
             || !grant
                 .route

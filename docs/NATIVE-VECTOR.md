@@ -493,6 +493,16 @@ parent/child close and same-ID peer isolation. The SDK API is now
 replacing the focus-only names. Producer `request_close` dismisses the group and
 fences its submissions; `close` still releases retained resources after dismissal.
 The route reuses Vivid 1.5 actions and introduces no wire or registry changes.
+The [local macOS pressure follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-pressure-macos.json)
+qualifies bounded action saturation and callback deadlines through authenticated
+sockets. Relayed actions share the SDK's 64 host-worker/eight-per-owner ceiling;
+the control reader remains live. The gateway admits four jobs per original owner
+within its 16-job pool. `OverlayActionRequest::is_pending` supports non-consuming
+queue expiry checks; only `claim` authorizes dispatch. Expired requests retire even
+without a surviving projection, and late acknowledgements cannot advance the
+original window. An already-admitted physical result remains uncertain after a
+timeout and is never automatically retried. This adds no GPU stress or physical
+input/device qualification.
 `timed-media-sync-v1` remains withheld.
 
 ## Live video

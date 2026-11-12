@@ -5019,13 +5019,21 @@ fn dispatch_control_for_connection(
             state.overlay_relay.actions.insert(id, grant);
         }
         state.overlay_relay.queued.push_back(host_request);
+        let action_deadline = state
+            .overlay_relay
+            .actions
+            .get(&id)
+            .map(overlay_actions::Grant::deadline);
         let wakeup = state.media_wakeup.clone();
         drop(state);
         if let Some(wakeup) = wakeup {
             wakeup();
         }
-        // This is the connection worker, never the session actor or the global state lock.
-        let response = receiver.recv_timeout(Duration::from_secs(10));
+        // This is a bounded host worker, never the control reader or the global state lock.
+        let remaining = action_deadline.map_or(Duration::from_secs(10), |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let response = receiver.recv_timeout(remaining);
         let mut state = lock(shared);
         state.overlay_relay.pending.remove(&id);
         state.overlay_relay.reservations.remove(&id);
@@ -5059,7 +5067,10 @@ fn dispatch_control_for_connection(
         let response = messages::decode_control(&body)
             .map_err(|_| ControlError::bad("invalid outer overlay reply"))?;
         if relay_action {
-            if !action_grant.as_ref().is_some_and(|grant| grant.claimed) {
+            if !action_grant
+                .as_ref()
+                .is_some_and(|grant| grant.claimed && !grant.expired())
+            {
                 return Err(ControlError::state("window action was not admitted"));
             }
             if !response.payload.is_empty() {
