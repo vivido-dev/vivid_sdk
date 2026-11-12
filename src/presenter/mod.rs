@@ -48,8 +48,8 @@ pub use service::native_vector::{
 pub use service::overlay_clipboard::OverlayClipboardWrite;
 pub use service::{
     AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
-    KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, PaneCapture,
-    PaneMediaSummary, PaneTrackSummary, PlayRequest, ProducerId, ProjectionSnapshot,
+    KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, OverlayDocumentTarget,
+    PaneCapture, PaneMediaSummary, PaneTrackSummary, PlayRequest, ProducerId, ProjectionSnapshot,
     RetainedRaster, SceneNode, SceneNodeConfig, SemanticDescriptor, SkipReason, SkippedSource,
     SnapshotOverlayWindow, SnapshotSource, SnapshotSurface, SourceDescriptor, SourceKey,
     VirtualVivid,

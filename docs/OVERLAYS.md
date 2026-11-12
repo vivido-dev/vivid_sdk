@@ -459,7 +459,10 @@ Rust producers can additionally negotiate `overlay-editor-v1` with a local
 `OverlayLaneEvent::EditorEdit` carries revision-scoped document selection and
 replacement; producers must match the exact window and validate editor identity
 before mutation. This is an optional extension to composition and caret geometry.
-Generic/font-only presenters and gateway/mux relays withhold it. See the
+Generic/font-only presenters and legacy gateway/mux routes withhold it. An opt-in
+[gateway document route](../../vivid_gateway/README.md#document-relay) uses independent
+hop identities and opaque inner targets. The legacy host-profile setter continues
+to decline it; a typed route uses `set_overlay_document_host_profiles`. See the
 [native document contract](NATIVE-VECTOR.md#surrounding-documents-and-native-replacement)
 and [normative wire fields](../../vivid_protocol/vivid-protocol-1.5-overlays.md#native-document-editing).
 

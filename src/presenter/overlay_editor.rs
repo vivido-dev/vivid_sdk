@@ -2,7 +2,6 @@
 
 // Rust guideline compliant 2026-10-07
 use super::*;
-#[cfg(feature = "vector-render")]
 use vivid_protocol::overlay::wire::text::editor::Edit;
 use vivid_protocol::overlay::wire::text::editor::{Context, SetContext};
 
@@ -13,10 +12,9 @@ const MAX_CONTEXTS: usize = 64;
 pub(super) struct Editors(HashMap<SurfaceIdentity, Slot>);
 pub(super) struct Slot {
     context: Context,
-    #[cfg(feature = "vector-render")]
     submission: Submission,
-    #[cfg(feature = "vector-render")]
     focus: u64,
+    lane: u64,
     active: bool,
 }
 impl Editors {
@@ -24,15 +22,22 @@ impl Editors {
         self.0.retain(keep);
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    submission: Submission,
+    focus: u64,
+    lane: u64,
+    editor: u64,
+}
 impl Overlays {
     pub(crate) fn document_host_available(&self) -> bool {
         #[cfg(feature = "vector-render")]
         {
-            self.native.is_some()
+            self.native.is_some() || self.document_relay
         }
         #[cfg(not(feature = "vector-render"))]
         {
-            false
+            self.document_relay
         }
     }
     pub(crate) fn set_text_context(
@@ -60,19 +65,20 @@ impl Overlays {
             return Err("editor context requires the focused displayed scene");
         }
         #[cfg(feature = "vector-render")]
-        if !self.native_window_ready(id) {
+        if self.native.is_some() && !self.native_window_ready(id) {
             return Err("editor context requires displayed native geometry");
         }
-        #[cfg(feature = "vector-render")]
         let pane = self
             .windows
             .pane(owner(session))
             .ok_or("editor pane is absent")?;
-        #[cfg(feature = "vector-render")]
         let focus = self
             .windows
             .focus_generation(pane)
             .ok_or("editor focus is absent")?;
+        let lane = self
+            .input_generation(session)
+            .ok_or("editor input lane is absent")?;
         if let Some(context) = request.context {
             if let Some(old) = self.editors.0.get(&id) {
                 if context.editor < old.context.editor
@@ -92,14 +98,13 @@ impl Overlays {
                 id,
                 Slot {
                     context,
-                    #[cfg(feature = "vector-render")]
                     submission: self
                         .displayed
                         .get(&id)
                         .expect("validated displayed scene")
                         .submission,
-                    #[cfg(feature = "vector-render")]
                     focus,
+                    lane,
                     active: true,
                 },
             );
@@ -109,8 +114,7 @@ impl Overlays {
         Ok((messages::OK, Vec::new()))
     }
 
-    #[cfg(feature = "vector-render")]
-    pub(crate) fn native_editor_context(&self, id: SurfaceIdentity) -> Option<Context> {
+    pub(crate) fn editor_context(&self, id: SurfaceIdentity) -> Option<Context> {
         let slot = self.editors.0.get(&id)?;
         let pane = self.windows.pane(id.context().session())?;
         let current = self.displayed.get(&id)?.submission;
@@ -119,12 +123,79 @@ impl Overlays {
             && current.track_id == original.track_id
             && current.channel_generation == original.channel_generation
             && current.epoch == original.epoch
+            && self.input_generation(id.context().session().session_id()) == Some(slot.lane)
             && slot.active
             && self.input_enabled(id.context().session().session_id())
             && self.windows.focus(pane) == Some(id)
             && self.windows.focus_generation(pane) == Some(slot.focus)
             && self.windows.input_eligible(id))
         .then(|| slot.context.clone())
+    }
+
+    pub(crate) fn editor_stamp(&self, session: u64, context: u64, surface: u64) -> Option<Stamp> {
+        let id = owner(session)
+            .context(context)
+            .ok()?
+            .surface(surface)
+            .ok()?;
+        self.editor_context(id)?;
+        let slot = self.editors.0.get(&id)?;
+        Some(Stamp {
+            submission: slot.submission,
+            focus: slot.focus,
+            lane: slot.lane,
+            editor: slot.context.editor,
+        })
+    }
+
+    pub(crate) fn set_document_relay(&mut self, enabled: bool) {
+        if self.document_relay != enabled {
+            self.editors
+                .0
+                .values_mut()
+                .for_each(|slot| slot.active = false);
+            self.document_relay = enabled;
+        }
+    }
+
+    pub(crate) fn relay_editor_edit(&mut self, session: u64, edit: &Edit) -> bool {
+        let Ok(id) = edit.address.identity(owner(session)) else {
+            return false;
+        };
+        let Some(context) = self.editor_context(id) else {
+            return false;
+        };
+        if !self.document_relay
+            || edit.validate_context(&context).is_err()
+            || self.displayed.get(&id).is_none_or(|displayed| {
+                displayed.submission.address != edit.address
+                    || displayed.revision != edit.scene_revision
+                    || self
+                        .editors
+                        .0
+                        .get(&id)
+                        .is_none_or(|slot| slot.submission != displayed.submission)
+            })
+        {
+            return false;
+        }
+        let Ok(payload) = edit.payload() else {
+            return false;
+        };
+        self.queue_for(
+            session,
+            LaneRecord {
+                record_type: messages::OVERLAY_TEXT_EDIT,
+                object_id: id.surface_id(),
+                payload,
+            },
+        );
+        true
+    }
+
+    #[cfg(feature = "vector-render")]
+    pub(crate) fn native_editor_context(&self, id: SurfaceIdentity) -> Option<Context> {
+        self.editor_context(id)
     }
 
     #[cfg(feature = "vector-render")]

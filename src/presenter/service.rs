@@ -983,6 +983,22 @@ pub struct VirtualVivid {
     media_events: Mutex<Option<mpsc::Receiver<MediaEvent>>>,
 }
 
+/// An opaque relay input destination pinned to one original inner editor incarnation.
+#[derive(Clone)]
+pub struct OverlayDocumentTarget {
+    state: Arc<Mutex<State>>,
+    surface: BridgeSurfaceKey,
+    stamp: super::overlay_host::EditorStamp,
+    writer: Arc<Writer>,
+    resume: u64,
+}
+impl std::fmt::Debug for OverlayDocumentTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayDocumentTarget")
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for VirtualVivid {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1029,6 +1045,79 @@ impl VirtualVivid {
         Ok(accepted)
     }
 
+    /// Captures the exact inner editor, input lane and authenticated session incarnation.
+    ///
+    /// Only available for a negotiated document relay with a current displayed
+    /// context. Capture while servicing that context's host request; never replace
+    /// this target when forwarding a delayed native callback.
+    pub fn overlay_document_target(
+        &self,
+        surface: BridgeSurfaceKey,
+    ) -> Option<OverlayDocumentTarget> {
+        let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
+        if !state.overlay_relay.enabled || !state.overlays.document_relay {
+            return None;
+        }
+        let stamp =
+            state
+                .overlays
+                .editor_stamp(surface.producer, surface.context, surface.surface)?;
+        let session = state.sessions.get(&surface.producer)?;
+        if session.closed || !session.accepted_profiles.contains(registry::OVERLAY_EDITOR) {
+            return None;
+        }
+        Some(OverlayDocumentTarget {
+            state: self.state.clone(),
+            surface,
+            stamp,
+            writer: session.writer.clone(),
+            resume: session.resume_generation,
+        })
+    }
+
+    /// Revalidates one typed document edit against its original inner grant.
+    ///
+    /// Stale, foreign, replaced, resumed or revoked targets return false. Callers
+    /// must retain the captured target rather than sampling new authority at input
+    /// delivery time. Input queuing and socket flushing follow ordinary overlay routing.
+    ///
+    /// # Errors
+    /// Rejects malformed edits or an address outside the target's surface context.
+    pub fn relay_overlay_document_edit(
+        &self,
+        target: &OverlayDocumentTarget,
+        edit: &vivid_protocol::overlay::wire::text::editor::Edit,
+    ) -> io::Result<bool> {
+        edit.validate().map_err(io::Error::other)?;
+        let surface = target.surface;
+        if edit.address.context_id != surface.context || edit.address.surface_id != surface.surface
+        {
+            return Err(invalid("overlay document owner mismatch"));
+        }
+        if !Arc::ptr_eq(&self.state, &target.state) {
+            return Ok(false);
+        }
+        let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
+        if !state.overlay_relay.enabled
+            || state.sessions.get(&surface.producer).is_none_or(|session| {
+                session.closed
+                    || session.resume_generation != target.resume
+                    || !Arc::ptr_eq(&session.writer, &target.writer)
+            })
+            || state
+                .overlays
+                .editor_stamp(surface.producer, surface.context, surface.surface)
+                != Some(target.stamp)
+        {
+            return Ok(false);
+        }
+        let accepted = state.overlays.relay_editor_edit(surface.producer, edit);
+        flush_overlay_lane(&mut state, surface.producer);
+        Ok(accepted)
+    }
+
     /// Route font measurement and retained-layout requests to the physical presenter.
     pub fn enable_overlay_host_relay(&self) {
         lock(&self.state).overlay_relay.enabled = true;
@@ -1036,8 +1125,30 @@ impl VirtualVivid {
 
     /// Only offer optional host services that the current physical presenter negotiated.
     pub fn set_overlay_host_profiles(&self, profiles: &[String]) {
+        self.set_overlay_profiles(profiles, false);
+    }
+
+    /// Installs physical host profiles for a route that preserves opaque document input.
+    ///
+    /// Use only with a typed document relay bound to this presenter. The legacy
+    /// host-profile setter deliberately withholds document editing even if listed.
+    /// Missing capabilities revoke cached contexts; a repeated unchanged set
+    /// preserves the existing input grant. Font-only local hosts still decline it.
+    pub fn set_overlay_document_host_profiles(&self, profiles: &[String]) {
+        self.set_overlay_profiles(profiles, true);
+    }
+
+    fn set_overlay_profiles(&self, profiles: &[String], document_route: bool) {
         let mut state = lock(&self.state);
+        let document = document_route
+            && state.overlay_relay.enabled
+            && !state.overlay_relay.local_host_claimed
+            && profiles
+                .iter()
+                .any(|profile| profile == registry::OVERLAY_EDITOR);
+        state.overlays.set_document_relay(document);
         for profile in [
+            registry::OVERLAY_EDITOR,
             registry::OVERLAY_CLIPBOARD,
             registry::OVERLAY_A11Y,
             registry::OVERLAY_TYPOGRAPHY,
@@ -1046,7 +1157,9 @@ impl VirtualVivid {
                 .config
                 .supported_profiles
                 .retain(|supported| supported != profile);
-            if profiles.iter().any(|supported| supported == profile) {
+            if profiles.iter().any(|supported| supported == profile)
+                && (profile != registry::OVERLAY_EDITOR || document)
+            {
                 state.config.supported_profiles.push(profile.into());
             }
         }

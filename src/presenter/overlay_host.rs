@@ -44,6 +44,7 @@ use vivid_protocol::overlay::wire::{
 use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics};
 #[path = "overlay_editor.rs"]
 mod editor;
+pub(crate) use editor::Stamp as EditorStamp;
 #[path = "overlay_windows.rs"]
 mod pane_windows;
 use pane_windows::PaneWindows as Windows;
@@ -154,6 +155,7 @@ pub(crate) struct Overlays {
     /// Where a focused editor last said its caret was, with the revision it said it at.
     editor_carets: HashMap<SurfaceIdentity, (u64, u64, Option<vivid_protocol::vector::Rect>)>,
     editors: editor::Editors,
+    pub(crate) document_relay: bool,
     next_layout: u64,
 }
 
@@ -1193,7 +1195,6 @@ impl Overlays {
         })
     }
 
-    #[cfg(feature = "vector-render")]
     pub(crate) fn input_generation(&self, session_id: u64) -> Option<u64> {
         self.input_enabled(session_id)
             .then(|| self.input_leases[&session_id].generation)

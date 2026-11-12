@@ -431,7 +431,9 @@ The counter renders preedit separately from committed-text byte counts.
 
 Local native hosts can explicitly offer `overlay-editor-v1` in
 `PresenterConfig.supported_profiles`. It requires `overlay-text-v1`; generic,
-font-only and terminating relay hosts decline it. The Rust `OverlaySession`
+font-only and legacy terminating relay hosts decline it. An explicitly configured
+[gateway document route](../../vivid_gateway/README.md#document-relay) can re-originate
+it through a capable physical native host. The Rust `OverlaySession`
 helper accepts it through `ProducerConfig.optional_profiles`; request it explicitly
 when handling document events. Producers that publish no document context retain
 the composition-only behavior above. Python, TypeScript and Lua do not automatically
@@ -474,7 +476,9 @@ callbacks. The counter demonstrates bounded producer-owned document mutation.
 
 Automated native Metal checks exercise these callbacks with real producer processes.
 Physical input sources, candidate menus, OS secure-input behavior, VoiceOver,
-non-macOS platforms and gateway/mux document re-origination remain unrun gates.
+non-macOS platforms and production mux/GUI relay integration remain unrun gates.
+The opt-in gateway core separately passes two-hop transport and native presenter API
+checks; these do not exercise GPU submission through the gateway frontend.
 `timed-media-sync-v1` remains withheld.
 
 ## Live video

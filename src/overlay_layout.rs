@@ -52,6 +52,9 @@ impl Session {
                 messages::SET_OVERLAY_EDITOR => {
                     (vivid_protocol::registry::OVERLAY_TEXT, messages::OK)
                 }
+                messages::SET_OVERLAY_TEXT_CONTEXT => {
+                    (vivid_protocol::registry::OVERLAY_EDITOR, messages::OK)
+                }
                 messages::SET_OVERLAY_CLIPBOARD => {
                     (vivid_protocol::registry::OVERLAY_CLIPBOARD, messages::OK)
                 }
