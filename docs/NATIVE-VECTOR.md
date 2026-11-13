@@ -519,6 +519,22 @@ add no GPU/device-loss or physical-input qualification, and the developer adapte
 still does not implement a producer's automatic lease recovery policy.
 `timed-media-sync-v1` remains withheld.
 
+The [local Metal first-key follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-first-key-macos.json)
+resolves three ordering failures in the developer relay. `OverlayActionWindow` is
+read-only owner/context/surface/generation/revision metadata, not authority.
+`OverlayActionRequest::preceding_windows` captures the bounded original owner window
+barrier; changes retire the admission and `claim` checks again. Project those roles
+before physical actions so popup creation cannot steal the requested focus.
+`OverlayActionRoute::window_stamp` lets the relay hold vector media until that
+original generation's physical role exists. Neither check waits for media or peers.
+Revision-only source acknowledgements no longer republish identical physical options;
+real geometry changes still retire stale input targets. Repeated runtime-shader
+Metal launches verify four synthetic key downs for the exercised source, admitted once each,
+with no peer keys, retries or increased action deadline. Physical input, sustained
+production startup/load, static shaders and other platform/device gates remain unrun.
+One full typed-relay Unicode commit timed out during overlapping acceptance workloads;
+the final isolated fixtures passed. Broader loaded composition remains unqualified.
+
 ## Live video
 
 Optional `vector-video` adds native live video scene nodes to the raster plane.

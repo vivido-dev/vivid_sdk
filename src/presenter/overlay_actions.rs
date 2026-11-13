@@ -19,6 +19,7 @@ pub(crate) struct Grant {
     resume: u64,
     started: Instant,
     action: Action,
+    preceding: Vec<OverlayActionWindow>,
     viewport_revision: Option<u64>,
     pub(super) centered_bounds: Option<Rect>,
     pub(super) claimed: bool,
@@ -87,6 +88,7 @@ impl Grant {
             resume: session.resume_generation,
             started: Instant::now(),
             action,
+            preceding: window_barrier(state, request.surface.producer),
             viewport_revision: centered_bounds.and_then(|_| {
                 state
                     .overlays
@@ -107,6 +109,46 @@ impl Grant {
             self.closed_observed = true;
         }
     }
+}
+
+/// One original window that must precede a relayed action physically.
+///
+/// Read-only projection metadata; it grants no action or input authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayActionWindow {
+    /// Complete original owner/context/surface key.
+    pub surface: BridgeSurfaceKey,
+    /// Original surface generation at admission.
+    pub generation: u64,
+    /// Original window revision at admission.
+    pub revision: u64,
+}
+
+fn window_barrier(state: &State, session: u64) -> Vec<OverlayActionWindow> {
+    let mut windows: Vec<_> = state
+        .surfaces
+        .keys()
+        .filter(|key| key.session == session)
+        .filter_map(|key| {
+            let id = super::super::overlay_host::owner(session)
+                .context(key.context)
+                .ok()?
+                .surface(key.surface)
+                .ok()?;
+            let window = state.overlays.window(id)?;
+            Some(OverlayActionWindow {
+                surface: BridgeSurfaceKey {
+                    producer: session,
+                    context: key.context,
+                    surface: key.surface,
+                },
+                generation: window.generation,
+                revision: window.revision,
+            })
+        })
+        .collect();
+    windows.sort_unstable_by_key(|window| (window.surface.context, window.surface.surface));
+    windows
 }
 
 /// Non-authoritative incarnation metadata for one original overlay input source.
@@ -267,6 +309,29 @@ impl VirtualVivid {
 }
 
 impl OverlayActionRoute {
+    /// Reads current original window metadata without granting media or input authority.
+    ///
+    /// Returns `None` after route retirement or when the surface has no window role.
+    /// A relay must create this generation's physical window role before submitting vector media.
+    pub fn window_stamp(&self, surface: BridgeSurfaceKey) -> Option<OverlayActionWindow> {
+        let state = self.state.upgrade()?;
+        let state = lock(&state);
+        if !self.scope.load(Ordering::Acquire) {
+            return None;
+        }
+        let id = super::super::overlay_host::owner(surface.producer)
+            .context(surface.context)
+            .ok()?
+            .surface(surface.surface)
+            .ok()?;
+        let window = state.overlays.window(id)?;
+        Some(OverlayActionWindow {
+            surface,
+            generation: window.generation,
+            revision: window.revision,
+        })
+    }
+
     /// Captures the current original input incarnation without granting input.
     ///
     /// Returns `None` after route/session/lane loss or source removal. Cache the
@@ -441,12 +506,28 @@ impl OverlayActionRequest {
                 .is_some_and(|grant| {
                     !grant.claimed
                         && !grant.expired()
+                        && grant.preceding == window_barrier(&state, self.request.surface.producer)
                         && grant.request == self.request
                         && grant
                             .route
                             .upgrade()
                             .is_some_and(|route| Arc::ptr_eq(&route, &scope))
                 })
+    }
+
+    /// Returns the bounded original window barrier while this request remains pending.
+    ///
+    /// Every listed window must reach its physical role before dispatch, without
+    /// waiting for its media. Changes to the original window set or revisions
+    /// retire this admission instead of replaying it against a different order.
+    pub fn preceding_windows(&self) -> Option<Vec<OverlayActionWindow>> {
+        if !self.is_pending() {
+            return None;
+        }
+        let state = self.state.upgrade()?;
+        let state = lock(&state);
+        let grant = state.overlay_relay.actions.get(&self.request.id)?;
+        (grant.request == self.request).then(|| grant.preceding.clone())
     }
 
     /// Returns the captured original-pane rectangle for a Center request.
@@ -489,6 +570,7 @@ impl OverlayActionRequest {
         if grant.request != self.request
             || grant.claimed
             || grant.expired()
+            || grant.preceding != window_barrier(&state, self.request.surface.producer)
             || !state.overlay_relay.pending.contains_key(&self.request.id)
             || !grant
                 .route
