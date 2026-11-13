@@ -8,6 +8,8 @@ use vivid_protocol::vector::Rect;
 
 // The correlated host RPC already has the same ten-second deadline.
 const LIFETIME: Duration = Duration::from_secs(10);
+// Match the typed document relay: a slow caller cannot retain native input indefinitely.
+const INPUT_LIFETIME: Duration = Duration::from_secs(1);
 
 pub(crate) struct Grant {
     route: Weak<AtomicBool>,
@@ -107,6 +109,88 @@ impl Grant {
     }
 }
 
+/// Non-authoritative incarnation metadata for one original overlay input source.
+///
+/// Compare across projection reconciliation. A changed value requires retiring
+/// the old physical window and its queued input before binding a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayInputEpoch {
+    presenter: PresenterInstanceId,
+    surface: BridgeSurfaceKey,
+    resume: u64,
+    lane: u64,
+}
+
+/// One-shot physical input bound to its original source resume and input lane.
+///
+/// Forward immediately. Lane replacement, source resume/removal, route retirement
+/// or a one-second local delay retires the receipt. It grants no replacement scope.
+pub struct OverlayRelayInput {
+    state: Weak<Mutex<State>>,
+    scope: Weak<AtomicBool>,
+    epoch: OverlayInputEpoch,
+    input: vivid_protocol::overlay::wire::InputEvent,
+    captured: Instant,
+}
+impl std::fmt::Debug for OverlayRelayInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayRelayInput").finish_non_exhaustive()
+    }
+}
+impl OverlayRelayInput {
+    /// Forwards once after atomically rechecking the original input incarnation.
+    pub fn forward(self) -> bool {
+        let (Some(state), Some(scope)) = (self.state.upgrade(), self.scope.upgrade()) else {
+            return false;
+        };
+        let mut state = lock(&state);
+        overlay_input::maintain(&mut state);
+        if !scope.load(Ordering::Acquire)
+            || self.captured.elapsed() >= INPUT_LIFETIME
+            || input_epoch(&state, self.epoch.surface) != Some(self.epoch)
+            || !input_surface_current(&state, self.epoch.surface, self.input.address.generation)
+        {
+            return false;
+        }
+        super::forward_overlay_input(&mut state, self.epoch.surface, self.input)
+    }
+}
+
+fn input_surface_current(state: &State, surface: BridgeSurfaceKey, generation: u64) -> bool {
+    state
+        .surfaces
+        .get(&SurfaceKey {
+            session: surface.producer,
+            context: surface.context,
+            surface: surface.surface,
+        })
+        .is_some_and(|source| source.state.generation.get() == generation)
+}
+
+fn input_epoch(state: &State, surface: BridgeSurfaceKey) -> Option<OverlayInputEpoch> {
+    let session = state.sessions.get(&surface.producer)?;
+    if session.closed
+        || session.writer.is_closed()
+        || session
+            .overlay_lane
+            .as_ref()
+            .is_none_or(|lane| lane.is_closed())
+        || !state.surfaces.contains_key(&SurfaceKey {
+            session: surface.producer,
+            context: surface.context,
+            surface: surface.surface,
+        })
+    {
+        return None;
+    }
+    Some(OverlayInputEpoch {
+        presenter: state.presenter,
+        surface,
+        resume: session.resume_generation,
+        lane: state.overlays.input_generation(surface.producer)?,
+    })
+}
+
 /// An exclusive, original-presenter route for producer-requested window actions.
 ///
 /// Off by default. Dropping the route cancels pending window actions; subsequent
@@ -145,7 +229,8 @@ impl VirtualVivid {
     /// Attaches one exclusive relay for existing producer window actions.
     ///
     /// Enable host relaying first. The caller must remap and service window-action RPCs,
-    /// and relay physical input/focus events back to this original presenter.
+    /// and forward physical input/focus using original-epoch `OverlayRelayInput`
+    /// receipts so already-drained input cannot target a replacement incarnation.
     /// Center captures the original pane viewport; close retires its window group.
     /// Legacy hosts that do not attach keep their existing local action behavior.
     ///
@@ -182,6 +267,60 @@ impl VirtualVivid {
 }
 
 impl OverlayActionRoute {
+    /// Captures the current original input incarnation without granting input.
+    ///
+    /// Returns `None` after route/session/lane loss or source removal. Cache the
+    /// result with its physical window and compare before forwarding input.
+    pub fn input_epoch(&self, surface: BridgeSurfaceKey) -> Option<OverlayInputEpoch> {
+        let state = self.state.upgrade()?;
+        let mut state = lock(&state);
+        overlay_input::maintain(&mut state);
+        if !self.scope.load(Ordering::Acquire) {
+            return None;
+        }
+        input_epoch(&state, surface)
+    }
+
+    /// Captures one original-incarnation input receipt from physical feedback.
+    ///
+    /// Returns `None` when the captured physical epoch is no longer current.
+    /// The returned receipt is neither serializable nor retargetable.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input or an address outside `epoch`.
+    pub fn input(
+        &self,
+        epoch: OverlayInputEpoch,
+        body: &[u8],
+    ) -> io::Result<Option<OverlayRelayInput>> {
+        let envelope = messages::decode_control(body)?;
+        let input = vivid_protocol::overlay::wire::InputEvent::decode(
+            epoch.surface.surface,
+            &Value::Map(envelope.payload),
+        )?;
+        if input.address.context_id != epoch.surface.context {
+            return Err(invalid("overlay input owner mismatch"));
+        }
+        let Some(state) = self.state.upgrade() else {
+            return Ok(None);
+        };
+        let mut state = lock(&state);
+        overlay_input::maintain(&mut state);
+        if !self.scope.load(Ordering::Acquire)
+            || input_epoch(&state, epoch.surface) != Some(epoch)
+            || !input_surface_current(&state, epoch.surface, input.address.generation)
+        {
+            return Ok(None);
+        }
+        Ok(Some(OverlayRelayInput {
+            state: self.state.clone(),
+            scope: Arc::downgrade(&self.scope),
+            epoch,
+            input,
+            captured: Instant::now(),
+        }))
+    }
+
     /// Pins a request to this route without consuming its one-shot admission.
     pub fn request(&self, request: &super::super::OverlayHostRequest) -> OverlayActionRequest {
         OverlayActionRequest {
@@ -225,6 +364,26 @@ impl Drop for OverlayActionRoute {
             retire(&mut lock(&state), &self.scope);
         }
     }
+}
+
+pub(super) fn retire_input(state: &mut State, owner: u64) {
+    let ids: HashSet<_> = state
+        .overlay_relay
+        .actions
+        .iter()
+        .filter_map(|(id, grant)| {
+            (grant.request.surface.producer == owner && grant.lane.is_some()).then_some(*id)
+        })
+        .collect();
+    for id in &ids {
+        state.overlay_relay.actions.remove(id);
+        state.overlay_relay.pending.remove(id);
+        state.overlay_relay.reservations.remove(id);
+    }
+    state
+        .overlay_relay
+        .queued
+        .retain(|request| !ids.contains(&request.id));
 }
 
 fn retire(state: &mut State, scope: &Arc<AtomicBool>) {

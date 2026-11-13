@@ -589,8 +589,10 @@ pub(super) fn status_payload(status: crate::InputBindingStatus) -> Vec<(u64, Val
 
 pub(super) fn revoke(state: &mut State, owner: u64, reason: u64, close_lane: bool) {
     if close_lane {
+        overlay_actions::retire_input(state, owner);
         state.overlays.close_lane(owner);
         flush_overlay_lane(state, owner);
+        advance_projection(state);
     }
     let Some(runtime) = state.sessions.get_mut(&owner) else {
         return;

@@ -503,6 +503,20 @@ without a surviving projection, and late acknowledgements cannot advance the
 original window. An already-admitted physical result remains uncertain after a
 timeout and is never automatically retried. This adds no GPU stress or physical
 input/device qualification.
+The [source recovery follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-resume-macos.json)
+adds real two-hop source lease resume and canonical input-lane replacement through
+the native presenter API. Lane revocation retires queued/claimed focus, raise and
+lower admissions promptly; center/close retain control authority. The action route
+exposes opaque `OverlayInputEpoch` comparison metadata and one-shot
+`OverlayRelayInput` receipts. The gateway requires `take_overlay_routed_input` for
+bound action routes; forwarding rechecks the original incarnation and one-second
+local deadline, including after input has been drained. It drops feedback from
+changed incarnations and reconciles fresh physical identities with retained frame
+replay, preserving same-ID peers. Opening/revoking an SDK input lane advances
+the projection revision. Leased producers adopt retained handles after resume,
+advance their media channel and authenticate a newer input lane. These API checks
+add no GPU/device-loss or physical-input qualification, and the developer adapter
+still does not implement a producer's automatic lease recovery policy.
 `timed-media-sync-v1` remains withheld.
 
 ## Live video

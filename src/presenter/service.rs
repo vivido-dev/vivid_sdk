@@ -1010,6 +1010,32 @@ impl std::fmt::Debug for VirtualVivid {
     }
 }
 
+fn forward_overlay_input(
+    state: &mut State,
+    surface: BridgeSurfaceKey,
+    input: vivid_protocol::overlay::wire::InputEvent,
+) -> bool {
+    let changes_projection = matches!(
+        input.event,
+        vivid_protocol::overlay::Event::Geometry { .. }
+            | vivid_protocol::overlay::Event::Focus(_)
+            | vivid_protocol::overlay::Event::Dismissed(_)
+    );
+    let closed = matches!(input.event, vivid_protocol::overlay::Event::Dismissed(_));
+    let address = input.address;
+    let accepted = state.overlays.relay_input(surface.producer, input);
+    if accepted && closed {
+        for grant in state.overlay_relay.actions.values_mut() {
+            grant.observe_close(surface, address);
+        }
+    }
+    if accepted && changes_projection {
+        advance_projection(state);
+    }
+    flush_overlay_lane(state, surface.producer);
+    accepted
+}
+
 impl VirtualVivid {
     pub fn pane_for_overlay_surface(&self, surface: BridgeSurfaceKey) -> Option<PaneId> {
         let state = lock(&self.state);
@@ -1034,25 +1060,7 @@ impl VirtualVivid {
         }
         let mut state = lock(&self.state);
         overlay_input::maintain(&mut state);
-        let changes_projection = matches!(
-            input.event,
-            vivid_protocol::overlay::Event::Geometry { .. }
-                | vivid_protocol::overlay::Event::Focus(_)
-                | vivid_protocol::overlay::Event::Dismissed(_)
-        );
-        let closed = matches!(input.event, vivid_protocol::overlay::Event::Dismissed(_));
-        let address = input.address;
-        let accepted = state.overlays.relay_input(surface.producer, input);
-        if accepted && closed {
-            for grant in state.overlay_relay.actions.values_mut() {
-                grant.observe_close(surface, address);
-            }
-        }
-        if accepted && changes_projection {
-            advance_projection(&mut state);
-        }
-        flush_overlay_lane(&mut state, surface.producer);
-        Ok(accepted)
+        Ok(forward_overlay_input(&mut state, surface, input))
     }
 
     /// Captures the exact inner editor, input lane and authenticated session incarnation.
@@ -3479,6 +3487,7 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
             .contains(registry::OVERLAY_INPUT)
         {
             state.overlays.open_lane(session_id, open.lane_generation);
+            advance_projection(&mut state);
             flush_overlay_lane(&mut state, session_id);
         }
     }

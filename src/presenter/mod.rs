@@ -45,7 +45,9 @@ pub use service::native_vector::{
     VectorInputTarget, VectorTextTarget,
 };
 #[doc(inline)]
-pub use service::overlay_actions::{OverlayActionRequest, OverlayActionRoute};
+pub use service::overlay_actions::{
+    OverlayActionRequest, OverlayActionRoute, OverlayInputEpoch, OverlayRelayInput,
+};
 #[doc(inline)]
 pub use service::overlay_clipboard::OverlayClipboardWrite;
 pub use service::{
