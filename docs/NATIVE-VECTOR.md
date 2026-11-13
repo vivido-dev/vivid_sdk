@@ -804,18 +804,44 @@ complete it with the corresponding downstream presentation outcome. The gateway'
 `overlay_document_editing` installs this automatically; callers must build the
 bridge before starting inner producers.
 
-Acceptance keeps one pending submission per window and the previous displayed scene.
-Only the matching outcome advances original display identity and ACKs. This preserves
-valid document edits for the physically displayed scene while a repaint is in flight.
-Receipts check original writer, resume incarnation, full source identity, surface and
-channel generation, plus exact pending submission. Ordinary stale-scene checks remain
-in force. Track retirement revokes its document targets immediately. Cancellation
+Acceptance coalesces only the latest unforwarded submission per window. A scene
+already forwarded retains its own physical outcome even if successors are accepted.
+`capture` returns `io::Result<OverlayPresentationCapture>`: forward `Forwarded`
+with its receipt, forward `Replay` without another original ACK, and consume
+`Discard` without forwarding or reporting source loss. Complete each receipt or
+explicitly `abandon` it when its physical attachment retires. Abandoning the final
+copy keeps the newest accepted scene available for replay; dropping a receipt
+alone supplies no physical outcome.
+
+Copies and live receipt metadata are bounded to four per owner and 64 globally.
+Additional retained forwarded canvases are charged by encoded size against
+`MediaConfig::aggregate_retained_bytes`; admission failure discards the new copy.
+This is an additional encoded-scene budget, not a decoded allocation measurement.
+Duplicate-copy supersession waits for other copies, and late older display
+outcomes cannot move original scene identity backward. Only a matching outcome
+advances original display identity and ACKs. This preserves valid document edits
+for the physically displayed scene while a repaint is in flight. Receipts check
+original writer, resume incarnation, full source identity, surface and channel
+generation, plus exact submission. Ordinary stale-scene checks remain in force. Track retirement revokes its document targets immediately. Cancellation
 supersedes pending submissions, retires focus and leaves the mode closed; dropping a
 route never restores synthetic display proof. Retained replay cannot acknowledge an
 original submission twice. Same-ID peer cleanup and lease/channel replacement are
 covered by local socket regressions. Physical scanout and automatic product recovery
 policy remain separate responsibilities.
 
-The local recovery fixture waits for fresh editor/focus admission before its first
-post-retry key. A visual display receipt alone does not establish keyboard readiness;
-immediate keys during focus/geometry turnover remain an explicit product gate.
+The compositor's display-loss status now overlays its retained app, preserving
+the viewport through failure and retry. The previous layout banner resized the
+producer twice and could invalidate the first restored keyboard target. Local
+Metal checks for direct and relayed hosts now send that key once at first retained
+state display admission, without waiting for editor republication. Canonical
+focus, source, scene and geometry validation remain unchanged; external geometry
+or authority changes still require the appropriate fresh display grant. See the
+[retry follow-up](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-retry-tcp-macos.json).
+
+Multiple accepted/forwarded revisions have local authenticated socket and native
+host API regression coverage, including early Unicode commit, same-ID peers,
+coalescing, copy/byte limits and repeated outer-attachment replacement. These
+fixtures call the native presentation API without GPU scanout. An aggressive
+multi-submission producer under Metal, and lease/channel recovery with several
+unresolved forwarded frames, remain unqualified. The long-lived Metal burst
+producer still waits for each source presentation outcome.

@@ -47,6 +47,9 @@ mod editor;
 #[path = "overlay_presented.rs"]
 mod presentation;
 pub(crate) use editor::Stamp as EditorStamp;
+pub(crate) use presentation::{
+    Claim as PresentationClaim, MAX_RELAY_FRAMES, MAX_RELAY_OWNER_FRAMES,
+};
 #[path = "overlay_windows.rs"]
 mod pane_windows;
 use pane_windows::PaneWindows as Windows;
@@ -1486,7 +1489,7 @@ impl Overlays {
         let _ = channel_generation;
 
         if self.presentation.is_some() {
-            return self.accept_presentation(window, submission, frame.canvas);
+            return self.accept_presentation(window, submission, frame.canvas, body.len() as u64);
         }
         // Anything the replacement supersedes resolves before the new scene publishes.
         if let Some(previous) = self.displayed.get(&window) {
