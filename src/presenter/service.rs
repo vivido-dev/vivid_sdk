@@ -35,6 +35,8 @@ mod native_video;
 pub(crate) mod overlay_actions;
 #[path = "overlay_clipboard.rs"]
 pub(crate) mod overlay_clipboard;
+#[path = "overlay_presentations.rs"]
+pub(crate) mod overlay_presentations;
 #[path = "overlay_tasks.rs"]
 mod overlay_tasks;
 #[path = "session_status.rs"]
@@ -1036,6 +1038,34 @@ fn forward_overlay_input(
     accepted
 }
 
+fn document_source_current(state: &State, surface: BridgeSurfaceKey) -> bool {
+    let Some(submission) =
+        state
+            .overlays
+            .editor_submission(surface.producer, surface.context, surface.surface)
+    else {
+        return false;
+    };
+    let key = SurfaceKey {
+        session: surface.producer,
+        context: surface.context,
+        surface: surface.surface,
+    };
+    state
+        .surfaces
+        .get(&key)
+        .is_some_and(|source| source.state.generation.get() == submission.address.generation)
+        && state
+            .tracks
+            .get(&TrackKey {
+                surface: key,
+                track: submission.track_id,
+            })
+            .is_some_and(|track| {
+                track.state.channel_generation.get() == submission.channel_generation
+            })
+}
+
 impl VirtualVivid {
     pub fn pane_for_overlay_surface(&self, surface: BridgeSurfaceKey) -> Option<PaneId> {
         let state = lock(&self.state);
@@ -1083,7 +1113,10 @@ impl VirtualVivid {
                 .overlays
                 .editor_stamp(surface.producer, surface.context, surface.surface)?;
         let session = state.sessions.get(&surface.producer)?;
-        if session.closed || !session.accepted_profiles.contains(registry::OVERLAY_EDITOR) {
+        if session.closed
+            || !session.accepted_profiles.contains(registry::OVERLAY_EDITOR)
+            || !document_source_current(&state, surface)
+        {
             return None;
         }
         Some(OverlayDocumentTarget {
@@ -1120,6 +1153,7 @@ impl VirtualVivid {
         let mut state = lock(&self.state);
         overlay_input::maintain(&mut state);
         if !state.overlay_relay.enabled
+            || !document_source_current(&state, surface)
             || state.sessions.get(&surface.producer).is_none_or(|session| {
                 session.closed
                     || session.resume_generation != target.resume

@@ -135,6 +135,21 @@ impl Overlays {
         .then(|| slot.context.clone())
     }
 
+    pub(crate) fn editor_submission(
+        &self,
+        session: u64,
+        context: u64,
+        surface: u64,
+    ) -> Option<Submission> {
+        let id = owner(session)
+            .context(context)
+            .ok()?
+            .surface(surface)
+            .ok()?;
+        self.editor_context(id)?;
+        Some(self.editors.0.get(&id)?.submission)
+    }
+
     pub(crate) fn editor_stamp(&self, session: u64, context: u64, surface: u64) -> Option<Stamp> {
         let id = owner(session)
             .context(context)

@@ -476,7 +476,9 @@ callbacks. The counter demonstrates bounded producer-owned document mutation.
 
 Automated native Metal checks exercise these callbacks with real producer processes.
 Physical input sources, candidate menus, OS secure-input behavior, VoiceOver,
-non-macOS platforms and production mux/GUI relay integration remain unrun gates.
+non-macOS platforms and production mux integration remain unrun gates. The local
+compositor now offers an ordinary opt-in `vector-gateway` route; its Metal
+qualification uses synthetic callbacks and simulated display completions.
 The opt-in gateway core separately passes two-hop transport and native presenter API
 checks; these do not exercise GPU submission through the gateway frontend.
 The compositor's separate [focus follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
@@ -791,3 +793,29 @@ font types through `vivid_sdk::vector_renderer::parley`. This public facade keep
 the exact dependency identity without requiring a consumer to name an SDK-private
 filesystem path. Vivido uses that facade and no longer declares Parley separately.
 A compiled rustdoc example verifies the public custom-provider contract.
+
+### Deferred source presentation through a terminating relay
+
+`VirtualVivid::attach_overlay_presentation_relay` binds one exclusive
+`OverlayPresentationRoute` before any producer authenticates. It requires host
+relaying and refuses local native/font hosts or another route. Capture an opaque
+`OverlayPresentationReceipt` for the exact source frame before forwarding, then
+complete it with the corresponding downstream presentation outcome. The gateway's
+`overlay_document_editing` installs this automatically; callers must build the
+bridge before starting inner producers.
+
+Acceptance keeps one pending submission per window and the previous displayed scene.
+Only the matching outcome advances original display identity and ACKs. This preserves
+valid document edits for the physically displayed scene while a repaint is in flight.
+Receipts check original writer, resume incarnation, full source identity, surface and
+channel generation, plus exact pending submission. Ordinary stale-scene checks remain
+in force. Track retirement revokes its document targets immediately. Cancellation
+supersedes pending submissions, retires focus and leaves the mode closed; dropping a
+route never restores synthetic display proof. Retained replay cannot acknowledge an
+original submission twice. Same-ID peer cleanup and lease/channel replacement are
+covered by local socket regressions. Physical scanout and automatic product recovery
+policy remain separate responsibilities.
+
+The local recovery fixture waits for fresh editor/focus admission before its first
+post-retry key. A visual display receipt alone does not establish keyboard readiness;
+immediate keys during focus/geometry turnover remain an explicit product gate.

@@ -51,6 +51,8 @@ pub use service::overlay_actions::{
 };
 #[doc(inline)]
 pub use service::overlay_clipboard::OverlayClipboardWrite;
+#[doc(inline)]
+pub use service::overlay_presentations::{OverlayPresentationReceipt, OverlayPresentationRoute};
 pub use service::{
     AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
     KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, OverlayDocumentTarget,

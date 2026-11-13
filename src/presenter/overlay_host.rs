@@ -44,6 +44,8 @@ use vivid_protocol::overlay::wire::{
 use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics};
 #[path = "overlay_editor.rs"]
 mod editor;
+#[path = "overlay_presented.rs"]
+mod presentation;
 pub(crate) use editor::Stamp as EditorStamp;
 #[path = "overlay_windows.rs"]
 mod pane_windows;
@@ -107,6 +109,7 @@ struct InputLease {
 
 #[derive(Default)]
 pub(crate) struct Overlays {
+    presentation: Option<presentation::Deferred>,
     #[cfg(feature = "vector-render")]
     pub(super) native: Option<native::Native>,
     windows: Windows,
@@ -461,6 +464,7 @@ impl Overlays {
                 );
             }
         }
+        self.prune_presentations();
     }
 
     // ---- control records -------------------------------------------------------------------
@@ -1408,6 +1412,7 @@ impl Overlays {
     }
 
     pub(crate) fn forget_track(&mut self, window: SurfaceIdentity, track_id: u64) {
+        self.forget_presentation_track(window, track_id);
         self.channels.remove(&(window, track_id));
         self.tracks.remove(&(
             window.context().session().session_id(),
@@ -1426,6 +1431,7 @@ impl Overlays {
         self.drain_events(owner(window.context().session().session_id()));
         #[cfg(feature = "vector-render")]
         self.prune_native();
+        self.prune_presentations();
         self.displayed
             .retain(|id, _| self.windows.get(*id).is_some());
         self.editor_carets
@@ -1479,6 +1485,9 @@ impl Overlays {
         #[cfg(not(feature = "vector-render"))]
         let _ = channel_generation;
 
+        if self.presentation.is_some() {
+            return self.accept_presentation(window, submission, frame.canvas);
+        }
         // Anything the replacement supersedes resolves before the new scene publishes.
         if let Some(previous) = self.displayed.get(&window) {
             self.resolve(window, previous.submission, PresentationOutcome::Superseded);
@@ -1590,6 +1599,7 @@ impl Overlays {
     /// as a producer disconnect must: an unrelated session that reused the same local context,
     /// surface, track, or asset numbers keeps its own state untouched.
     pub(crate) fn remove_session(&mut self, session_id: u64) {
+        self.forget_presentations(session_id);
         self.channels
             .retain(|(window, _), _| window.context().session().session_id() != session_id);
         #[cfg(feature = "vector-render")]
