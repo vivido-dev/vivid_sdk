@@ -1067,7 +1067,8 @@ impl VirtualVivid {
     ///
     /// Only available for a negotiated document relay with a current displayed
     /// context. Capture while servicing that context's host request; never replace
-    /// this target when forwarding a delayed native callback.
+    /// this target when forwarding a delayed native callback. Ordinary repaint
+    /// preserves the editor grant; delivery still checks the exact mapped scene.
     pub fn overlay_document_target(
         &self,
         surface: BridgeSurfaceKey,

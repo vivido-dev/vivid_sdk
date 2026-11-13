@@ -532,8 +532,17 @@ real geometry changes still retire stale input targets. Repeated runtime-shader
 Metal launches verify four synthetic key downs for the exercised source, admitted once each,
 with no peer keys, retries or increased action deadline. Physical input, sustained
 production startup/load, static shaders and other platform/device gates remain unrun.
-One full typed-relay Unicode commit timed out during overlapping acceptance workloads;
-the final isolated fixtures passed. Broader loaded composition remains unqualified.
+The [Unicode composition follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-unicode-macos.json)
+addresses the overlapping-workload timeout with two controlled two-hop regressions.
+An opaque `OverlayDocumentTarget` preserves its original editor grant across ordinary
+repaint, retaining the window/source, track/channel/epoch, focus, lane and authenticated
+session incarnation. Delivery still checks the edit's exact mapped displayed scene;
+stale scenes and focus round trips fail. Each gateway publication retains a separate
+target under a fresh physical excerpt revision and installs its mapping before
+physical publication, covering input between context application and acknowledgement.
+No callback samples replacement authority, retries an edit or extends its deadline.
+Finite overlapping runtime-shader Metal checks cover the corrected local path;
+sustained production workloads and physical platform/device gates remain open.
 
 ## Live video
 

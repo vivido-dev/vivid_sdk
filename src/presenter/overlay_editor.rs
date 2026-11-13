@@ -24,7 +24,10 @@ impl Editors {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stamp {
-    submission: Submission,
+    address: vivid_protocol::overlay::wire::WindowAddress,
+    track: u64,
+    channel: u64,
+    epoch: u32,
     focus: u64,
     lane: u64,
     editor: u64,
@@ -140,8 +143,13 @@ impl Overlays {
             .ok()?;
         self.editor_context(id)?;
         let slot = self.editors.0.get(&id)?;
+        // Repaint preserves this editor authority. The edit's mapped scene is
+        // still checked against the current displayed submission at delivery.
         Some(Stamp {
-            submission: slot.submission,
+            address: slot.submission.address,
+            track: slot.submission.track_id,
+            channel: slot.submission.channel_generation,
+            epoch: slot.submission.epoch,
             focus: slot.focus,
             lane: slot.lane,
             editor: slot.context.editor,
