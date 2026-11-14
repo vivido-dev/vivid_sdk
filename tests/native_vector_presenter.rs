@@ -16,6 +16,10 @@ use vivid_sdk::{
     ProducerConfig,
 };
 
+#[cfg(feature = "vector-offscreen")]
+#[path = "native_vector_presenter/gpu.rs"]
+mod gpu;
+
 fn fixture() -> (Arc<VirtualVivid>, NativeVectorHost) {
     let presenter = Arc::new(
         VirtualVivid::start_configured_eventless(

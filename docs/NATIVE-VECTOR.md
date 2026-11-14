@@ -48,6 +48,14 @@ prepared frame settles its superseded outcome on the next `poll` or `prepare`;
 showing a newer frame also settles older unresolved scenes. Already-presented
 scenes never receive another terminal outcome when their frame objects retire.
 
+An explicit native GPU regression renders an older reserved scene after accepting
+its successor, then checks exact outcomes only after simulated display admission.
+It also renders the successor, retires a dropped unshown reservation, and removes
+one owner while a same-ID peer keeps its original pixels and revision. These are
+native offscreen readbacks, not physical display or IME acceptance. The
+[local GPU evidence](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-reserved-gpu-macos.json)
+records both explicit native GPU tests and the SDK verification matrix.
+
 Display admission checks the presenter, pane, target generation, owner set,
 session resume generations, complete window topology, placement revisions,
 active vector tracks and exact submissions. Retained frame-object identity also
@@ -867,14 +875,27 @@ regression fills four forwarding slots, advances the channel, fills four more,
 resumes the lease and admits source revision 12 while a same-ID peer retains its
 unshown original scene. Physical writer retirement releases its own receipt copies
 outside the mapping lock, and a writer-specific fence prevents late reinsertion.
-Stale prepared frames remain rejected. An aggressive multi-submission producer
-under Metal remains unqualified; the long-lived Metal burst producer still waits
-for each source presentation outcome.
+Stale prepared frames remain rejected. The long-lived burst producer waits for
+each source outcome; the separate bounded streaming source below does not.
 
 The bounded four-source Metal streaming fixture now runs with multiple source
 submissions between receipt polls. Two full local runs passed 769 exact physical
 keys and 24 Unicode compositions, logical device retry and source replacement.
-One repeat timed out waiting for focus/editor readiness after 144 owner batches;
-that intermittent failure is unresolved. The prepared-scene outcome and resource
-invariants have focused coverage, but continuous native editor readiness is still
-an open qualification gate. See the [streaming follow-up](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json).
+One repeat timed out waiting for focus/editor readiness after 144 owner batches.
+The compositor then fixed candidate queries that used an older GUI caret copy
+instead of the current local worker snapshot. A focused handler regression checks
+publication, clearing, republication and epoch retirement without GUI polling.
+The subsequent 43.2-minute streaming soak passes 18,433 exact keys and 144 Unicode
+compositions, GPU retry, source replacement and stale callbacks. This qualifies
+the declared four-receipt, 100-ms offered batch policy; peak/higher-rate workloads,
+packet-loss faults, production mux adoption and automatic frontend lease recovery
+remain open. See the [historical streaming follow-up](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json)
+and the [long soak](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-soak-macos.json).
+
+A faster four-owner fixture requests batches every 10 ms while retaining the
+overlay helper's 60-record/s declaration and token-bucket pacing. An 18.1-minute
+run passes 7,681 exact keys and 60 Unicode compositions through GPU retry and
+source replacement, with approximately 60 source scenes/s per owner measured
+between rendered checkpoints. This covers the current declared ceiling, not
+400 GPU/display FPS, other track declarations or general peak throughput.
+See the [higher-offer evidence](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-fast-macos.json).
