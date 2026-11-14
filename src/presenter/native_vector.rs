@@ -112,6 +112,7 @@ struct Entry {
     resume: u64,
     body: Arc<[u8]>,
     writer: Weak<Writer>,
+    reservation: Arc<()>,
 }
 impl VectorFrame {
     /// Returns the back-to-front drawings for the shared GPU compositor.
@@ -196,6 +197,7 @@ struct Candidate {
     body: Arc<[u8]>,
     assets: Vec<(u16, Arc<[u8]>)>,
     writer: Weak<Writer>,
+    reservation: Option<Arc<()>>,
 }
 struct Snapshot {
     identity: PresenterInstanceId,
@@ -399,6 +401,12 @@ impl NativeVectorHost {
         super::native_audio::tick(&mut lock(&self.presenter.state));
         #[cfg(feature = "vector-video")]
         super::native_video::tick(&mut lock(&self.presenter.state));
+        {
+            let mut state = lock(&self.presenter.state);
+            state.overlays.prune_native();
+            let owners: Vec<_> = state.sessions.keys().copied().collect();
+            flush_overlay_lanes(&mut state, &owners);
+        }
         self.flush_input();
         let request = self.text.poll()?;
         if matches!(
@@ -496,6 +504,12 @@ impl NativeVectorHost {
     }
 
     /// Compiles one bounded, immutable pane composition without acknowledging it.
+    ///
+    /// Preparing reserves each exact source scene before compilation. Newer media
+    /// acceptance alone cannot supersede that scene while the frame remains live.
+    /// Encoded scene reservations share the native resource budget; duplicate
+    /// prepares of one incarnation share its reservation. A source that cannot
+    /// reserve new scene bytes closes only its own window.
     ///
     /// Images and text are resolved in their complete source/channel namespaces.
     /// Unsupported scenes close their own window, leaving peers renderable.
@@ -605,6 +619,10 @@ impl NativeVectorHost {
                 resume: candidate.resume,
                 body: candidate.body.clone(),
                 writer: candidate.writer.clone(),
+                reservation: candidate
+                    .reservation
+                    .clone()
+                    .expect("native snapshot reserved scene"),
             });
             drawings.push(Drawing {
                 window,
@@ -656,7 +674,10 @@ impl NativeVectorHost {
     /// Acknowledges the exact composition the outer GUI actually displayed.
     ///
     /// Call after displayed-frame completion, including when the GPU cache was
-    /// reused. A stale composition returns `false` and grants no new input.
+    /// reused. A reserved scene may be shown after a successor was accepted, but
+    /// never after a newer physical scene was published. Dropping an unshown
+    /// reservation settles its superseded outcome on the next poll or preparation.
+    /// Lifecycle, placement and input fences still reject stale compositions.
     ///
     /// # Errors
     /// Rejects a receipt from another presenter or host attachment, or a detached host.
@@ -738,6 +759,10 @@ impl NativeVectorHost {
                     drawing.window_revision,
                     drawing.submission,
                     drawing.compiled.clone(),
+                    Frame::decode(&entry.body)
+                        .expect("prepared native scene was validated")
+                        .canvas,
+                    Arc::clone(&entry.reservation),
                 ),
                 "native frame preflight must make presentation atomic"
             );
@@ -769,6 +794,7 @@ impl NativeVectorHost {
                 stamp: frame.stamp.clone(),
             },
         );
+        state.overlays.prune_native();
         for owner in owners {
             flush_overlay_lane(&mut state, owner);
         }
@@ -985,7 +1011,86 @@ impl NativeVectorHost {
                         .as_ref()
                         .expect("attached native channel"),
                 ),
+                reservation: None,
             });
+        }
+        for candidate in &mut candidates {
+            let key = (candidate.window, candidate.submission.revision);
+            // Retained track bytes alone cannot authorize a recreated window.
+            // Reserve only scenes still pending, committed, or already reserved
+            // in this native window incarnation.
+            let admitted = state.overlays.native.as_ref().is_some_and(|native| {
+                native
+                    .pending
+                    .get(&candidate.window)
+                    .is_some_and(|pending| pending.submission == candidate.submission)
+                    || native.committed.get(&candidate.window) == Some(&candidate.submission)
+                    || native.prepared.get(&key).is_some_and(|prepared| {
+                        prepared.submission == candidate.submission
+                            && prepared.pin.strong_count() != 0
+                            && prepared
+                                .body
+                                .upgrade()
+                                .is_some_and(|body| Arc::ptr_eq(&body, &candidate.body))
+                    })
+            });
+            if !admitted {
+                continue;
+            }
+            let existing = state
+                .overlays
+                .native
+                .as_ref()
+                .and_then(|native| native.prepared.get(&key))
+                .filter(|prepared| {
+                    prepared.submission == candidate.submission
+                        && prepared
+                            .body
+                            .upgrade()
+                            .is_some_and(|body| Arc::ptr_eq(&body, &candidate.body))
+                })
+                .and_then(|prepared| prepared.pin.upgrade());
+            let pin = if let Some(pin) = existing {
+                pin
+            } else {
+                let pin = match charge(&mut state, candidate.body.len()) {
+                    Ok(pin) => pin,
+                    Err(_) => {
+                        state.overlays.close_native(candidate.window);
+                        flush_overlay_lane(&mut state, candidate.source.producer);
+                        continue;
+                    }
+                };
+                let resolved = state
+                    .overlays
+                    .native
+                    .as_ref()
+                    .expect("native host attached")
+                    .committed
+                    .get(&candidate.window)
+                    == Some(&candidate.submission);
+                state
+                    .overlays
+                    .native
+                    .as_mut()
+                    .expect("native host attached")
+                    .prepared
+                    .insert(
+                        key,
+                        super::super::overlay_host::native::Prepared {
+                            submission: candidate.submission,
+                            body: Arc::downgrade(&candidate.body),
+                            pin: Arc::downgrade(&pin),
+                            resolved,
+                        },
+                    );
+                pin
+            };
+            candidate.reservation = Some(pin);
+        }
+        candidates.retain(|candidate| candidate.reservation.is_some());
+        for owner in &owners {
+            flush_overlay_lane(&mut state, *owner);
         }
         Ok(Snapshot {
             identity: state.presenter,
@@ -1014,13 +1119,19 @@ fn current(state: &State, entry: &Entry, drawing: &Drawing) -> bool {
     };
     if window.revision != drawing.window_revision
         || window.generation != drawing.submission.address.generation
-        || native.pending.get(&entry.window).map_or_else(
-            || native.committed.get(&entry.window) != Some(&drawing.submission),
-            |pending| {
-                pending.submission != drawing.submission
-                    || window.scene_revision >= drawing.submission.revision
-            },
-        )
+        || window.scene_revision > drawing.submission.revision
+        || (native.committed.get(&entry.window) != Some(&drawing.submission)
+            && !native
+                .prepared
+                .get(&(entry.window, drawing.submission.revision))
+                .is_some_and(|prepared| {
+                    prepared.submission == drawing.submission
+                        && Weak::ptr_eq(&prepared.pin, &Arc::downgrade(&entry.reservation))
+                        && prepared
+                            .body
+                            .upgrade()
+                            .is_some_and(|body| Arc::ptr_eq(&body, &entry.body))
+                }))
     {
         return false;
     }
@@ -1046,16 +1157,12 @@ fn current(state: &State, entry: &Entry, drawing: &Drawing) -> bool {
         && surface.state.generation.get() == drawing.submission.address.generation
         && surface.active_slots.get(&SLOT_VECTOR) == Some(&entry.source.track)
         && track.state.channel_generation.get() == drawing.submission.channel_generation
-        && track.channel_writer.is_some()
-        && track
-            .retained
-            .as_ref()
-            .filter(|body| Arc::ptr_eq(body, &entry.body))
-            .and_then(|body| Frame::decode(body).ok())
-            .is_some_and(|frame| {
-                frame.epoch == drawing.submission.epoch
-                    && frame.revision == drawing.submission.revision
-            })
+        && track.channel_writer.as_ref().is_some_and(|writer| {
+            entry
+                .writer
+                .upgrade()
+                .is_some_and(|old| Arc::ptr_eq(writer, &old) && !old.is_closed())
+        })
 }
 impl std::fmt::Debug for NativeVectorHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1135,3 +1242,7 @@ impl Drop for NativeVectorHost {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_vector/prepared_tests.rs"]
+mod prepared_tests;

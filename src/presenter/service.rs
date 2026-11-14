@@ -5719,6 +5719,15 @@ fn dispatch_control_for_connection(
                     track.state.revision.get(),
                 )
             };
+            // Forwarded scenes belong to the retired channel even if physical
+            // outcomes are still queued. They cannot reserve replacement capacity.
+            if let Ok(window) = super::overlay_host::owner(key.surface.session)
+                .context(key.surface.context)
+                .and_then(|context| context.surface(key.surface.surface))
+            {
+                state.overlays.forget_presentation_track(window, key.track);
+                flush_overlay_lane(&mut state, session_id);
+            }
             // Actor-queued records were admitted under the retired generation. Removing their
             // delivery identities makes the actor drop their event shells instead of forwarding
             // them after the replacement projection is acknowledged.
@@ -8972,6 +8981,9 @@ fn suspend_session(
         session.anchors.clear();
         session.seen_anchors.clear();
     }
+    // The writer/resume incarnation has retired. Its unresolved physical copies
+    // can never complete, and must not retain the resumed owner's scene budget.
+    state.overlays.forget_presentations(session_id);
     // Uncommitted work cannot survive the connection that owned its transaction.
     state
         .transactions

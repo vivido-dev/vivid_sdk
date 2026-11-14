@@ -29,6 +29,25 @@ The host loop has four responsibilities:
    It returns `false` for a superseded, invalidated or otherwise stale frame.
    GPU submission, GPU readback and GUI upload alone are insufficient evidence.
 
+Preparing also reserves the exact accepted source scene before compilation leaves
+the state lock. A newer accepted scene cannot prematurely supersede that live
+reservation. A prepared image may therefore be acknowledged after a successor
+arrives, provided no newer physical scene has been published. Placement, surface,
+channel/writer incarnation, resume, visibility and input-lane fences still apply.
+Retained track bytes alone cannot authorize a recreated native window.
+
+Encoded scene reservations share the existing native resource budget, with one
+charge reused by duplicate prepares of the same incarnation. Frame objects and
+the current displayed-scene cache keep that charge until their last reference
+retires; dropping an acknowledged frame cannot force a cached peer to re-admit
+its bytes. Reservation metadata holds weak references. The existing two-frame
+per-pane and 64-frame host bounds, plus bounded native windows, still apply. A
+source that cannot reserve new bytes closes only its own window; cached peers can
+reuse their existing reservation and compiled resources. Dropping an unshown
+prepared frame settles its superseded outcome on the next `poll` or `prepare`;
+showing a newer frame also settles older unresolved scenes. Already-presented
+scenes never receive another terminal outcome when their frame objects retire.
+
 Display admission checks the presenter, pane, target generation, owner set,
 session resume generations, complete window topology, placement revisions,
 active vector tracks and exact submissions. Retained frame-object identity also
@@ -841,7 +860,21 @@ or authority changes still require the appropriate fresh display grant. See the
 Multiple accepted/forwarded revisions have local authenticated socket and native
 host API regression coverage, including early Unicode commit, same-ID peers,
 coalescing, copy/byte limits and repeated outer-attachment replacement. These
-fixtures call the native presentation API without GPU scanout. An aggressive
-multi-submission producer under Metal, and lease/channel recovery with several
-unresolved forwarded frames, remain unqualified. The long-lived Metal burst
-producer still waits for each source presentation outcome.
+fixtures call the native presentation API without GPU scanout. Channel advance
+now retires that exact source track's pending/forwarded scenes and encoded charges;
+lease suspension drops unresolved scenes for only that owner. A native socket
+regression fills four forwarding slots, advances the channel, fills four more,
+resumes the lease and admits source revision 12 while a same-ID peer retains its
+unshown original scene. Physical writer retirement releases its own receipt copies
+outside the mapping lock, and a writer-specific fence prevents late reinsertion.
+Stale prepared frames remain rejected. An aggressive multi-submission producer
+under Metal remains unqualified; the long-lived Metal burst producer still waits
+for each source presentation outcome.
+
+The bounded four-source Metal streaming fixture now runs with multiple source
+submissions between receipt polls. Two full local runs passed 769 exact physical
+keys and 24 Unicode compositions, logical device retry and source replacement.
+One repeat timed out waiting for focus/editor readiness after 144 owner batches;
+that intermittent failure is unresolved. The prepared-scene outcome and resource
+invariants have focused coverage, but continuous native editor readiness is still
+an open qualification gate. See the [streaming follow-up](../../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json).

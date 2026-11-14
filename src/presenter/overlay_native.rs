@@ -3,11 +3,14 @@
 // Rust guideline compliant 2026-10-07
 use super::*;
 use crate::vector_renderer::CompiledScene;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Default)]
 pub(crate) struct Native {
     pub pending: HashMap<SurfaceIdentity, Pending>,
+    // Only live native frame reservations remain here. They retain metadata,
+    // while their already-budgeted frame objects own the encoded scene bytes.
+    pub prepared: HashMap<(SurfaceIdentity, u64), Prepared>,
     pub displayed: HashMap<SurfaceIdentity, Displayed>,
     pub committed: HashMap<SurfaceIdentity, Submission>,
     pub compositions: HashMap<u64, Composition>,
@@ -20,18 +23,28 @@ pub(crate) struct Composition {
 }
 pub(crate) struct Pending {
     pub submission: Submission,
-    pub canvas: Canvas,
+}
+pub(crate) struct Prepared {
+    pub submission: Submission,
+    pub body: Weak<[u8]>,
+    pub pin: Weak<()>,
+    pub resolved: bool,
 }
 pub(crate) struct Displayed {
     pub submission: Submission,
     pub placement: u64,
     pub viewport: u64,
     pub compiled: Arc<CompiledScene>,
+    // Cached displayed geometry owns its reservation even after the caller drops
+    // the acknowledged frame, so a peer repaint needs no fresh byte admission.
+    _reservation: Arc<()>,
 }
 impl Native {
     pub fn remove_owner(&mut self, session: u64) {
         self.pending
             .retain(|id, _| id.context().session().session_id() != session);
+        self.prepared
+            .retain(|(id, _), _| id.context().session().session_id() != session);
         self.displayed
             .retain(|id, _| id.context().session().session_id() != session);
         self.committed
@@ -418,12 +431,43 @@ impl Overlays {
     }
 
     pub(crate) fn prune_native(&mut self) {
+        let mut retired = Vec::new();
+        if let Some(native) = &mut self.native {
+            native.prepared.retain(|(id, _), prepared| {
+                let valid = prepared.pin.strong_count() != 0
+                    && self.windows.get(*id).is_some_and(|window| {
+                        window.generation == prepared.submission.address.generation
+                            && window.scene_revision <= prepared.submission.revision
+                    })
+                    && self.channels.get(&(*id, prepared.submission.track_id))
+                        == Some(&prepared.submission.channel_generation);
+                if !valid
+                    && !prepared.resolved
+                    && !native
+                        .pending
+                        .get(id)
+                        .is_some_and(|pending| pending.submission == prepared.submission)
+                    && native.committed.get(id) != Some(&prepared.submission)
+                {
+                    retired.push((*id, prepared.submission));
+                }
+                valid
+            });
+        }
+        for (id, submission) in retired {
+            self.native_outcome(submission, id, PresentationOutcome::Superseded);
+        }
+
         let expired: Vec<_> = self
             .native
             .as_ref()
             .into_iter()
             .flat_map(|native| &native.pending)
-            .filter(|(id, _)| self.windows.get(**id).is_none())
+            .filter(|(id, pending)| {
+                self.windows
+                    .get(**id)
+                    .is_none_or(|window| window.generation != pending.submission.address.generation)
+            })
             .map(|(id, pending)| (*id, pending.submission))
             .collect();
         for (id, submission) in expired {
@@ -497,11 +541,11 @@ impl Overlays {
     }
 
     pub(crate) fn close_native(&mut self, id: SurfaceIdentity) {
-        if let Some(pending) = self
-            .native
-            .as_mut()
-            .and_then(|native| native.pending.remove(&id))
-        {
+        if let Some(pending) = self.native.as_mut().and_then(|native| {
+            let pending = native.pending.remove(&id)?;
+            native.prepared.remove(&(id, pending.submission.revision));
+            Some(pending)
+        }) {
             self.native_outcome(pending.submission, id, PresentationOutcome::Superseded);
         }
         self.windows
@@ -556,6 +600,7 @@ impl Overlays {
         channel: u64,
         frame: Frame,
     ) -> bool {
+        self.prune_native();
         let Some(state) = self.windows.get(window) else {
             return false;
         };
@@ -570,16 +615,17 @@ impl Overlays {
             epoch: frame.epoch,
             revision: frame.revision,
         };
-        let old = self.native.as_mut().and_then(|native| {
-            native.pending.insert(
-                window,
-                Pending {
-                    submission,
-                    canvas: frame.canvas,
-                },
-            )
-        });
-        if let Some(old) = old {
+        let old = self
+            .native
+            .as_mut()
+            .and_then(|native| native.pending.insert(window, Pending { submission }));
+        if let Some(old) = old
+            && !self.native.as_ref().is_some_and(|native| {
+                native
+                    .prepared
+                    .contains_key(&(window, old.submission.revision))
+            })
+        {
             self.native_outcome(old.submission, window, PresentationOutcome::Superseded);
         }
         true
@@ -614,6 +660,8 @@ impl Overlays {
         placement: u64,
         submission: Submission,
         compiled: Arc<CompiledScene>,
+        canvas: Canvas,
+        reservation: Arc<()>,
     ) -> bool {
         let Some(state) = self.windows.get(window) else {
             return false;
@@ -628,14 +676,28 @@ impl Overlays {
         let Some(native) = &mut self.native else {
             return false;
         };
-        if let Some(pending) = native.pending.get(&window) {
-            if pending.submission != submission {
+        if native.committed.get(&window) != Some(&submission) {
+            if !native
+                .prepared
+                .get(&(window, submission.revision))
+                .is_some_and(|prepared| {
+                    prepared.submission == submission && prepared.pin.strong_count() != 0
+                })
+            {
                 return false;
             }
-            let pending = native
+            if native
                 .pending
-                .remove(&window)
-                .expect("validated native pending scene");
+                .get(&window)
+                .is_some_and(|pending| pending.submission == submission)
+            {
+                native.pending.remove(&window);
+            }
+            native
+                .prepared
+                .get_mut(&(window, submission.revision))
+                .expect("reserved native scene")
+                .resolved = true;
             if self
                 .windows
                 .publish_scene(window, submission.address.generation, submission.revision)
@@ -648,15 +710,13 @@ impl Overlays {
                 PresentedScene {
                     window,
                     revision: submission.revision,
-                    canvas: pending.canvas,
+                    canvas,
                     submission,
                 },
             );
             self.semantics.remove(&window);
             self.editor_carets.remove(&window);
             self.native_outcome(submission, window, PresentationOutcome::Presented);
-        } else if native.committed.get(&window) != Some(&submission) {
-            return false;
         }
         let native = self.native.as_mut().expect("native presenter attached");
         native.committed.insert(window, submission);
@@ -668,6 +728,7 @@ impl Overlays {
                 placement,
                 viewport,
                 compiled,
+                _reservation: reservation,
             },
         );
         self.drain_events(owner(window.context().session().session_id()));

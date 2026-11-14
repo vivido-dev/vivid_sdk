@@ -190,7 +190,7 @@ fn only_displayed_frames_acknowledge_exact_submissions_and_enable_compiled_hits(
 }
 
 #[test]
-fn replaced_or_moved_frames_cannot_acknowledge_and_peer_state_survives_close() {
+fn prepared_frames_survive_new_acceptance_but_not_moves_or_owner_retirement() {
     let (presenter, mut host) = fixture();
     let first = connect(&presenter);
     let peer = connect(&presenter);
@@ -205,11 +205,12 @@ fn replaced_or_moved_frames_cannot_acknowledge_and_peer_state_survives_close() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(!host.presented(&frame).unwrap());
+    assert!(host.presented(&frame).unwrap());
     assert_eq!(
         old.wait(Duration::from_secs(2)).unwrap(),
-        Some(PresentationOutcome::Superseded)
+        Some(PresentationOutcome::Presented)
     );
+    assert_eq!(replacement.wait(Duration::ZERO).unwrap(), None);
     drop(frame);
     let frame = prepare(&mut host, 2);
     a.set_bounds(Rect::new(1., 0., 48., 48.).unwrap()).unwrap();
@@ -613,4 +614,78 @@ fn native_host_renders_owner_scoped_images_and_retained_glyphs_with_real_gpu_rea
     assert!(gpu.render(frame.drawings(), 128, 128).unwrap());
     let retained = pixels(&mut gpu);
     assert_eq!(&*retained.rgba, &*rendered.rgba);
+}
+
+#[test]
+fn newer_physical_display_and_dropped_reservations_resolve_only_their_original_scenes() {
+    let (presenter, mut host) = fixture();
+    let first = connect(&presenter);
+    let peer = connect(&presenter);
+    let a = window(&first, 0.);
+    let b = window(&peer, 64.);
+    let one = a.submit(scene(0xff0000ff)).unwrap();
+    let peer_one = b.submit(scene(0x0000ffff)).unwrap();
+    let old = prepare(&mut host, 2);
+    assert_eq!(
+        old.drawings()[0].submission.address,
+        old.drawings()[1].submission.address
+    );
+    assert_ne!(
+        old.drawings()[0].window.context().session(),
+        old.drawings()[1].window.context().session()
+    );
+    let two = a.submit(scene(0x00ff00ff)).unwrap();
+    let accepted = std::time::Instant::now() + Duration::from_secs(3);
+    while a.reconcile().unwrap().accepted_revision != two.revision() {
+        assert!(std::time::Instant::now() < accepted);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(one.wait(Duration::ZERO).unwrap(), None);
+    let fresh = prepare(&mut host, 2);
+    assert!(host.presented(&fresh).unwrap());
+    assert_eq!(
+        two.wait(Duration::from_secs(3)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    assert_eq!(
+        peer_one.wait(Duration::from_secs(3)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    assert_eq!(
+        one.wait(Duration::from_secs(3)).unwrap(),
+        Some(PresentationOutcome::Superseded)
+    );
+    assert!(!host.presented(&old).unwrap());
+    drop(old);
+    drop(fresh);
+    let three = a.submit(scene(0xff00ffff)).unwrap();
+    let accepted = std::time::Instant::now() + Duration::from_secs(3);
+    while a.reconcile().unwrap().accepted_revision != three.revision() {
+        assert!(std::time::Instant::now() < accepted);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let abandoned = prepare(&mut host, 2);
+    let four = a.submit(scene(0x00ffffff)).unwrap();
+    let accepted = std::time::Instant::now() + Duration::from_secs(3);
+    while a.reconcile().unwrap().accepted_revision != four.revision() {
+        assert!(std::time::Instant::now() < accepted);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(three.wait(Duration::ZERO).unwrap(), None);
+    drop(abandoned);
+    host.poll();
+    assert_eq!(
+        three.wait(Duration::from_secs(3)).unwrap(),
+        Some(PresentationOutcome::Superseded)
+    );
+    assert_eq!(four.wait(Duration::ZERO).unwrap(), None);
+    let fresh = prepare(&mut host, 2);
+    assert!(host.presented(&fresh).unwrap());
+    assert_eq!(
+        four.wait(Duration::from_secs(3)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+    assert_eq!(b.reconcile().unwrap().presented_revision, 1);
+    first.close().unwrap();
+    peer.close().unwrap();
 }

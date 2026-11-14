@@ -294,7 +294,7 @@ impl Overlays {
             );
         }
     }
-    pub(super) fn forget_presentation_track(&mut self, window: SurfaceIdentity, track: u64) {
+    pub(crate) fn forget_presentation_track(&mut self, window: SurfaceIdentity, track: u64) {
         let mut scenes = Vec::new();
         if let Some(relay) = &mut self.presentation {
             if relay
@@ -324,7 +324,7 @@ impl Overlays {
             );
         }
     }
-    pub(super) fn forget_presentations(&mut self, session: u64) {
+    pub(crate) fn forget_presentations(&mut self, session: u64) {
         if let Some(relay) = &mut self.presentation {
             relay
                 .pending
