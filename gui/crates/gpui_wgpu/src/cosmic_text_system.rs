@@ -1285,10 +1285,12 @@ mod tests {
                 let backend = platform_text_system.0.read();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let cold = scope.spawn(|| text_system.resolve_font(&cached.clone().bold()));
-                while !platform_text_system.0.is_locked_exclusive() && Instant::now() < deadline {
+                // Our read guard prevents exclusive ownership. A queued writer instead
+                // excludes new nonrecursive readers, which witnesses the cold lookup's wait.
+                while platform_text_system.0.try_read().is_some() && Instant::now() < deadline {
                     thread::yield_now();
                 }
-                let cold_waiting = platform_text_system.0.is_locked_exclusive();
+                let cold_waiting = platform_text_system.0.try_read().is_none();
                 let warm = scope.spawn(|| sender.send(text_system.resolve_font(&cached)));
                 let result =
                     receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));

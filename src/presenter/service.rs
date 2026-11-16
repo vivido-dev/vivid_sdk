@@ -3,8 +3,12 @@
 //! This module terminates the inner session. Nothing secret-bearing or authoritative is relayed:
 //! projection snapshots contain validated semantic state and portable media bodies only.
 
+#[path = "bridge_recovery.rs"]
+mod bridge_recovery;
 #[path = "desktop_input.rs"]
 mod desktop_input;
+#[doc(inline)]
+pub use bridge_recovery::BridgeRecoveryFence;
 #[path = "overlay_input.rs"]
 mod overlay_input;
 pub use desktop_input::DesktopInputTarget;
@@ -39,6 +43,11 @@ pub(crate) mod overlay_clipboard;
 pub(crate) mod overlay_presentations;
 #[path = "overlay_tasks.rs"]
 mod overlay_tasks;
+#[cfg(test)]
+#[path = "resume_race_tests.rs"]
+mod resume_race_tests;
+#[path = "resume_wait.rs"]
+mod resume_wait;
 #[path = "session_status.rs"]
 mod session_status;
 
@@ -94,8 +103,12 @@ use super::overlay_host::OverlayReply;
 use super::transport::{Reader, Writer};
 use crate::presenter::{KEYFRAME_REASON_TRANSPORT_LOSS, PresenterListener, Transport};
 
-const MAX_CONNECTIONS: usize = 64;
 const MAX_SESSIONS: usize = 16;
+// Keep retirement coordination inside the existing absolute handshake budget.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+// One connection per configured media source, plus bounded space for control,
+// interactive lanes, authentication and retiring/replacement session transports.
+const CONNECTION_HEADROOM: usize = MAX_SESSIONS * 4;
 const MAX_LEASES: usize = 64;
 const MAX_WAITS: usize = 64;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
@@ -229,6 +242,8 @@ pub struct SceneNode {
 #[derive(Debug, Clone)]
 pub struct ProjectionSnapshot {
     pub revision: u64,
+    /// Ordinary surfaces followed by overlays in each pane's bottom-to-top stack order.
+    /// Hidden overlays retain their position for host reconstruction.
     pub surfaces: Vec<SnapshotSurface>,
     pub sources: Vec<SnapshotSource>,
     pub nodes: Vec<SceneNode>,
@@ -758,6 +773,8 @@ struct TrackEntry {
     microphone: Option<MicrophoneEndpoint>,
     configuration: TrackConfiguration,
     state: TrackState,
+    // Local lifetime identity survives channel changes but not destroy/recreate.
+    incarnation: Arc<()>,
     decoder_reset_serial: u64,
     hold_pause_decoder: Option<u64>,
     flush_pending_channel_advance: bool,
@@ -897,6 +914,7 @@ struct State {
     #[cfg(any(test, feature = "testing"))]
     play_commands: Vec<BridgeSourceKey>,
     connections: usize,
+    connection_limit: usize,
     delivery_metrics: DeliveryMetrics,
     /// Overlay window/focus/revision bookkeeping, shared by every session this presenter accepts.
     /// Only populated when `config.overlay` is set; otherwise no session ever negotiates the
@@ -909,6 +927,8 @@ struct State {
     wait_changed: Arc<Condvar>,
     /// Track waits currently parked on `wait_changed`.
     parked_waits: usize,
+    #[cfg(test)]
+    waiting_resumes: usize,
 }
 
 impl State {
@@ -973,8 +993,9 @@ fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
     }
 }
 
-/// Events the runtime queues for a pull-mode [`VirtualVivid::wait_media_event`] caller before it
-/// backpressures media into recovery, matching the depth push consumers typically choose.
+/// Events queued for a pull-mode [`VirtualVivid::wait_media_event`] caller.
+/// Full queues retain one admitted packet per media channel without success credit;
+/// the wait releases the state lock so control and other owners remain live.
 const MEDIA_EVENT_QUEUE_BOUND: usize = 16;
 
 pub struct VirtualVivid {
@@ -1171,6 +1192,23 @@ impl VirtualVivid {
         Ok(accepted)
     }
 
+    /// Bound aggregate overlay windows across all authenticated owners and panes.
+    ///
+    /// Configure route admission before producers authenticate. A gateway mapping
+    /// several inner owners onto one outer session should use
+    /// [`vivid_protocol::overlay::MAX_WINDOWS_PER_OWNER`]. Existing windows and
+    /// updates keep their authority; closing a window returns admission capacity.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] for zero, a value above the protocol
+    /// aggregate ceiling, or a value below the number of existing windows.
+    pub fn set_overlay_window_capacity(&self, maximum: usize) -> io::Result<()> {
+        lock(&self.state)
+            .overlays
+            .set_window_capacity(maximum)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    }
+
     /// Route font measurement and retained-layout requests to the physical presenter.
     pub fn enable_overlay_host_relay(&self) {
         lock(&self.state).overlay_relay.enabled = true;
@@ -1363,6 +1401,16 @@ impl VirtualVivid {
         mut config: PresenterConfig,
         delivery: MediaEventDelivery,
     ) -> io::Result<Self> {
+        let connection_limit = config
+            .media
+            .max_sources
+            .checked_add(CONNECTION_HEADROOM)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "presenter connection capacity overflows usize",
+                )
+            })?;
         config.supported_profiles.sort();
         config.supported_profiles.dedup();
         if !config.overlay
@@ -1476,6 +1524,7 @@ impl VirtualVivid {
             #[cfg(any(test, feature = "testing"))]
             play_commands: Vec::new(),
             connections: 0,
+            connection_limit,
             delivery_metrics: DeliveryMetrics::default(),
             overlays: crate::presenter::overlay_host::Overlays::default(),
             overlay_relay: Default::default(),
@@ -1483,6 +1532,8 @@ impl VirtualVivid {
             released_overlay_layouts: HashSet::new(),
             wait_changed: Arc::new(Condvar::new()),
             parked_waits: 0,
+            #[cfg(test)]
+            waiting_resumes: 0,
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2019,7 +2070,7 @@ impl VirtualVivid {
     }
 
     pub fn projection_snapshot(&self, panes: &HashSet<PaneId>) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, &HashMap::new(), Some(true))
+        self.projection_snapshot_inner(panes, &HashMap::new(), Some(true), None)
     }
 
     pub fn projection_snapshot_with_viewports(
@@ -2027,7 +2078,7 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
     ) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, viewport_offsets, Some(true))
+        self.projection_snapshot_inner(panes, viewport_offsets, Some(true), None)
     }
 
     /// Build a projection without exposing newly visible timed sources to their workers.
@@ -2178,7 +2229,7 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
     ) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, viewport_offsets, Some(false))
+        self.projection_snapshot_inner(panes, viewport_offsets, Some(false), None)
     }
 
     /// Read scene and retained content without changing playback visibility or ingress flow.
@@ -2188,7 +2239,7 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
     ) -> ProjectionSnapshot {
-        self.projection_snapshot_inner(panes, viewport_offsets, None)
+        self.projection_snapshot_inner(panes, viewport_offsets, None, None)
     }
 
     fn projection_snapshot_inner(
@@ -2196,6 +2247,7 @@ impl VirtualVivid {
         panes: &HashSet<PaneId>,
         viewport_offsets: &HashMap<PaneId, usize>,
         activation: Option<bool>,
+        recovery: Option<(&HashSet<SourceKey>, &mut bridge_recovery::Scopes)>,
     ) -> ProjectionSnapshot {
         let mut state = lock(&self.state);
         let sessions = state
@@ -2203,7 +2255,25 @@ impl VirtualVivid {
             .iter()
             .filter_map(|(id, session)| panes.contains(&session.pane).then_some(*id))
             .collect::<HashSet<_>>();
-        let surfaces = state
+        // Creation order is part of window stacking. Re-originating a hash-map
+        // iteration can reverse overlapping windows after an outer replacement.
+        let stacking = state
+            .overlays
+            .stacked_windows()
+            .enumerate()
+            .map(|(rank, window)| {
+                let context = window.identity.context();
+                (
+                    SurfaceKey {
+                        session: context.session().session_id(),
+                        context: context.context_id(),
+                        surface: window.identity.surface_id(),
+                    },
+                    rank,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut surfaces = state
             .surfaces
             .iter()
             .filter(|(key, _)| sessions.contains(&key.session))
@@ -2247,6 +2317,22 @@ impl VirtualVivid {
                 }
             })
             .collect::<Vec<_>>();
+        // Ordinary surfaces keep a deterministic identity order. Overlay windows
+        // retain the complete pane stack, including temporarily hidden entries.
+        surfaces.sort_by_key(|surface| {
+            let rank = stacking.get(&SurfaceKey {
+                session: surface.producer,
+                context: surface.context,
+                surface: surface.surface,
+            });
+            (
+                rank.is_some(),
+                rank.copied().unwrap_or_default(),
+                surface.producer,
+                surface.context,
+                surface.surface,
+            )
+        });
         let sources =
             state
                 .tracks
@@ -2300,6 +2386,9 @@ impl VirtualVivid {
                     })
                 })
                 .collect::<Vec<_>>();
+        let recovery_retired = recovery.is_some_and(|(selected, scopes)| {
+            bridge_recovery::retire(&mut state, &sources, selected, scopes)
+        });
         let mut nodes = Vec::new();
         for (key, entry) in &state.nodes {
             if !sessions.contains(&key.session) {
@@ -2456,7 +2545,7 @@ impl VirtualVivid {
             videos_needing_keyframes,
         };
         drop(state);
-        if activate_immediately || !stale_deliveries.is_empty() {
+        if activate_immediately || recovery_retired || !stale_deliveries.is_empty() {
             self.delivery_changed.notify_all();
         }
         snapshot
@@ -3318,7 +3407,9 @@ fn accept_loop<L: PresenterListener>(
             Ok(stream) => {
                 {
                     let mut state = lock(&state);
-                    if shutdown.load(Ordering::Acquire) || state.connections >= MAX_CONNECTIONS {
+                    if shutdown.load(Ordering::Acquire)
+                        || state.connections >= state.connection_limit
+                    {
                         continue;
                     }
                     state.connections += 1;
@@ -3354,13 +3445,20 @@ fn handle_connection(
     state: &Arc<Mutex<State>>,
     changed: &Arc<Condvar>,
 ) -> io::Result<()> {
+    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     stream
-        .set_read_deadline(Duration::from_secs(3))
+        .set_read_deadline(HANDSHAKE_TIMEOUT)
         .map_err(|error| with_context(error, "setting handshake deadline"))?;
     let (mut reader, preface, preface_bytes) =
         Reader::new(stream).map_err(|error| with_context(error, "reading Vivid preface"))?;
     match preface.kind {
-        ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, state, changed),
+        ConnectionKind::Control => handle_control(
+            &mut reader,
+            &preface_bytes,
+            state,
+            changed,
+            handshake_deadline,
+        ),
         ConnectionKind::Track => handle_track(&mut reader, state, changed),
         ConnectionKind::Lane => {
             let serves_input = {
@@ -3695,6 +3793,7 @@ fn handle_control(
     preface: &[u8; 16],
     shared: &Arc<Mutex<State>>,
     changed: &Arc<Condvar>,
+    handshake_deadline: Instant,
 ) -> io::Result<()> {
     let writer = reader.writer();
     let first = reader
@@ -3703,6 +3802,7 @@ fn handle_control(
     let body = Zeroizing::new(first.body);
     let (request_id, hello) = Hello::decode(&body)
         .map_err(|error| io::Error::other(format!("decoding HELLO: {error}")))?;
+    resume_wait::retire(shared, changed, preface, &hello, handshake_deadline)?;
     let (session_id, maximum) =
         establish_session(shared, writer.clone(), preface, &hello, request_id, &body)
             .map_err(|error| with_context(error, "establishing root session"))?;
@@ -5584,6 +5684,7 @@ fn dispatch_control_for_connection(
                     microphone: None,
                     configuration,
                     state: track_state,
+                    incarnation: Arc::new(()),
                     decoder_reset_serial: 1,
                     hold_pause_decoder: None,
                     flush_pending_channel_advance: false,
@@ -7395,20 +7496,13 @@ fn track_loop(
             recovered_keyframe,
             body: record.body,
         };
-        let queued = events
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(event).is_ok());
-        if !queued {
-            state.deliveries.remove(&delivery_id);
-            let track = state.tracks.get_mut(&key).unwrap();
-            track.recovery_pending = true;
-            track.recovery_requested = false;
-            track.discard_blocked_for_recovery = false;
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "bounded bridge media queue is full",
-            ));
-        }
+        let sender = events.as_ref().expect("eventful media route");
+        let Some(next) =
+            queue_media_event(state, changed, sender, event, key, generation, connection)?
+        else {
+            return Ok(());
+        };
+        state = next;
         // Timed packets change delivery state, not the outer scene projection. Advancing the
         // projection for every audio/video packet makes the attached bridge reconcile a no-op
         // snapshot before nearly every media record; linked audio then accumulates behind video
@@ -7567,41 +7661,19 @@ fn vector_track_loop(
                     channel_generation: generation,
                 },
             );
-            let mut event = MediaEvent {
+            let event = MediaEvent {
                 delivery_id,
                 source: bridge_track_key(key),
                 record_type: record.record_type,
                 recovered_keyframe: None,
                 body: record.body,
             };
-            loop {
-                match events.try_send(event) {
-                    Ok(()) => break,
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        state.deliveries.remove(&delivery_id);
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "bridge media consumer closed",
-                        ));
-                    }
-                    Err(mpsc::TrySendError::Full(pending)) => event = pending,
-                }
-                // Keep this channel's one admitted packet; release the global lock while
-                // another owner drains. No success credit or unbounded spill queue is needed.
-                state = changed
-                    .wait_timeout(state, Duration::from_millis(50))
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .0;
-                if state
-                    .tracks
-                    .get(&key)
-                    .is_none_or(|track| !owns_media_channel(track, generation, connection))
-                    || !state.deliveries.contains_key(&delivery_id)
-                {
-                    state.deliveries.remove(&delivery_id);
-                    return Ok(());
-                }
-            }
+            let Some(next) =
+                queue_media_event(state, changed, &events, event, key, generation, connection)?
+            else {
+                return Ok(());
+            };
+            state = next;
         } else if let Some(track) = state.tracks.get_mut(&key) {
             grant_rolling_flow(key, track);
         }
@@ -7611,6 +7683,51 @@ fn vector_track_loop(
         if let Some(wakeup) = wakeup {
             wakeup();
         }
+    }
+}
+
+// One admitted packet stays on its original channel while the bounded host queue
+// drains. Waiting releases the presenter lock and never grants success credit.
+fn queue_media_event<'a>(
+    mut state: std::sync::MutexGuard<'a, State>,
+    changed: &Condvar,
+    events: &mpsc::SyncSender<MediaEvent>,
+    mut event: MediaEvent,
+    key: TrackKey,
+    generation: ChannelGeneration,
+    connection: &Arc<Writer>,
+) -> io::Result<Option<std::sync::MutexGuard<'a, State>>> {
+    let delivery_id = event.delivery_id;
+    loop {
+        if state
+            .tracks
+            .get(&key)
+            .is_none_or(|track| !owns_media_channel(track, generation, connection))
+        {
+            state.deliveries.remove(&delivery_id);
+            return Ok(None);
+        }
+        if !state.deliveries.contains_key(&delivery_id) {
+            // A recovery cut discarded this delivery, not the still-current channel.
+            return Ok(Some(state));
+        }
+        match events.try_send(event) {
+            Ok(()) => return Ok(Some(state)),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                state.deliveries.remove(&delivery_id);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "bridge media consumer closed",
+                ));
+            }
+            Err(mpsc::TrySendError::Full(pending)) => event = pending,
+        }
+        // Push consumers cannot notify this condvar; the bounded fallback also
+        // rechecks cancellation when no unrelated media is making progress.
+        state = changed
+            .wait_timeout(state, Duration::from_millis(50))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
 }
 
@@ -7870,7 +7987,7 @@ fn validate_media_record(
                 if (frame.width, frame.height) != (config.width, config.height) {
                     return Err(invalid("raster dimensions differ from track configuration"));
                 }
-                let _ = media::decode_raster_pixels(frame)?;
+                validate_raster_alpha(config.alpha_mode, &media::decode_raster_pixels(frame)?)?;
                 Ok((frame.epoch, frame.frame_id, true, frame.pts_us, true))
             } else {
                 if !config.delta_enabled {
@@ -7884,6 +8001,11 @@ fn validate_media_record(
                     },
                     u32::from(config.maximum_delta_operations),
                 )?;
+                for operation in &frame.operations {
+                    if let media::ParsedRasterDeltaOperation::Overwrite { rgba, .. } = operation {
+                        validate_raster_alpha(config.alpha_mode, rgba)?;
+                    }
+                }
                 // The composed retained canvas changed just as it does for a full frame.
                 // Snapshot subscribers must observe that revision even though this is a delta.
                 Ok((frame.epoch, frame.frame_id, false, frame.pts_us, true))
@@ -7904,6 +8026,21 @@ fn validate_media_record(
         }
         _ => Err(invalid("media record type does not match its track kind")),
     }
+}
+
+// Parsing has already bounded and checked the complete RGBA sample length.
+// Validate every supplied overwrite before any retained canvas is mutated.
+fn validate_raster_alpha(alpha_mode: u64, rgba: &[u8]) -> io::Result<()> {
+    if alpha_mode == 2
+        && rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[..3].iter().any(|channel| *channel > pixel[3]))
+    {
+        return Err(invalid("premultiplied raster color exceeds alpha"));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -8860,6 +8997,10 @@ fn remove_surface_children(state: &mut State, surface: SurfaceKey) {
 /// has not authenticated yet simply keeps its queue; the initial snapshot [`Overlays::open_lane`]
 /// queues on lane authentication drains it once the writer exists.
 fn flush_overlay_lane(state: &mut State, session_id: u64) {
+    if state.overlays.take_lane_overflow(session_id) {
+        desktop_input::revoke(state, session_id, 9, true);
+        return;
+    }
     let Some(writer) = state
         .sessions
         .get(&session_id)
@@ -8872,7 +9013,14 @@ fn flush_overlay_lane(state: &mut State, session_id: u64) {
             continue;
         };
         if writer
-            .write_record(record.record_type, record.object_id, &body)
+            .write_record_retained(
+                record.record_type,
+                record.object_id,
+                &body,
+                record
+                    .retention
+                    .map(|permit| Box::new(permit) as Box<dyn Send>),
+            )
             .is_err()
         {
             break;
@@ -9099,7 +9247,11 @@ fn detach_session(state: &mut State, session: u64) {
         });
         if retain {
             if let Some(track) = state.tracks.get_mut(&key) {
-                track.channel_writer = None;
+                // Retained pixels outlive the owner, but its transport must not.
+                // The reader holds another writer reference until explicitly closed.
+                if let Some(writer) = track.channel_writer.take() {
+                    writer.close();
+                }
                 track.playing = false;
             }
         } else {
@@ -9502,6 +9654,10 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
+#[path = "overlay_backlog_socket_tests.rs"]
+mod backlog_socket_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::config::BridgeSourceKey;
     use super::*;
@@ -9634,7 +9790,7 @@ mod tests {
         }
     }
 
-    fn producer(endpoint: String, secret: &str) -> ProducerConfig {
+    pub(super) fn producer(endpoint: String, secret: &str) -> ProducerConfig {
         ProducerConfig {
             endpoint_control: Some(endpoint.clone()),
             endpoint_interactive: Some(endpoint.clone()),
@@ -9674,7 +9830,7 @@ mod tests {
         assert_eq!(presenter.revision(), revision);
     }
 
-    fn surface(context_id: u64, surface_id: u64) -> SurfaceDefinition {
+    pub(super) fn surface(context_id: u64, surface_id: u64) -> SurfaceDefinition {
         SurfaceDefinition {
             context_id,
             surface_id,
@@ -9697,7 +9853,7 @@ mod tests {
         }
     }
 
-    fn raster(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
+    pub(super) fn raster(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         TrackConfiguration {
             direction: Default::default(),
             context_id,
@@ -10572,6 +10728,98 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_connection_capacity_is_rejected_before_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("overflow.sock")).unwrap(),
+            MediaConfig {
+                max_sources: usize::MAX,
+                ..MediaConfig::default()
+            },
+        )
+        .expect_err("overflowing connection capacity accepted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn configured_media_capacity_keeps_control_and_same_id_peer_transports_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("capacity.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let mut session =
+                crate::Session::connect(producer(presenter.endpoint().to_owned(), &secret))
+                    .unwrap();
+            let context = session.info().root_context_id;
+            let surface = session
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let mut tracks = Vec::new();
+            let mut channels = Vec::new();
+            for id in 1..=32 {
+                let track = session
+                    .create_track(
+                        raster(context, surface.id(), id),
+                        &RequestMetadata::default(),
+                    )
+                    .unwrap();
+                channels.push(session.open_track_channel(&track).unwrap_or_else(|error| {
+                    panic!(
+                        "configured source {id} could not attach: {error}; live connections={}",
+                        lock(&presenter.state).connections
+                    )
+                }));
+                tracks.push(track);
+            }
+            owners.push((session, tracks, channels));
+        }
+        for (owner, tracks, channels) in &owners {
+            channels[0].send_raster(0, 1, &[255; 16], false).unwrap();
+            owner
+                .wait_track(
+                    &tracks[0],
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_OUTPUT_READY),
+                    5_000_000,
+                )
+                .unwrap();
+            assert_eq!(owner.query_track(&tracks[0]).unwrap().last_media_id, 1);
+            assert_eq!(
+                owner.query_track(&tracks[31]).unwrap().terminal_loss_code,
+                None
+            );
+        }
+        let (retired, _, channels) = owners.remove(0);
+        for channel in channels {
+            channel.close().unwrap();
+        }
+        retired.close().unwrap();
+        wait_for_connection_count(&presenter, 33);
+        let (peer, tracks, channels) = owners.pop().unwrap();
+        assert_eq!(peer.query_track(&tracks[0]).unwrap().last_media_id, 1);
+        channels[1].send_raster(0, 1, &[0; 16], false).unwrap();
+        peer.wait_track(
+            &tracks[1],
+            TrackWaitCondition::MilestoneSet,
+            Some(MILESTONE_OUTPUT_READY),
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(peer.query_track(&tracks[1]).unwrap().last_media_id, 1);
+        for channel in channels {
+            channel.close().unwrap();
+        }
+        peer.close().unwrap();
+        wait_for_connection_count(&presenter, 0);
+    }
+
+    #[test]
     fn retired_track_transports_release_connection_slots_without_touching_another_owner() {
         let directory = tempfile::tempdir().unwrap();
         let presenter = VirtualVivid::start(
@@ -10610,7 +10858,8 @@ mod tests {
             .unwrap();
         let unrelated_channel = owner_b.open_track_channel(&track_b).unwrap();
 
-        for epoch in 1_u32..=u32::try_from(MAX_CONNECTIONS + 8).unwrap() {
+        let connection_limit = lock(&presenter.state).connection_limit;
+        for epoch in 1_u32..=u32::try_from(connection_limit + 8).unwrap() {
             let channel = owner_a
                 .open_track_channel(&track_a)
                 .unwrap_or_else(|error| {
@@ -10991,6 +11240,80 @@ mod tests {
     }
 
     #[test]
+    fn retained_recovery_fence_rejects_destroyed_and_recreated_track_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(8);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("recovery-cut.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let mut client =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let context = client.info().root_context_id;
+            client
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = client
+                .create_track(raster(context, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            let channel = client.open_track_channel(&track).unwrap();
+            channel.send_raster(1, 1, &[0xab; 16], false).unwrap();
+            let event = received.recv_timeout(Duration::from_secs(3)).unwrap();
+            owners.push((client, track, channel, event));
+        }
+        let source = owners[0].3.source;
+        let peer = owners[1].3.source;
+        assert_eq!(
+            (source.context, source.surface, source.track),
+            (peer.context, peer.surface, peer.track)
+        );
+        assert_ne!(source.producer, peer.producer);
+        let (_, cut) = presenter.prepare_bridge_recovery_snapshot_with_viewports(
+            &HashSet::from([7]),
+            &HashMap::new(),
+            &HashSet::from([source]),
+        );
+        assert!(presenter.bridge_recovery_source_is_current(&cut, source));
+        let next = {
+            let (client, track, _, _) = &mut owners[0];
+            client
+                .destroy_track(track, &RequestMetadata::default())
+                .unwrap();
+            let replacement = client
+                .create_track(
+                    raster(source.context, source.surface, source.track),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let next = client.open_track_channel(&replacement).unwrap();
+            assert_eq!(replacement.channel_generation(), track.channel_generation());
+            assert!(
+                !presenter.bridge_recovery_source_is_current(&cut, source),
+                "old cut targeted a replacement with the same numeric generations"
+            );
+            next
+        };
+        next.send_raster(1, 1, &[0xcd; 16], false).unwrap();
+        let fresh = received.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(fresh.source, source);
+        assert!(presenter.bridge_delivery_is_pending(owners[1].3.delivery_id, peer));
+        assert!(presenter.bridge_delivery_is_pending(fresh.delivery_id, source));
+        let (_, fresh_cut) = presenter.prepare_bridge_recovery_snapshot_with_viewports(
+            &HashSet::from([7]),
+            &HashMap::new(),
+            &HashSet::from([source]),
+        );
+        assert!(presenter.bridge_recovery_source_is_current(&fresh_cut, source));
+        assert!(presenter.bridge_delivery_is_pending(owners[1].3.delivery_id, peer));
+    }
+
+    #[test]
     fn superseded_delivery_releases_flow_without_starting_another_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let (events, received) = mpsc::sync_channel(4);
@@ -11035,6 +11358,16 @@ mod tests {
         assert!(!presenter.complete_bridge_delivery(keyframe.delivery_id, true));
         send(2, false);
         let superseded = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (_, static_cut) = presenter.prepare_bridge_recovery_snapshot_with_viewports(
+            &HashSet::from([7]),
+            &HashMap::new(),
+            &HashSet::from([superseded.source]),
+        );
+        assert!(
+            presenter.bridge_delivery_is_pending(superseded.delivery_id, superseded.source),
+            "static replay retired an unretained video packet"
+        );
+        assert!(!presenter.bridge_recovery_source_is_current(&static_cut, superseded.source));
         assert!(presenter.release_bridge_delivery(superseded.delivery_id));
 
         let source = BridgeSourceKey {
@@ -13080,6 +13413,134 @@ mod tests {
     /// failed one kept its allowance the producer would run out and block in a credit wait with
     /// no event able to release it: the pane would freeze mid-frame and stop reading its input.
     #[test]
+    fn full_media_queue_preserves_control_recovery_and_reused_peer_channels() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(1);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("queue.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let mut owner =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let context = owner.info().root_context_id;
+            owner
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = owner
+                .create_track(raster(context, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            let channel = owner.open_track_channel(&track).unwrap();
+            owners.push((owner, track, channel));
+        }
+        let first = owners[0].0.info().session_id;
+        let peer = owners[1].0.info().session_id;
+        let pending = |owner| {
+            lock(&presenter.state)
+                .deliveries
+                .iter()
+                .find_map(|(id, delivery)| (delivery.track.surface.session == owner).then_some(*id))
+        };
+        owners[0].2.send_raster(0, 1, &[255; 16], false).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while pending(first).is_none() {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(1));
+        }
+        owners[1].2.send_raster(0, 1, &[0; 16], false).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while pending(peer).is_none() {
+            let status = owners[1].0.query_track(&owners[1].1).unwrap();
+            assert_eq!(
+                status.terminal_loss_code, None,
+                "queue saturation lost the peer source"
+            );
+            assert!(
+                Instant::now() < end,
+                "peer packet was not retained under backpressure"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            owners[0].0.query_track(&owners[0].1).unwrap().last_media_id,
+            1
+        );
+        assert_eq!(
+            owners[1].0.query_track(&owners[1].1).unwrap().last_media_id,
+            1
+        );
+        let discarded = pending(peer).unwrap();
+        let selected = BridgeSourceKey {
+            producer: peer,
+            context: owners[1].1.context_id(),
+            surface: 9,
+            track: 11,
+        };
+        presenter.prepare_bridge_recovery_snapshot_with_viewports(
+            &HashSet::from([7]),
+            &Default::default(),
+            &HashSet::from([selected]),
+        );
+        assert!(!presenter.bridge_delivery_is_pending(discarded, selected));
+        owners[1].2.send_raster(0, 2, &[0; 16], false).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while pending(peer).is_none() {
+            assert_eq!(
+                owners[1]
+                    .0
+                    .query_track(&owners[1].1)
+                    .unwrap()
+                    .terminal_loss_code,
+                None
+            );
+            assert!(
+                Instant::now() < end,
+                "recovery cut retired the live peer channel"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (retired, _, channel) = owners.remove(0);
+        channel.close().unwrap();
+        retired.close().unwrap();
+        // GOODBYE's response precedes asynchronous transport/session retirement.
+        // Observe that retirement before checking the queued event's authority.
+        let end = Instant::now() + Duration::from_secs(2);
+        while lock(&presenter.state)
+            .sessions
+            .get(&first)
+            .is_some_and(|session| !session.closed)
+        {
+            assert!(Instant::now() < end, "closed owner was not retired");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let stale = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(stale.source.producer, first);
+        assert!(!presenter.bridge_delivery_is_pending(stale.delivery_id, stale.source));
+        let current = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(current.source, selected);
+        assert_ne!(current.delivery_id, discarded);
+        assert!(presenter.bridge_delivery_is_pending(current.delivery_id, current.source));
+        assert!(!presenter.complete_bridge_delivery(current.delivery_id, true));
+        assert!(!presenter.bridge_delivery_is_pending(current.delivery_id, current.source));
+        let (owner, track, channel) = owners.pop().unwrap();
+        assert_eq!(owner.query_track(&track).unwrap().last_media_id, 2);
+        channel.send_raster(0, 3, &[255; 16], false).unwrap();
+        let next = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(next.source, selected);
+        assert!(presenter.bridge_delivery_is_pending(next.delivery_id, next.source));
+        assert!(!presenter.complete_bridge_delivery(next.delivery_id, true));
+        assert_eq!(owner.query_track(&track).unwrap().last_media_id, 3);
+        assert_eq!(owner.query_track(&track).unwrap().terminal_loss_code, None);
+        channel.close().unwrap();
+        owner.close().unwrap();
+    }
+
+    #[test]
     fn a_delivery_the_bridge_failed_returns_the_allowance_it_held() {
         let directory = tempfile::tempdir().unwrap();
         let (events, received) = mpsc::sync_channel(4);
@@ -13126,6 +13587,55 @@ mod tests {
         }
         writer.join().unwrap();
         client.close().unwrap();
+    }
+
+    #[test]
+    fn clean_goodbye_retires_held_raster_transports_without_touching_same_id_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("goodbye.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let mut owner =
+                crate::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let context = owner.info().root_context_id;
+            owner
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = owner
+                .create_track(raster(context, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            let channel = owner.open_track_channel(&track).unwrap();
+            channel.send_raster(0, 1, &[255; 16], false).unwrap();
+            let event = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+            owners.push((owner, track, channel));
+        }
+        let (retired, _, held_channel) = owners.remove(0);
+        retired.close().unwrap();
+        wait_for_connection_count(&presenter, 2);
+        assert!(held_channel.send_raster(0, 2, &[0; 16], false).is_err());
+        let (peer, track, held_peer_channel) = owners.pop().unwrap();
+        assert_eq!(peer.query_track(&track).unwrap().last_media_id, 1);
+        assert_eq!(peer.query_track(&track).unwrap().terminal_loss_code, None);
+        held_peer_channel
+            .send_raster(0, 2, &[0; 16], false)
+            .unwrap();
+        let next = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(next.source.producer, peer.info().session_id);
+        assert!(!presenter.complete_bridge_delivery(next.delivery_id, true));
+        assert_eq!(peer.query_track(&track).unwrap().last_media_id, 2);
+        peer.close().unwrap();
+        wait_for_connection_count(&presenter, 0);
+        drop(held_channel);
+        drop(held_peer_channel);
     }
 
     #[test]

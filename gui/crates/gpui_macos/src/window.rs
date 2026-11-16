@@ -39,14 +39,14 @@ use objc2::{
 )]
 use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSAppearance, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep,
-    NSButton, NSColor, NSCursor, NSDragOperation, NSDraggingContext, NSDraggingImageComponent,
-    NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType, NSImage,
-    NSPasteboardWriting, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowAnimationBehavior,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
+    NSAlert, NSAlertStyle, NSAppearance, NSApplication, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSBeep, NSButton, NSColor, NSCursor, NSDragOperation, NSDraggingContext,
+    NSDraggingImageComponent, NSDraggingImageComponentIconKey, NSDraggingItem,
+    NSEventModifierFlags, NSEventType, NSImage, NSPasteboardWriting, NSRequestUserAttentionType,
+    NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSWindow,
+    NSWindowAnimationBehavior, NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{
@@ -828,11 +828,7 @@ impl MacWindowState {
     /// weakly to deliver frames.
     fn start_display_link(&mut self, window_state: &Rc<Mutex<MacWindowState>>) {
         self.stop_display_link();
-        if !self
-            .native_window()
-            .occlusionState()
-            .contains(NSWindowOcclusionState::Visible)
-        {
+        if !visibility(self).is_visible() {
             return;
         }
         match &mut self.frame_source {
@@ -3051,10 +3047,17 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
 }
 
 fn visibility(state: &MacWindowState) -> WindowVisibility {
-    let is_visible = state
-        .native_window()
-        .occlusionState()
-        .contains(NSWindowOcclusionState::Visible);
+    let main_thread = crate::main_thread_marker().expect("macOS windows require the main thread");
+    let app = NSApplication::sharedApplication(main_thread);
+    let window = state.native_window();
+    // Ordering a window after application hide can leave its occlusion flag
+    // visible while the application is still hidden. Such frames are not shown.
+    let is_visible = !app.isHidden()
+        && window.isVisible()
+        && !window.isMiniaturized()
+        && window
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible);
     if is_visible {
         WindowVisibility::Visible
     } else {
@@ -3097,11 +3100,7 @@ fn report_visibility(window_state: &Rc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
-    if lock
-        .native_window()
-        .occlusionState()
-        .contains(NSWindowOcclusionState::Visible)
-    {
+    if visibility(&lock).is_visible() {
         lock.move_traffic_light();
         lock.start_display_link(&window_state);
     } else {

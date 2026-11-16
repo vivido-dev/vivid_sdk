@@ -1,6 +1,6 @@
 [package]
 name = "vivid_sdk"
-version = "1.5.12"
+version = "1.5.13"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.95"
@@ -51,15 +51,30 @@ local-control = ["dep:vivid_local_control"]
 # Experimental bounded Metal/IOSurface frame sharing; does not enable GUI.
 gpu-share = ["dep:vivid_gpu_share"]
 # Shared portable display-list compilation; independent of GPUI and a GPU device.
-vector-render = ["dep:vello", "dep:parley", "dep:bytemuck", "dep:unicode-segmentation"]
+vector-render = [
+  "dep:vello",
+  "dep:parley",
+  "dep:bytemuck",
+  "dep:unicode-segmentation",
+]
 # Bounded PNG/JPEG decoding on a separate native presenter worker.
 vector-images = ["vector-render", "dep:image", "dep:moxcms", "dep:crc32fast"]
-# Cached GPU composition using an existing host-owned Vello renderer and device.
+# Shared GPU composition types; checked output requires vector-texture.
 vector-gpu = ["vector-render", "dep:wgpu", "vello/wgpu"]
+# Checked GPU texture exports on a host-owned device; no adapter or GUI creation.
+vector-texture = ["vector-gpu", "dep:vivid_vello_backend"]
 # Native adapter and bounded asynchronous CPU readback for hosted GUI images.
-vector-offscreen = ["vector-gpu", "wgpu/metal", "wgpu/vulkan", "wgpu/dx12"]
+vector-offscreen = ["vector-texture", "vello/debug_layers", "wgpu/metal", "wgpu/vulkan", "wgpu/dx12"]
 # Desktop GUI runtime is opt-in; protocol consumers retain their existing dependency graph.
-gui = ["accessible-text", "dep:gpui", "dep:gpui_platform", "dep:serde", "dep:serde_json", "dep:async-channel", "vivid_gpu_share?/gui"]
+gui = [
+  "accessible-text",
+  "dep:gpui",
+  "dep:gpui_platform",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:async-channel",
+  "vivid_gpu_share?/gui",
+]
 # Compile Metal shaders at runtime when the Xcode Metal command-line tool is absent.
 gui-runtime-shaders = ["gui", "gpui_platform/runtime_shaders"]
 # Production frame readback without enabling deterministic test runtimes.
@@ -67,7 +82,13 @@ gui-offscreen = ["gui", "gpui/offscreen", "gpui_platform/offscreen"]
 # Production GUI application rendered into an authenticated desktop surface.
 gui-remote = ["gui-offscreen", "local-control"]
 # Optional Linux nested Wayland server; independent of Vivid wire authority.
-gui-wayland = ["gui", "dep:smithay", "dep:tempfile", "dep:rustix", "dep:wayland-backend"]
+gui-wayland = [
+  "gui",
+  "dep:smithay",
+  "dep:tempfile",
+  "dep:rustix",
+  "dep:wayland-backend",
+]
 # Deterministic GUI contexts for host lifecycle integration tests.
 gui-testing = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 default = ["native-media"]
@@ -90,16 +111,29 @@ vivid_audio = { version = "0.1.0", path = "audio", optional = true }
 vivid_audio_output = { version = "0.1.0", path = "audio-output", optional = true }
 vivid_video = { version = "0.1.0", path = "video", optional = true }
 vivid_local_control = { version = "0.1.0", path = "local-control", optional = true }
-moxcms = { version = "0.8.1", optional = true }
+moxcms = { version = "0.9", optional = true }
 crc32fast = { version = "1.5", optional = true }
-image = { version = "0.25.10", optional = true, default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25.10", optional = true, default-features = false, features = [
+  "png",
+  "jpeg",
+] }
 unicode-segmentation = { version = "1.12", optional = true }
 bytemuck = { version = "1.25", optional = true }
-parley = { version = "0.12", path = "vendor/parley", optional = true, features = ["bytemuck", "complex-scripts"] }
-vello = { version = "0.11", optional = true, default-features = false }
-wgpu = { version = "30.0", optional = true, default-features = false, features = ["std", "wgsl"] }
+parley = { version = "0.12", path = "vendor/parley", optional = true, features = [
+  "bytemuck",
+  "complex-scripts",
+] }
+vello = { version = "=0.11.0", optional = true, default-features = false }
+vivid_vello_backend = { version = "0.11.0-vivid.1", path = "vendor/vello-backend", optional = true, default-features = false, features = ["wgpu", "debug_layers"] }
+wgpu = { version = "30.0", optional = true, default-features = false, features = [
+  "std",
+  "wgsl",
+] }
 gpui = { path = "gui/crates/gpui", optional = true, default-features = false }
-gpui_platform = { path = "gui/crates/gpui_platform", optional = true, default-features = false, features = ["font-kit", "wayland"] }
+gpui_platform = { path = "gui/crates/gpui_platform", optional = true, default-features = false, features = [
+  "font-kit",
+  "wayland",
+] }
 getrandom = "0.4"
 log = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -112,12 +146,15 @@ zeroize = "1.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", optional = true, features = ["fs", "event", "net"] }
-smithay = { path = "vendor/smithay", optional = true, default-features = false, features = ["wayland_frontend", "renderer_pixman"] }
+smithay = { path = "vendor/smithay", optional = true, default-features = false, features = [
+  "wayland_frontend",
+  "renderer_pixman",
+] }
 tempfile = { version = "3", optional = true }
 wayland-backend = { path = "vendor/wayland/wayland-backend", optional = true }
 
 [dev-dependencies]
-pollster = "0.4"
+pollster = "1"
 tempfile = "3"
 # `test-util` lets the presenter tests send a preface that claims another protocol version.
 vivid_protocol = { version = "1.5.13", path = "../vivid_protocol", default-features = false, features = [
@@ -130,7 +167,9 @@ serde_json = "1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 wayland-client = { path = "vendor/wayland/wayland-client" }
-wayland-protocols = { path = "vendor/wayland/wayland-protocols", features = ["client"] }
+wayland-protocols = { path = "vendor/wayland/wayland-protocols", features = [
+  "client",
+] }
 
 # A std-only send-path benchmark: `cargo bench --bench send`. The adaptive raster scenarios need
 # zstd.
@@ -147,7 +186,18 @@ required-features = ["presenter"]
 [workspace]
 members = ["python-bindings", "node-bindings"]
 resolver = "3"
-exclude = ["gui", "local-control", "video", "audio", "audio-output", "gpu-share", "vendor/smithay", "vendor/wayland", "vendor/parley"]
+exclude = [
+  "gui",
+  "local-control",
+  "video",
+  "audio",
+  "audio-output",
+  "gpu-share",
+  "vendor/smithay",
+  "vendor/wayland",
+  "vendor/parley",
+  "vendor/vello-backend",
+]
 
 [[example]]
 name = "sdk_01_show_image"

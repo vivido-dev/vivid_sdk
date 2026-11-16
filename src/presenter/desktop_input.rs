@@ -260,6 +260,47 @@ impl VirtualVivid {
         let session = state.sessions.get(&source.producer)?;
         (!session.closed).then_some(session.resume_generation)
     }
+
+    /// Disconnects one exact leased source connection for native conformance checks.
+    ///
+    /// Uses ordinary control shutdown and lease suspension. Visibility and GPU
+    /// progress are not required. Stale resume or media-channel generations cannot
+    /// close newer authority, and no principal is revoked. Test support only.
+    ///
+    /// # Errors
+    /// Rejects absent source tuples, root sessions and stale or closed connections.
+    #[cfg(feature = "testing")]
+    pub fn disconnect_leased_source_for_test(
+        &self,
+        source: SourceKey,
+        resume_generation: u64,
+        channel_generation: u64,
+    ) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        let key = inner_track_key(source);
+        if !state
+            .tracks
+            .get(&key)
+            .is_some_and(|track| track.state.channel_generation.get() == channel_generation)
+            || !state.surfaces.contains_key(&key.surface)
+        {
+            return Err(invalid("test disconnect source is absent"));
+        }
+        let session = state
+            .sessions
+            .get(&source.producer)
+            .ok_or_else(|| invalid("test disconnect owner is absent"))?;
+        if session.closed
+            || session.lease.is_none()
+            || session.resume_generation != resume_generation
+        {
+            return Err(invalid("test disconnect connection is stale or not leased"));
+        }
+        let writer = session.writer.clone();
+        revoke(&mut state, source.producer, 5, true);
+        writer.close();
+        Ok(())
+    }
     /// Sets an explicit input-class policy for one delegated lease.
     ///
     /// Defaults to zero. Profile negotiation, surface capabilities, physical

@@ -374,3 +374,168 @@ fn a_pane_resize_moves_only_its_own_overlay_viewport_and_a_disconnect_spares_the
         Rect::new(0., 0., 200., 100.).unwrap()
     );
 }
+
+#[test]
+fn split_relay_input_epochs_fence_replaced_lanes_and_foreign_presenters() {
+    use vivid_protocol::{
+        messages,
+        overlay::{
+            WindowOptions,
+            wire::{InputEvent, SetWindow, WindowAddress},
+        },
+    };
+    use vivid_sdk::{RequestMetadata, Session, SurfaceBuilder, SurfaceRole};
+    fn source(
+        presenter: &VirtualVivid,
+        endpoint: &str,
+        pane: u64,
+    ) -> (
+        Session,
+        vivid_sdk::Surface,
+        vivid_sdk::OverlayInputLane,
+        vivid_sdk::presenter::BridgeSurfaceKey,
+    ) {
+        presenter.update_metrics(pane, 80, 24, CELL);
+        let secret = presenter.issue_pane_capability(pane).unwrap();
+        let mut config = ProducerConfig {
+            authentication: ProducerAuthentication::root_hex(&secret).unwrap(),
+            endpoint_control: Some(endpoint.into()),
+            endpoint_interactive: Some(endpoint.into()),
+            endpoint_realtime: Some(endpoint.into()),
+            endpoint_bulk: Some(endpoint.into()),
+            required_profiles: [
+                vivid_sdk::CORE_CONTROL,
+                vivid_sdk::LIVE_MEDIA,
+                vivid_sdk::TERMINAL_SURFACE,
+                vivid_sdk::TERMINAL_OVERLAY,
+                vivid_sdk::VECTOR_SCENE,
+                vivid_sdk::OVERLAY_INPUT,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            optional_profiles: Vec::new(),
+            ..ProducerConfig::default()
+        };
+        config.required_profiles.sort();
+        let mut session = Session::connect(config).unwrap();
+        let lane = session.open_overlay_input_lane(1).unwrap();
+        lane.renew(5_000_000, Duration::from_secs(1)).unwrap();
+        let definition = SurfaceBuilder::new(&session, 16, 16)
+            .unwrap()
+            .titled(SurfaceRole::Figure, "epoch")
+            .build()
+            .unwrap();
+        let surface = session
+            .create_surface(definition, &RequestMetadata::default())
+            .unwrap();
+        session
+            .set_overlay_window(&SetWindow {
+                address: WindowAddress {
+                    context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    generation: surface.generation().get(),
+                },
+                expected_revision: 0,
+                options: WindowOptions::new(
+                    Rect::new(0., 0., 16., 16.).unwrap(),
+                    WindowMode::Floating,
+                ),
+            })
+            .unwrap();
+        let key = vivid_sdk::presenter::BridgeSurfaceKey {
+            producer: session.info().session_id,
+            context: surface.context_id(),
+            surface: surface.id(),
+        };
+        (session, surface, lane, key)
+    }
+    fn body(surface: &vivid_sdk::Surface) -> Vec<u8> {
+        let event = InputEvent {
+            address: WindowAddress {
+                context_id: surface.context_id(),
+                surface_id: surface.id(),
+                generation: surface.generation().get(),
+            },
+            scene_revision: 0,
+            event: vivid_protocol::overlay::Event::Focus(false),
+        };
+        messages::Envelope::new(surface.id(), event.payload().unwrap())
+            .encode()
+            .unwrap()
+    }
+    let (presenter, endpoint) = presenter();
+    presenter.enable_overlay_host_relay();
+    let (a, surface_a, old_a, key_a) = source(&presenter, &endpoint, 1);
+    let (b, surface_b, _lane_b, key_b) = source(&presenter, &endpoint, 2);
+    assert_ne!(key_a.producer, key_b.producer);
+    assert_eq!(
+        (key_a.context, key_a.surface),
+        (key_b.context, key_b.surface)
+    );
+    let epoch_a = presenter.overlay_relay_input_epoch(key_a).unwrap();
+    let epoch_b = presenter.overlay_relay_input_epoch(key_b).unwrap();
+    assert!(
+        presenter
+            .relay_overlay_input_at_epoch(epoch_a, &body(&surface_a))
+            .unwrap()
+    );
+    let next = a.open_overlay_input_lane(2).unwrap();
+    next.renew(5_000_000, Duration::from_secs(1)).unwrap();
+    let _ = old_a.close();
+    let new_epoch = presenter.overlay_relay_input_epoch(key_a).unwrap();
+    assert_ne!(epoch_a, new_epoch);
+    assert!(
+        !presenter
+            .relay_overlay_input_at_epoch(epoch_a, &body(&surface_a))
+            .unwrap()
+    );
+    assert!(
+        presenter
+            .relay_overlay_input_at_epoch(new_epoch, &body(&surface_a))
+            .unwrap()
+    );
+    assert_eq!(presenter.overlay_relay_input_epoch(key_b), Some(epoch_b));
+    assert!(
+        presenter
+            .relay_overlay_input_at_epoch(epoch_b, &body(&surface_b))
+            .unwrap()
+    );
+    let (foreign, foreign_endpoint) = self::presenter();
+    foreign.enable_overlay_host_relay();
+    let (c, surface_c, _lane_c, key_c) = source(&foreign, &foreign_endpoint, 1);
+    assert_eq!(key_a, key_c);
+    assert!(
+        !foreign
+            .relay_overlay_input_at_epoch(epoch_a, &body(&surface_c))
+            .unwrap()
+    );
+    (a.cancel_handle())();
+    let until = Instant::now() + Duration::from_secs(3);
+    while presenter.overlay_relay_input_epoch(key_a).is_some() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !presenter
+            .relay_overlay_input_at_epoch(new_epoch, &body(&surface_a))
+            .unwrap()
+    );
+    assert!(
+        presenter
+            .relay_overlay_input_at_epoch(epoch_b, &body(&surface_b))
+            .unwrap()
+    );
+    let mut request = b
+        .query_overlay_window(vivid_protocol::overlay::wire::Query {
+            context_id: surface_b.context_id(),
+            surface_id: surface_b.id(),
+        })
+        .unwrap()
+        .window;
+    request.options.bounds = Rect::new(16., 0., 16., 16.).unwrap();
+    b.set_overlay_window(&request).unwrap();
+    b.close().unwrap();
+    c.close().unwrap();
+    presenter.shutdown();
+    foreign.shutdown();
+}

@@ -9,7 +9,7 @@ use vivid_protocol::{identity::SurfaceIdentity, vector::Rect};
 // Matches the native vector target's maximum axis; bytes have their own tighter cap.
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 
-/// Validated straight RGBA8 pixels shared by immutable raster drawings.
+/// Bounded RGBA8 pixels and alpha interpretation shared by immutable raster drawings.
 pub struct RasterImage {
     pub(crate) data: ImageData,
     pub(crate) charge: Option<Arc<dyn Send + Sync>>,
@@ -27,6 +27,17 @@ impl RasterImage {
         rgba: Arc<[u8]>,
     ) -> Result<Self, super::wire::InvalidScene> {
         Self::from_buffer(width, height, Arc::new(rgba))
+    }
+
+    #[cfg(feature = "presenter")]
+    pub(crate) fn new_premultiplied(
+        width: u32,
+        height: u32,
+        rgba: Arc<[u8]>,
+    ) -> Result<Self, super::wire::InvalidScene> {
+        let mut image = Self::new(width, height, rgba)?;
+        image.data.alpha_type = ImageAlphaType::AlphaPremultiplied;
+        Ok(image)
     }
 
     /// Retains decoded video pixels without copying or losing their buffer pool.

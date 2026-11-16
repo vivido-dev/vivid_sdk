@@ -208,6 +208,7 @@ impl Overlays {
         self.queue_for(
             session,
             LaneRecord {
+                retention: None,
                 record_type: messages::OVERLAY_TEXT_EDIT,
                 object_id: id.surface_id(),
                 payload,
@@ -244,6 +245,7 @@ impl Overlays {
         self.queue_for(
             id.context().session().session_id(),
             LaneRecord {
+                retention: None,
                 record_type: messages::OVERLAY_TEXT_EDIT,
                 object_id: id.surface_id(),
                 payload,

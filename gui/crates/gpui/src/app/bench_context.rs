@@ -1475,10 +1475,34 @@ mod tests {
         });
         run_task_to_completion(&foreground_executor, task);
 
+        // Another UI thread may draw while this foreground task never owns a window.
+        let unrelated_window = crate::WindowId::from(0xBADC0DE);
+        std::thread::spawn(move || {
+            let mut profiler = crate::profiler::WindowProfiler::new(unrelated_window)
+                .expect("unrelated window profiler should initialize");
+            profiler.begin_draw();
+            profiler.end_draw(None, 0);
+        })
+        .join()
+        .expect("unrelated draw should finish");
+
         let events = trace_scope.finish();
         assert!(
-            events.frame_events.is_empty(),
-            "no window was involved, so no frame events should be recorded"
+            events.frame_events.iter().any(|event| {
+                matches!(event, FrameEvent::Draw(timing) if timing.window_id == unrelated_window)
+            }),
+            "the process-wide collector must witness the unrelated draw"
+        );
+        // Frame timings are process-wide; this thread's foreground journal is
+        // the authority for whether the measured task itself performed window work.
+        assert!(
+            events.foreground_events().all(|event| {
+                !matches!(
+                    event,
+                    ForegroundEvent::Draw(_) | ForegroundEvent::Present(_)
+                )
+            }),
+            "the window-free foreground task must record no local draw or present"
         );
 
         let report = BenchReport::default();

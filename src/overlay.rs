@@ -38,6 +38,11 @@ use crate::*;
 
 #[path = "overlay_layout.rs"]
 mod layout;
+#[path = "overlay_resume.rs"]
+mod resume;
+#[cfg(all(test, feature = "presenter", feature = "vector-render"))]
+#[path = "overlay_retained_tests.rs"]
+mod retained_tests;
 pub use layout::{OverlayHostHandle, RetainedTextLayout};
 pub use vivid_protocol::overlay::wire::text::styled::{
     StyledText, TextAlignment, TextOverflow, TextRun, TextStyle, Typography,
@@ -198,6 +203,10 @@ impl OverlaySession {
     }
 
     pub fn from_session(session: Session) -> io::Result<Self> {
+        Self::from_session_generation(session, 1)
+    }
+
+    fn from_session_generation(session: Session, generation: u64) -> io::Result<Self> {
         for profile in [
             TERMINAL_SURFACE,
             TERMINAL_OVERLAY,
@@ -208,7 +217,7 @@ impl OverlaySession {
                 return Err(invalid_input(format!("overlay session requires {profile}")));
             }
         }
-        let input = Arc::new(session.open_overlay_input_lane(1)?);
+        let input = Arc::new(session.open_overlay_input_lane(generation)?);
         input.renew(2_000_000, Duration::from_secs(1))?;
         let (renewal_stop, stop) = mpsc::channel();
         let lane = Arc::downgrade(&input);

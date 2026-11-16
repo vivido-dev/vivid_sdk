@@ -58,11 +58,15 @@ keeps its original charge token alive. `retain_resource` attaches other external
 charges and rejects more than `MAX_COMMANDS + MAX_RETAINED_ASSETS` tokens before
 mutation. Namespace release does not release storage still referenced by a scene.
 
-`vector-gpu` additionally exposes `vector_renderer::compositor`. A `Compositor`
-borrows the host's existing WGPU 30 device, queue and Vello renderer, creates a
-premultiplied RGBA target, and composes back-to-front `Drawing` values. It creates
-no adapter, native window or event loop. The application selects its WGPU backend;
-Vivido uses Metal, Vulkan or DirectX 12 through its existing renderer.
+`vector-gpu` exposes shared composition types in `vector_renderer::compositor`.
+For output, enable `vector-texture` and construct `texture::TextureRenderer` on a
+render worker with the host's existing WGPU 30 device, queue and health observer.
+It owns a checked backend renderer and private working target, then exports
+immutable straight-alpha RGBA8 textures. It creates no adapter, window or event
+loop. The host selects its WGPU backend; Vivido uses Metal, Vulkan or DirectX 12
+through its existing renderer. The former public `Compositor` and its
+submission-only `render`/`render_mixed` entry points have been removed. The obsolete
+`Error::Render` variant is also removed; checked backend errors use `Error::Backend`.
 
 The adapter must support Vello's shader capabilities. Linux software GPU
 acceptance uses Mesa 25; the older Mesa 22 test image fails shader validation for
@@ -80,19 +84,36 @@ Compiled encoding and hit storage are bounded to 64 MiB per scene, including
 retained-layout expansion checks. Aggregate composition encoding is checked
 before append. Caller-owned aggregate scene/image/font quotas remain required.
 
-Unchanged keys, immutable compiled objects and target dimensions reuse the cached
-image. Placement, submission or compiled-object replacement redraws; target resize
-allocates a new texture. The cache retains compiled objects to prevent pointer
-identity reuse. Metrics count
-submitted render passes, cache hits and target allocations. These counters and
-the changed flag do not acknowledge physical presentation. The host acknowledges
-the exact submissions only after composition into its displayed frame, and
-cancels unfinished outcomes on invalidation or failure.
+Unchanged keys, immutable compiled objects and target dimensions reuse checked
+pixels. Placement, submission or compiled-object replacement redraws; target resize
+allocates a new private texture. The cache retains compiled objects to prevent
+pointer identity reuse. `TextureRenderer::metrics` reports submitted attempts,
+cache hits, target allocations and allocation retries.
 
-Use the same renderer and device until `clear` unregisters the cached target.
-Clear before renderer replacement or teardown, and discard parent scenes that
-reference the invalidated image. Native health checks, GPU polling and recovery
-remain the owning host's responsibilities.
+`start_budgeted(..., &WorkBudget)` lets cooperating texture renderers claim the
+same finite tile-dispatch allowance. Cache hits claim no credit; exhaustion is
+`Error::Cancelled`, produces no output and grants no source-fault evidence.
+Ordinary per-job limits and deadlines remain. The caller bounds renderer/pool
+counts, polls each pending future on its worker, retains exact snapshots and
+performs display admission; a shared budget supplies none of that authority.
+
+`start(drawings, rasters, width, height)` returns an opaque job identity. Retain
+the exact prepared snapshot until `poll` returns its `Completed` output. The
+worker checks allocation status before publishing pixels and has bounded tile
+retries, exports and cancellation retirement. The private backend enables shader
+runtime bounds checks and skips fine dispatch after failed coarse allocation.
+Even empty output includes the outer clip, so a successful all-zero allocator
+download is rejected as a backend failure rather than rendering proof. Register the completed texture on
+the host's original Vello renderer on the same logical device. Keep the import
+through its final use, then explicitly unregister it; dropping guards alone does
+not remove the renderer's override. The host acknowledges exact submissions only
+after composing that imported image into a displayed frame. Neither metrics,
+`redrawn`, nor GPU completion acknowledges presentation.
+
+Reuse the original `TexturePool` during renderer replacement and keep polling
+cancellation retirement. Native health callbacks, visible-window completion and
+recovery remain the host's responsibilities. See the
+[checked texture contract](RAW-TEXTURE-PLAN.md) for worker and import lifetimes.
 
 Vivido's production overlay path uses the shared compiler and GPU compositor;
 its adapter retains terminal font policy, authenticated window/input state and
@@ -108,11 +129,28 @@ lists into presentation proof.
 
 ## Verification
 
-From `vivid_sdk/`, run the CPU/compiler and GPU-cache validation suites:
+The checked backend's pinned MSAA8 shader uses full-width nonzero winding
+counters for tiles with at least 128 segments. This repairs the observed
+127/128-contour boundary without changing sampling, accepted limits, bindings or
+work budgets. The derived shader and reproducible offline generator are described
+in [the upstream patch notes](upstream/vello-0.11-wide-winding.md).
+
+All eight native arena cases pass: cubic/clip/segment pressure, four-owner
+isolation, exact reference coverage at 1/127/128/255/256/682 contours, signed
+cancellation and even-odd parity. Native texture and consumer regressions pass
+separately, including actual ordinary-window receipts, pixels and peer input.
+The prior failing native and ordinary-window findings remain historical evidence;
+the analytic-AA alternative was rejected. Broader sustained/aggregate mixtures,
+physical devices and unrun platforms remain separate gates.
+[Failure evidence](../../vivid_compositor/docs/performance/2026-11-15-sdk-vector-winding-failure-macos.json).
+[Repair evidence](../../vivid_compositor/docs/performance/2026-11-15-sdk-vector-wide-winding-macos.json).
+
+From `vivid_sdk/`, run compiler/common validation and explicit native texture checks:
 
 ```sh
 cargo test --no-default-features --features vector-render --lib vector_renderer
 cargo test --no-default-features --features vector-gpu --lib vector_renderer
+cargo test --features presenter,testing,vector-offscreen --test native_vector_texture -- --ignored
 ```
 
 From `vivido/`, explicitly run the GPU acceptance check:
@@ -124,6 +162,6 @@ cargo test --lib sdk_overlay_compositor -- --ignored --nocapture
 The GPU check is ignored in ordinary suites so they can run without an adapter;
 the explicit command requires one and checks rendered pixels. It covers a visible
 clipping gap, cache reuse, two owners with reused local IDs, independent removal,
-target resizing and rejection before mutation. Native Metal and Linux software
-Vulkan have both been exercised. Full Linux Vivido checks additionally require
+target resizing and rejection before mutation. The checked replacement is qualified locally on native Metal. Earlier legacy
+coverage on Linux software Vulkan does not qualify this replacement. Full Linux Vivido checks additionally require
 its supported FFmpeg ABI; the verified environment uses FFmpeg 7.1 and Mesa 25.

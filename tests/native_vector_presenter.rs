@@ -19,6 +19,12 @@ use vivid_sdk::{
 #[cfg(feature = "vector-offscreen")]
 #[path = "native_vector_presenter/gpu.rs"]
 mod gpu;
+#[path = "native_vector_presenter/refusal.rs"]
+mod refusal;
+#[path = "native_vector_presenter/resume.rs"]
+mod resume;
+#[path = "native_vector_presenter/retained.rs"]
+mod retained;
 
 fn fixture() -> (Arc<VirtualVivid>, NativeVectorHost) {
     let presenter = Arc::new(
@@ -504,7 +510,7 @@ fn native_host_renders_owner_scoped_images_and_retained_glyphs_with_real_gpu_rea
     assert_eq!(
         pixel(&rendered, 20, 20),
         [255, 0, 0, 128],
-        "readback must unpremultiply native pixels"
+        "readback must preserve straight-alpha native pixels"
     );
     assert_eq!(pixel(&rendered, 70, 20), [0, 0, 255, 255]);
     assert_eq!(pixel(&rendered, 60, 20), [0, 0, 0, 0]);

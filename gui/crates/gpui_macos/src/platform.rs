@@ -651,8 +651,15 @@ impl Platform for MacPlatform {
 
     #[allow(deprecated)]
     fn activate(&self, ignoring_other_apps: bool) {
-        let app = NSApplication::sharedApplication(self.1);
-        app.activateIgnoringOtherApps(ignoring_other_apps);
+        // Match window activation's deferred ordering. An immediate application
+        // request could otherwise overtake an earlier native window request.
+        let main_thread = self.1;
+        self.foreground_executor()
+            .spawn(async move {
+                let app = NSApplication::sharedApplication(main_thread);
+                app.activateIgnoringOtherApps(ignoring_other_apps);
+            })
+            .detach();
     }
 
     fn set_activation_policy(&self, policy: ActivationPolicy) {
@@ -698,7 +705,14 @@ impl Platform for MacPlatform {
     }
 
     fn hide(&self) {
-        NSApplication::sharedApplication(self.1).hide(None);
+        // A later hide must run after any window activation already queued on
+        // this executor, rather than being undone by that earlier request.
+        let main_thread = self.1;
+        self.foreground_executor()
+            .spawn(async move {
+                NSApplication::sharedApplication(main_thread).hide(None);
+            })
+            .detach();
     }
 
     fn hide_other_apps(&self) {

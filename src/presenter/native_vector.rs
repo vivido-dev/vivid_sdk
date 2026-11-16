@@ -29,6 +29,10 @@ mod images;
 mod input;
 #[path = "native_vector/raster.rs"]
 mod raster;
+#[path = "native_vector/refusal.rs"]
+mod refusal;
+#[path = "native_vector/retained.rs"]
+mod retained;
 #[path = "native_vector/visibility.rs"]
 mod visibility;
 #[doc(inline)]
@@ -39,7 +43,8 @@ pub use input::{
 #[doc(inline)]
 pub use visibility::NativePaneVisibility;
 
-// Two outstanding GUI/upload frames per pane, and at most 64 across the host.
+// Two ordinary GUI/upload frames per pane. Retained-scene preparation permits
+// one diagnostic handoff slot, within the same 64-frame host-wide ceiling.
 const MAX_FRAMES: usize = 64;
 const MAX_PANES: usize = 64;
 const MAX_DIMENSION: u32 = 8192;
@@ -106,6 +111,7 @@ struct FrameData {
     raster_entries: Vec<raster::Entry>,
     rasters: Vec<vector_renderer::RasterDrawing>,
 }
+#[derive(Clone)]
 struct Entry {
     window: SurfaceIdentity,
     source: SourceKey,
@@ -519,6 +525,15 @@ impl NativeVectorHost {
     /// panes whose metrics have not been installed. At most two frames per pane
     /// may remain outstanding; drop obsolete upload/presentation receipts.
     pub fn prepare(&mut self, pane: PaneId, scale: f64) -> io::Result<VectorFrame> {
+        self.prepare_inner(pane, scale, None)
+    }
+
+    fn prepare_inner(
+        &mut self,
+        pane: PaneId,
+        scale: f64,
+        retained: Option<(&VectorFrame, &[SurfaceIdentity])>,
+    ) -> io::Result<VectorFrame> {
         if !scale.is_finite() || scale <= 0. || scale > 8. {
             return Err(invalid("invalid native vector scale"));
         }
@@ -530,7 +545,7 @@ impl NativeVectorHost {
                 .filter_map(Weak::upgrade)
                 .filter(|frame| frame.pane == pane)
                 .count()
-                >= 2
+                >= if retained.is_some() { 3 } else { 2 }
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -551,7 +566,7 @@ impl NativeVectorHost {
             mut stamp,
             candidates,
             rasters,
-        } = self.snapshot(pane, scale)?;
+        } = self.snapshot(pane, scale, retained)?;
         // Prune against the entire presenter's live sources, not just this
         // pane. Preparing a neighbor must not evict another pane's image cache.
         {
@@ -596,6 +611,20 @@ impl NativeVectorHost {
                 .window(candidate.window)
                 .is_none()
             {
+                continue;
+            }
+            if let Some((entry, drawing)) = retained.and_then(|(frame, windows)| {
+                frame
+                    .0
+                    .entries
+                    .iter()
+                    .zip(frame.drawings())
+                    .find(|(entry, drawing)| {
+                        entry.window == candidate.window && windows.contains(&drawing.window)
+                    })
+            }) {
+                entries.push(entry.clone());
+                drawings.push(drawing.clone());
                 continue;
             }
             let compiled = match self.compile(&candidate) {
@@ -920,8 +949,16 @@ impl NativeVectorHost {
         Ok(compiled)
     }
 
-    fn snapshot(&self, pane: PaneId, scale: f64) -> io::Result<Snapshot> {
+    fn snapshot(
+        &self,
+        pane: PaneId,
+        scale: f64,
+        retained: Option<(&VectorFrame, &[SurfaceIdentity])>,
+    ) -> io::Result<Snapshot> {
         let mut state = lock(&self.presenter.state);
+        if let Some((previous, windows)) = retained {
+            retained::validate(self, &state, pane, scale, previous, windows)?;
+        }
         #[cfg(feature = "vector-video")]
         super::native_video::tick(&mut state);
         state.overlays.prune_native();
@@ -953,6 +990,30 @@ impl NativeVectorHost {
         let mut candidates = Vec::new();
         for window in state.overlays.native_windows() {
             let session = window.identity.context().session().session_id();
+            if let Some((entry, drawing)) = retained.and_then(|(frame, windows)| {
+                frame
+                    .0
+                    .entries
+                    .iter()
+                    .zip(frame.drawings())
+                    .find(|(entry, drawing)| {
+                        entry.window == window.identity && windows.contains(&drawing.window)
+                    })
+            }) {
+                candidates.push(Candidate {
+                    window: entry.window,
+                    source: entry.source,
+                    resume: entry.resume,
+                    placement: drawing.window_revision,
+                    bounds: drawing.bounds,
+                    submission: drawing.submission,
+                    body: entry.body.clone(),
+                    assets: Vec::new(),
+                    writer: entry.writer.clone(),
+                    reservation: Some(entry.reservation.clone()),
+                });
+                continue;
+            }
             if !owners.contains(&session) {
                 continue;
             }

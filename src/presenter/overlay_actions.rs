@@ -268,6 +268,67 @@ impl std::fmt::Debug for OverlayActionRequest {
 }
 
 impl VirtualVivid {
+    /// Observes one original input incarnation for a split-process relay.
+    ///
+    /// The opaque stamp grants no authority and is not serializable. Retain it on
+    /// the owning presenter and associate downstream correlation metadata with it.
+    /// A changed stamp requires retiring the old physical window and queued input.
+    /// Only an enabled host relay without a local native host or local action
+    /// route can observe stamps.
+    pub fn overlay_relay_input_epoch(
+        &self,
+        surface: BridgeSurfaceKey,
+    ) -> Option<OverlayInputEpoch> {
+        let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
+        if !state.overlay_relay.enabled
+            || state.overlay_relay.local_host_claimed
+            || state.overlay_relay.action_route.is_some()
+        {
+            return None;
+        }
+        input_epoch(&state, surface)
+    }
+
+    /// Forwards authenticated relay input only to its observed original incarnation.
+    ///
+    /// The caller must validate its reporting presenter client and physical bridge
+    /// correlation before using the retained stamp. This does not activate input,
+    /// renew a lane, or grant native focus. Resume, lane replacement, another
+    /// presenter and surface retirement are rechecked atomically before mutation.
+    ///
+    /// # Errors
+    /// Returns malformed input or an envelope whose context does not match the stamp.
+    pub fn relay_overlay_input_at_epoch(
+        &self,
+        epoch: OverlayInputEpoch,
+        body: &[u8],
+    ) -> io::Result<bool> {
+        let envelope = messages::decode_control(body)?;
+        let input = vivid_protocol::overlay::wire::InputEvent::decode(
+            epoch.surface.surface,
+            &Value::Map(envelope.payload),
+        )?;
+        if input.address.context_id != epoch.surface.context {
+            return Err(invalid("overlay input owner mismatch"));
+        }
+        let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
+        if !state.overlay_relay.enabled
+            || state.overlay_relay.local_host_claimed
+            || state.overlay_relay.action_route.is_some()
+            || input_epoch(&state, epoch.surface) != Some(epoch)
+            || !input_surface_current(&state, epoch.surface, input.address.generation)
+        {
+            return Ok(false);
+        }
+        Ok(super::forward_overlay_input(
+            &mut state,
+            epoch.surface,
+            input,
+        ))
+    }
+
     /// Attaches one exclusive relay for existing producer window actions.
     ///
     /// Enable host relaying first. The caller must remap and service window-action RPCs,
@@ -488,6 +549,32 @@ fn retire(state: &mut State, scope: &Arc<AtomicBool>) {
 }
 
 impl OverlayActionRequest {
+    /// Observes this exact request's remaining original lifetime, including after admission.
+    ///
+    /// Returns `None` after completion, route retirement or deadline expiry. This
+    /// neither claims the request nor renews its deadline. A remote dispatcher
+    /// must conservatively account for its complete claim round trip before
+    /// using this duration; do not start a fresh lifetime when a reply arrives.
+    pub fn remaining_lifetime(&self) -> Option<Duration> {
+        let (state, scope) = (self.state.upgrade()?, self.scope.upgrade()?);
+        let state = lock(&state);
+        let grant = state.overlay_relay.actions.get(&self.request.id)?;
+        if !scope.load(Ordering::Acquire)
+            || !state.overlay_relay.pending.contains_key(&self.request.id)
+            || grant.request != self.request
+            || !grant
+                .route
+                .upgrade()
+                .is_some_and(|route| Arc::ptr_eq(&route, &scope))
+        {
+            return None;
+        }
+        grant
+            .deadline()
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
     /// Checks whether this receipt still awaits dispatch before its original deadline.
     ///
     /// This non-consuming queue check grants no authority. Call `claim` immediately

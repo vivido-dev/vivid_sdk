@@ -33,6 +33,8 @@ pub use config::{
 };
 pub use listener::{ConnectionCancel, PresenterListener, Transport};
 pub use resource::{Binding, MediaResourceDescription, ResourceError, TrackFacts};
+#[doc(inline)]
+pub use service::BridgeRecoveryFence;
 pub use service::DesktopInputTarget;
 #[cfg(feature = "vector-render")]
 #[doc(inline)]
@@ -53,7 +55,8 @@ pub use service::overlay_actions::{
 pub use service::overlay_clipboard::OverlayClipboardWrite;
 #[doc(inline)]
 pub use service::overlay_presentations::{
-    OverlayPresentationCapture, OverlayPresentationReceipt, OverlayPresentationRoute,
+    OverlayPresentationAttempt, OverlayPresentationCapture, OverlayPresentationReceipt,
+    OverlayPresentationRoute,
 };
 pub use service::{
     AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,

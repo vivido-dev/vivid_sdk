@@ -59,6 +59,24 @@ negotiated session. The session owns its windows; dropping it cancels their tran
 window handles remain alive. An independent bounded renewal worker maintains the input lane
 without invoking application callbacks.
 
+Rust's explicit `resume(config, &mut [&mut window, ...])` adopts the complete
+window set of a leased session, including children. It retains logical window
+identities and scene revision allocation, advances input/media channels, and
+starts a new input renewal worker. Supply the original endpoints; the wrapper
+uses its retained resume authority and requires the previously negotiated
+profiles. Root sessions and incomplete or foreign window sets are rejected
+before retirement. Extra surfaces or tracks outside the window set are rejected.
+
+After successful recovery, republish full scenes and fresh editor context, and
+discard old preedit, held gestures and queued input. Old pending receipts fail;
+old image/layout handles cannot be reused, so upload or measure them again.
+Establishment retries retain one authenticated HELLO. A failure after transport
+retirement closes the wrapper; use explicit application restart rather than
+repeating an uncertain recovery mutation. This blocking operation belongs on a
+producer worker. It does not itself add an automatic frontend recovery policy.
+With a custom carrier, release its old blocking I/O before calling resume, as
+required by `Session::cancel_handle`; native endpoint transports close directly.
+
 Windows support `set_bounds`, `set_visible`, `center`, `request_focus`, `raise`, `lower`, and
 explicit `close`. `bounds()` and `viewport()` query host truth, including DPI scale. Use
 `create_child(&parent, options)` for parent-scoped popup or modal windows. Foreign-session parent

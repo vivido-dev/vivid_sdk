@@ -1,0 +1,75 @@
+{
+  "package": "vello",
+  "version": "0.11.0",
+  "repository": "https://github.com/linebender/vello",
+  "vcs": {
+    "git": {
+      "sha1": "f3000c8d9e7a9c7e6abb09b9587238bf8b4860ff"
+    },
+    "path_in_vcs": "research/vello_research"
+  },
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "8e1aafd62a3cee701b4045e8d757f29a677f893363f3e5e86392184e662839f9"
+    },
+    {
+      "path": "LICENSE-APACHE",
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+    },
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "adf157330f722fe7cfd5964a2a6974eff851b718228c6735724a11706e6f4dec"
+    },
+    {
+      "path": "README.md",
+      "sha256": "ed21f51b7e2f91b806294c2a33185ecaae1977ad45829d63bbf6cd619b76f2c2"
+    },
+    {
+      "path": "src/debug/renderer.rs",
+      "sha256": "dc1b72bb5f5e0b26f09e78244c8fb0c9226a666e91889f0475f84307fcb05884"
+    },
+    {
+      "path": "src/debug/validate.rs",
+      "sha256": "327563d6a5292bac921dc42d3e0c636ad6da8958e586b0d4a5988ed9da453891"
+    },
+    {
+      "path": "src/debug.rs",
+      "sha256": "e98b23706684dc49a23f7142950625aaa64bef539013f596a4386f6e21376d74"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "3006591740e3770d1241f80a32dc5162567ed6feb2479b151e9093ecb0a47145"
+    },
+    {
+      "path": "src/recording.rs",
+      "sha256": "3c760a7c7610274443efe06c2e9a37eb71471b14a6635d9f65ce92b39de98b3c"
+    },
+    {
+      "path": "src/render.rs",
+      "sha256": "f75a73fae27085c870273b6e670f355455eea61f1d1dde9b102ab9ed2528e7ed"
+    },
+    {
+      "path": "src/scene.rs",
+      "sha256": "a9544b3913a8e6c314e1a11afb6b430557889821d9594ba5da0bcc0a07731ad4"
+    },
+    {
+      "path": "src/shaders.rs",
+      "sha256": "c1392afa0ce8d33873e43a26ba79e881adb0a53e2ed92a90201fac5592a0058e"
+    },
+    {
+      "path": "src/util.rs",
+      "sha256": "ebadf73ea1022ff4f2ee73a603877689580c55a99ff696691fc90db387f03ce8"
+    },
+    {
+      "path": "src/wgpu_engine.rs",
+      "sha256": "d893b8ba540a0627ee08b36222f7d917d97bbdc9f18ff0f40d78b72a7c5c1d0c"
+    }
+  ],
+  "changes": [
+    "Cancellation/map-range safety patch in SDK docs/upstream.",
+    "Scene module is not copied; re-export upstream vello Scene/DrawGlyphs to preserve public type identity.",
+    "Private package metadata/features; scene-only png/skrifa dependencies and upstream development profiler/hot reload are not exposed.",
+    "Use the standard no-op waker in the upstream blocking utility to satisfy the current compiler lint."
+  ]
+}

@@ -3,7 +3,7 @@
 // Rust guideline compliant 2026-10-07
 use super::*;
 use std::sync::{
-    Weak,
+    Arc, Weak,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -15,9 +15,11 @@ pub(crate) enum Claim {
     Forwarded,
     Replay,
     Discard,
+    Blocked,
 }
 struct Scene {
     value: PresentedScene,
+    origin: Arc<()>,
     bytes: u64,
     copies: usize,
 }
@@ -25,10 +27,21 @@ pub(super) struct Deferred {
     alive: Weak<AtomicBool>,
     pending: HashMap<SurfaceIdentity, Scene>,
     forwarded: HashMap<(SurfaceIdentity, u64), Scene>,
+    // One identity per currently displayed window, never a scene history.
+    displayed_origins: HashMap<SurfaceIdentity, (Submission, Arc<()>)>,
     bytes: u64,
     byte_limit: u64,
+    #[cfg(any(test, feature = "testing"))]
+    blocked_captures: u64,
 }
 impl Deferred {
+    fn blocked(&mut self) -> Claim {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.blocked_captures = self.blocked_captures.saturating_add(1);
+        }
+        Claim::Blocked
+    }
     fn remove(&mut self, key: (SurfaceIdentity, u64)) -> Option<Scene> {
         let scene = self.forwarded.remove(&key)?;
         self.bytes = self
@@ -44,6 +57,12 @@ fn matches(scene: &Scene, track: u64, epoch: u32, revision: u64) -> bool {
         && scene.value.revision == revision
 }
 impl Overlays {
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn presentation_blocked_captures(&self) -> u64 {
+        self.presentation
+            .as_ref()
+            .map_or(0, |relay| relay.blocked_captures)
+    }
     pub(crate) fn install_presentation_relay(
         &mut self,
         alive: Weak<AtomicBool>,
@@ -56,18 +75,21 @@ impl Overlays {
             alive,
             pending: HashMap::new(),
             forwarded: HashMap::new(),
+            displayed_origins: HashMap::new(),
             bytes: 0,
             byte_limit,
+            #[cfg(any(test, feature = "testing"))]
+            blocked_captures: 0,
         });
         true
     }
-    pub(crate) fn presentation_submission(
+    pub(crate) fn presentation_origin(
         &self,
         window: SurfaceIdentity,
         track: u64,
         epoch: u32,
         revision: u64,
-    ) -> Option<Submission> {
+    ) -> Option<(Submission, Weak<()>)> {
         let relay = self.presentation.as_ref()?;
         if !relay.alive.upgrade()?.load(Ordering::Acquire) {
             return None;
@@ -77,7 +99,7 @@ impl Overlays {
             .get(&(window, revision))
             .or_else(|| relay.pending.get(&window))
             .filter(|scene| matches(scene, track, epoch, revision))
-            .map(|scene| scene.value.submission)
+            .map(|scene| (scene.value.submission, Arc::downgrade(&scene.origin)))
             .or_else(|| {
                 self.displayed
                     .get(&window)
@@ -86,7 +108,13 @@ impl Overlays {
                             && scene.submission.epoch == epoch
                             && scene.revision == revision
                     })
-                    .map(|scene| scene.submission)
+                    .and_then(|scene| {
+                        relay
+                            .displayed_origins
+                            .get(&window)
+                            .filter(|(submission, _)| *submission == scene.submission)
+                    })
+                    .map(|(submission, origin)| (*submission, Arc::downgrade(origin)))
             })
     }
     pub(crate) fn claim_presentation(
@@ -133,7 +161,7 @@ impl Overlays {
             .sum();
         if let Some(scene) = relay.forwarded.get_mut(&(window, submission.revision)) {
             if !credit || count >= MAX_RELAY_FRAMES || owner_count >= MAX_RELAY_OWNER_FRAMES {
-                return Claim::Discard;
+                return relay.blocked();
             }
             scene.copies += 1;
             return Claim::Forwarded;
@@ -148,15 +176,21 @@ impl Overlays {
             .bytes
             .checked_add(scene.bytes)
             .filter(|bytes| *bytes <= relay.byte_limit);
-        let scene = relay.pending.remove(&window).unwrap();
+        // Permanent oversize cannot be relieved by downstream progress. Temporary
+        // receipt/byte pressure leaves the current pending scene retryable.
+        if scene.bytes > relay.byte_limit {
+            relay.pending.remove(&window);
+            self.resolve(window, submission, PresentationOutcome::Superseded);
+            return Claim::Discard;
+        }
         if !credit
             || count >= MAX_RELAY_FRAMES
             || owner_count >= MAX_RELAY_OWNER_FRAMES
             || bytes.is_none()
         {
-            self.resolve(window, submission, PresentationOutcome::Superseded);
-            return Claim::Discard;
+            return relay.blocked();
         }
+        let scene = relay.pending.remove(&window).unwrap();
         relay.bytes = bytes.unwrap();
         relay
             .forwarded
@@ -184,6 +218,7 @@ impl Overlays {
         let previous = relay.pending.insert(
             window,
             Scene {
+                origin: Arc::new(()),
                 value: PresentedScene {
                     window,
                     revision: submission.revision,
@@ -237,6 +272,9 @@ impl Overlays {
             {
                 self.semantics.remove(&window);
                 self.editor_carets.remove(&window);
+                relay
+                    .displayed_origins
+                    .insert(window, (submission, scene.origin));
                 self.displayed.insert(window, scene.value);
             } else {
                 // A late older physical outcome cannot move display identity backward.
@@ -285,6 +323,7 @@ impl Overlays {
             scenes.extend(std::mem::take(&mut relay.pending).into_values());
             scenes.extend(std::mem::take(&mut relay.forwarded).into_values());
             relay.bytes = 0;
+            relay.displayed_origins.clear();
         }
         for scene in scenes {
             self.resolve(
@@ -297,6 +336,13 @@ impl Overlays {
     pub(crate) fn forget_presentation_track(&mut self, window: SurfaceIdentity, track: u64) {
         let mut scenes = Vec::new();
         if let Some(relay) = &mut self.presentation {
+            if relay
+                .displayed_origins
+                .get(&window)
+                .is_some_and(|(submission, _)| submission.track_id == track)
+            {
+                relay.displayed_origins.remove(&window);
+            }
             if relay
                 .pending
                 .get(&window)
@@ -327,6 +373,9 @@ impl Overlays {
     pub(crate) fn forget_presentations(&mut self, session: u64) {
         if let Some(relay) = &mut self.presentation {
             relay
+                .displayed_origins
+                .retain(|id, _| id.context().session().session_id() != session);
+            relay
                 .pending
                 .retain(|id, _| id.context().session().session_id() != session);
             let remove: Vec<_> = relay
@@ -343,6 +392,15 @@ impl Overlays {
     pub(super) fn prune_presentations(&mut self) {
         let mut scenes = Vec::new();
         if let Some(relay) = &mut self.presentation {
+            relay.displayed_origins.retain(|id, (submission, _)| {
+                self.windows
+                    .get(*id)
+                    .is_some_and(|window| window.generation == submission.address.generation)
+                    && self
+                        .displayed
+                        .get(id)
+                        .is_some_and(|scene| scene.submission == *submission)
+            });
             let remove: Vec<_> = relay
                 .pending
                 .keys()

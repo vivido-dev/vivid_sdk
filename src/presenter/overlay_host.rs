@@ -42,10 +42,18 @@ use vivid_protocol::overlay::wire::{
     Submission, SubmissionOutcome, Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::{Event, PointerReport, Scroll, Semantics};
+#[path = "overlay_backlog.rs"]
+mod backlog;
+#[cfg(test)]
+#[path = "overlay_backlog_tests.rs"]
+mod backlog_tests;
 #[path = "overlay_editor.rs"]
 mod editor;
 #[path = "overlay_presented.rs"]
 mod presentation;
+#[cfg(test)]
+#[path = "overlay_snapshot_tests.rs"]
+mod snapshot_tests;
 pub(crate) use editor::Stamp as EditorStamp;
 pub(crate) use presentation::{
     Claim as PresentationClaim, MAX_RELAY_FRAMES, MAX_RELAY_OWNER_FRAMES,
@@ -81,6 +89,7 @@ pub(crate) struct LaneRecord {
     pub record_type: u16,
     pub object_id: u64,
     pub payload: PayloadMap,
+    pub retention: Option<backlog::Permit>,
 }
 
 /// One session's viewport and the revision it last changed at.
@@ -136,6 +145,8 @@ pub(crate) struct Overlays {
     /// itself; viewports, window events, scene outcomes and accessibility actions are queued only
     /// for the session that owns them.
     pending: HashMap<u64, Vec<LaneRecord>>,
+    backlogs: HashMap<u64, backlog::Owner>,
+    lane_overflows: BTreeSet<u64>,
     /// Every session known to this host, so an environment broadcast reaches exactly the sessions
     /// that might be listening and no others.
     active_sessions: BTreeSet<u64>,
@@ -236,6 +247,12 @@ pub(crate) fn owner(session_id: u64) -> SessionIdentity {
 }
 
 impl Overlays {
+    pub(crate) fn set_window_capacity(
+        &mut self,
+        maximum: usize,
+    ) -> Result<(), vivid_protocol::vector::InvalidScene> {
+        self.windows.set_capacity(maximum)
+    }
     #[cfg(feature = "vector-render")]
     pub(crate) fn local_native(&self) -> bool {
         self.native.is_some()
@@ -336,8 +353,34 @@ impl Overlays {
         self.active_sessions.insert(session_id);
     }
 
-    fn queue_for(&mut self, session_id: u64, record: LaneRecord) {
-        self.pending.entry(session_id).or_default().push(record);
+    fn queue_for(&mut self, session_id: u64, mut record: LaneRecord) {
+        let backlog = self.backlogs.entry(session_id).or_default();
+        if backlog.revoked {
+            return;
+        }
+        if record.retention.is_none()
+            && !matches!(
+                record.record_type,
+                messages::OVERLAY_ENV_CHANGED | messages::OVERLAY_VIEWPORT_CHANGED
+            )
+        {
+            record.retention =
+                backlog.record(record.record_type == messages::OVERLAY_SUBMISSION_OUTCOME);
+            if record.retention.is_none() {
+                self.revoke_backlog(session_id);
+                return;
+            }
+        }
+        let pending = self.pending.entry(session_id).or_default();
+        if matches!(
+            record.record_type,
+            messages::OVERLAY_ENV_CHANGED | messages::OVERLAY_VIEWPORT_CHANGED
+        ) {
+            // Unsent snapshots carry current state, not transition history.
+            // Keep one per family while preserving every non-snapshot record.
+            pending.retain(|queued| queued.record_type != record.record_type);
+        }
+        pending.push(record);
     }
 
     fn environment_record(&self) -> Option<LaneRecord> {
@@ -346,6 +389,7 @@ impl Overlays {
             environment: self.environment.clone(),
         };
         Some(LaneRecord {
+            retention: None,
             record_type: messages::OVERLAY_ENV_CHANGED,
             object_id: 0,
             payload: update.payload().ok()?,
@@ -359,6 +403,7 @@ impl Overlays {
             viewport: current.viewport,
         };
         Some(LaneRecord {
+            retention: None,
             record_type: messages::OVERLAY_VIEWPORT_CHANGED,
             object_id: 0,
             payload: changed.payload().ok()?,
@@ -374,6 +419,7 @@ impl Overlays {
             self.queue_for(
                 session_id,
                 LaneRecord {
+                    retention: None,
                     record_type: record.record_type,
                     object_id: record.object_id,
                     payload: record.payload.clone(),
@@ -396,6 +442,16 @@ impl Overlays {
     /// The environment goes first: a producer that adopts the host's font wants it before it lays
     /// anything out against the viewport.
     pub(crate) fn open_lane(&mut self, session_id: u64, generation: u64) {
+        self.backlogs.entry(session_id).or_default().revoked = false;
+        // Pre-authentication changes may already be queued. Their current
+        // revisions form the initial snapshot, never a second equal revision.
+        let mut retained = self.pending.remove(&session_id).unwrap_or_default();
+        retained.retain(|record| {
+            !matches!(
+                record.record_type,
+                messages::OVERLAY_ENV_CHANGED | messages::OVERLAY_VIEWPORT_CHANGED
+            )
+        });
         // Authentication supplies identity; only the first renewal grants input.
         // An unused overlay profile must not time out a healthy shared desktop lane.
         self.input_leases.insert(
@@ -412,6 +468,9 @@ impl Overlays {
         if let Some(record) = self.viewport_record(session_id) {
             self.queue_for(session_id, record);
         }
+        // Initial environment/viewport precede all retained input and outcomes;
+        // those records keep their complete identities and original order.
+        self.pending.entry(session_id).or_default().extend(retained);
     }
 
     pub(crate) fn limits(&self) -> &Limits {
@@ -460,12 +519,16 @@ impl Overlays {
                 self.queue_for(
                     owner.session_id(),
                     LaneRecord {
+                        retention: None,
                         record_type: messages::OVERLAY_INPUT_EVENT,
                         object_id,
                         payload,
                     },
                 );
             }
+        }
+        if self.windows.take_overflow(owner) {
+            self.revoke_backlog(owner.session_id());
         }
         self.prune_presentations();
     }
@@ -578,6 +641,7 @@ impl Overlays {
         self.queue_for(
             session,
             LaneRecord {
+                retention: None,
                 record_type: messages::OVERLAY_INPUT_EVENT,
                 object_id: input.address.surface_id,
                 payload,
@@ -1216,6 +1280,7 @@ impl Overlays {
         self.queue_for(
             window.context().session().session_id(),
             LaneRecord {
+                retention: None,
                 record_type: messages::OVERLAY_INPUT_EVENT,
                 object_id: window.surface_id(),
                 payload,
@@ -1479,21 +1544,41 @@ impl Overlays {
         if frame.revision <= *accepted {
             return false;
         }
+        if !self
+            .backlogs
+            .entry(session_id)
+            .or_default()
+            .reserve(submission)
+        {
+            self.revoke_backlog(session_id);
+            return false;
+        }
         *accepted = frame.revision;
 
         #[cfg(feature = "vector-render")]
         if self.native.is_some() {
-            return self.accept_native(window, track_id, channel_generation, frame);
+            let accepted = self.accept_native(window, track_id, channel_generation, frame);
+            if !accepted {
+                self.backlogs
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .resolve(submission);
+            }
+            return accepted;
         }
         #[cfg(not(feature = "vector-render"))]
         let _ = channel_generation;
 
         if self.presentation.is_some() {
-            return self.accept_presentation(window, submission, frame.canvas, body.len() as u64);
-        }
-        // Anything the replacement supersedes resolves before the new scene publishes.
-        if let Some(previous) = self.displayed.get(&window) {
-            self.resolve(window, previous.submission, PresentationOutcome::Superseded);
+            let accepted =
+                self.accept_presentation(window, submission, frame.canvas, body.len() as u64);
+            if !accepted {
+                self.backlogs
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .resolve(submission);
+            }
+            return accepted;
         }
         let generation = self.windows.get(window).map_or(0, |w| w.generation);
         if self
@@ -1501,6 +1586,10 @@ impl Overlays {
             .publish_scene(window, generation, frame.revision)
             .is_err()
         {
+            self.backlogs
+                .get_mut(&session_id)
+                .unwrap()
+                .resolve(submission);
             return false;
         }
         // A tree described the scene that was just replaced, so it no longer describes anything.
@@ -1526,6 +1615,15 @@ impl Overlays {
         submission: Submission,
         outcome: PresentationOutcome,
     ) {
+        let session = window.context().session().session_id();
+        let Some(retention) = self
+            .backlogs
+            .get_mut(&session)
+            .and_then(|b| b.resolve(submission))
+        else {
+            // Already resolved, retired by lane overflow, or not accepted here.
+            return;
+        };
         let result = SubmissionOutcome {
             submission,
             outcome,
@@ -1536,6 +1634,7 @@ impl Overlays {
                 LaneRecord {
                     record_type: messages::OVERLAY_SUBMISSION_OUTCOME,
                     object_id: window.surface_id(),
+                    retention: Some(retention),
                     payload,
                 },
             );
@@ -1629,6 +1728,8 @@ impl Overlays {
             .retain(|id, _| id.context().session().session_id() != session_id);
         self.clear_owner_gesture(session_id);
         self.pending.remove(&session_id);
+        self.backlogs.remove(&session_id);
+        self.lane_overflows.remove(&session_id);
         self.input_leases.remove(&session_id);
         self.last_pointer.remove(&session_id);
         self.viewports.remove(&session_id);
@@ -1668,6 +1769,9 @@ impl Overlays {
     /// One window's current bounds, mode, visibility, generation and revision, if it exists. Read
     /// by the projection snapshot so a terminating bridge can re-issue `SET_OVERLAY_WINDOW` in its
     /// own outer coordinate space.
+    pub(crate) fn stacked_windows(&self) -> impl Iterator<Item = &vivid_protocol::overlay::Window> {
+        self.windows.stacked()
+    }
     pub(crate) fn window(&self, id: SurfaceIdentity) -> Option<&vivid_protocol::overlay::Window> {
         self.windows.get(id)
     }
@@ -1901,7 +2005,7 @@ mod tests {
 
     /// Both owners these tests use are given the same pane geometry, as two producers in one pane
     /// would have.
-    fn viewport() -> Overlays {
+    pub(super) fn viewport() -> Overlays {
         let mut overlays = Overlays::default();
         overlays.install_viewport(1, 800., 600.);
         overlays.install_viewport(2, 800., 600.);
@@ -1917,7 +2021,7 @@ mod tests {
         }
     }
 
-    fn window(overlays: &mut Overlays, session_id: u64) -> SurfaceIdentity {
+    pub(super) fn window(overlays: &mut Overlays, session_id: u64) -> SurfaceIdentity {
         if overlays.windows.pane(owner(session_id)).is_none() {
             overlays.bind_session(session_id, 1).unwrap();
         }
@@ -1935,7 +2039,7 @@ mod tests {
         id
     }
 
-    fn scene(colour: u32, revision: u64) -> Vec<u8> {
+    pub(super) fn scene(colour: u32, revision: u64) -> Vec<u8> {
         let mut canvas = Canvas::new();
         canvas
             .fill(

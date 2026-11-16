@@ -132,6 +132,7 @@ impl Overlays {
         self.queue_for(
             id.context().session().session_id(),
             LaneRecord {
+                retention: None,
                 record_type: messages::OVERLAY_INPUT_EVENT,
                 object_id: id.surface_id(),
                 payload,
@@ -531,6 +532,7 @@ impl Overlays {
                 self.queue_for(
                     id.context().session().session_id(),
                     LaneRecord {
+                        retention: None,
                         record_type: messages::OVERLAY_INPUT_EVENT,
                         object_id: id.surface_id(),
                         payload,
@@ -637,21 +639,7 @@ impl Overlays {
         window: SurfaceIdentity,
         outcome: PresentationOutcome,
     ) {
-        if let Ok(payload) = (SubmissionOutcome {
-            submission,
-            outcome,
-        })
-        .payload()
-        {
-            self.queue_for(
-                window.context().session().session_id(),
-                LaneRecord {
-                    record_type: messages::OVERLAY_SUBMISSION_OUTCOME,
-                    object_id: window.surface_id(),
-                    payload,
-                },
-            );
-        }
+        self.resolve(window, submission, outcome);
     }
 
     pub(crate) fn present_native(

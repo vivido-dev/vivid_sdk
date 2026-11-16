@@ -102,6 +102,9 @@ struct Peer {
 }
 impl Peer {
     fn new(p: &VirtualVivid, x: i64, color: [u8; 4]) -> Self {
+        Self::new_alpha(p, x, color, 1)
+    }
+    fn new_alpha(p: &VirtualVivid, x: i64, color: [u8; 4], alpha_mode: u64) -> Self {
         let secret = p.issue_pane_capability(1).unwrap();
         let mut session = Session::connect(ProducerConfig {
             endpoint_control: Some(p.endpoint()),
@@ -152,10 +155,10 @@ impl Peer {
                     kind: KindConfiguration::Raster(RasterConfiguration {
                         width: 2,
                         height: 2,
-                        alpha_mode: 1,
+                        alpha_mode,
                         delta_enabled: true,
                         maximum_delta_operations: 4,
-                        zstd_enabled: false,
+                        zstd_enabled: alpha_mode == 2,
                     }),
                     target_latency_us: 0,
                     maximum_latency_us: 0,
@@ -410,6 +413,160 @@ fn pixels(
         }
         assert!(Instant::now() < deadline, "mixed GPU readback timed out");
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(feature = "vector-offscreen")]
+#[test]
+#[ignore = "requires a native GPU; configured straight/premultiplied raster alpha"]
+fn native_gpu_preserves_raster_alpha_modes_deltas_and_same_id_peer() {
+    let (presenter, mut host) = fixture();
+    let a = Peer::new_alpha(&presenter, 0, [9, 47, 16, 64], 2);
+    let b = Peer::new(&presenter, 16, [96, 48, 192, 128]);
+    let old = prepare(&mut host, 2);
+    assert_eq!(
+        old.rasters()[0].surface.surface_id(),
+        old.rasters()[1].surface.surface_id()
+    );
+    assert_ne!(
+        old.rasters()[0].surface.context().session(),
+        old.rasters()[1].surface.context().session()
+    );
+    let mut gpu =
+        pollster::block_on(vector_renderer::compositor::offscreen::Offscreen::new()).unwrap();
+    let check =
+        |image: &vector_renderer::compositor::offscreen::Pixels, x: usize, expected: [u8; 4]| {
+            let actual: [u8; 4] = image.rgba[(4 * 32 + x) * 4..(4 * 32 + x) * 4 + 4]
+                .try_into()
+                .unwrap();
+            assert_eq!(actual[3], expected[3]);
+            assert!(
+                actual[..3]
+                    .iter()
+                    .zip(&expected[..3])
+                    .all(|(a, e)| a.abs_diff(*e) <= 1),
+                "raster alpha changed: {actual:?} != {expected:?}"
+            );
+        };
+    let image = pixels(&mut gpu, &old);
+    check(&image, 4, [36, 188, 64, 64]);
+    check(&image, 20, [96, 48, 192, 128]);
+    assert_eq!((a.presented(), b.presented()), (0, 0));
+    assert!(host.presented(&old).unwrap());
+    assert_eq!((a.presented(), b.presented()), (1, 1));
+    a.channel
+        .send_raster_delta(
+            0,
+            2,
+            1,
+            0,
+            0,
+            &[vivid_protocol::media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                rgba: &[0; 16],
+            }],
+            false,
+        )
+        .unwrap();
+    a.accepted(2);
+    let current = prepare(&mut host, 2);
+    check(&pixels(&mut gpu, &current), 4, [0; 4]);
+    check(&pixels(&mut gpu, &old), 4, [36, 188, 64, 64]);
+    assert!(host.presented(&current).unwrap());
+    assert_eq!(a.presented(), 2);
+    a.session.close().unwrap();
+    assert!(!host.presented(&old).unwrap());
+    drop(old);
+    drop(current);
+    let survivor = prepare(&mut host, 1);
+    let image = pixels(&mut gpu, &survivor);
+    check(&image, 4, [0; 4]);
+    check(&image, 20, [96, 48, 192, 128]);
+    assert!(host.presented(&survivor).unwrap());
+    assert_eq!(b.presented(), 1);
+    b.session.close().unwrap();
+    presenter.shutdown();
+}
+
+#[test]
+fn malformed_premultiplied_full_and_delta_leave_same_id_peer_and_retained_revision_intact() {
+    for invalid_pixel in [[1, 0, 0, 0], [65, 0, 0, 64]] {
+        for (delta, compressed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (presenter, mut host) = fixture();
+            let a = Peer::new_alpha(&presenter, 0, [9, 47, 16, 64], 2);
+            let b = Peer::new(&presenter, 16, [96, 48, 192, 128]);
+            let old = prepare(&mut host, 2);
+            assert_eq!(
+                old.rasters()[0].surface.surface_id(),
+                old.rasters()[1].surface.surface_id()
+            );
+            let invalid = invalid_pixel.repeat(4);
+            if delta {
+                a.channel
+                    .send_raster_delta(
+                        0,
+                        2,
+                        1,
+                        0,
+                        0,
+                        &[
+                            vivid_protocol::media::RasterDeltaOperation::Overwrite {
+                                x: 0,
+                                y: 0,
+                                width: 2,
+                                height: 2,
+                                rgba: &[0; 16],
+                            },
+                            vivid_protocol::media::RasterDeltaOperation::Overwrite {
+                                x: 0,
+                                y: 0,
+                                width: 2,
+                                height: 2,
+                                rgba: &invalid,
+                            },
+                        ],
+                        compressed,
+                    )
+                    .unwrap();
+            } else {
+                a.channel.send_raster(0, 2, &invalid, compressed).unwrap();
+            }
+            let end = Instant::now() + Duration::from_secs(3);
+            loop {
+                let state = a.session.query_track(&a.track).unwrap();
+                if state.milestones & vivid_protocol::track::MILESTONE_TRACK_LOST != 0 {
+                    assert_eq!(state.last_media_id, 1);
+                    break;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "malformed premultiplied source did not retire"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(b.presented(), 0);
+            // Presentation may settle the still-current peer independently of the lost entry.
+            assert!(host.presented(&old).unwrap());
+            assert_eq!(a.presented(), 0);
+            assert_eq!(b.presented(), 1);
+            let survivor = prepare(&mut host, 1);
+            assert_eq!(
+                survivor.rasters()[0]
+                    .surface
+                    .context()
+                    .session()
+                    .session_id(),
+                b.session.info().session_id
+            );
+            assert!(host.presented(&survivor).unwrap());
+            assert_eq!(b.presented(), 1);
+            a.session.close().unwrap();
+            b.session.close().unwrap();
+            presenter.shutdown();
+        }
     }
 }
 

@@ -30,8 +30,10 @@ block2.workspace = true
 collections.workspace = true
 core-foundation.workspace = true
 core-foundation-sys.workspace = true
-core-graphics.workspace = true
-core-text = { workspace = true, optional = true }
+# The pinned zed-font-kit exposes these native Rust types in its public API.
+# Keep this bridge on the same versions until that revision is upgraded.
+core-graphics = "0.24"
+core-text = { version = "21", optional = true }
 dispatch2 = { workspace = true, features = ["block2"] }
 etagere.workspace = true
 futures.workspace = true

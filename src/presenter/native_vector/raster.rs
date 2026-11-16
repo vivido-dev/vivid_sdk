@@ -56,6 +56,7 @@ enum Content {
         height: u32,
     },
     Raster {
+        premultiplied: bool,
         epoch: u32,
         frame: u64,
         width: u32,
@@ -70,7 +71,14 @@ impl Content {
             return false;
         }
         match (self, other) {
-            (Self::Raster { .. }, Self::Raster { .. }) => true,
+            (
+                Self::Raster {
+                    premultiplied: a, ..
+                },
+                Self::Raster {
+                    premultiplied: b, ..
+                },
+            ) => a == b,
             #[cfg(feature = "vector-video")]
             (Self::Video { .. }, Self::Video { .. }) => true,
             #[cfg(feature = "vector-images")]
@@ -151,12 +159,18 @@ impl Scope {
                 .native_video
                 .as_ref()
                 .is_some_and(|f| self.body.same(&Body::Video(Arc::downgrade(&f.image)))),
-            Content::Raster { width, height, .. } => {
-                track.retained_raster.as_ref().is_some_and(|r| {
-                    r.width == *width
-                        && r.height == *height
-                        && self.body.same(&Body::Bytes(Arc::downgrade(&r.pixels)))
-                })
+            Content::Raster {
+                width,
+                height,
+                premultiplied,
+                ..
+            } => {
+                matches!(&track.configuration.kind, KindConfiguration::Raster(c) if (c.alpha_mode == 2) == *premultiplied)
+                    && track.retained_raster.as_ref().is_some_and(|r| {
+                        r.width == *width
+                            && r.height == *height
+                            && self.body.same(&Body::Bytes(Arc::downgrade(&r.pixels)))
+                    })
             }
             #[cfg(feature = "vector-images")]
             Content::Encoded(config) => {
@@ -397,13 +411,14 @@ pub(super) fn snapshot(state: &State, pane: PaneId) -> Vec<Candidate> {
                     },
                 )
             }
-            KindConfiguration::Raster(_) => {
+            KindConfiguration::Raster(config) => {
                 let Some(r) = &track.retained_raster else {
                     continue;
                 };
                 (
                     Pixels::Bytes(r.pixels.clone()),
                     Content::Raster {
+                        premultiplied: config.alpha_mode == 2,
                         epoch: r.epoch,
                         frame: r.frame_id,
                         width: r.width,
@@ -525,7 +540,12 @@ impl NativeVectorHost {
                     };
                     CachedImage::Ready(image.clone())
                 }
-                Content::Raster { width, height, .. } => {
+                Content::Raster {
+                    width,
+                    height,
+                    premultiplied,
+                    ..
+                } => {
                     #[cfg(not(feature = "vector-video"))]
                     let Pixels::Bytes(body) = &candidate.body;
                     #[cfg(feature = "vector-video")]
@@ -535,7 +555,12 @@ impl NativeVectorHost {
                     let Ok(token) = self.charge(body.len()) else {
                         continue;
                     };
-                    let Ok(mut image) = RasterImage::new(*width, *height, body.clone()) else {
+                    let image = if *premultiplied {
+                        RasterImage::new_premultiplied(*width, *height, body.clone())
+                    } else {
+                        RasterImage::new(*width, *height, body.clone())
+                    };
+                    let Ok(mut image) = image else {
                         continue;
                     };
                     image

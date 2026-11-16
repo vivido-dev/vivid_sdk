@@ -107,6 +107,13 @@ further connects and release their prepared buffers; dropping an attempt also re
 Root authentication requires a fresh attempt after failure because accepted root nonces cannot
 be replayed. Ordinary `Session::connect` still performs one attempt.
 
+A matching authenticated resume can arrive while the presenter is still retiring
+its old control handler. It waits for suspension inside the original absolute
+three-second handshake deadline, releasing the state lock so other owners remain
+responsive. It cannot force a healthy connection to retire. Invalid proofs do not
+park, and normal grace, identity, generation and profile checks still decide
+acceptance after retirement; competing resumes cannot both advance the generation.
+
 Dropping a session or input lane shuts down its transport, including native readers retained by
 background workers. `Session::close` performs graceful GOODBYE; dropping is unclean loss and allows
 a leased presenter to suspend. `abort` continues to close the local lifecycle so callers can stop

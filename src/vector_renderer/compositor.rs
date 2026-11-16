@@ -1,21 +1,42 @@
-//! Cached vector overlay composition with a host-owned Vello device and renderer.
+//! Checked vector output and shared bounded drawing validation.
 //!
-//! This module creates no event loop, GPU adapter, Vivid session or input authority.
-//! The host supplies back-to-front immutable drawings, owns resource quotas, and
-//! acknowledges submissions only after the returned image was actually composed.
-//! The cache borrows its renderer per operation; call `clear` before replacing or
-//! dropping that renderer so registered textures are unregistered there.
+//! This module creates no event loop, Vivid session or input authority.
+//! With `vector-texture`, `texture::TextureRenderer` owns its checked worker
+//! renderer and exports immutable images on the host's shared device. The host
+//! retains exact prepared drawings until completion and acknowledges only the
+//! imported image actually composed. `vector-offscreen` adds checked CPU readback.
+//! Working targets and cache mutation remain private to these checked backends.
 
 // Rust guideline compliant 2026-10-07
+#[cfg(feature = "vector-texture")]
+mod budget;
+#[cfg(feature = "vector-texture")]
+mod checked;
 #[cfg(feature = "vector-offscreen")]
 #[path = "offscreen.rs"]
 pub mod offscreen;
+#[cfg(feature = "vector-texture")]
+pub mod texture;
+#[cfg(feature = "vector-texture")]
+mod tiles;
+#[cfg(feature = "vector-texture")]
+#[doc(inline)]
+pub use budget::WorkBudget;
 
-use super::{CompiledScene, RasterDrawing};
+#[cfg(any(feature = "vector-texture", test))]
+use super::CompiledScene;
+#[cfg(feature = "vector-texture")]
+use super::RasterDrawing;
+#[cfg(any(feature = "vector-texture", test))]
 use std::sync::Arc;
+#[cfg(any(feature = "vector-texture", test))]
+use vello::Scene;
+#[cfg(any(feature = "vector-texture", test))]
 use vello::kurbo::{Affine, Rect};
-use vello::peniko::{Color, Fill, ImageAlphaType, ImageData, Mix};
-use vello::{AaConfig, RenderParams, Renderer, Scene};
+#[cfg(feature = "vector-texture")]
+use vello::peniko::{Color, Fill, Mix};
+#[cfg(feature = "vector-texture")]
+use vello::{AaConfig, RenderParams};
 
 #[doc(inline)]
 pub use super::Drawing;
@@ -23,18 +44,22 @@ pub use super::Drawing;
 /// Cumulative work performed by the pane-overlay render cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderMetrics {
-    /// Successfully submitted GPU render passes.
+    /// Submitted tile render attempts, including allocation retries and failed attempts.
     pub render_passes: u64,
     /// Calls that reused unchanged cached output.
     pub skipped_passes: u64,
-    /// Registered GPU target allocations.
+    /// Private working-target allocations.
     pub target_allocations: u64,
+    /// Area-sensitive arena failures retried with smaller checked tiles.
+    pub allocation_retries: u64,
 }
 
-/// A bounded GPU overlay target and immutable-drawing cache.
+/// Working resources owned exclusively by a checked output renderer.
+#[cfg(feature = "vector-texture")]
 #[derive(Default)]
-pub struct Compositor {
+struct Cache {
     target: Option<Target>,
+    scratch: Option<tiles::Scratch>,
     key: Vec<(
         vivid_protocol::identity::SurfaceIdentity,
         u64,
@@ -42,97 +67,66 @@ pub struct Compositor {
         vivid_protocol::vector::Rect,
         u64,
     )>,
-    generation: u64,
     scenes: Vec<Arc<CompiledScene>>,
     rasters: Vec<RasterDrawing>,
     metrics: RenderMetrics,
 }
+#[cfg(feature = "vector-texture")]
 struct Target {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    image: ImageData,
+    texture: wgpu::Texture,
     width: u32,
     height: u32,
 }
-impl Compositor {
-    /// Returns the current texture-cache generation.
-    pub fn generation(&self) -> u64 {
-        self.generation
+#[cfg(feature = "vector-texture")]
+struct Plan {
+    scene: Scene,
+    key: Vec<(
+        vivid_protocol::identity::SurfaceIdentity,
+        u64,
+        vivid_protocol::overlay::wire::Submission,
+        vivid_protocol::vector::Rect,
+        u64,
+    )>,
+    drawings: Vec<Drawing>,
+    rasters: Vec<RasterDrawing>,
+    width: u32,
+    height: u32,
+}
+#[cfg(feature = "vector-texture")]
+impl Plan {
+    fn params(&self) -> RenderParams {
+        RenderParams {
+            base_color: Color::TRANSPARENT,
+            width: self.width,
+            height: self.height,
+            antialiasing_method: AaConfig::Msaa8,
+        }
     }
+}
 
+#[cfg(feature = "vector-texture")]
+impl Cache {
     /// Returns cumulative composition and allocation counters.
-    pub fn metrics(&self) -> RenderMetrics {
+    fn metrics(&self) -> RenderMetrics {
         self.metrics
     }
 
-    /// Unregisters the cached texture from the renderer that created it.
-    ///
-    /// # Panics
-    /// Panics if the cache generation counter is exhausted.
-    pub fn clear(&mut self, renderer: &mut Renderer) {
-        if let Some(target) = self.target.take() {
-            renderer.unregister_texture(target.image);
-        }
+    fn clear(&mut self) {
+        self.target = None;
+        self.scratch = None;
         self.key.clear();
         self.scenes.clear();
         self.rasters.clear();
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .expect("overlay cache generation exhausted");
     }
 
-    /// Composes changed drawings into a bounded premultiplied RGBA texture.
-    ///
-    /// Unchanged identities, revisions, bounds, scale and target dimensions reuse
-    /// the texture while their immutable compiled objects are unchanged. Replacing
-    /// a compiled object redraws even when its numeric identities are reused.
-    /// The boolean reports GPU work, not presentation or scanout.
-    /// Use the same renderer and device until `clear` unregisters its target.
-    ///
-    /// # Errors
-    /// Rejects invalid drawings or target limits before changing the cache.
-    /// Returns renderer errors without publishing the failed key.
-    ///
-    /// # Panics
-    /// Panics if the cache generation counter is exhausted.
-    pub fn render(
+    fn prepare(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        renderer: &mut Renderer,
-        drawings: &[Drawing],
-        width: u32,
-        height: u32,
-    ) -> Result<(Option<ImageData>, bool), Error> {
-        self.render_mixed(device, queue, renderer, drawings, &[], width, height)
-    }
-
-    /// Composes scene-node raster layers beneath ordered vector windows.
-    ///
-    /// Raster layers arrive back to front and grant no input authority. Their
-    /// fit, sampling, opacity and clips apply before vector windows are drawn.
-    /// Hosts retain ownership of aggregate pixel resources and display receipts.
-    ///
-    /// # Errors
-    /// Rejects invalid layers/targets before cache mutation, or returns GPU errors.
-    ///
-    /// # Panics
-    /// Panics if the cache generation counter is exhausted.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "extends the existing host-owned renderer interface"
-    )]
-    pub fn render_mixed(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        renderer: &mut Renderer,
         drawings: &[Drawing],
         rasters: &[RasterDrawing],
         width: u32,
         height: u32,
-    ) -> Result<(Option<ImageData>, bool), Error> {
+    ) -> Result<Option<Plan>, Error> {
         validate(
             drawings,
             width,
@@ -154,15 +148,12 @@ impl Compositor {
                 "mixed composition encoding exceeds byte budget",
             ));
         }
-        if drawings.is_empty() && rasters.is_empty() && self.target.is_none() {
-            return Ok((None, false));
-        }
         let new_target = self
             .target
             .as_ref()
             .is_none_or(|t| t.width != width || t.height != height);
         if new_target {
-            self.clear(renderer);
+            self.clear();
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("vivid.vector.overlay.target"),
                 size: wgpu::Extent3d {
@@ -174,16 +165,13 @@ impl Compositor {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let view = texture.create_view(&Default::default());
-            let mut image = renderer.register_texture(texture.clone());
-            image.alpha_type = ImageAlphaType::AlphaPremultiplied;
             self.target = Some(Target {
-                _texture: texture,
-                view,
-                image,
+                texture,
                 width,
                 height,
             });
@@ -201,7 +189,6 @@ impl Compositor {
                 )
             })
             .collect();
-        let target = self.target.as_ref().expect("overlay target allocated");
         let same_scenes = self.scenes.len() == drawings.len()
             && self
                 .scenes
@@ -215,38 +202,74 @@ impl Compositor {
                 .zip(rasters)
                 .all(|(a, b)| a.same_content(b));
         if new_target || self.key != key || !same_scenes || !same_rasters {
-            let scene = compose(drawings, rasters, width, height);
-            renderer
-                .render_to_texture(
-                    device,
-                    queue,
-                    &scene,
-                    &target.view,
-                    &RenderParams {
-                        base_color: Color::TRANSPARENT,
-                        width,
-                        height,
-                        antialiasing_method: AaConfig::Msaa8,
-                    },
-                )
-                .map_err(Error::Render)?;
-            renderer.mark_override_image_dirty(&target.image);
-            self.key = key;
-            // Keep the objects alive as long as their pointer identities are cached.
-            self.scenes = drawings
-                .iter()
-                .map(|drawing| drawing.compiled.clone())
-                .collect();
-            self.rasters = rasters.to_vec();
-            self.metrics.render_passes = self.metrics.render_passes.saturating_add(1);
-            Ok((Some(target.image.clone()), true))
+            Ok(Some(Plan {
+                scene: compose(drawings, rasters, width, height),
+                key,
+                drawings: drawings.to_vec(),
+                rasters: rasters.to_vec(),
+                width,
+                height,
+            }))
         } else {
             self.metrics.skipped_passes = self.metrics.skipped_passes.saturating_add(1);
-            Ok((Some(target.image.clone()), false))
+            Ok(None)
+        }
+    }
+    fn commit(&mut self, plan: Plan) {
+        self.key = plan.key;
+        self.scenes = plan
+            .drawings
+            .into_iter()
+            .map(|drawing| drawing.compiled)
+            .collect();
+        self.rasters = plan.rasters;
+    }
+
+    async fn checked_with_budget(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut vivid_vello_backend::Renderer,
+        plan: Plan,
+        cancelled: &std::sync::atomic::AtomicBool,
+        budget: Option<&WorkBudget>,
+    ) -> Result<(), Error> {
+        let target = self
+            .target
+            .as_ref()
+            .expect("prepared checked overlay target");
+        let scratch = self
+            .scratch
+            .get_or_insert_with(|| tiles::Scratch::new(device, plan.width, plan.height));
+        let result = checked::render(
+            device,
+            queue,
+            renderer,
+            &plan.scene,
+            scratch,
+            &target.texture,
+            &plan.params(),
+            &mut self.metrics,
+            cancelled,
+            budget,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                self.commit(plan);
+                Ok(())
+            }
+            Err(error) => {
+                // Retire partial pixels as well as their key. Merely clearing the
+                // key would make a later empty composition appear unchanged.
+                self.clear();
+                Err(error)
+            }
         }
     }
 }
 
+#[cfg(feature = "vector-texture")]
 fn compose(drawings: &[Drawing], rasters: &[RasterDrawing], width: u32, height: u32) -> Scene {
     let mut scene = Scene::new();
     scene.push_layer(
@@ -320,6 +343,7 @@ fn compose(drawings: &[Drawing], rasters: &[RasterDrawing], width: u32, height: 
     scene
 }
 
+#[cfg(feature = "vector-texture")]
 fn validate_rasters(rasters: &[RasterDrawing]) -> Result<(), Error> {
     if rasters.len() > vivid_protocol::overlay::MAX_WINDOWS {
         return Err(Error::InvalidInput(
@@ -360,34 +384,44 @@ pub const MAX_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 pub enum Error {
     /// Invalid target extent or drawing metadata.
     InvalidInput(&'static str),
-    /// The native renderer failed to produce the requested frame.
-    Render(vello::Error),
+    /// The private checked backend failed to produce the requested frame.
+    Backend(Box<dyn std::error::Error + Send + Sync>),
+    /// A native GPU allocation stage could not fit its bounded arena.
+    Arena(u32),
+    /// Checked subdivision reached its bounded per-frame GPU work limit.
+    WorkLimit,
+    /// The host cancelled an unpublished native GPU composition.
+    Cancelled,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidInput(message) => f.write_str(message),
-            Self::Render(error) => write!(f, "vector composition failed: {error}"),
+            Self::Backend(error) => write!(f, "checked vector composition failed: {error}"),
+            Self::Arena(stages) => write!(f, "vector GPU allocation failed (stages {stages:#x})"),
+            Self::WorkLimit => f.write_str("checked vector GPU work limit exceeded"),
+            Self::Cancelled => f.write_str("checked vector composition cancelled"),
         }
     }
 }
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Render(error) => Some(error),
+            Self::Backend(error) => Some(error.as_ref()),
             _ => None,
         }
     }
 }
-impl std::fmt::Debug for Compositor {
+#[cfg(feature = "vector-texture")]
+impl std::fmt::Debug for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Compositor")
-            .field("generation", &self.generation)
+        f.debug_struct("Cache")
             .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }
 
+#[cfg(any(feature = "vector-texture", test))]
 fn validate(drawings: &[Drawing], width: u32, height: u32, limit: u32) -> Result<(), Error> {
     let bytes = u64::from(width)
         .checked_mul(u64::from(height))

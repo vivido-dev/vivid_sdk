@@ -5,6 +5,23 @@ is migrated from the local Zed checkout into an independent workspace in `gui/`;
 [UPSTREAM.md](../gui/UPSTREAM.md) records its revision and extraction scope.
 The source is copied, not a dependency on the developer's Zed checkout.
 
+The Apple font bridge keeps Core Graphics/Core Text versions aligned with the
+native Rust types exposed by the pinned zed-font-kit revision. The macOS
+accessibility adapter likewise shares the framework's AccessKit 0.24 tree and
+action types. These local compatibility constraints are independent of broader
+workspace dependency upgrades. The current compositor passes real AppKit
+visibility/input recovery and ordinary-window capture on the unlocked local Mac;
+see [current native evidence](../../vivid_compositor/docs/performance/2026-11-14-vivido-vector-wire-resume-macos.json).
+Affected Apple package and downstream compositor checks pass. A subsequent
+[qualification follow-up](../../vivid_compositor/docs/performance/2026-11-14-vivido-vector-native-window-macos.json)
+repairs two GUI test observation errors: writer waiting is distinct from
+exclusive lock ownership, and a thread-local foreground measurement must not
+assert that process-wide frame timings contain no unrelated draws. A real foreign
+profiler draw remains visible in the strengthened regression. Production font
+resolution and profiling are unchanged. The current GUI workspace passes fmt,
+all-target compilation/tests and Clippy with native font-kit/runtime shaders.
+Other platforms and physical device/input gates remain explicit.
+
 `gui-runtime-shaders` enables Apple's runtime Metal shader compilation when the
 Xcode Metal command-line tool is unavailable. `gui-testing` enables deterministic
 GPUI test contexts. Existing protocol-only builds do not compile GUI dependencies.

@@ -188,7 +188,10 @@ struct WriterInner {
     sequence: u64,
 }
 enum Outbound {
-    Record(zeroize::Zeroizing<Vec<u8>>),
+    Record {
+        body: zeroize::Zeroizing<Vec<u8>>,
+        retention: Option<Box<dyn Send>>,
+    },
     Barrier(mpsc::SyncSender<()>),
 }
 
@@ -214,10 +217,11 @@ impl Writer {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     match item {
-                        Outbound::Record(body) => {
+                        Outbound::Record { body, retention } => {
                             let result =
                                 write_complete(stream.as_mut(), &body).and_then(|_| stream.flush());
                             worker_bytes.fetch_sub(body.len(), Ordering::AcqRel);
+                            drop(retention);
                             if result.is_err() {
                                 break;
                             }
@@ -290,6 +294,27 @@ impl Writer {
         object_id: u64,
         parts: &[&[u8]],
     ) -> io::Result<u64> {
+        self.write_parts_retained(record_type, object_id, parts, None)
+    }
+
+    // Keep admission credits charged through queued and active socket writes.
+    pub(crate) fn write_record_retained(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+        retention: Option<Box<dyn Send>>,
+    ) -> io::Result<u64> {
+        self.write_parts_retained(record_type, object_id, &[body], retention)
+    }
+
+    fn write_parts_retained(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        parts: &[&[u8]],
+        retention: Option<Box<dyn Send>>,
+    ) -> io::Result<u64> {
         let body_length = parts.iter().try_fold(0usize, |total, part| {
             total
                 .checked_add(part.len())
@@ -341,7 +366,14 @@ impl Writer {
         for part in parts {
             encoded.extend_from_slice(part);
         }
-        if inner.sender.try_send(Outbound::Record(encoded)).is_err() {
+        if inner
+            .sender
+            .try_send(Outbound::Record {
+                body: encoded,
+                retention,
+            })
+            .is_err()
+        {
             self.bytes.fetch_sub(size, Ordering::AcqRel);
             self.close();
             return Err(io::Error::new(
@@ -481,6 +513,79 @@ mod writer_audit_tests {
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+    struct Retained(Arc<AtomicUsize>);
+    impl Drop for Retained {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    struct Paused {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        first: bool,
+    }
+    impl Write for Paused {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.first {
+                self.first = false;
+                let _ = self.entered.send(());
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn retained_credits_survive_queued_and_active_writes_until_completion_or_close() {
+        for cancel in [false, true] {
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::channel();
+            let cancel_tx = release_tx.clone();
+            let writer = Writer::new(
+                Box::new(Paused {
+                    entered: entered_tx,
+                    release: release_rx,
+                    first: true,
+                }),
+                ConnectionCancel::new(move || {
+                    let _ = cancel_tx.send(());
+                }),
+                1024,
+            )
+            .unwrap();
+            let credits = Arc::new(AtomicUsize::new(2));
+            for _ in 0..2 {
+                writer
+                    .write_record_retained(
+                        3,
+                        0,
+                        &[1],
+                        Some(Box::new(Retained(Arc::clone(&credits)))),
+                    )
+                    .unwrap();
+            }
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(credits.load(Ordering::Acquire), 2);
+            if cancel {
+                writer.close();
+            } else {
+                release_tx.send(()).unwrap();
+                writer.flush().unwrap();
+            }
+            let end = std::time::Instant::now() + Duration::from_secs(1);
+            while credits.load(Ordering::Acquire) != 0 {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "writer retained retired credits"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(writer.is_closed(), cancel);
+            writer.close();
         }
     }
     #[test]

@@ -56,7 +56,7 @@ pub enum OverlayPresentationCapture {
     Forwarded(OverlayPresentationReceipt),
     /// Forward already-presented retained content without another original acknowledgement.
     Replay,
-    /// Consume this obsolete or resource-limited delivery without forwarding it.
+    /// Consume this obsolete or permanently oversized delivery without forwarding it.
     ///
     /// Release its original ingress allowance without reporting a source loss or presentation.
     Discard,
@@ -78,6 +78,28 @@ impl std::fmt::Debug for OverlayPresentationRoute {
             .finish_non_exhaustive()
     }
 }
+/// An immutable source-scene identity for retrying bounded capture.
+///
+/// Created by [`OverlayPresentationRoute::begin_capture`]. It reserves no receipt
+/// credit or encoded scene bytes. It cannot rebind to a replacement writer,
+/// resume, surface, channel or window scene, even when numeric IDs repeat.
+#[must_use = "capture this original attempt or discard the obsolete delivery"]
+pub struct OverlayPresentationAttempt {
+    state: Weak<Mutex<State>>,
+    alive: Weak<AtomicBool>,
+    credits: Arc<Mutex<Credits>>,
+    writer: Weak<Writer>,
+    source: BridgeSourceKey,
+    submission: Submission,
+    resume: u64,
+    origin: Weak<()>,
+}
+impl std::fmt::Debug for OverlayPresentationAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayPresentationAttempt")
+            .finish_non_exhaustive()
+    }
+}
 /// A one-shot downstream outcome bound to an original pending source submission.
 ///
 /// Neither cloneable nor retargetable. Completing a stale, replaced, resumed or
@@ -91,6 +113,7 @@ pub struct OverlayPresentationReceipt {
     source: BridgeSourceKey,
     submission: Submission,
     resume: u64,
+    origin: Weak<()>,
     _credit: Credit,
 }
 impl std::fmt::Debug for OverlayPresentationReceipt {
@@ -100,6 +123,14 @@ impl std::fmt::Debug for OverlayPresentationReceipt {
     }
 }
 impl VirtualVivid {
+    /// Counts temporary capture refusals for bounded developer pressure checks.
+    ///
+    /// This read-only counter saturates at `u64::MAX`; it grants no route or
+    /// scene authority and is absent from ordinary builds.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn overlay_presentation_blocked_captures(&self) -> u64 {
+        lock(&self.state).overlays.presentation_blocked_captures()
+    }
     /// Defers source presentation to one explicitly bound downstream relay.
     ///
     /// Host relaying must be enabled and no producer may have authenticated yet.
@@ -141,6 +172,7 @@ fn current(
     submission: Submission,
     writer: &Weak<Writer>,
     resume: u64,
+    origin: &Weak<()>,
 ) -> bool {
     state.sessions.get(&source.producer).is_some_and(|session| {
         !session.closed
@@ -169,6 +201,16 @@ fn current(
             .is_some_and(|track| {
                 track.state.channel_generation.get() == submission.channel_generation
             })
+        && window(source)
+            .and_then(|window| {
+                state.overlays.presentation_origin(
+                    window,
+                    source.track,
+                    submission.epoch,
+                    submission.revision,
+                )
+            })
+            .is_some_and(|(current, life)| current == submission && Weak::ptr_eq(&life, origin))
 }
 fn window(source: BridgeSourceKey) -> Option<vivid_protocol::identity::SurfaceIdentity> {
     super::super::overlay_host::owner(source.producer)
@@ -184,63 +226,78 @@ impl OverlayPresentationRoute {
     /// abandon it when that physical attachment is retired. Unforwarded frames may
     /// coalesce; accepted successors cannot retire a frame already forwarded.
     /// Four live copies per owner, 64 total copies, and the presenter's configured
-    /// aggregate retained-byte budget bound additional scene retention. A refused
-    /// frame is `Discard`, not an acknowledgement of physical presentation.
+    /// aggregate retained-byte budget bound additional scene retention. Temporary
+    /// capacity pressure leaves the current frame pending for retry. Obsolete or
+    /// permanently oversized frames are `Discard`, without presentation acknowledgement.
     ///
     /// # Errors
     /// Returns `BrokenPipe` after route retirement or original presenter destruction.
+    /// Returns `WouldBlock` while other live receipts consume the bounded owner,
+    /// global or retained-byte budget. Retry after downstream progress; no outcome
+    /// is resolved by that temporary refusal. Use [`Self::begin_capture`] and retain
+    /// its attempt when retrying across possible source lifecycle changes.
     pub fn capture(
         &self,
         source: BridgeSourceKey,
         epoch: u32,
         revision: u64,
     ) -> io::Result<OverlayPresentationCapture> {
+        match self.begin_capture(source, epoch, revision)? {
+            Some(attempt) => attempt.capture(),
+            None => Ok(OverlayPresentationCapture::Discard),
+        }
+    }
+    /// Pins an original scene before a potentially delayed capture attempt.
+    ///
+    /// Returns `None` for an obsolete source or scene. Retain the returned attempt
+    /// across `WouldBlock` and retry its `capture` method. Starting another attempt
+    /// would classify the then-current source rather than preserve the original.
+    /// The attempt holds only weak origin references and reserves no copy credit.
+    ///
+    /// # Errors
+    /// Returns `BrokenPipe` after route retirement or original presenter destruction.
+    pub fn begin_capture(
+        &self,
+        source: BridgeSourceKey,
+        epoch: u32,
+        revision: u64,
+    ) -> io::Result<Option<OverlayPresentationAttempt>> {
         let state = self
             .state
             .upgrade()
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
-        let mut state = lock(&state);
+        let state = lock(&state);
         if !self.alive.load(Ordering::Acquire) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         let Some(window) = window(source) else {
-            return Ok(OverlayPresentationCapture::Discard);
+            return Ok(None);
         };
-        let Some(submission) =
+        let Some((submission, origin)) =
             state
                 .overlays
-                .presentation_submission(window, source.track, epoch, revision)
+                .presentation_origin(window, source.track, epoch, revision)
         else {
-            return Ok(OverlayPresentationCapture::Discard);
+            return Ok(None);
         };
         let Some(session) = state.sessions.get(&source.producer) else {
-            return Ok(OverlayPresentationCapture::Discard);
+            return Ok(None);
         };
         let writer = Arc::downgrade(&session.writer);
         let resume = session.resume_generation;
-        if !current(&state, source, submission, &writer, resume) {
-            return Ok(OverlayPresentationCapture::Discard);
+        if !current(&state, source, submission, &writer, resume, &origin) {
+            return Ok(None);
         }
-        let credit = Credit::acquire(&self.credits, source.producer);
-        let claim = state
-            .overlays
-            .claim_presentation(window, submission, credit.is_some());
-        flush_overlay_lane(&mut state, source.producer);
-        Ok(match claim {
-            PresentationClaim::Replay => OverlayPresentationCapture::Replay,
-            PresentationClaim::Discard => OverlayPresentationCapture::Discard,
-            PresentationClaim::Forwarded => {
-                OverlayPresentationCapture::Forwarded(OverlayPresentationReceipt {
-                    state: self.state.clone(),
-                    alive: Arc::downgrade(&self.alive),
-                    writer,
-                    source,
-                    submission,
-                    resume,
-                    _credit: credit.expect("forwarded frame reserved a credit"),
-                })
-            }
-        })
+        Ok(Some(OverlayPresentationAttempt {
+            state: self.state.clone(),
+            alive: Arc::downgrade(&self.alive),
+            credits: Arc::clone(&self.credits),
+            writer,
+            source,
+            submission,
+            resume,
+            origin,
+        }))
     }
     /// Returns an idempotent cancellation hook for route retirement.
     pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
@@ -265,6 +322,80 @@ impl Drop for OverlayPresentationRoute {
         self.cancel_handle()();
     }
 }
+impl OverlayPresentationAttempt {
+    /// Compares the complete original scene occurrence without granting capture authority.
+    ///
+    /// Includes presenter, owner, writer, resume, channel/submission and opaque
+    /// scene lifetime. Equal numeric IDs or revisions alone cannot match a
+    /// replacement occurrence. Equality does not prove either attempt is still
+    /// live; continue using `capture` for original-incarnation admission.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.state, &other.state)
+            && Weak::ptr_eq(&self.writer, &other.writer)
+            && Weak::ptr_eq(&self.alive, &other.alive)
+            && Weak::ptr_eq(&self.origin, &other.origin)
+            && self.source == other.source
+            && self.submission == other.submission
+            && self.resume == other.resume
+    }
+    /// Captures this original scene without reclassifying its numeric IDs.
+    ///
+    /// A replacement or superseded scene returns `Discard` without mutating the
+    /// replacement. A successful copy retains the original identity through its
+    /// physical outcome. Already-presented content may return `Replay`.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` for temporary receipt or byte pressure; retry this same
+    /// attempt after downstream progress. Returns `BrokenPipe` after route or
+    /// presenter retirement. This method performs no waiting or transport I/O.
+    pub fn capture(&self) -> io::Result<OverlayPresentationCapture> {
+        let (Some(shared), Some(alive)) = (self.state.upgrade(), self.alive.upgrade()) else {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        };
+        let mut state = lock(&shared);
+        if !alive.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        if !current(
+            &state,
+            self.source,
+            self.submission,
+            &self.writer,
+            self.resume,
+            &self.origin,
+        ) {
+            return Ok(OverlayPresentationCapture::Discard);
+        }
+        let window = window(self.source).expect("validated original window identity");
+        let credit = Credit::acquire(&self.credits, self.source.producer);
+        let claim = state
+            .overlays
+            .claim_presentation(window, self.submission, credit.is_some());
+        flush_overlay_lane(&mut state, self.source.producer);
+        Ok(match claim {
+            PresentationClaim::Blocked => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "overlay presentation capacity is full",
+                ));
+            }
+            PresentationClaim::Replay => OverlayPresentationCapture::Replay,
+            PresentationClaim::Discard => OverlayPresentationCapture::Discard,
+            PresentationClaim::Forwarded => {
+                OverlayPresentationCapture::Forwarded(OverlayPresentationReceipt {
+                    state: self.state.clone(),
+                    alive: self.alive.clone(),
+                    writer: self.writer.clone(),
+                    source: self.source,
+                    submission: self.submission,
+                    resume: self.resume,
+                    origin: self.origin.clone(),
+                    _credit: credit.expect("forwarded frame reserved a credit"),
+                })
+            }
+        })
+    }
+}
 impl OverlayPresentationReceipt {
     /// Retires a physical copy without inventing an original display outcome.
     ///
@@ -284,6 +415,7 @@ impl OverlayPresentationReceipt {
                 self.submission,
                 &self.writer,
                 self.resume,
+                &self.origin,
             )
         {
             return false;
@@ -311,6 +443,7 @@ impl OverlayPresentationReceipt {
                 self.submission,
                 &self.writer,
                 self.resume,
+                &self.origin,
             )
         {
             return false;
@@ -334,7 +467,7 @@ mod tests {
         OverlaySession, OverlayWindow, OverlayWindowOptions, ProducerAuthentication, ProducerConfig,
     };
     use vivid_protocol::vector::{Canvas, Rect};
-    fn captured(
+    pub(super) fn captured(
         route: &OverlayPresentationRoute,
         source: BridgeSourceKey,
         epoch: u32,
@@ -345,7 +478,7 @@ mod tests {
             other => panic!("expected forwarded capture, got {other:?}"),
         }
     }
-    fn connect(presenter: &VirtualVivid, pane: u64) -> OverlaySession {
+    pub(super) fn connect(presenter: &VirtualVivid, pane: u64) -> OverlaySession {
         presenter.update_metrics(pane, 80, 24, (8, 16));
         let secret = presenter.issue_pane_capability(pane).unwrap();
         let endpoint = presenter.endpoint();
@@ -359,14 +492,14 @@ mod tests {
         })
         .unwrap()
     }
-    fn accepted(window: &OverlayWindow, revision: u64) {
+    pub(super) fn accepted(window: &OverlayWindow, revision: u64) {
         let end = Instant::now() + Duration::from_secs(3);
         while window.reconcile().unwrap().accepted_revision < revision {
             assert!(Instant::now() < end, "source acceptance stalled");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    fn key(presenter: &VirtualVivid, pane: u64) -> BridgeSourceKey {
+    pub(super) fn key(presenter: &VirtualVivid, pane: u64) -> BridgeSourceKey {
         presenter
             .inspect_projection_snapshot_with_viewports(&HashSet::from([pane]), &Default::default())
             .sources[0]
@@ -486,13 +619,14 @@ mod tests {
         }
         let refused = a.submit(Canvas::new()).unwrap();
         accepted(&a, 6);
-        assert!(matches!(
-            route.capture(ka, 1, 6).unwrap(),
-            OverlayPresentationCapture::Discard
-        ));
         assert_eq!(
-            refused.wait(Duration::from_secs(3)).unwrap(),
-            Some(PresentationOutcome::Superseded)
+            route.capture(ka, 1, 6).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            refused.wait(Duration::ZERO).unwrap(),
+            None,
+            "temporary receipt pressure resolved the current scene"
         );
         assert!(
             matches!(
@@ -508,6 +642,11 @@ mod tests {
         );
         let newest_held = held.pop().unwrap();
         assert!(newest_held.complete(PresentationOutcome::Presented));
+        assert!(captured(&route, ka, 1, 6).complete(PresentationOutcome::Presented));
+        assert_eq!(
+            refused.wait(Duration::from_secs(3)).unwrap(),
+            Some(PresentationOutcome::Presented)
+        );
         assert!(
             matches!(
                 route.capture(ka, 1, 2).unwrap(),
@@ -605,19 +744,23 @@ mod tests {
         }
         let refused = b.submit(Canvas::new()).unwrap();
         accepted(&b, 3);
-        assert!(matches!(
-            route.capture(key(&presenter, 2), 1, 3).unwrap(),
-            OverlayPresentationCapture::Discard
-        ));
         assert_eq!(
-            refused.wait(Duration::from_secs(3)).unwrap(),
-            Some(PresentationOutcome::Superseded)
+            route.capture(key(&presenter, 2), 1, 3).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
+        assert_eq!(refused.wait(Duration::ZERO).unwrap(), None);
         b.set_bounds(Rect::new(4., 4., 40., 40.).unwrap()).unwrap();
         assert_eq!(b.bounds().unwrap().origin.x.get(), 4.);
         for receipt in held {
             receipt.complete(PresentationOutcome::Superseded);
         }
+        assert!(
+            captured(&route, key(&presenter, 2), 1, 3).complete(PresentationOutcome::Presented)
+        );
+        assert_eq!(
+            refused.wait(Duration::from_secs(3)).unwrap(),
+            Some(PresentationOutcome::Presented)
+        );
         let fresh = b.submit(Canvas::new()).unwrap();
         accepted(&b, 4);
         assert!(
@@ -724,3 +867,7 @@ mod tests {
         presenter.shutdown();
     }
 }
+
+#[cfg(test)]
+#[path = "overlay_presentation_attempt_tests.rs"]
+mod attempt_tests;

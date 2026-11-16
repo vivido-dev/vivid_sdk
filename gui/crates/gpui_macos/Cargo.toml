@@ -26,7 +26,8 @@ gpui.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accesskit.workspace = true
-accesskit_macos.workspace = true
+# This adapter must share the framework's accesskit 0.24 tree/action types.
+accesskit_macos = "0.26"
 anyhow.workspace = true
 block2.workspace = true
 collections.workspace = true

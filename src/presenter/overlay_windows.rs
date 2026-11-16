@@ -21,6 +21,8 @@ const MAX_PANES: usize = 64;
 pub(super) struct PaneWindows {
     owners: BTreeMap<SessionIdentity, PaneId>,
     panes: BTreeMap<PaneId, overlay::Windows>,
+    // Route policy may be tighter than the protocol's aggregate window budget.
+    capacity: Option<usize>,
 }
 impl PaneWindows {
     pub fn bind(&mut self, owner: SessionIdentity, pane: PaneId) -> Result<(), InvalidScene> {
@@ -82,9 +84,25 @@ impl PaneWindows {
         self.for_owner(owner)
             .is_some_and(|windows| windows.has_owner(owner))
     }
+    pub fn stacked(&self) -> impl Iterator<Item = &Window> {
+        self.panes.values().flat_map(overlay::Windows::stacked)
+    }
     #[cfg(any(test, feature = "vector-render"))]
     pub fn visible(&self) -> impl Iterator<Item = &Window> {
         self.panes.values().flat_map(overlay::Windows::visible)
+    }
+    pub fn set_capacity(&mut self, maximum: usize) -> Result<(), InvalidScene> {
+        if maximum == 0 || maximum > overlay::MAX_WINDOWS || self.window_count() > maximum {
+            return Err(InvalidScene::new("invalid overlay window capacity"));
+        }
+        self.capacity = Some(maximum);
+        Ok(())
+    }
+    fn window_count(&self) -> usize {
+        self.panes
+            .values()
+            .map(overlay::Windows::window_count)
+            .sum()
     }
     pub fn create(
         &mut self,
@@ -92,13 +110,7 @@ impl PaneWindows {
         generation: u64,
         options: WindowOptions,
     ) -> Result<(), InvalidScene> {
-        if self
-            .panes
-            .values()
-            .map(overlay::Windows::window_count)
-            .sum::<usize>()
-            >= overlay::MAX_WINDOWS
-        {
+        if self.window_count() >= self.capacity.unwrap_or(overlay::MAX_WINDOWS) {
             return Err(InvalidScene::new("overlay window capacity exhausted"));
         }
         self.owner_capacity(id.context().session())?;
@@ -189,6 +201,10 @@ impl PaneWindows {
             return;
         }
         self.panes.entry(pane).or_default().set_pane_focus(focused);
+    }
+    pub fn take_overflow(&mut self, owner: SessionIdentity) -> bool {
+        self.for_owner_mut(owner)
+            .is_ok_and(|windows| windows.take_overflow(owner))
     }
     pub fn take_event(&mut self, owner: SessionIdentity) -> Option<WindowEvent> {
         self.for_owner_mut(owner).ok()?.take_event(owner)
@@ -332,5 +348,30 @@ mod tests {
                 .is_err()
         );
         assert_eq!(windows.visible().count(), overlay::MAX_WINDOWS);
+    }
+    #[test]
+    fn route_capacity_rejects_overflow_and_preserves_reused_peer_ids() {
+        let mut windows = PaneWindows::default();
+        windows.set_capacity(2).unwrap();
+        assert!(windows.set_capacity(0).is_err());
+        assert!(windows.set_capacity(overlay::MAX_WINDOWS + 1).is_err());
+        let a = owner(1).context(1).unwrap().surface(1).unwrap();
+        let b = owner(2).context(1).unwrap().surface(1).unwrap();
+        windows.bind(owner(1), 1).unwrap();
+        windows.bind(owner(2), 2).unwrap();
+        windows.create(a, 1, options()).unwrap();
+        windows.create(b, 1, options()).unwrap();
+        assert!(windows.set_capacity(1).is_err());
+        let extra = owner(1).context(1).unwrap().surface(2).unwrap();
+        assert!(windows.create(extra, 1, options()).is_err());
+        assert_eq!(windows.get(a).unwrap().options, options());
+        assert_eq!(windows.get(b).unwrap().options, options());
+        windows.close(a, DismissReason::Closed);
+        windows.create(extra, 1, options()).unwrap();
+        assert!(windows.get(a).is_none());
+        assert!(windows.get(extra).is_some());
+        assert_eq!(windows.get(b).unwrap().options, options());
+        assert!(windows.create(a, 2, options()).is_err());
+        assert_eq!(windows.window_count(), 2);
     }
 }
