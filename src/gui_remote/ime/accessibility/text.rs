@@ -218,10 +218,10 @@ impl Selection {
             let Some(mut i) = entries.iter().position(|n| n.id == id) else {
                 return false;
             };
-            if !entries[i]
+            if entries[i]
                 .run
                 .as_ref()
-                .is_some_and(|r| offset <= r.lengths.len())
+                .is_none_or(|r| offset > r.lengths.len())
             {
                 return false;
             }

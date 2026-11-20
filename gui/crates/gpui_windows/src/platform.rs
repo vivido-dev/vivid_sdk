@@ -1027,11 +1027,82 @@ impl Platform for WindowsPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        write_to_clipboard(item);
+        write_to_clipboard(item, self.handle);
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
+    }
+
+    fn supports_uri_list_clipboard(&self) -> bool {
+        true
+    }
+
+    fn key_repeat_timing(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let mut delay = 0u32;
+        let mut speed = 0u32;
+        // SAFETY: these read-only SPI calls receive correctly sized live u32s.
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETKEYBOARDDELAY,
+                0,
+                Some((&mut delay as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+            )
+            .ok()?;
+            SystemParametersInfoW(
+                SPI_GETKEYBOARDSPEED,
+                0,
+                Some((&mut speed as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+            )
+            .ok()?;
+        }
+        if delay > 3 || speed > 31 {
+            return None;
+        }
+        Some((
+            std::time::Duration::from_millis(u64::from(delay + 1) * 250),
+            std::time::Duration::from_secs_f64(1.0 / (2.5 + f64::from(speed) * 27.5 / 31.0)),
+        ))
+    }
+
+    fn read_clipboard_text_async(
+        &self,
+        selection: ClipboardSelection,
+        max_bytes: usize,
+    ) -> Task<std::result::Result<Option<String>, ClipboardReadError>> {
+        if selection != ClipboardSelection::Clipboard || max_bytes > 1024 * 1024 {
+            return Task::ready(Err(ClipboardReadError::Unavailable));
+        }
+        crate::clipboard::read_bounded(&self.background_executor, move || {
+            crate::clipboard::read_text_bounded(max_bytes)
+        })
+    }
+
+    fn clipboard_has_file_list(&self) -> bool {
+        crate::clipboard::has_file_list()
+    }
+
+    fn read_clipboard_uri_list_async(
+        &self,
+        max_bytes: usize,
+    ) -> Task<std::result::Result<Option<String>, ClipboardReadError>> {
+        if max_bytes > MAX_CLIPBOARD_URI_BYTES {
+            return Task::ready(Err(ClipboardReadError::Unavailable));
+        }
+        crate::clipboard::read_bounded(&self.background_executor, move || {
+            crate::clipboard::read_files_bounded(max_bytes)
+        })
+    }
+
+    fn read_clipboard_media_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardPasteMedia>, ClipboardReadError>> {
+        crate::clipboard::read_bounded(
+            &self.background_executor,
+            crate::clipboard::read_media_bounded,
+        )
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
@@ -2000,6 +2071,45 @@ mod tests {
 
     #[test]
     fn test_clipboard() {
+        use gpui::{
+            ClipboardEntry, ClipboardPasteMedia, ExternalPaths, Image, ImageFormat,
+            MAX_CLIPBOARD_URI_BYTES, parse_file_uri_list,
+        };
+        use std::path::PathBuf;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        use windows::core::w;
+        // SAFETY: create a private, hidden built-in window for clipboard ownership.
+        let owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("clipboard test"),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let write_to_clipboard = |item| write_to_clipboard(item, owner);
+        let read_from_clipboard = || {
+            // Native clipboard viewers may briefly lock a newly published offer.
+            // Retrying this test observation does not repeat a clipboard mutation.
+            for _ in 0..100 {
+                if let Some(item) = read_from_clipboard() {
+                    return Some(item);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            None
+        };
         let item = ClipboardItem::new_string("你好，我是张小白".to_string());
         write_to_clipboard(item.clone());
         assert_eq!(read_from_clipboard(), Some(item));
@@ -2022,5 +2132,57 @@ mod tests {
                 vec![12],
             )),
         );
+        let item = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                vec![
+                    PathBuf::from(r"C:\Users\Public\é 文.png"),
+                    PathBuf::from(r"D:\second.txt"),
+                ]
+                .into(),
+            ))],
+        };
+        write_to_clipboard(item);
+        assert!(crate::clipboard::has_file_list());
+        let uris = crate::clipboard::read_files_bounded(MAX_CLIPBOARD_URI_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_file_uri_list(&uris, MAX_CLIPBOARD_URI_BYTES)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(crate::clipboard::read_files_bounded(1).is_err());
+        let invalid = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                vec![PathBuf::from("relative")].into(),
+            ))],
+        };
+        write_to_clipboard(invalid);
+        assert_eq!(
+            crate::clipboard::read_files_bounded(MAX_CLIPBOARD_URI_BYTES).unwrap(),
+            Some(uris)
+        );
+        let mut png = std::io::Cursor::new(Vec::new());
+        let pixels = image::RgbaImage::from_raw(2, 1, vec![1, 2, 3, 255, 9, 8, 7, 128]).unwrap();
+        pixels.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            png.into_inner(),
+        )));
+        assert!(!crate::clipboard::has_file_list());
+        let Some(ClipboardPasteMedia::Image(image)) =
+            crate::clipboard::read_media_bounded().unwrap()
+        else {
+            panic!("missing native image")
+        };
+        assert_eq!(
+            image::load_from_memory(&image.into_bytes())
+                .unwrap()
+                .to_rgba8(),
+            pixels
+        );
+        // SAFETY: this test owns the window and all clipboard guards have closed.
+        unsafe { DestroyWindow(owner) }.unwrap();
     }
 }

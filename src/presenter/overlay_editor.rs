@@ -60,10 +60,10 @@ impl Overlays {
             || !self.input_enabled(session)
             || !self.windows.input_eligible(id)
             || self.windows.focus_of(id) != Some(id)
-            || !self
+            || self
                 .displayed
                 .get(&id)
-                .is_some_and(|s| s.revision == request.scene_revision)
+                .is_none_or(|s| s.revision != request.scene_revision)
         {
             return Err("editor context requires the focused displayed scene");
         }

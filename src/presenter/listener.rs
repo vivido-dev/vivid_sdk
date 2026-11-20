@@ -27,6 +27,11 @@ pub trait PresenterListener: Send + 'static {
 }
 
 impl Transport {
+    /// Wraps accepted I/O with framing deadlines and connection cancellation.
+    ///
+    /// The timeout callback must configure the actual reader handle. On Windows,
+    /// reads use bounded waits to observe cancellation even while the peer remains
+    /// connected; timed-out partial records resume without discarding their bytes.
     pub fn new(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
@@ -38,6 +43,8 @@ impl Transport {
             inner: reader,
             timeout: timeout.clone(),
             deadline: deadline.clone(),
+            #[cfg(windows)]
+            cancel: cancel.clone(),
         });
         Self {
             reader,
@@ -68,25 +75,73 @@ struct DeadlineReader {
     inner: Box<dyn Read + Send>,
     timeout: Arc<dyn Fn(Option<Duration>) -> io::Result<()> + Send + Sync>,
     deadline: Arc<Mutex<Option<Instant>>>,
+    #[cfg(windows)]
+    cancel: ConnectionCancel,
 }
 
 impl Read for DeadlineReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let deadline = *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(deadline) = deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Vivid handshake deadline expired",
-                ));
-            }
-            (self.timeout)(Some(remaining))?;
+        #[cfg(windows)]
+        {
+            self.read_cancellable(buffer)
         }
-        self.inner.read(buffer)
+
+        #[cfg(not(windows))]
+        {
+            let deadline = *self
+                .deadline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Vivid handshake deadline expired",
+                    ));
+                }
+                (self.timeout)(Some(remaining))?;
+            }
+            self.inner.read(buffer)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl DeadlineReader {
+    fn read_cancellable(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // Winsock shutdown on a cloned socket does not wake an already blocked
+        // receive. Bound each read and observe cancellation between attempts.
+        // Retrying here preserves partial headers/bodies inside read_exact.
+        loop {
+            if self.cancel.inner.cancelled.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let deadline = *self
+                .deadline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut timeout = Duration::from_millis(100);
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Vivid handshake deadline expired",
+                    ));
+                }
+                timeout = timeout.min(remaining);
+            }
+            (self.timeout)(Some(timeout))?;
+            match self.inner.read(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
     }
 }
 
@@ -188,5 +243,42 @@ mod tests {
             reader.read_exact(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cancel_wakes_idle_tcp_reader_and_preserves_partial_reads() {
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+
+        let listener = super::super::SocketListener::bind("tcp:127.0.0.1:0").unwrap();
+        let endpoint = listener.endpoint();
+        let mut peer = TcpStream::connect(endpoint.strip_prefix("tcp:").unwrap()).unwrap();
+        let transport = listener.accept().unwrap();
+        let cancel = transport.cancel();
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut reader = transport.reader;
+            let mut bytes = [0; 2];
+            reader.read_exact(&mut bytes).unwrap();
+            send.send(Ok(bytes)).unwrap();
+            let error = reader.read_exact(&mut bytes).unwrap_err();
+            send.send(Err(error.kind())).unwrap();
+        });
+        peer.write_all(b"a").unwrap();
+        // Cross a polling timeout with an incomplete record still in read_exact.
+        std::thread::sleep(Duration::from_millis(150));
+        peer.write_all(b"b").unwrap();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(*b"ab")
+        );
+        cancel.cancel();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(io::ErrorKind::ConnectionAborted | io::ErrorKind::UnexpectedEof)
+        ));
+        worker.join().unwrap();
+        drop(peer);
     }
 }

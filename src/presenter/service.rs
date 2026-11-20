@@ -9872,22 +9872,7 @@ mod tests {
                 ));
             }
             stream.set_nonblocking(false)?;
-            stream.set_nodelay(true)?;
-            let reader = stream.try_clone()?;
-            let timeout_stream = stream.try_clone()?;
-            let cancel_reader = stream.try_clone()?;
-            let cancel_writer = stream.try_clone()?;
-            let cancel = crate::presenter::ConnectionCancel::new(move || {
-                let _ = cancel_reader.shutdown(std::net::Shutdown::Both);
-                let _ = cancel_writer.shutdown(std::net::Shutdown::Both);
-            });
-            let timeout = Arc::new(move |value| timeout_stream.set_read_timeout(value));
-            Ok(Transport::new(
-                Box::new(reader),
-                Box::new(stream),
-                cancel,
-                timeout,
-            ))
+            super::super::socket::tcp_transport(stream)
         }
     }
 

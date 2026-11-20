@@ -96,7 +96,8 @@ fn main() -> io::Result<()> {
         "GUI runtime stopped before verification",
     ))));
     let result_slot = gui_result.clone();
-    vivid_sdk::gui_platform::headless().run(move |cx| {
+    let platform = vivid_sdk::gui_platform::current_platform(!cfg!(target_os = "windows"));
+    gui::Application::with_platform(platform).run(move |cx| {
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(

@@ -60,6 +60,7 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
+    pub physical_character_key: Cell<Option<(u16, Modifiers)>>,
     pub hovered: Cell<bool>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
@@ -175,6 +176,7 @@ impl WindowsWindowState {
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
+            physical_character_key: Cell::new(None),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             last_visibility: Cell::new(None),
@@ -584,6 +586,23 @@ impl WindowsWindow {
             }
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
+            // Hidden producer windows still need real client geometry. Waiting
+            // until ShowWindow leaves CW_USEDEFAULT in their logical size and
+            // makes the first offscreen frame invalid. Apply bounds without
+            // showing or activating the window; WM_SIZE updates the renderer.
+            let rect = placement.rcNormalPosition;
+            // SAFETY: hwnd is owned by this window and rect is native placement data.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                )?;
+            }
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,
                 state: WindowOpenState::Windowed,
@@ -670,7 +689,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -706,6 +725,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn modifiers(&self) -> Modifiers {
         current_modifiers()
+    }
+
+    fn physical_character_key(&self) -> Option<(u16, Modifiers)> {
+        self.0.state.physical_character_key.get()
     }
 
     fn capslock(&self) -> Capslock {

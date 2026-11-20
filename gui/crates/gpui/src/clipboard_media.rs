@@ -44,6 +44,7 @@ impl ClipboardPng {
             ImageFormat::Png => image::ImageFormat::Png,
             ImageFormat::Tiff => image::ImageFormat::Tiff,
             ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+            ImageFormat::Bmp => image::ImageFormat::Bmp,
             _ => return Err(invalid),
         };
         let mut limits = image::Limits::default();

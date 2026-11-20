@@ -278,7 +278,11 @@ pub fn run<V: Render + 'static>(
         }
     };
     let app_state = shared.clone();
-    crate::gui_platform::headless().run(move |cx| {
+    // Windows' truly headless platform has neither native windows nor a text
+    // system. Raster producers need a hidden native window and DirectWrite;
+    // `show: false` below keeps that producer window off the desktop.
+    let platform = crate::gui_platform::current_platform(!cfg!(target_os = "windows"));
+    gui::Application::with_platform(platform).run(move |cx| {
         // The native producer window is hidden. Draw prompts into the published canvas.
         cx.set_prompt_builder(gui::fallback_prompt_renderer);
         let services = std::rc::Rc::new(clipboard);
@@ -332,11 +336,22 @@ pub fn run<V: Render + 'static>(
                         return Ok(());
                     };
                     if changed {
-                        window.resize(gui::size(
+                        let requested_size = gui::size(
                             gui::px(requested.width as f32),
                             gui::px(requested.height as f32),
-                        ));
+                        );
+                        window.resize(requested_size);
                         window.bounds_changed(cx);
+                        // Windows applies native resize on a later GUI turn.
+                        // Do not label pixels from the old canvas with the new geometry.
+                        let actual = window.viewport_size();
+                        let scale = window.scale_factor();
+                        if (f32::from(actual.width - requested_size.width) * scale).abs() > 1.0
+                            || (f32::from(actual.height - requested_size.height) * scale).abs()
+                                > 1.0
+                        {
+                            return Ok(());
+                        }
                         geometry = Some(requested);
                     }
                     let arena = window.needs_draw().then(|| window.draw(cx));

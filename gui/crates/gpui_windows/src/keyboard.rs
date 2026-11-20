@@ -2,8 +2,9 @@ use anyhow::Result;
 use collections::HashMap;
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
-        GetKeyboardLayoutNameW, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MapVirtualKeyW, ToUnicode,
-        VIRTUAL_KEY, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9, VK_ABNT_C1,
+        GetKeyboardLayout, GetKeyboardLayoutNameW, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC,
+        MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, MapVirtualKeyW, ToUnicode, ToUnicodeEx, VIRTUAL_KEY,
+        VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9, VK_ABNT_C1, VK_CAPITAL,
         VK_CONTROL, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
         VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_SHIFT,
     },
@@ -17,6 +18,7 @@ use gpui::{
 pub(crate) struct WindowsKeyboardLayout {
     id: String,
     name: String,
+    keys: Vec<gpui::KeyboardCharacterKey>,
 }
 
 pub(crate) struct WindowsKeyboardMapper {
@@ -32,6 +34,10 @@ impl PlatformKeyboardLayout for WindowsKeyboardLayout {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn character_keys(&self) -> Vec<gpui::KeyboardCharacterKey> {
+        self.keys.clone()
     }
 }
 
@@ -99,15 +105,129 @@ impl WindowsKeyboardLayout {
             "System\\CurrentControlSet\\Control\\Keyboard Layouts\\{id}"
         ))?;
         let name = entry.get_string("Layout Text")?;
-        Ok(Self { id, name })
+        Ok(Self {
+            id,
+            name,
+            keys: character_keys(),
+        })
     }
 
     pub(crate) fn unknown() -> Self {
         Self {
             id: "unknown".to_string(),
             name: "unknown".to_string(),
+            keys: Vec::new(),
         }
     }
+}
+
+// Set-1 scan codes for printable USB keyboard positions. Extended navigation
+// keys are deliberately absent; the same table samples layouts and tags input.
+const CHARACTER_POSITIONS: &[(u16, u16)] = &[
+    (0x1e, 0x04),
+    (0x30, 0x05),
+    (0x2e, 0x06),
+    (0x20, 0x07),
+    (0x12, 0x08),
+    (0x21, 0x09),
+    (0x22, 0x0a),
+    (0x23, 0x0b),
+    (0x17, 0x0c),
+    (0x24, 0x0d),
+    (0x25, 0x0e),
+    (0x26, 0x0f),
+    (0x32, 0x10),
+    (0x31, 0x11),
+    (0x18, 0x12),
+    (0x19, 0x13),
+    (0x10, 0x14),
+    (0x13, 0x15),
+    (0x1f, 0x16),
+    (0x14, 0x17),
+    (0x16, 0x18),
+    (0x2f, 0x19),
+    (0x11, 0x1a),
+    (0x2d, 0x1b),
+    (0x15, 0x1c),
+    (0x2c, 0x1d),
+    (0x02, 0x1e),
+    (0x03, 0x1f),
+    (0x04, 0x20),
+    (0x05, 0x21),
+    (0x06, 0x22),
+    (0x07, 0x23),
+    (0x08, 0x24),
+    (0x09, 0x25),
+    (0x0a, 0x26),
+    (0x0b, 0x27),
+    (0x39, 0x2c),
+    (0x0c, 0x2d),
+    (0x0d, 0x2e),
+    (0x1a, 0x2f),
+    (0x1b, 0x30),
+    (0x2b, 0x31),
+    (0x27, 0x33),
+    (0x28, 0x34),
+    (0x29, 0x35),
+    (0x33, 0x36),
+    (0x34, 0x37),
+    (0x35, 0x38),
+    (0x56, 0x64),
+];
+
+pub(crate) fn character_usage(scan: u16) -> Option<u16> {
+    CHARACTER_POSITIONS
+        .iter()
+        .find_map(|&(code, usage)| (code == scan).then_some(usage))
+}
+
+fn character_keys() -> Vec<gpui::KeyboardCharacterKey> {
+    // SAFETY: zero selects this GUI thread's current layout; the handle is borrowed.
+    let layout = unsafe { GetKeyboardLayout(0) };
+    CHARACTER_POSITIONS
+        .iter()
+        .map(|&(scan, usage)| {
+            // SAFETY: mapping a scalar scan code does not mutate keyboard state.
+            let vkey =
+                unsafe { MapVirtualKeyExW(u32::from(scan), MAPVK_VSC_TO_VK_EX, Some(layout)) };
+            let sample = |shift: bool, altgr: bool, caps: bool| {
+                let mut state = [0u8; 256];
+                state[VK_SHIFT.0 as usize] = if shift { 0x80 } else { 0 };
+                state[VK_CONTROL.0 as usize] = if altgr { 0x80 } else { 0 };
+                state[VK_MENU.0 as usize] = if altgr { 0x80 } else { 0 };
+                state[VK_CAPITAL.0 as usize] = u8::from(caps);
+                let mut buffer = [0u16; 16];
+                // SAFETY: bounded arrays live through the call. Bit 2 prevents
+                // sampling dead keys from changing the thread's keyboard state.
+                let length = unsafe {
+                    ToUnicodeEx(vkey, u32::from(scan), &state, &mut buffer, 4, Some(layout))
+                };
+                usize::try_from(length)
+                    .ok()
+                    .filter(|&n| n > 0 && n <= buffer.len())
+                    .and_then(|n| String::from_utf16(&buffer[..n]).ok())
+                    .filter(|text| !text.chars().any(char::is_control))
+                    .unwrap_or_default()
+            };
+            gpui::KeyboardCharacterKey {
+                usage,
+                layers: [
+                    sample(false, false, false),
+                    sample(true, false, false),
+                    sample(false, true, false),
+                    sample(true, true, false),
+                    sample(false, false, false),
+                    sample(true, false, false),
+                ],
+                caps_lock_layers: Some([
+                    sample(false, false, true),
+                    sample(true, false, true),
+                    sample(false, true, true),
+                    sample(true, true, true),
+                ]),
+            }
+        })
+        .collect()
 }
 
 impl WindowsKeyboardMapper {
@@ -318,6 +438,23 @@ const CANDIDATE_VKEYS: &[VIRTUAL_KEY] = &[
 mod tests {
     use crate::WindowsKeyboardMapper;
     use gpui::{Keystroke, Modifiers, PlatformKeyboardMapper};
+
+    #[test]
+    fn printable_positions_are_unique_and_exclude_extended_keys() {
+        let mut scans = std::collections::HashSet::new();
+        let mut usages = std::collections::HashSet::new();
+        for &(scan, usage) in super::CHARACTER_POSITIONS {
+            assert!(scans.insert(scan));
+            assert!(usages.insert(usage));
+            assert_eq!(super::character_usage(scan), Some(usage));
+            assert_eq!(super::character_usage(scan | 0x100), None);
+        }
+        assert_eq!(super::character_usage(0x1e), Some(0x04));
+        assert_eq!(super::character_usage(0x39), Some(0x2c));
+        let keys = super::character_keys();
+        assert_eq!(keys.len(), scans.len());
+        assert!(keys.iter().all(|key| key.caps_lock_layers.is_some()));
+    }
 
     #[test]
     fn test_keyboard_mapper() {

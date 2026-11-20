@@ -10,7 +10,7 @@
 //! them: `unix:/absolute/path` or `tcp:host:port`.
 
 use std::io;
-use std::net::{Shutdown, TcpListener};
+use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 #[cfg(unix)]
@@ -122,18 +122,7 @@ impl PresenterListener for SocketListener {
         match &self.kind {
             Bound::Tcp(listener) => {
                 let (stream, _) = listener.accept()?;
-                stream.set_nodelay(true)?;
-                let reader = stream.try_clone()?;
-                let deadline = stream.try_clone()?;
-                let cancel = stream.try_clone()?;
-                Ok(Transport::new(
-                    Box::new(reader),
-                    Box::new(stream),
-                    ConnectionCancel::new(move || {
-                        let _ = cancel.shutdown(Shutdown::Both);
-                    }),
-                    Arc::new(move |timeout| deadline.set_read_timeout(timeout)),
-                ))
+                tcp_transport(stream)
             }
             #[cfg(unix)]
             Bound::Unix { listener, .. } => {
@@ -152,6 +141,32 @@ impl PresenterListener for SocketListener {
             }
         }
     }
+}
+
+struct TcpReader(Arc<TcpStream>);
+
+impl io::Read for TcpReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buffer)
+    }
+}
+
+pub(super) fn tcp_transport(stream: TcpStream) -> io::Result<Transport> {
+    stream.set_nodelay(true)?;
+    let writer = stream.try_clone()?;
+    let reader = Arc::new(stream);
+    let cancel = reader.clone();
+    let deadline = reader.clone();
+    // Windows receive timeouts must be set on the actual reader socket, not
+    // another Winsock handle produced by TcpStream::try_clone.
+    Ok(Transport::new(
+        Box::new(TcpReader(reader)),
+        Box::new(writer),
+        ConnectionCancel::new(move || {
+            let _ = cancel.shutdown(Shutdown::Both);
+        }),
+        Arc::new(move |timeout| deadline.set_read_timeout(timeout)),
+    ))
 }
 
 #[cfg(test)]

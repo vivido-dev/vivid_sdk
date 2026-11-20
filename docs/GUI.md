@@ -44,7 +44,11 @@ Wayland/X11 server, but require a working GPU adapter or software Vulkan driver.
 There are no native frame or resize callbacks: drive `Window::draw` explicitly,
 clear its returned arena token after capture, and call `Window::bounds_changed`
 after a programmatic resize. macOS and Windows read back their native renderer;
-a hidden macOS window still uses AppKit and native system services. Windowed
+a hidden macOS window still uses AppKit and native system services. Windows
+raster producers use the native platform with `show: false`, retaining DirectWrite
+and the native Direct3D renderer; the fully headless Windows platform cannot open
+windows. Standalone test/offscreen renderer contexts use WGPU on Windows, as on
+Linux. These contexts do not qualify native window presentation timing. Windowed
 Linux capture and a native-window-free macOS backend are not provided here.
 
 The Rust-only [offscreen round trip](../examples/rust/gui_offscreen_roundtrip.rs)
@@ -190,6 +194,11 @@ keypad characters, including layouts with separate Command shortcuts.
 Launchers can install the same bounded map using `CharacterLayout::sample`
 and `configure`. Hosts without a map retain the basic US mapping. Pointer
 buttons, motion and scroll use the same authenticated input binding.
+Windows exports printable Set-1 scan-code positions, Shift/AltGr and Caps Lock
+layers from the active native layout. Sampling does not consume dead-key state.
+The compositor forwards live layout, lock-state and ordinary keyboard repeat
+policy changes through the same owner-scoped grant service. Physical IME,
+Filter Keys and live layout-switch acceptance remain separate platform checks.
 Native physical-key repeats are suppressed. The producer applies bounded local typematic:
 500 ms initial delay and 50 ms interval by default, with at most one repeat per
 GUI turn and no catch-up burst after a stall. Repeats pass through the ordinary

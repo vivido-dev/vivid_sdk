@@ -409,6 +409,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let _physical = PhysicalKey::new(&self.state, lparam);
         let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
             PlatformInput::KeyUp(KeyUpEvent { keystroke })
         })?;
@@ -424,6 +425,7 @@ impl WindowsWindowInner {
     // It's a known bug that you can't trigger `ctrl-shift-0`. See:
     // https://superuser.com/questions/1455762/ctrl-shift-number-key-combination-has-stopped-working-for-a-few-numbers
     pub(crate) fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let _physical = PhysicalKey::new(&self.state, lparam);
         let Some(input) = handle_key_event(
             wparam,
             lparam,
@@ -451,6 +453,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let _physical = PhysicalKey::new(&self.state, lparam);
         let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
             PlatformInput::KeyUp(KeyUpEvent { keystroke })
         }) else {
@@ -1516,6 +1519,30 @@ impl Drop for ImeContext {
         unsafe {
             ImmReleaseContext(self.hwnd, self.himc).ok().log_err();
         }
+    }
+}
+
+struct PhysicalKey<'a> {
+    slot: &'a std::cell::Cell<Option<(u16, Modifiers)>>,
+    previous: Option<(u16, Modifiers)>,
+}
+
+impl<'a> PhysicalKey<'a> {
+    fn new(state: &'a WindowsWindowState, lparam: LPARAM) -> Self {
+        let scan = ((lparam.0 >> 16) & 0x1ff) as u16;
+        let physical =
+            crate::keyboard::character_usage(scan).map(|usage| (usage, current_modifiers()));
+        let slot = &state.physical_character_key;
+        Self {
+            slot,
+            previous: slot.replace(physical),
+        }
+    }
+}
+
+impl Drop for PhysicalKey<'_> {
+    fn drop(&mut self) {
+        self.slot.set(self.previous);
     }
 }
 

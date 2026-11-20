@@ -119,13 +119,13 @@ pub fn current_headless_renderer() -> anyhow::Result<Option<Box<dyn gpui::Platfo
         )))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         gpui_wgpu::WgpuHeadlessRenderer::new()
             .map(|renderer| Some(Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Ok(None)
     }
