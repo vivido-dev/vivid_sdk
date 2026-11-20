@@ -50,7 +50,9 @@ fn receive(stream: &mut LocalStream) -> Message {
     local::receive(stream, MAX_FRAME, Instant::now() + BUDGET).unwrap()
 }
 fn request(host: &Host) -> bridge::Request {
-    let end = Instant::now() + BUDGET;
+    // Allow a child to schedule its *next* operation. Each admitted transfer
+    // still has its own one-second deadline.
+    let end = Instant::now() + STARTUP;
     loop {
         if let Some(request) = host.next_request() {
             return request;

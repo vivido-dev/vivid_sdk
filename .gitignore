@@ -31,3 +31,5 @@ node-bindings/index.d.ts
 dist/
 node_modules/
 bun.lock
+
+!vendor/vello-backend/src/debug/

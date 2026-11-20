@@ -24,11 +24,20 @@ impl ClipboardWrites {
         if bytes.len() > MAX_BYTES {
             return false;
         }
+        self.enqueue(fd, || bytes)
+    }
+
+    pub(crate) fn send_image(&self, fd: OwnedFd, bytes: &[u8]) -> bool {
+        bytes.len() <= gpui::MAX_CLIPBOARD_IMAGE_BYTES && self.enqueue(fd, || bytes.to_vec())
+    }
+
+    fn enqueue(&self, fd: OwnedFd, bytes: impl FnOnce() -> Vec<u8>) -> bool {
         let mut tasks = self.tasks.borrow_mut();
         tasks.retain(|task| !task.is_finished());
         if tasks.len() >= MAX_WRITES {
             return false;
         }
+        let bytes = bytes();
         let deadline = Instant::now() + WRITE_TIMEOUT;
         // Retain task handles: dropping the clipboard cancels every owned write.
         tasks.push(smol::spawn(async move {
@@ -100,6 +109,20 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn image_writes_preserve_binary_data_above_the_text_limit() {
+        let queue = ClipboardWrites::default();
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let pixels = vec![0x80; MAX_BYTES + 1];
+        assert!(queue.send_image(writer.into(), &pixels));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, pixels);
     }
 
     #[test]

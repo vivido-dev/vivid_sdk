@@ -1492,7 +1492,7 @@ impl WaylandConnection {
                 .entries()
                 .iter()
                 .any(|entry| matches!(entry, gpui::ClipboardEntry::String(_)));
-            state.clipboard.set(item);
+
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
                     "Skipping Wayland clipboard ownership request because no keyboard or pointer press serial has been received"
@@ -1501,6 +1501,16 @@ impl WaylandConnection {
             };
             let data_source = data_device_manager
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
+            if let [gpui::ClipboardEntry::Image(image)] = item.entries()
+                && matches!(
+                    image.format,
+                    gpui::ImageFormat::Png | gpui::ImageFormat::Tiff | gpui::ImageFormat::Jpeg
+                )
+                && image.bytes.len() <= gpui::MAX_CLIPBOARD_IMAGE_BYTES
+            {
+                data_source.offer(image.format.mime_type().into());
+            }
+            state.clipboard.set(item, data_source.clone());
             if has_text {
                 for mime_type in TEXT_MIME_TYPES {
                     data_source.offer(mime_type.to_string());
@@ -1524,6 +1534,14 @@ impl WaylandConnection {
         max_bytes: usize,
     ) -> Result<crate::linux::clipboard_text::ClipboardTextRead, gpui::ClipboardReadError> {
         self.0.borrow().clipboard.prepare_text(primary, max_bytes)
+    }
+    pub(crate) fn prepare_clipboard_media(
+        &self,
+    ) -> Result<
+        crate::linux::clipboard_text::ClipboardRead<gpui::ClipboardPasteMedia>,
+        gpui::ClipboardReadError,
+    > {
+        self.0.borrow().clipboard.prepare_media()
     }
     pub(crate) fn clipboard_has_file_list(&self) -> bool {
         self.0.borrow().clipboard.has_file_list()
@@ -3123,7 +3141,7 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
 
         match (kind, event) {
             (DataSourceKind::Clipboard, wl_data_source::Event::Send { mime_type, fd }) => {
-                state.clipboard.send(mime_type, fd);
+                state.clipboard.send(data_source, mime_type, fd);
             }
             (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
                 data_source.destroy();

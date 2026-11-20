@@ -52,7 +52,7 @@ use strum::IntoEnumIterator;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-static CLIPBOARD: Mutex<Option<GlobalClipboard>> = parking_lot::const_mutex(None);
+static CLIPBOARD: Mutex<Option<GlobalClipboard>> = Mutex::new(None);
 
 x11rb::atom_manager! {
     pub Atoms: AtomCookies {
@@ -1223,7 +1223,7 @@ impl Drop for Clipboard {
 }
 
 /// Threads handing a dropped clipboard's data to the clipboard manager.
-static HANDOVERS: Mutex<Vec<JoinHandle<()>>> = parking_lot::const_mutex(Vec::new());
+static HANDOVERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
 /// Waits for dropped clipboards to finish handing their data to the clipboard manager.
 ///

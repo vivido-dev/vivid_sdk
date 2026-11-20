@@ -36,7 +36,7 @@ edition = "2024"
 [workspace.dependencies]
 accesskit = { "version" = "0.24.0", "features" = ["enumn"] }
 accesskit_macos = "0.27"
-accesskit_unix = "0.24"
+accesskit_unix = "0.22.1"
 accesskit_windows = "0.35"
 anyhow = "1.0.86"
 ashpd = { "version" = "0.13", "default-features" = false, "features" = [

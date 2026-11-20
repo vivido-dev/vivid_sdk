@@ -21,6 +21,8 @@ pub(crate) struct Clipboard {
     writes: crate::linux::clipboard_write::ClipboardWrites,
     self_mime: String,
 
+    source: Option<wayland_client::protocol::wl_data_source::WlDataSource>,
+
     // Internal clipboard
     contents: Option<ClipboardItem>,
     primary_contents: Option<ClipboardItem>,
@@ -56,6 +58,43 @@ pub(crate) struct DataOffer<T: ReceiveData> {
 }
 
 impl<T: ReceiveData> DataOffer<T> {
+    fn prepare_media(
+        &self,
+        connection: &Connection,
+    ) -> Result<
+        crate::linux::clipboard_text::ClipboardRead<gpui::ClipboardPasteMedia>,
+        gpui::ClipboardReadError,
+    > {
+        use std::os::fd::AsFd as _;
+        if self.has_mime_type(FILE_LIST_MIME_TYPE) {
+            let read = self.prepare_uri_list(connection, gpui::MAX_CLIPBOARD_URI_BYTES)?;
+            return Ok(Box::new(move |deadline| {
+                Ok(read(deadline)?.map(gpui::ClipboardPasteMedia::Files))
+            }));
+        }
+        let Some(format) = [ImageFormat::Png, ImageFormat::Tiff, ImageFormat::Jpeg]
+            .into_iter()
+            .find(|format| self.has_mime_type(format.mime_type()))
+        else {
+            return Ok(Box::new(|_| Ok(None)));
+        };
+        let pipe = Pipe::new().map_err(|_| gpui::ClipboardReadError::Unavailable)?;
+        self.inner
+            .receive_data(format.mime_type().into(), pipe.write.as_fd());
+        connection
+            .flush()
+            .map_err(|_| gpui::ClipboardReadError::Unavailable)?;
+        drop(pipe.write);
+        Ok(Box::new(move |deadline| {
+            let bytes = crate::linux::clipboard_text::read_bytes(
+                pipe.read,
+                deadline,
+                gpui::MAX_CLIPBOARD_IMAGE_BYTES,
+            )?;
+            let png = gpui::ClipboardPng::from_encoded(format, &bytes)?;
+            Ok(Some(gpui::ClipboardPasteMedia::Image(png)))
+        }))
+    }
     fn prepare_uri_list(
         &self,
         connection: &Connection,
@@ -188,6 +227,17 @@ impl<T: ReceiveData> DataOffer<T> {
 }
 
 impl Clipboard {
+    pub(crate) fn prepare_media(
+        &self,
+    ) -> Result<
+        crate::linux::clipboard_text::ClipboardRead<gpui::ClipboardPasteMedia>,
+        gpui::ClipboardReadError,
+    > {
+        match &self.current_offer {
+            Some(offer) => offer.prepare_media(&self.connection),
+            None => Ok(Box::new(|_| Ok(None))),
+        }
+    }
     pub(crate) fn has_file_list(&self) -> bool {
         self.current_offer
             .as_ref()
@@ -254,6 +304,7 @@ impl Clipboard {
             writes: Default::default(),
             self_mime: format!("pid/{}", std::process::id()),
 
+            source: None,
             contents: None,
             primary_contents: None,
 
@@ -264,7 +315,12 @@ impl Clipboard {
         }
     }
 
-    pub fn set(&mut self, item: ClipboardItem) {
+    pub fn set(
+        &mut self,
+        item: ClipboardItem,
+        source: wayland_client::protocol::wl_data_source::WlDataSource,
+    ) {
+        self.source = Some(source);
         self.contents = Some(item);
     }
 
@@ -286,7 +342,27 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+    pub fn send(
+        &self,
+        source: &wayland_client::protocol::wl_data_source::WlDataSource,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        if self.source.as_ref() != Some(source) {
+            return;
+        }
+        if let Some([ClipboardEntry::Image(image)]) =
+            self.contents.as_ref().map(ClipboardItem::entries)
+        {
+            if matches!(
+                image.format,
+                ImageFormat::Png | ImageFormat::Tiff | ImageFormat::Jpeg
+            ) && image.format.mime_type() == mime_type
+            {
+                self.writes.send_image(fd, &image.bytes);
+            }
+            return;
+        }
         let text = if mime_type == FILE_LIST_MIME_TYPE {
             gpui::clipboard_uri_list(self.contents.clone(), gpui::MAX_CLIPBOARD_URI_BYTES)
                 .ok()
@@ -369,10 +445,11 @@ mod file_list_tests {
         bytes: &'static [u8],
         held: RefCell<Option<OwnedFd>>,
         stall: bool,
+        mime: &'static str,
     }
     impl ReceiveData for Source {
         fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>) {
-            assert_eq!(mime_type, FILE_LIST_MIME_TYPE);
+            assert_eq!(mime_type, self.mime);
             let owned = fd.try_clone_to_owned().unwrap();
             if self.stall {
                 self.held.replace(Some(owned));
@@ -388,6 +465,7 @@ mod file_list_tests {
             bytes: b"",
             held: RefCell::new(None),
             stall: false,
+            mime: FILE_LIST_MIME_TYPE,
         });
         for bad in [
             String::new(),
@@ -405,6 +483,51 @@ mod file_list_tests {
         }
         assert_eq!(offer.mime_types.len(), 32);
         assert!(offer.has_mime_type(FILE_LIST_MIME_TYPE));
+    }
+
+    #[test]
+    fn media_reads_only_the_selected_representation() {
+        const FIXTURE_PNG: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 244, 34, 127, 138, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 248, 207,
+            192, 0, 66, 245, 0, 15, 121, 3, 125, 21, 103, 11, 0, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+            66, 96, 130,
+        ];
+        let (client, _server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let read = |mime, bytes, formats: &[&str]| {
+            let mut offer = DataOffer::new(Source {
+                mime,
+                bytes,
+                held: RefCell::new(None),
+                stall: false,
+            });
+            for format in formats {
+                offer.add_mime_type((*format).into());
+            }
+            offer.prepare_media(&connection).unwrap()(Instant::now() + Duration::from_secs(1))
+        };
+        let Some(gpui::ClipboardPasteMedia::Image(image)) =
+            read("image/png", FIXTURE_PNG, &["image/png"]).unwrap()
+        else {
+            panic!("missing image")
+        };
+        assert_eq!(
+            image.into_bytes(),
+            gpui::ClipboardPng::from_encoded(ImageFormat::Png, FIXTURE_PNG)
+                .unwrap()
+                .into_bytes()
+        );
+        assert!(matches!(
+            read(
+                FILE_LIST_MIME_TYPE,
+                b"file:///tmp/example",
+                &["image/png", FILE_LIST_MIME_TYPE]
+            ),
+            Ok(Some(gpui::ClipboardPasteMedia::Files(_)))
+        ));
+        assert!(read("image/png", b"broken", &["image/png"]).is_err());
+        assert!(matches!(read("", b"", &["text/plain"]), Ok(None)));
     }
 
     #[test]
@@ -426,6 +549,7 @@ mod file_list_tests {
             let mut offer = DataOffer::new(Source {
                 bytes,
                 stall,
+                mime: FILE_LIST_MIME_TYPE,
                 held: RefCell::new(None),
             });
             assert!(offer.prepare_uri_list(&connection, max).is_err());

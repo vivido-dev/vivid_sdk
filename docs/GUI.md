@@ -467,7 +467,7 @@ revocation or after its one-second cache deadline. The platform rechecks
 the clipboard during an explicit read because its contents can change between
 discovery and paste. Older hosts and producers retain their transfer versions.
 
-Version 4 adds `read_clipboard_media_async` for an explicit paste. A macOS host
+Version 4 adds `read_clipboard_media_async` for an explicit paste. A macOS or Wayland host
 checks for files first and otherwise normalizes a supported native bitmap to PNG.
 The private clipboard socket carries a length-checked binary body up to 16 MiB.
 The child checks the request identity and validates the image on its clipboard
@@ -1095,7 +1095,10 @@ using `gui_host::clipboard::Host::with_media` shares its owner lease and queue
 between media and text requests.
 
 Linux Wayland platform clipboard output also runs off-thread: at most four
-pending pipe/socket writes, 1 MiB each, with one-second absolute deadlines.
+pending pipe/socket writes with one-second absolute deadlines. Text and file lists
+are limited to 1 MiB each and bitmap writes to 16 MiB. Explicit Wayland media
+paste requests file URIs first, then PNG, TIFF or JPEG. It uses the shared read
+permit and the same decoded-image limits as AppKit.
 Ordinary and primary output share that capacity; dropping the platform clipboard
 cancels its tasks. External offer metadata retains at most 32 unique ASCII MIME
 names, each at most 128 bytes. Slow recipients cannot block the GUI thread.

@@ -4,15 +4,27 @@
 use gpui::ClipboardReadError;
 use std::time::Instant;
 
-pub(crate) type ClipboardTextRead =
-    Box<dyn FnOnce(Instant) -> Result<Option<String>, ClipboardReadError> + Send>;
+pub(crate) type ClipboardTextRead = ClipboardRead<String>;
+pub(crate) type ClipboardRead<T> =
+    Box<dyn FnOnce(Instant) -> Result<Option<T>, ClipboardReadError> + Send>;
 
 #[cfg(feature = "wayland")]
 pub(crate) fn read_pipe(
-    mut fd: filedescriptor::FileDescriptor,
+    fd: filedescriptor::FileDescriptor,
     deadline: Instant,
     max_bytes: usize,
 ) -> Result<Option<String>, ClipboardReadError> {
+    String::from_utf8(read_bytes(fd, deadline, max_bytes)?)
+        .map(Some)
+        .map_err(|_| ClipboardReadError::UnsupportedContent)
+}
+
+#[cfg(feature = "wayland")]
+pub(crate) fn read_bytes(
+    mut fd: filedescriptor::FileDescriptor,
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ClipboardReadError> {
     use std::{io::Read as _, os::fd::AsRawFd as _};
     fd.set_non_blocking(true)
         .map_err(|_| ClipboardReadError::Unavailable)?;
@@ -38,11 +50,7 @@ pub(crate) fn read_pipe(
             Err(_) => return Err(ClipboardReadError::Unavailable),
         }
         match fd.read(&mut chunk) {
-            Ok(0) => {
-                return String::from_utf8(bytes)
-                    .map(Some)
-                    .map_err(|_| ClipboardReadError::UnsupportedContent);
-            }
+            Ok(0) => return Ok(bytes),
             Ok(count) => {
                 if bytes
                     .len()

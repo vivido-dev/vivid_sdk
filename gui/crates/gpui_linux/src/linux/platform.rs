@@ -329,12 +329,32 @@ impl LinuxPlatform {
         max_bytes: usize,
         files: bool,
     ) -> Task<Result<Option<String>, gpui::ClipboardReadError>> {
+        if max_bytes > gpui::MAX_CLIPBOARD_URI_BYTES {
+            return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
+        }
+        self.run_clipboard_read(|| {
+            if files {
+                self.connection
+                    .borrow()
+                    .prepare_clipboard_uri_list(max_bytes)
+            } else {
+                self.connection.borrow().prepare_clipboard_text(
+                    selection == gpui::ClipboardSelection::Primary,
+                    max_bytes,
+                )
+            }
+        })
+    }
+
+    fn run_clipboard_read<T: Send + 'static>(
+        &self,
+        prepare: impl FnOnce() -> Result<
+            super::clipboard_text::ClipboardRead<T>,
+            gpui::ClipboardReadError,
+        >,
+    ) -> Task<Result<Option<T>, gpui::ClipboardReadError>> {
         use std::sync::atomic::Ordering;
-        // Text and file lists share one actual external read, even after cancellation.
-        if max_bytes > gpui::MAX_CLIPBOARD_URI_BYTES
-            || (files && !self.connection.borrow().supports_uri_list_clipboard())
-            || self.clipboard_read_busy.swap(true, Ordering::SeqCst)
-        {
+        if self.clipboard_read_busy.swap(true, Ordering::SeqCst) {
             return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
         }
         struct Permit(Arc<std::sync::atomic::AtomicBool>);
@@ -344,17 +364,8 @@ impl LinuxPlatform {
             }
         }
         let permit = Permit(self.clipboard_read_busy.clone());
-        let prepared = if files {
-            self.connection
-                .borrow()
-                .prepare_clipboard_uri_list(max_bytes)
-        } else {
-            self.connection
-                .borrow()
-                .prepare_clipboard_text(selection == gpui::ClipboardSelection::Primary, max_bytes)
-        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        match prepared {
+        match prepare() {
             Ok(read) => self.background_executor().spawn(async move {
                 let _permit = permit;
                 read(deadline)
@@ -1221,6 +1232,15 @@ impl Platform for LinuxPlatform {
         max_bytes: usize,
     ) -> Task<Result<Option<String>, gpui::ClipboardReadError>> {
         self.read_selection_async(selection, max_bytes, false)
+    }
+    #[cfg(feature = "wayland")]
+    fn read_clipboard_media_async(
+        &self,
+    ) -> Task<Result<Option<gpui::ClipboardPasteMedia>, gpui::ClipboardReadError>> {
+        self.run_clipboard_read(|| match &*self.connection.borrow() {
+            DisplayConnection::Wayland(client) => client.prepare_clipboard_media(),
+            _ => Err(gpui::ClipboardReadError::Unavailable),
+        })
     }
     fn supports_uri_list_clipboard(&self) -> bool {
         self.connection.borrow().supports_uri_list_clipboard()
