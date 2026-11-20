@@ -64,7 +64,13 @@ vector-gpu = ["vector-render", "dep:wgpu", "vello/wgpu"]
 # Checked GPU texture exports on a host-owned device; no adapter or GUI creation.
 vector-texture = ["vector-gpu", "dep:vivid_vello_backend"]
 # Native adapter and bounded asynchronous CPU readback for hosted GUI images.
-vector-offscreen = ["vector-texture", "vello/debug_layers", "wgpu/metal", "wgpu/vulkan", "wgpu/dx12"]
+vector-offscreen = [
+  "vector-texture",
+  "vello/debug_layers",
+  "wgpu/metal",
+  "wgpu/vulkan",
+  "wgpu/dx12",
+]
 # Desktop GUI runtime is opt-in; protocol consumers retain their existing dependency graph.
 gui = [
   "accessible-text",
@@ -123,8 +129,11 @@ parley = { version = "0.12", path = "vendor/parley", optional = true, features =
   "bytemuck",
   "complex-scripts",
 ] }
-vello = { version = "=0.11.0", optional = true, default-features = false }
-vivid_vello_backend = { version = "0.11.0-vivid.1", path = "vendor/vello-backend", optional = true, default-features = false, features = ["wgpu", "debug_layers"] }
+vello = { version = "=0.12.0", optional = true, default-features = false }
+vivid_vello_backend = { version = "0.11.0-vivid.1", path = "vendor/vello-backend", optional = true, default-features = false, features = [
+  "wgpu",
+  "debug_layers",
+] }
 wgpu = { version = "30.0", optional = true, default-features = false, features = [
   "std",
   "wgsl",
