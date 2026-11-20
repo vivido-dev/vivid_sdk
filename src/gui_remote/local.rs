@@ -45,7 +45,11 @@ pub(super) fn remaining(end: Instant) -> io::Result<Duration> {
         Ok(time)
     }
 }
-fn read_exact(stream: &mut LocalStream, mut bytes: &mut [u8], end: Instant) -> io::Result<()> {
+pub(super) fn read_exact(
+    stream: &mut LocalStream,
+    mut bytes: &mut [u8],
+    end: Instant,
+) -> io::Result<()> {
     while !bytes.is_empty() {
         remaining(end)?;
         #[cfg(not(unix))]
@@ -81,25 +85,31 @@ pub(super) fn send<T: Serialize>(
     let header = u32::try_from(body.len())
         .map_err(|_| invalid())?
         .to_be_bytes();
-    for mut bytes in [&header[..], &body[..]] {
-        while !bytes.is_empty() {
-            remaining(end)?;
-            #[cfg(not(unix))]
-            stream.set_write_timeout(Some(remaining(end)?))?;
-            match stream.write(bytes) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => bytes = &bytes[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    thread::sleep(POLL.min(remaining(end)?))
-                }
-                Err(e) => return Err(e),
+    write_all(stream, &header, end)?;
+    write_all(stream, &body, end)
+}
+pub(super) fn write_all(
+    stream: &mut LocalStream,
+    mut bytes: &[u8],
+    end: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        remaining(end)?;
+        #[cfg(not(unix))]
+        stream.set_write_timeout(Some(remaining(end)?))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(POLL.min(remaining(end)?))
             }
+            Err(e) => return Err(e),
         }
     }
     Ok(())

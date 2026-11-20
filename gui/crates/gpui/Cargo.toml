@@ -151,7 +151,7 @@ uuid = { workspace = true, features = ["js"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2-core-foundation.workspace = true
-objc2-core-video = { workspace = true, features = ["CVPixelBuffer"] }
+objc2-core-video = { workspace = true, features = ["CVPixelBuffer", "CVMetalTexture"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 log.workspace = true
@@ -180,7 +180,7 @@ env_logger.workspace = true
 futures-concurrency.workspace = true
 postage = { workspace = true, features = ["blocking"] }
 web-time.workspace = true
-gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11", "test-support"] }
 gpui_util.workspace = true
 lyon = { version = "1.0", features = ["extra"] }
 rand = { workspace = true, default-features = true }

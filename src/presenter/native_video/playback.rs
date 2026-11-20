@@ -604,6 +604,10 @@ pub(crate) fn tick(state: &mut State) {
                 continue;
             };
             track.native_frame_serial = id;
+            #[cfg(feature = "testing")]
+            {
+                frame.selected = Some((now, p.clock(now)));
+            }
             frame.id = id;
             frame.play = p.serial;
             track.native_video = Some(frame);
@@ -660,6 +664,8 @@ mod tests {
     use super::*;
     fn frame(pts: i64, end: i64, id: u64) -> Frame {
         Frame {
+            #[cfg(feature = "testing")]
+            selected: None,
             incarnation: Weak::new(),
             image: Arc::new(RasterImage::new(1, 1, Arc::from([0, 0, 0, 255])).unwrap()),
             epoch: 0,

@@ -58,17 +58,32 @@ geometry changes may first evict idle images from the old generation.
 
 Publication requires completion of the exact producer submission, under an
 absolute five-second deadline. `Pending::poll` observes progress without waiting
-and returns the frame once. Completion or error consumes the operation; late
+by polling the copy’s submission index with a zero timeout. The blocking path waits
+for the same index with the remaining deadline. Both recheck the deadline before
+returning the frame. Completion or error consumes the operation; late
 polls fail. Producer redraws may proceed after submission because queue ordering
 precedes those later writes. `Pool::copy` and `Pending::wait` supply synchronous
 worker-only convenience and teardown paths. Native objects and both quotas remain
 retained through submitted work, including cancellation and error retirement.
+The native resize regression submits two sizes on the same producer queue.
+A withheld Metal event stalls the second copy while the first lease can finish.
+Both IOSurfaces preserve their respective pixels after the resize completes.
 Keep the producer's device-loss/error monitor: WGPU completion callbacks alone
 do not prove successful rendering. During the GUI paint phase, call
 `frame.paint(bounds, window)` on an `Arc<Frame>`. The scene and renderer retain
 that lease, its pixel buffer and its Metal mapping until the consumer GPU
 command finishes. The renderer checks the producer's physical device identity.
-Packed surfaces use a separate cache from NV12 video surfaces. The shader samples
+The Apple renderer regressions hold a submitted draw behind a Metal event
+while dropping its scene and renderer. A fresh renderer draws a different size
+and color before the old command completes. Both packed BGRA and NV12 retain
+their surface lease through teardown, reproduce the reference pixels, and
+release the lease after completion.
+For SDK packed frames the Apple renderer samples the very CoreVideo Metal
+mapping that the export worker prepared before GPU submission. It checks the
+native device, backing IOSurface identity, plane, pixel format, texture type
+and extent. The checked lease still gates publication. A same-size mapping
+from another allocation is rejected. Packed surfaces supplied without a
+mapping use a separate cache from NV12 video surfaces. The shader samples
 premultiplied pixels and converts the filtered sample to the renderer's existing
 blend convention, including zero alpha.
 
@@ -79,9 +94,21 @@ it. Holding only the underlying Metal texture does not replace that ownership.
 
 This proves a transfer/lifetime mechanism, not physical display completion or a
 performance advantage. The prototype now reuses released native images and
-CoreVideo mappings, while importing them into WGPU for each lease. It uses
-worker-side CPU observation of a producer fence rather than a GPU-to-GPU shared
-event. Physical device-loss acceptance across two renderers, cross-device
+CoreVideo mappings, while importing them into WGPU for each lease. Each native allocation owns a Metal shared event. The WGPU submission
+contains the export and a trailing command buffer that signals the pool-local
+frame serial. Recycling an IOSurface advances its event value. A replacement
+pool owns a separate event even when its serial matches. Before publication the
+worker checks both WGPU retirement and the exact Metal event value.
+
+The native regression queues a GPU read on an independent Metal queue while a
+recycled allocation still has its previous value. It holds the producer past
+the publication deadline, verifies a replacement with the same serial, then
+releases the producer. A prompt release yields the original pixels. With the
+full five-second deadline on Apple M4 a retired read can instead finish with
+Metal command-buffer error 2 (GPU timeout). Its destination must be discarded.
+The same consumer queue must subsequently read the replacement's exact pixels. The compositor currently hands frames
+to GPUI after the worker's checks. Early imports by the production GUI remain
+open. Physical device-loss acceptance across two renderers, cross-device
 behavior and native Linux/Windows paths still need production acceptance.
 The compositor's optional Terminal adapter now supplies runtime/revision guards
 and bounded asynchronous export across resize, hide, close and replacement.

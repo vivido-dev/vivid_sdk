@@ -239,6 +239,14 @@ fn node_to_json(
     if let Some(v) = node.description() {
         aria.insert("description".into(), json!(v));
     }
+    if let Some(selection) = node.text_selection() {
+        let endpoint =
+            |p: &accesskit::TextPosition| json!([p.node.0.to_string(), p.character_index]);
+        aria.insert(
+            "text_selection".into(),
+            json!({"anchor": endpoint(&selection.anchor), "focus": endpoint(&selection.focus)}),
+        );
+    }
     if let Some(v) = node.value() {
         aria.insert("value".into(), json!(v));
     }
@@ -259,6 +267,9 @@ fn node_to_json(
     }
 
     // Boolean / enum states.
+    if node.is_modal() {
+        aria.insert("modal".into(), json!(true));
+    }
     if let Some(v) = node.is_selected() {
         aria.insert("selected".into(), json!(v));
     }

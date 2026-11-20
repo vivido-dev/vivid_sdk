@@ -119,6 +119,10 @@ pub(crate) const ROOT_NODE_ID: NodeId = NodeId(0);
 pub(crate) type A11yActionListener =
     Box<dyn FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static>;
 
+type ActionListeners = FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>;
+
+pub(super) type HostedTreeObserver = Box<dyn FnMut(&TreeUpdate, [f32; 2])>;
+
 /// Per-window accessibility state.
 ///
 /// Manages the AccessKit tree that is built each frame and the mappings
@@ -133,6 +137,7 @@ pub(crate) struct A11y {
     /// Updated by AccessKit using callbacks provided to the adapter. Can change
     /// halfway through a frame.
     active_flag: Arc<AtomicBool>,
+    pub(super) hosted_observer: Option<HostedTreeObserver>,
     /// Whether a11y features are active for *this specific frame*.
     ///
     /// At the start of each frame, we load [`Self::active_flag`] (using
@@ -145,10 +150,11 @@ pub(crate) struct A11y {
     /// At the end of the frame, we re-call [`Self::sync_active_flag`] to
     /// determine whether we should actually send the finished [`TreeUpdate`].
     active_this_frame: bool,
+    pub(super) behind_prompt: bool,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-    pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    pub(crate) action_listeners: ActionListeners,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -172,7 +178,9 @@ impl A11y {
         Self {
             force_disabled,
             active_flag,
+            hosted_observer: None,
             active_this_frame: false,
+            behind_prompt: false,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
@@ -210,7 +218,12 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = self.is_enabled() && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame =
+            self.is_enabled() && (self.hosted_observer.is_some() || self.platform_active());
+    }
+
+    pub(super) fn platform_active(&self) -> bool {
+        self.active_flag.load(Ordering::SeqCst)
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -218,7 +231,7 @@ impl A11y {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.active_this_frame
+        self.active_this_frame && !self.behind_prompt
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
@@ -273,10 +286,14 @@ impl A11y {
 
     /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
+        self.clear_action_targets();
+        self.nodes.begin_frame(self.window_title.as_ref());
+    }
+
+    pub(super) fn clear_action_targets(&mut self) {
         self.focus_ids.clear();
         self.node_bounds.clear();
         self.action_listeners.clear();
-        self.nodes.begin_frame(self.window_title.as_ref());
     }
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
@@ -304,6 +321,7 @@ impl A11y {
 pub struct A11ySubtreeBuilder<'a> {
     parent_id: NodeId,
     nodes: &'a mut A11yNodeBuilder,
+    listeners: &'a mut ActionListeners,
     /// Provenance of the real element whose `a11y_synthetic_children` is
     /// running.
     #[cfg(debug_assertions)]
@@ -311,10 +329,15 @@ pub struct A11ySubtreeBuilder<'a> {
 }
 
 impl<'a> A11ySubtreeBuilder<'a> {
-    pub(crate) fn new(parent_id: NodeId, nodes: &'a mut A11yNodeBuilder) -> Self {
+    pub(crate) fn new(
+        parent_id: NodeId,
+        nodes: &'a mut A11yNodeBuilder,
+        listeners: &'a mut ActionListeners,
+    ) -> Self {
         Self {
             parent_id,
             nodes,
+            listeners,
             #[cfg(debug_assertions)]
             creator: debug::NodeCreator::default(),
         }
@@ -358,6 +381,47 @@ impl<'a> A11ySubtreeBuilder<'a> {
             );
         }
         pushed
+    }
+
+    /// Appends a synthetic node and builds its children in its own ID scope.
+    /// Returns false when the node's ID already belongs to the tree.
+    pub fn push_subtree(
+        &mut self,
+        id: NodeId,
+        node: accesskit::Node,
+        children: impl FnOnce(&mut A11ySubtreeBuilder<'_>),
+    ) -> bool {
+        if !self.nodes.push(id, node) {
+            return false;
+        }
+        let mut subtree = A11ySubtreeBuilder::new(id, self.nodes, self.listeners);
+        #[cfg(debug_assertions)]
+        {
+            subtree.creator = self.creator.clone();
+        }
+        children(&mut subtree);
+        self.nodes.pop();
+        true
+    }
+
+    /// Advertises an action and binds its listener to this synthetic node.
+    pub fn on_action(
+        &mut self,
+        action: Action,
+        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    ) {
+        self.parent_node().add_action(action);
+        self.listeners
+            .entry(self.parent_id)
+            .or_default()
+            .push((action, Box::new(listener)));
+    }
+
+    /// Reports this synthetic node as focused when its real container owns focus.
+    pub fn mark_active_descendant(&mut self) {
+        if self.nodes.focus_is_ancestor_of_current() {
+            self.nodes.set_active_descendant(self.parent_id);
+        }
     }
 
     /// A mutable reference to the parent node.

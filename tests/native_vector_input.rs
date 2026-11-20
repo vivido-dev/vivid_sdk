@@ -233,6 +233,61 @@ fn document_event(session: &OverlaySession) -> vivid_protocol::overlay::wire::te
 }
 
 #[test]
+fn requested_native_focus_gain_waits_for_its_current_display() {
+    let (presenter, mut host) = fixture();
+    let first = connect(&presenter);
+    let peer = connect(&presenter);
+    let a = window(&first, 0.);
+    let b = window(&peer, 64.);
+    submit(&a, HitRole::Input);
+    submit(&b, HitRole::Input);
+    a.request_focus().unwrap();
+    let old = display(&mut host, 2);
+    drain(&first);
+    drain(&peer);
+
+    b.request_focus().unwrap();
+    assert!(!b.reconcile().unwrap().focused);
+    assert!(!drain(&peer).contains(&Event::Focus(true)));
+    assert_eq!(
+        host.dispatch_input(&old, key(true, false, Some("old")))
+            .unwrap(),
+        Result::Rejected
+    );
+    let superseded = host.prepare(1, 1.).unwrap();
+    a.request_focus().unwrap();
+    assert!(!host.presented(&superseded).unwrap());
+    let current = display(&mut host, 2);
+    assert!(a.reconcile().unwrap().focused);
+    assert!(!b.reconcile().unwrap().focused);
+    expect(&first, |event| event == &Event::Focus(true));
+    assert_eq!(
+        host.dispatch_input(&current, key(true, false, Some("new")))
+            .unwrap(),
+        Result::Delivered { text: true }
+    );
+    expect(
+        &first,
+        |event| matches!(event, Event::Text(text) if text == "new"),
+    );
+    assert!(!drain(&peer).iter().any(|event| matches!(
+        event,
+        Event::Focus(true) | Event::Text(_) | Event::Key { .. }
+    )));
+    host.dispatch_input(&current, key(false, false, None))
+        .unwrap();
+    b.request_focus().unwrap();
+    host.set_visible(1, false).unwrap();
+    host.set_visible(1, true).unwrap();
+    display(&mut host, 2);
+    assert!(!b.reconcile().unwrap().focused);
+    assert!(!drain(&peer).contains(&Event::Focus(true)));
+    b.request_focus().unwrap();
+    display(&mut host, 2);
+    expect(&peer, |event| event == &Event::Focus(true));
+}
+
+#[test]
 fn native_document_edits_require_the_original_editor_revision_and_remain_owner_scoped() {
     use vivid_sdk::presenter::VectorDocumentEdit;
     let (presenter, mut host) = fixture();

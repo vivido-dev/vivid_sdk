@@ -1,3 +1,6 @@
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+mod animation_profile;
+
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -36,8 +39,8 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
     MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
+    MTLRenderPipelineState, MTLResource, MTLResourceOptions, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
 };
 #[cfg(any(
     test,
@@ -692,6 +695,9 @@ impl MetalRenderer {
             }
         };
 
+        #[cfg(all(target_os = "macos", feature = "test-support"))]
+        animation_profile::record(scene, &self.sprite_atlas, &command_buffer, &drawable);
+
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.waitUntilScheduled();
@@ -748,7 +754,11 @@ impl MetalRenderer {
             .collect();
         // Exported immutable frames use a separate cache so retiring their
         // mappings does not change the existing NV12 video cache policy.
-        let cache = self.rgba_surface_texture_cache.clone();
+        let cache = scene
+            .surfaces
+            .iter()
+            .any(|surface| surface.packed_mapping.is_none())
+            .then(|| self.rgba_surface_texture_cache.clone());
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures, surface_owners)));
         let block = RcBlock::new(
             move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -756,7 +766,9 @@ impl MetalRenderer {
                     instance_buffer_pool.lock().release(instance_buffer);
                     drop(textures);
                     // Evict cache references before returning producer capacity.
-                    CVMetalTextureCache::flush(&cache, 0);
+                    if let Some(cache) = &cache {
+                        CVMetalTextureCache::flush(cache, 0);
+                    }
                     drop(owners);
                 }
             },
@@ -1467,6 +1479,40 @@ impl MetalRenderer {
         }
     }
 
+    fn map_packed_surface(
+        &self,
+        image_buffer: &objc2_core_video::CVPixelBuffer,
+        format: MTLPixelFormat,
+        texture_size: Size<DevicePixels>,
+    ) -> Result<CFRetained<CVMetalTexture>> {
+        let mut texture = ptr::null_mut();
+        // SAFETY: This nonplanar buffer's format and checked extent match
+        // the requested Metal mapping. The output is writable and owned.
+        let status = unsafe {
+            CVMetalTextureCache::create_texture_from_image(
+                None,
+                &self.rgba_surface_texture_cache,
+                image_buffer,
+                None,
+                format,
+                texture_size.width.0 as usize,
+                texture_size.height.0 as usize,
+                0,
+                ptr::NonNull::from(&mut texture),
+            )
+        };
+        anyhow::ensure!(
+            status == kCVReturnSuccess,
+            "creating shared surface texture: {status}"
+        );
+        // SAFETY: Successful Create transfers the non-null mapping.
+        Ok(unsafe {
+            CFRetained::from_raw(
+                ptr::NonNull::new(texture).context("shared surface mapping absent")?,
+            )
+        })
+    }
+
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1521,39 +1567,43 @@ impl MetalRenderer {
                     texture_size.width.0 > 0 && texture_size.height.0 > 0,
                     "invalid shared surface extent"
                 );
-                let mut texture = ptr::null_mut();
                 let format = if pixel_format == kCVPixelFormatType_32BGRA {
                     MTLPixelFormat::BGRA8Unorm
                 } else {
                     MTLPixelFormat::RGBA8Unorm
                 };
-                // SAFETY: This nonplanar buffer's format and checked extent match
-                // the requested Metal mapping. The output is writable and owned.
-                let status = unsafe {
-                    CVMetalTextureCache::create_texture_from_image(
-                        None,
-                        &self.rgba_surface_texture_cache,
-                        image_buffer,
-                        None,
-                        format,
-                        texture_size.width.0 as usize,
-                        texture_size.height.0 as usize,
-                        0,
-                        ptr::NonNull::from(&mut texture),
-                    )
-                };
-                anyhow::ensure!(
-                    status == kCVReturnSuccess,
-                    "creating shared surface texture: {status}"
-                );
-                // SAFETY: Successful Create transfers the non-null mapping.
-                let texture = unsafe {
-                    CFRetained::from_raw(
-                        ptr::NonNull::new(texture).context("shared surface mapping absent")?,
-                    )
+                let texture = if let Some(mapping) = &surface.packed_mapping {
+                    anyhow::ensure!(
+                        objc2_core_foundation::CFGetTypeID(Some(mapping))
+                            == objc2_core_video::CVMetalTextureGetTypeID(),
+                        "expected a CoreVideo Metal texture mapping"
+                    );
+                    mapping.clone()
+                } else {
+                    self.map_packed_surface(image_buffer, format, texture_size)?
                 };
                 let metal = CVMetalTextureGetTexture(&texture)
                     .context("shared surface Metal texture absent")?;
+                if surface.packed_mapping.is_some() {
+                    let usage = metal.usage();
+                    let backing = objc2_core_video::CVPixelBufferGetIOSurface(Some(image_buffer))
+                        .context("shared surface IOSurface absent")?;
+                    anyhow::ensure!(
+                        surface.lease.is_some()
+                            && ptr::eq(&*metal.device(), &*self.device)
+                            && metal
+                                .iosurface()
+                                .is_some_and(|mapped| ptr::eq(&*mapped, &*backing))
+                            && metal.iosurfacePlane() == 0
+                            && metal.pixelFormat() == format
+                            && (usage == MTLTextureUsage::Unknown
+                                || usage.contains(MTLTextureUsage::ShaderRead))
+                            && metal.textureType() == MTLTextureType::Type2D
+                            && metal.width() == texture_size.width.0 as usize
+                            && metal.height() == texture_size.height.0 as usize,
+                        "packed Metal mapping does not match its leased surface"
+                    );
+                }
                 command_encoder.setRenderPipelineState(&self.rgba_surfaces_pipeline_state);
                 // SAFETY: The native mapping matches the shader slot and lives
                 // in surface_textures until the command completion callback.
@@ -1577,6 +1627,10 @@ impl MetalRenderer {
                 }
                 continue;
             }
+            anyhow::ensure!(
+                surface.packed_mapping.is_none(),
+                "packed mapping supplied for a planar surface"
+            );
             anyhow::ensure!(
                 pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                 "unsupported surface pixel format: {pixel_format:#x}"
@@ -2383,6 +2437,7 @@ mod tests {
             content_mask: ContentMask { bounds },
             image_buffer: buffer,
             lease: None,
+            packed_mapping: None,
         });
         scene.finish();
         let mut renderer =
@@ -2404,6 +2459,7 @@ mod tests {
                 "packed sample {x},{y}: {pixel:?}"
             );
         }
+        verify_pending_consumer_teardown(renderer, scene, image);
         Ok(())
     }
 
@@ -2458,6 +2514,7 @@ mod tests {
             content_mask: ContentMask { bounds },
             image_buffer: image_buffer.clone(),
             lease: None,
+            packed_mapping: None,
         });
         drop(image_buffer);
         scene.finish();
@@ -2473,6 +2530,72 @@ mod tests {
             assert!(green.abs_diff(128) <= 2);
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
+        }
+
+        verify_pending_consumer_teardown(renderer, scene, image);
+    }
+
+    fn verify_pending_consumer_teardown(
+        mut renderer: MetalRenderer,
+        mut scene: Scene,
+        image: RgbaImage,
+    ) {
+        use objc2_metal::MTLSharedEvent;
+
+        #[derive(Debug)]
+        struct Lease(u64);
+        impl gpui::SurfaceLease for Lease {
+            fn device_registry_id(&self) -> u64 {
+                self.0
+            }
+        }
+        let lease = Arc::new(Lease(renderer.device.registryID()));
+        let observer = Arc::downgrade(&lease);
+        scene.surfaces[0].lease = Some(lease);
+        if CVPixelBufferGetPixelFormatType(&scene.surfaces[0].image_buffer)
+            == kCVPixelFormatType_32BGRA
+        {
+            let extent = size(DevicePixels(16), DevicePixels(16));
+            let original = scene.surfaces[0].image_buffer.clone();
+            let mapping = renderer
+                .map_packed_surface(&original, MTLPixelFormat::BGRA8Unorm, extent)
+                .unwrap();
+            scene.surfaces[0].packed_mapping = Some(mapping);
+            let attributes = CFDictionary::from_slices(
+                // SAFETY: CoreVideo exports this immortal IOSurface allocation key.
+                &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+                &[&*CFDictionary::<CFType, CFType>::empty()],
+            );
+            let mut peer = ptr::null_mut();
+            // SAFETY: Create writes an owned CoreVideo buffer into the live output.
+            assert_eq!(
+                unsafe {
+                    CVPixelBufferCreate(
+                        None,
+                        16,
+                        16,
+                        kCVPixelFormatType_32BGRA,
+                        Some(attributes.as_opaque()),
+                        ptr::NonNull::from(&mut peer),
+                    )
+                },
+                kCVReturnSuccess
+            );
+            // SAFETY: Create transferred the non-null buffer on success.
+            scene.surfaces[0].image_buffer =
+                unsafe { CFRetained::from_raw(ptr::NonNull::new(peer).unwrap()) };
+            let error = renderer.render_scene_to_image(&scene, extent).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match its leased surface"),
+                "{error:#}"
+            );
+            scene.surfaces[0].image_buffer = original;
+            assert_eq!(
+                renderer.render_scene_to_image(&scene, extent).unwrap(),
+                image
+            );
         }
 
         let descriptor = MTLTextureDescriptor::new();
@@ -2504,11 +2627,59 @@ mod tests {
             blit.synchronizeResource(ProtocolObject::from_ref(&*target_texture));
             blit.endEncoding();
         }
+        let mut replacement =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+                .unwrap();
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(32.), ScaledPixels(8.)),
+        };
+        let mut replacement_scene = Scene::default();
+        replacement_scene.insert_primitive(gpui::Quad {
+            order: 0,
+            border_style: gpui::BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::red().into(),
+            border_color: gpui::red(),
+            corner_radii: gpui::Corners::default(),
+            border_widths: gpui::Edges::default(),
+        });
+        replacement_scene.finish();
+        let event = renderer.device.newSharedEvent().unwrap();
+        let blocker = renderer.command_queue.commandBuffer().unwrap();
+        blocker.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        blocker.commit();
+        command_buffer.commit();
         drop(scene);
         drop(renderer);
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let replacement_image = replacement
+            .render_scene_to_image(&replacement_scene, size(DevicePixels(32), DevicePixels(8)));
+        // Release the GPU before asserting so fixture failures cannot strand the queue.
+        let retained_while_pending = observer.upgrade().is_some();
+        let status_while_pending = command_buffer.status();
+        event.setSignaledValue(1);
+        let replacement_image = replacement_image.unwrap();
+        assert_eq!(replacement_image.dimensions(), (32, 8));
+        assert!(
+            replacement_image
+                .pixels()
+                .all(|pixel| pixel.0 == [255, 0, 0, 255])
+        );
+        assert!(retained_while_pending);
+        assert_ne!(status_while_pending, MTLCommandBufferStatus::Completed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while observer.upgrade().is_some()
+            || command_buffer.status() != MTLCommandBufferStatus::Completed
+        {
+            assert_ne!(command_buffer.status(), MTLCommandBufferStatus::Error);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "consumer lease failed to retire"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
     }
 }

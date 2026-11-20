@@ -28,6 +28,13 @@ must be short and must not block. The [counter example](../examples/rust/gui_rem
 shares its constructor/view with standalone mode and demonstrates count restoration.
 With no state environment, `build` receives `None` and no state worker starts.
 
+A native vector producer can use `gui_remote::state::Producer::from_env` with
+a closure that validates and installs its durable state. Call `Producer::poll`
+between model updates to service one capture on the model's owning thread.
+The worker handles framing, deadlines and replies. Keep the handle until the
+producer shuts down. A standalone launch without a state endpoint returns
+`None` and keeps the producer's normal defaults.
+
 A host calls `gui_remote::state::Host::bind(endpoint, initial_state)` to obtain a
 queue proxy and `Service` guard, then calls `Host::configure` on its associated
 child's `Command`. Unix requires an absolute endpoint in an owner-private
@@ -50,7 +57,15 @@ grants no input or protocol authority. A surviving process can retain this state
 channel across Vivid reconnect/resume; a new process gets a fresh channel and
 fresh Vivid credentials plus only saved app data.
 
-The service admits four queued captures and one active transaction. A four-byte
+A host opts in with `Host::configure_methods(command, true)`, which sets
+`VIVID_GUI_APP_METHODS=1` for the child. Older hosts receive the existing state-only ready message. With
+`Host::configure_methods(command, false)`, the child skips registration.
+Only a live, registered method can receive an offer. The model loop claims it,
+then the host validates the original responder before granting execution. A
+declined claim consumes its serial and permits the next call. A granted command
+can have changed the model even if its reply is lost.
+
+The service admits four queued requests and one active transaction. A four-byte
 big-endian length precedes version-1 JSON, capped at 256 KiB plus 1 KiB envelope
 overhead before allocation. Messages bind the exact channel owner and nonzero
 monotonic request ID. Startup allows fifteen seconds for native GUI creation;
@@ -78,8 +93,11 @@ its app callback runs.
 
 The built-in raster SDK counter supports this by default. Set
 `options.persistent = false` to disable it, or `true` for an external app using
-`run_persistent`. Custom commands default to stateless. Vector producers and
-Wayland clients do not yet support the channel. The compositor validates generic
+`run_persistent`. Custom commands default to stateless. Local vector producers opt in with
+`persistent = true` on direct or gateway launches. State belongs to the original
+producer process. The sample persists its count, received-byte total, committed
+text and selection. Restoring creates fresh editor and session identities.
+Wayland clients still require a state contract. The compositor validates generic
 envelopes locally; the producer validates its schema before declaring readiness.
 Ordinary terminals still start fresh rather than persisting PTYs or presenter
 sessions.

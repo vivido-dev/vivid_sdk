@@ -44,7 +44,9 @@
 ---@field PROFILE_OVERLAY_PAINT string
 ---@field PROFILE_OVERLAY_POINTER string
 ---@field PROFILE_OVERLAY_CLIPBOARD string
+---@field PROFILE_OVERLAY_EDITOR string
 ---@field PROFILE_OVERLAY_ENV string
+---@field PROFILE_OVERLAY_A11Y string
 ---@field SURFACE_GENERIC string
 ---@field SURFACE_TERMINAL string
 ---@field SURFACE_DESKTOP string
@@ -1980,6 +1982,8 @@ function OverlayWindow:set_visible(visible) end
 function OverlayWindow:center() end
 
 function OverlayWindow:request_focus() end
+
+function OverlayWindow:request_close() end
 
 function OverlayWindow:raise() end
 

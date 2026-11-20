@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterator, Literal, Optional, Protocol, Sequence, Tuple, cast
 
 from . import _native, connect as _connect
-from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV
+from . import PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT, PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV, PROFILE_OVERLAY_A11Y
 
 WindowMode = Literal["floating", "popup", "modal"]
 HitRole = Literal["input", "drag", "resize", "transparent"]
@@ -530,7 +530,7 @@ class OverlaySession:
     def connect(cls, **options: Any) -> OverlaySession:
         required = set(options.pop("required_profiles", ()) or ())
         required.update((PROFILE_CORE, PROFILE_LIVE_MEDIA, PROFILE_TERMINAL_SURFACE, PROFILE_TERMINAL_OVERLAY, PROFILE_VECTOR_SCENE, PROFILE_OVERLAY_INPUT))
-        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV) if p not in required})
+        options["optional_profiles"] = sorted({p for p in (*(options.get("optional_profiles", ()) or ()), PROFILE_OVERLAY_TEXT, PROFILE_OVERLAY_TEXT_LAYOUT, PROFILE_OVERLAY_TYPOGRAPHY, PROFILE_OVERLAY_PAINT, PROFILE_OVERLAY_POINTER, PROFILE_OVERLAY_CLIPBOARD, PROFILE_OVERLAY_ENV, PROFILE_OVERLAY_A11Y) if p not in required})
         options["target_profile"] = PROFILE_TERMINAL_SURFACE
         session = _connect(required_profiles=sorted(required), **options)
         return cls(_native.OverlaySession.adopt(session))
@@ -622,6 +622,7 @@ class OverlayWindow:
     def set_visible(self, visible: bool) -> None: self._raw.set_visible(visible)
     def center(self) -> None: self._raw.action("center")
     def request_focus(self) -> None: self._raw.action("focus")
+    def request_close(self) -> None: self._raw.action("request-close")
     def raise_window(self) -> None: self._raw.action("raise")
     def lower(self) -> None: self._raw.action("lower")
     def bounds(self) -> Rect: return Rect(*self._raw.bounds())

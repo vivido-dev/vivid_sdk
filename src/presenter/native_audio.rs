@@ -16,7 +16,7 @@ const RECHECK: Duration = Duration::from_millis(10);
 const SILENCE_SAMPLES: usize = 4096;
 #[path = "native_audio/drain.rs"]
 mod drain;
-#[cfg(all(test, feature = "testing", feature = "vector-video"))]
+#[cfg(all(test, feature = "testing"))]
 #[path = "native_audio_failure_tests.rs"]
 mod failure_tests;
 #[path = "native_audio/timeline.rs"]
@@ -205,11 +205,16 @@ pub(super) fn failed(state: &mut State, scope: &Admission) {
     state.wake_waits();
 }
 
-#[cfg(feature = "testing")]
+#[cfg(all(test, feature = "testing", feature = "vector-video"))]
 pub(super) fn fail_output_for_test(state: &State, key: TrackKey) -> bool {
-    if !state.audio_test_device {
+    if !state.audio_test_device.clocked() {
         return false;
     }
+    stop_bound_output_for_test(state, key)
+}
+
+#[cfg(feature = "testing")]
+pub(super) fn stop_bound_output_for_test(state: &State, key: TrackKey) -> bool {
     let Some(binding) = state
         .tracks
         .get(&key)
@@ -718,9 +723,9 @@ fn ensure_worker(
         let wake = changed.clone();
         let config = state.tracks[&scope.key].configuration.clone();
         #[cfg(feature = "testing")]
-        let test_device = state.audio_test_device;
+        let test_device = state.audio_test_device.clone();
         #[cfg(not(feature = "testing"))]
-        let test_device = false;
+        let test_device = DeviceSelection::Default;
         state
             .tracks
             .get_mut(&scope.key)
@@ -951,19 +956,35 @@ fn current(shared: &Weak<Mutex<State>>, scope: &Admission, control: &Control) ->
     !control.stopped.load(Ordering::Acquire)
         && shared.upgrade().is_some_and(|s| scope.current(&lock(&s)))
 }
-fn output(generation: u64, test: bool) -> io::Result<Arc<Output>> {
+#[derive(Clone, Default)]
+pub(super) enum DeviceSelection {
+    #[default]
+    Default,
     #[cfg(feature = "testing")]
-    if test {
-        return Ok(Output::test_clocked_output(generation));
+    Clocked,
+    #[cfg(feature = "testing")]
+    Native(crate::audio_output::testing::DeviceId),
+}
+impl DeviceSelection {
+    #[cfg(feature = "testing")]
+    pub(super) fn clocked(&self) -> bool {
+        matches!(self, Self::Clocked)
     }
-    let _ = test;
-    Output::open_with_limits(
-        generation,
-        crate::audio_output::Limits {
-            max_ring_samples: RING_SAMPLES,
-            buffer_duration_us: RING_DURATION_US,
-        },
-    )
+}
+fn output(generation: u64, selection: DeviceSelection) -> io::Result<Arc<Output>> {
+    let limits = crate::audio_output::Limits {
+        max_ring_samples: RING_SAMPLES,
+        buffer_duration_us: RING_DURATION_US,
+    };
+    match selection {
+        DeviceSelection::Default => Output::open_with_limits(generation, limits),
+        #[cfg(feature = "testing")]
+        DeviceSelection::Clocked => Ok(Output::test_clocked_output(generation)),
+        #[cfg(feature = "testing")]
+        DeviceSelection::Native(id) => {
+            crate::audio_output::testing::open_device(&id, generation, limits)
+        }
+    }
 }
 
 struct Staging<'a> {
@@ -1075,7 +1096,7 @@ fn run(
     control: &Control,
     jobs: mpsc::Receiver<Job>,
     config: TrackConfiguration,
-    test: bool,
+    test: DeviceSelection,
 ) -> io::Result<()> {
     if !current(shared, scope, control) {
         return Ok(());

@@ -186,6 +186,14 @@ pub trait HostedApp: fmt::Debug + 'static {
         &[]
     }
 
+    /// Borrows methods registered by the current independent process, when available.
+    fn process_automation_methods<'a>(
+        &'a self,
+        _cx: &'a App,
+    ) -> Option<&'a [automation::Method<String>]> {
+        None
+    }
+
     /// Handles a call through its cancellation-aware responder without blocking.
     ///
     /// Defer slow work to a bounded worker queue. Use `Responder::run` around
@@ -425,13 +433,17 @@ impl AppHost {
     ///
     /// # Errors
     /// Returns `Closed` for foreign/retired IDs or `InvalidRequest` for invalid metadata.
-    pub fn automation_methods(
-        &self,
+    pub fn automation_methods<'a>(
+        &'a self,
         id: InstanceId,
-        cx: &App,
-    ) -> Result<Vec<automation::Method>, automation::Error> {
+        cx: &'a App,
+    ) -> Result<Vec<automation::Method<&'a str>>, automation::Error> {
         let instance = self.instances.get(&id).ok_or(automation::Error::Closed)?;
-        automation::methods(instance.automation_methods(cx))
+        if let Some(methods) = instance.process_automation_methods(cx) {
+            automation::methods(methods)
+        } else {
+            automation::methods(instance.automation_methods(cx))
+        }
     }
 
     /// Dispatches one bounded application call without changing focus or placement.
@@ -449,16 +461,17 @@ impl AppHost {
         cx: &mut App,
     ) -> Result<automation::Reply, automation::Error> {
         let methods = self.automation_methods(id, cx)?;
-        let method = methods
+        let access = methods
             .iter()
             .find(|method| method.name == request.method())
+            .map(|method| method.access)
             .ok_or(automation::Error::Unsupported)?;
         if self.status(id, cx) != Some(AppStatus::Running) {
             return Err(automation::Error::Unavailable);
         }
         let (reply, response) = self.automation.admit(
             id,
-            method.access == automation::Access::Command,
+            access == automation::Access::Command,
             self.active == Some(id) && !self.hidden.contains(&id),
             cx,
         )?;

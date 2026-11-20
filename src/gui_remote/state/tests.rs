@@ -34,6 +34,12 @@ impl AppFactory for Proxy {
     }
 }
 impl HostedApp for Instance {
+    fn process_automation_methods<'a>(&'a self, _: &'a App) -> Option<&'a [Method<String>]> {
+        Some(self.1.0.methods())
+    }
+    fn automate(&mut self, request: Request, response: Responder, _: &mut App) {
+        self.1.0.call(request, response);
+    }
     fn view(&self) -> gpui::AnyView {
         self.0.clone().into()
     }
@@ -101,6 +107,9 @@ fn final_reply_remains_readable_after_peer_eof() {
     ));
 }
 fn connect(host: &Host) -> LocalStream {
+    connect_methods(host, Vec::new())
+}
+fn connect_methods(host: &Host, methods: Vec<Method<String>>) -> LocalStream {
     let mut stream = LocalStream::connect(&host.endpoint).unwrap();
     write_message(
         &mut stream,
@@ -113,7 +122,10 @@ fn connect(host: &Host) -> LocalStream {
     );
     write_message(
         &mut stream,
-        Message::Ready { owner: host.owner },
+        Message::Ready {
+            owner: host.owner,
+            methods,
+        },
         Instant::now() + BUDGET,
     )
     .unwrap();
@@ -242,4 +254,177 @@ fn service_shutdown_interrupts_unfinished_handshakes() {
     drop(service);
     assert!(start.elapsed() < Duration::from_secs(1));
     assert!(host.control.stopped.load(Ordering::Acquire));
+}
+
+#[test]
+fn cancelled_offers_never_receive_a_grant_and_the_next_call_still_completes() {
+    let directory = directory();
+    let (process, _service) = Host::bind(&endpoint(&directory, "methods"), None).unwrap();
+    let owner = process.owner;
+    let mut socket = connect_methods(
+        &process,
+        vec![Method {
+            name: "change".into(),
+            access: automation::Access::Command,
+            description: "Update model".into(),
+        }],
+    );
+    let end = Instant::now() + BUDGET;
+    while !process.is_ready() {
+        assert!(Instant::now() < end);
+        thread::yield_now();
+    }
+    let mut cx = TestAppContext::single();
+    let mut host = AppHost::new(1).unwrap();
+    let mut pane = None;
+    cx.add_window(|window, cx| {
+        let id = host
+            .mount(&Proxy(process), &AppConfig::default(), window, cx)
+            .unwrap();
+        host.activate(id, window, cx);
+        pane = Some(id);
+        View
+    });
+    let pane = pane.unwrap();
+    for (id, cancelled) in [(1, true), (2, false)] {
+        let reply = cx
+            .update(|cx| {
+                host.automate(
+                    pane,
+                    Request::new("change".into(), Data::default()).unwrap(),
+                    cx,
+                )
+            })
+            .unwrap();
+        let end = Instant::now() + BUDGET;
+        assert!(
+            matches!(read_message(&mut socket,end).unwrap(), Message::Offer {owner: got, id: seq, ..} if got == owner && seq == id)
+        );
+        let mut reply = Some(reply);
+        if cancelled {
+            drop(reply.take());
+        }
+        write_message(&mut socket, Message::Claim { owner, id }, end).unwrap();
+        assert!(
+            matches!(read_message(&mut socket,end).unwrap(), Message::Decision {owner: got,id: seq,remaining_us} if got == owner && seq == id && (remaining_us > 0) != cancelled)
+        );
+        if let Some(reply) = reply {
+            write_message(
+                &mut socket,
+                Message::Result {
+                    owner,
+                    id,
+                    result: Ok(Data::new(serde_json::json!({"count":1})).unwrap()),
+                },
+                end,
+            )
+            .unwrap();
+            assert_eq!(
+                pollster::block_on(reply)
+                    .unwrap()
+                    .decode::<serde_json::Value>()
+                    .unwrap()["count"],
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_method_registrations_do_not_become_ready() {
+    let base = serde_json::json!({"name":"inspect","access":"query","description":"Read model"});
+    for methods in [
+        vec![base.clone(); 33],
+        vec![base.clone(), base.clone()],
+        vec![serde_json::json!({"name":"private/method","access":"command","description":""})],
+        vec![serde_json::json!({"name":"read","access":"query","description":"x".repeat(257)})],
+    ] {
+        let frame = serde_json::json!({"version":1,"message":{"method":"ready","owner":vec![0u8;16],"methods":methods}});
+        assert!(serde_json::from_value::<Envelope>(frame).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn expired_grant_cannot_run_at_a_later_model_turn() {
+    let (mut host, stream) = LocalStream::pair().unwrap();
+    let owner = [8u8; 16];
+    let child = Connection {
+        owner,
+        stream,
+        initial: None,
+        methods_enabled: true,
+    };
+    let (_service, model) = child
+        .start_io(&[Method {
+            name: "increment",
+            access: automation::Access::Command,
+            description: "Increment",
+        }])
+        .unwrap();
+    let end = Instant::now() + BUDGET;
+    assert!(matches!(
+        read_message(&mut host, end).unwrap(),
+        Message::Ready { .. }
+    ));
+    let mut count = 0;
+    for (id, lifetime) in [(1, 5_000), (2, 1_000_000)] {
+        write_message(
+            &mut host,
+            Message::Offer {
+                owner,
+                id,
+                name: "increment".into(),
+                data: Data::default(),
+            },
+            end,
+        )
+        .unwrap();
+        model.recv_blocking().unwrap().service(
+            &mut (),
+            |_| panic!("unexpected capture"),
+            |_, _| panic!("call before grant"),
+        );
+        assert!(
+            matches!(read_message(&mut host,end).unwrap(),Message::Claim{id: claim,..} if claim==id)
+        );
+        write_message(
+            &mut host,
+            Message::Decision {
+                owner,
+                id,
+                remaining_us: lifetime,
+            },
+            end,
+        )
+        .unwrap();
+        let job = model.recv_blocking().unwrap();
+        if id == 1 {
+            thread::sleep(Duration::from_millis(25));
+        }
+        job.service(
+            &mut (),
+            |_| panic!("unexpected capture"),
+            |_, _| {
+                count += 1;
+                Ok(Data::default())
+            },
+        );
+        let Message::Result {
+            id: finished,
+            result,
+            ..
+        } = read_message(&mut host, end).unwrap()
+        else {
+            panic!("missing result")
+        };
+        assert_eq!(finished, id);
+        if id == 1 {
+            assert_eq!(result.unwrap_err(), Error::Expired);
+            assert_eq!(count, 0);
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(count, 1);
+        }
+    }
 }

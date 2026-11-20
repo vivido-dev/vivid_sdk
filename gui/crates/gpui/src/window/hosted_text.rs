@@ -175,6 +175,7 @@ impl Window {
                 selection,
                 ..Default::default()
             },
+            false,
             cx,
         )
     }
@@ -192,7 +193,29 @@ impl Window {
         edit: &HostedTextEdit<'_>,
         cx: &mut App,
     ) -> bool {
-        self.dispatch_hosted_edit(target, Some(context), edit, cx)
+        self.dispatch_hosted_edit(target, Some(context), edit, false, cx)
+    }
+
+    /// Applies a selection in excerpt UTF-8 coordinates, preserving the active
+    /// endpoint for handlers implementing directed selection.
+    pub fn dispatch_hosted_selection(
+        &mut self,
+        target: &HostedTextTarget,
+        context: &HostedTextContext,
+        anchor: usize,
+        cursor: usize,
+        cx: &mut App,
+    ) -> bool {
+        self.dispatch_hosted_edit(
+            target,
+            Some(context),
+            &HostedTextEdit {
+                document_selection: Some(anchor.min(cursor)..anchor.max(cursor)),
+                ..Default::default()
+            },
+            cursor < anchor,
+            cx,
+        )
     }
 
     fn dispatch_hosted_edit(
@@ -200,6 +223,7 @@ impl Window {
         target: &HostedTextTarget,
         context: Option<&HostedTextContext>,
         edit: &HostedTextEdit<'_>,
+        selection_reversed: bool,
         cx: &mut App,
     ) -> bool {
         if context.is_some_and(|c| !c.is_valid())
@@ -269,6 +293,7 @@ impl Window {
                     replacement,
                     document_selection,
                 },
+                selection_reversed,
                 self,
                 cx,
             );
@@ -524,7 +549,11 @@ mod tests {
                 ..Default::default()
             };
             assert!(window.dispatch_hosted_document(&target, &context, &select, cx));
-            assert_eq!(reports.borrow().selected, [101..103]);
+            // This older handler accepts only an ordered UTF-16 range. A backward
+            // request still selects the full surrogate pair at the excerpt offset.
+            assert!(window.dispatch_hosted_selection(&target, &context, 5, 1, cx));
+            assert!(!window.dispatch_hosted_selection(&target, &context, 5, 2, cx));
+            assert_eq!(reports.borrow().selected, [101..103, 101..103]);
             assert_eq!(
                 reports.borrow().unmarks,
                 1,

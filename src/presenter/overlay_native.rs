@@ -15,6 +15,14 @@ pub(crate) struct Native {
     pub committed: HashMap<SurfaceIdentity, Submission>,
     pub compositions: HashMap<u64, Composition>,
     invalidated: std::collections::HashSet<SurfaceIdentity>,
+    // At most one newly requested gain per pane. Loss is always immediate.
+    focus_gains: HashMap<PaneId, FocusGain>,
+}
+struct FocusGain {
+    window: SurfaceIdentity,
+    submission: Submission,
+    focus: u64,
+    lane: u64,
 }
 pub(crate) type Stamp = Vec<(SurfaceIdentity, u64, u64)>;
 pub(crate) struct Composition {
@@ -41,6 +49,8 @@ pub(crate) struct Displayed {
 }
 impl Native {
     pub fn remove_owner(&mut self, session: u64) {
+        self.focus_gains
+            .retain(|_, gain| gain.window.context().session().session_id() != session);
         self.pending
             .retain(|id, _| id.context().session().session_id() != session);
         self.prepared
@@ -73,6 +83,108 @@ impl Native {
     }
 }
 impl Overlays {
+    pub(crate) fn defer_action_focus(&mut self, pane: PaneId, window: SurfaceIdentity) {
+        let Some(lane) = self.input_generation(window.context().session().session_id()) else {
+            return;
+        };
+        let Some(focus) = self.windows.focus_generation(pane) else {
+            return;
+        };
+        let Some(native) = &mut self.native else {
+            return;
+        };
+        let Some(display) = native.displayed.get(&window) else {
+            return;
+        };
+        native.focus_gains.insert(
+            pane,
+            FocusGain {
+                window,
+                submission: display.submission,
+                focus,
+                lane,
+            },
+        );
+    }
+
+    pub(crate) fn awaiting_action_focus(&self, window: SurfaceIdentity) -> bool {
+        let owner = window.context().session();
+        let Some(pane) = self.windows.pane(owner) else {
+            return false;
+        };
+        let Some(gain) = self.native.as_ref().and_then(|n| n.focus_gains.get(&pane)) else {
+            return false;
+        };
+        gain.window == window
+            && self.windows.focus_generation(pane) == Some(gain.focus)
+            && self.input_generation(owner.session_id()) == Some(gain.lane)
+            && self
+                .windows
+                .get(window)
+                .is_some_and(|w| w.generation == gain.submission.address.generation)
+    }
+
+    pub(crate) fn publish_action_focus(&mut self, pane: PaneId) {
+        let Some(window) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.focus_gains.get(&pane))
+            .map(|g| g.window)
+        else {
+            return;
+        };
+        let current =
+            self.windows.focus(pane) == Some(window) && self.awaiting_action_focus(window);
+        if current && !self.native_window_ready(window) {
+            return;
+        }
+        let gain = self
+            .native
+            .as_mut()
+            .expect("native focus gain")
+            .focus_gains
+            .remove(&pane)
+            .expect("pending gain");
+        if current {
+            let binding = self
+                .native
+                .as_ref()
+                .and_then(|native| native.displayed.get(&window))
+                .map(|d| d.submission);
+            if binding.is_some_and(|s| {
+                s.address == gain.submission.address
+                    && s.track_id == gain.submission.track_id
+                    && s.channel_generation == gain.submission.channel_generation
+                    && s.epoch == gain.submission.epoch
+            }) {
+                self.native_emit(window, Event::Focus(true));
+            } else {
+                self.windows.clear_focus(window);
+                self.drain_events(window.context().session());
+            }
+        }
+    }
+
+    pub(crate) fn discard_action_focus(&mut self, pane: PaneId) {
+        if let Some(gain) = self
+            .native
+            .as_mut()
+            .and_then(|native| native.focus_gains.remove(&pane))
+            && self.windows.focus_generation(pane) == Some(gain.focus)
+            && self.windows.focus(pane) == Some(gain.window)
+        {
+            self.windows.clear_focus(gain.window);
+            self.drain_events(gain.window.context().session());
+        }
+    }
+    pub(crate) fn retire_action_focus(&mut self, session: u64) {
+        if let Some(native) = &mut self.native {
+            native
+                .focus_gains
+                .retain(|_, gain| gain.window.context().session().session_id() != session);
+        }
+    }
+
     pub(crate) fn note_native_cancel(&mut self, id: SurfaceIdentity) {
         if let Some(native) = &mut self.native {
             native.invalidated.insert(id);
@@ -404,6 +516,7 @@ impl Overlays {
             .flatten()
     }
     pub(crate) fn suspend_native(&mut self, owner: u64) {
+        self.retire_action_focus(owner);
         if let Some(native) = &mut self.native {
             native
                 .compositions

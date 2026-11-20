@@ -75,6 +75,18 @@ impl MetalFrameSource {
         let delegate = MetalDisplayLinkDelegate::new(main_thread, callback);
         let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), layer);
         link.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        #[cfg(all(target_os = "macos", feature = "test-support"))]
+        if let Some(setting) = std::env::var_os("VIVID_PROFILE_FRAME_LATENCY")
+            && (setting == "one" || setting == "default")
+        {
+            if setting == "one" {
+                link.setPreferredFrameLatency(1.0);
+            }
+            eprintln!(
+                "vv-animation-frame-latency {}",
+                link.preferredFrameLatency()
+            );
+        }
         // The default range follows the display and system power policy:
         // https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/preferredframeraterange
         // SAFETY: the retained marker confines the source to the main thread,

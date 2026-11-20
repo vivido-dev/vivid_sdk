@@ -465,6 +465,9 @@ pub trait Platform: 'static {
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
 
+    /// Installs the macOS application termination veto before shutdown starts.
+    #[cfg(target_os = "macos")]
+    fn on_should_terminate(&self, _callback: Rc<dyn Fn() -> bool>) {}
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system is about to sleep.
@@ -626,6 +629,16 @@ pub trait Platform: 'static {
             .spawn(async move { clipboard_text(read.await?, max_bytes) })
     }
 
+    /// Reads media for an explicit paste, preferring file offers. File-only backends
+    /// reuse their bounded URI service. Native image decoding runs off the GUI thread.
+    fn read_clipboard_media_async(
+        &self,
+    ) -> Task<Result<Option<crate::ClipboardPasteMedia>, ClipboardReadError>> {
+        let files = self.read_clipboard_uri_list_async(crate::MAX_CLIPBOARD_URI_BYTES);
+        self.foreground_executor()
+            .spawn(async move { Ok(files.await?.map(crate::ClipboardPasteMedia::Files)) })
+    }
+
     /// Whether this backend supports bounded local file-list clipboard transfers.
     fn supports_uri_list_clipboard(&self) -> bool {
         false
@@ -666,6 +679,11 @@ pub trait Platform: 'static {
 
     /// Atomically writes credentials unless an item with this URL and username exists.
     ///
+    /// Returns the platform's initial key-repeat delay and interval, when available.
+    fn key_repeat_timing(&self) -> Option<(Duration, Duration)> {
+        None
+    }
+
     /// Returns `true` if written, or `false` if the existing item was left unchanged.
     #[cfg(target_os = "macos")]
     fn write_credentials_if_not_exists(
@@ -683,6 +701,11 @@ pub trait Platform: 'static {
     fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+    /// Looks up an installed layout for a test without changing the user's active source.
+    #[cfg(any(test, feature = "test-support"))]
+    fn installed_keyboard_layout(&self, _id: &str) -> Option<Box<dyn PlatformKeyboardLayout>> {
+        None
+    }
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 }
@@ -1327,10 +1350,22 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Whether the current mouse button callback represents a Control-left gesture
+    /// Physical printable key and original modifiers during native keyboard dispatch.
+    fn physical_character_key(&self) -> Option<(u16, Modifiers)> {
+        None
+    }
+    /// translated to a secondary click by the platform.
+    fn is_control_click(&self) -> bool {
+        false
+    }
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    /// Requests native keyboard input protection for the live focused editor.
+    fn set_secure_keyboard_input(&mut self, _enabled: bool) {}
+
     /// Apply the focused text region's [`TextInputConfiguration`] to the
     /// platform's text input session (e.g. attributes of the hidden editable
     /// element on web). Called only when the configuration changes, because
@@ -2247,14 +2282,21 @@ impl PlatformInputHandler {
         &mut self,
         target: &crate::HostedTextTarget,
         edit: &crate::HostedTextEdit<'_>,
+        selection_reversed: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(range) = &edit.document_selection {
             // Selection is one handler operation. An intervening unmark callback
             // could commit text and invalidate the excerpt coordinates we checked.
-            self.handler
-                .set_selected_text_range(range.clone(), window, cx);
+            self.handler.set_text_selection(
+                UTF16Selection {
+                    range: range.clone(),
+                    reversed: selection_reversed,
+                },
+                window,
+                cx,
+            );
             return;
         }
         if let Some(commit) = edit.commit {
@@ -2406,6 +2448,14 @@ impl PlatformInputHandler {
                     && self.handler.prefers_ime_for_printable_keys(window, cx)
             })
             .unwrap_or(false)
+    }
+
+    pub(crate) fn requires_secure_keyboard_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.handler.requires_secure_keyboard_input(window, cx)
     }
 
     /// See [`InputHandler::text_input_configuration`].
@@ -2582,6 +2632,18 @@ pub trait InputHandler: 'static {
     ) {
     }
 
+    /// Applies an ordered UTF-16 range with its active endpoint. Override this
+    /// method to preserve backward selections. Range-only handlers keep their
+    /// existing selection behavior.
+    fn set_text_selection(
+        &mut self,
+        selection: crate::UTF16Selection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.set_selected_text_range(selection.range, window, cx);
+    }
+
     /// Get the bounds of the focused text element in window coordinates, if known.
     ///
     /// This is the pull counterpart to the [`PlatformWindow::update_ime_position`]
@@ -2638,6 +2700,11 @@ pub trait InputHandler: 'static {
     /// character input (e.g. Vim insert mode returns `true`, normal mode returns `false`).
     /// The terminal keeps the default `false` so that raw keys reach the terminal process.
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
+
+    /// Whether the focused editor requests operating-system protection for keyboard events.
+    fn requires_secure_keyboard_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
     }
 
@@ -3263,11 +3330,36 @@ pub struct ClipboardItem {
 /// Replaces native clipboard access for an explicitly hosted application.
 ///
 /// Implementations must bound transfers and recheck owner authority on completion.
-/// Synchronous reads, primary/find selections and file-list APIs are unavailable
+/// Synchronous reads, and primary/find selections are unavailable
 /// while a provider is installed; they never fall back to the native clipboard.
 pub trait HostedClipboard: std::fmt::Debug {
     /// Starts an asynchronous text read without blocking the GUI thread.
     fn read(&self, cx: &crate::App) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>>;
+    /// Whether the host accepts explicit file-list operations.
+    fn supports_file_lists(&self) -> bool {
+        false
+    }
+    /// Reports the current owner's latest file-offer snapshot without native I/O.
+    fn has_file_offer(&self) -> bool {
+        false
+    }
+    /// Reads bounded local file metadata through the host.
+    fn read_file_uris(
+        &self,
+        _cx: &crate::App,
+        _max_bytes: usize,
+    ) -> Task<Result<Option<String>, ClipboardReadError>> {
+        Task::ready(Err(ClipboardReadError::Unavailable))
+    }
+    /// Reads one explicit media offer, with file lists available on file-only hosts.
+    fn read_media(
+        &self,
+        cx: &crate::App,
+    ) -> Task<Result<Option<crate::ClipboardPasteMedia>, ClipboardReadError>> {
+        let files = self.read_file_uris(cx, crate::MAX_CLIPBOARD_URI_BYTES);
+        cx.foreground_executor()
+            .spawn(async move { Ok(files.await?.map(crate::ClipboardPasteMedia::Files)) })
+    }
     /// Queues a bounded write; this callback does not acknowledge native completion.
     fn write(&self, item: ClipboardItem);
 }

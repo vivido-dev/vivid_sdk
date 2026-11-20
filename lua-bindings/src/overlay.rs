@@ -1183,6 +1183,9 @@ impl LuaUserData for LuaOverlayWindow {
         methods.add_method("request_focus", |_, this, ()| {
             this.get()?.request_focus().lua()
         });
+        methods.add_method("request_close", |_, this, ()| {
+            this.get()?.request_close().lua()
+        });
         methods.add_method("raise", |_, this, ()| this.get()?.raise().lua());
         methods.add_method("lower", |_, this, ()| this.get()?.lower().lua());
         methods.add_method("bounds", |lua, this, ()| {

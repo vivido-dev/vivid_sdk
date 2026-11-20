@@ -9,6 +9,7 @@ use crate::gui::{App, HostedTextContext, HostedTextEdit, HostedTextTarget, Windo
 pub(crate) struct Producer {
     state: Arc<State>,
     configured: bool,
+    accessible_tree: Option<std::rc::Rc<std::cell::RefCell<Option<Arc<AccessibilityTree>>>>>,
     target: Option<HostedTextTarget>,
     editor: u64,
     generation: u64,
@@ -54,6 +55,7 @@ impl Producer {
             Self {
                 state,
                 configured,
+                accessible_tree: None,
                 target: None,
                 editor: 0,
                 generation: 0,
@@ -68,6 +70,48 @@ impl Producer {
     }
     pub(in crate::gui_remote) fn enabled(&self) -> bool {
         self.configured
+    }
+
+    pub(in crate::gui_remote) fn mapping(
+        &self,
+        tag: crate::InputTuple,
+    ) -> Option<(Mapping, Option<KeyRepeat>)> {
+        if !self.configured {
+            return Some((Mapping::Launch, None));
+        }
+        let bound = self.state.bound.lock().expect("composition mutex");
+        (!self.state.stopped.load(Ordering::Acquire) && bound.tag == Some(binding(tag)))
+            .then(|| (bound.layout.clone(), bound.repeat))
+    }
+
+    // Consume lock changes only up to the next physical report. Metadata alone cannot generate a key.
+    pub(in crate::gui_remote) fn lock_state(
+        &self,
+        tag: crate::InputTuple,
+        key: Option<(u16, bool)>,
+    ) -> io::Result<(Option<bool>, bool)> {
+        let mut bound = self.state.bound.lock().expect("composition mutex");
+        if self.state.stopped.load(Ordering::Acquire) || bound.tag != Some(binding(tag)) {
+            return Ok((None, false));
+        }
+        let mut caps = None;
+        while bound
+            .keyboard
+            .front()
+            .is_some_and(|context| context.key.is_none())
+        {
+            caps = bound.keyboard.pop_front().map(|context| context.caps_lock);
+        }
+        let Some(key) = key else {
+            return Ok((caps, true));
+        };
+        let Some(context) = bound.keyboard.pop_front() else {
+            return Ok((caps, false));
+        };
+        if context.key != Some(key) {
+            return Err(invalid());
+        }
+        Ok((Some(context.caps_lock), true))
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut App) {
@@ -124,11 +168,33 @@ impl Producer {
                 .is_some_and(|s| !s.closed.load(Ordering::Acquire))
             && tag.is_some()
             && bound.tag == tag;
-        if !live
-            || self.generation != bound.generation
-            || self.reset != input.reset
-            || self.tag != tag
-        {
+        let changed =
+            self.generation != bound.generation || self.reset != input.reset || self.tag != tag;
+        if (!live || !bound.request_tree || changed) && self.accessible_tree.take().is_some() {
+            window.stop_observing_hosted_accessibility();
+        }
+        if live && bound.request_tree && self.accessible_tree.is_none() {
+            let accessible_tree = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let latest = accessible_tree.clone();
+            let allow_click = input
+                .guard
+                .grant()
+                .is_some_and(|g| g.effective_classes & crate::INPUT_CLASS_POINTER_BUTTON != 0);
+            window.observe_hosted_accessibility(move |tree, size| {
+                let captured = AccessibilityTree::capture(tree, size, allow_click);
+                let mut old = latest.borrow_mut();
+                if old.as_deref() != captured.as_ref() {
+                    *old = captured.map(Arc::new);
+                }
+            });
+            self.accessible_tree = Some(accessible_tree);
+        }
+        bound.accessible_tree = self
+            .accessible_tree
+            .as_ref()
+            .and_then(|latest| latest.borrow().clone())
+            .map(|v| (v, Instant::now()));
+        if !live || changed {
             self.cancel(window, cx);
             self.generation = bound.generation;
             self.reset = input.reset;
@@ -136,7 +202,42 @@ impl Producer {
             bound.jobs.clear();
             bound.snapshot = None;
             if !live {
+                bound.assist.clear();
                 return Ok(());
+            }
+        }
+        if changed || !bound.request_tree {
+            bound.assist.clear();
+        }
+        if let Some(job) = bound.assist.pop_front() {
+            // Render intervening app changes before comparing the original publication.
+            if window.needs_draw() {
+                window.draw(cx).clear(cx);
+            }
+            let request = job.request;
+            if job.end > Instant::now()
+                && request.remaining().is_some()
+                && !state.stopped.load(Ordering::Acquire)
+                && input
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|s| !s.closed.load(Ordering::Acquire))
+                && input.guard.is_armed(input.now())
+                && input.guard.grant().is_some_and(|grant| {
+                    !matches!(request.action, TreeAction::Click)
+                        || grant.effective_classes & crate::INPUT_CLASS_POINTER_BUTTON != 0
+                })
+                && self.accessible_tree.as_ref().is_some_and(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|tree| Arc::ptr_eq(tree, &job.tree))
+                })
+            {
+                window.dispatch_hosted_accessibility_action(
+                    crate::gui::accesskit::NodeId(request.node),
+                    request.action.native(),
+                    cx,
+                );
             }
         }
         let current = window.hosted_text_state(cx);
@@ -200,20 +301,28 @@ impl Producer {
                 let Some(document) = &self.document else {
                     continue;
                 };
-                window.dispatch_hosted_document(
-                    target,
-                    document,
-                    &HostedTextEdit {
-                        commit: edit.commit.as_deref(),
-                        preedit: &edit.preedit,
-                        selection,
-                        replacement: edit.replacement.map(|(a, b)| a as usize..b as usize),
-                        document_selection: edit
-                            .document_selection
-                            .map(|(a, b)| a as usize..b as usize),
-                    },
-                    cx,
-                )
+                if let Some((anchor, cursor)) = edit.document_selection {
+                    window.dispatch_hosted_selection(
+                        target,
+                        document,
+                        anchor as usize,
+                        cursor as usize,
+                        cx,
+                    )
+                } else {
+                    window.dispatch_hosted_document(
+                        target,
+                        document,
+                        &HostedTextEdit {
+                            commit: edit.commit.as_deref(),
+                            preedit: &edit.preedit,
+                            selection,
+                            replacement: edit.replacement.map(|(a, b)| a as usize..b as usize),
+                            document_selection: None,
+                        },
+                        cx,
+                    )
+                }
             } else {
                 window.dispatch_hosted_composition(
                     target,
@@ -299,8 +408,9 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
         return Err(invalid());
     }
     let mut expected = 1u64;
+    let mut previous_tree: Option<Arc<AccessibilityTree>> = None;
     while !state.stopped.load(Ordering::Acquire) {
-        let message = match local::receive_idle(&mut stream, MAX_FRAME, BUDGET)? {
+        let message = match local::receive_idle(&mut stream, MAX_TICK, BUDGET)? {
             Some(message) => message,
             None => continue,
         };
@@ -308,7 +418,12 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
             id,
             generation,
             binding,
+            layout,
+            repeat,
+            keyboard,
             edit,
+            request_tree,
+            tree_action,
         } = message
         else {
             return Err(invalid());
@@ -317,18 +432,63 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
             return Err(invalid());
         }
         expected = expected.checked_add(1).ok_or_else(invalid)?;
-        let editor = {
+        let (editor, keyboard_credit, accessible_tree) = {
             let mut bound = state.bound.lock().expect("composition mutex");
             if generation < bound.generation
                 || (generation == bound.generation && binding != bound.tag)
             {
                 return Err(invalid());
             }
-            if generation != bound.generation || binding != bound.tag {
+            let changed = generation != bound.generation || binding != bound.tag;
+            if layout.is_some() != (changed && binding.is_some()) {
+                return Err(invalid());
+            }
+            if let Some(Mapping::Host(Some(map)) | Mapping::HostWithLocks(Some(map))) = &layout {
+                map.encode()?;
+            }
+            if (request_tree || repeat.is_some()) && binding.is_none() {
+                return Err(invalid());
+            }
+            if changed || !request_tree {
+                bound.assist.clear();
+                previous_tree = None;
+                bound.accessible_tree = None;
+            }
+            if let Some(request) = tree_action
+                && let Some(tree) = &previous_tree
+                && tree.supports(request.node, request.action)
+                && let Some(remaining) = request.remaining()
+                && bound.assist.len() < INPUT_CAPACITY
+            {
+                bound.assist.push_back(AssistJob {
+                    tree: tree.clone(),
+                    request,
+                    end: Instant::now() + remaining,
+                });
+            }
+            bound.request_tree = request_tree;
+            bound.repeat = repeat;
+            if changed {
+                bound.layout = layout.unwrap_or_default();
+                bound.keyboard.clear();
                 bound.generation = generation;
                 bound.tag = binding;
                 bound.snapshot = None;
                 bound.jobs.clear();
+            }
+            if !keyboard.is_empty() {
+                if binding.is_none()
+                    || !matches!(bound.layout, Mapping::HostWithLocks(_))
+                    || keyboard.len() > INPUT_CAPACITY.saturating_sub(bound.keyboard.len())
+                    || keyboard.iter().any(|context| {
+                        context
+                            .key
+                            .is_some_and(|(usage, _)| !(4..=231).contains(&usage))
+                    })
+                {
+                    return Err(invalid());
+                }
+                bound.keyboard.extend(keyboard);
             }
             if let Some(operation) = edit {
                 operation.edit.validate()?;
@@ -349,12 +509,27 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
                     });
                 }
             }
-            bound
+            let editor = bound
                 .snapshot
                 .as_ref()
                 .filter(|(_, at)| at.elapsed() <= Duration::from_millis(500))
-                .map(|(s, _)| s.clone())
+                .map(|(s, _)| s.clone());
+            (
+                editor,
+                INPUT_CAPACITY - bound.keyboard.len(),
+                bound
+                    .accessible_tree
+                    .as_ref()
+                    .filter(|(_, at)| at.elapsed() <= Duration::from_millis(500))
+                    .map(|(v, _)| v.clone()),
+            )
         };
+        let tree = match (&previous_tree, &accessible_tree) {
+            (_, None) => TreePublication::Empty,
+            (Some(old), Some(new)) if Arc::ptr_eq(old, new) => TreePublication::Retained,
+            (_, Some(new)) => TreePublication::Published(new.clone()),
+        };
+        previous_tree = accessible_tree;
         local::send(
             &mut stream,
             &Message::Snapshot {
@@ -362,6 +537,8 @@ fn connected(endpoint: &Path, secret: &[u8; 16], state: &State) -> io::Result<()
                 generation,
                 binding,
                 editor,
+                keyboard_credit,
+                tree,
             },
             MAX_FRAME,
             Instant::now() + BUDGET,

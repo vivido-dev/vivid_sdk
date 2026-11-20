@@ -85,6 +85,7 @@ impl NativePaneVisibility {
         if let Some(next) = next {
             state.native_visibility.insert(self.pane, next);
         }
+        state.overlays.discard_action_focus(self.pane);
         if let Some(native) = &mut state.overlays.native {
             native.compositions.remove(&self.pane);
         }
@@ -173,34 +174,73 @@ impl NativePaneVisibility {
         track: u64,
         generation: u64,
     ) -> bool {
+        self.stop_bound_audio(
+            super::super::TrackKey {
+                surface: super::super::SurfaceKey {
+                    session: owner,
+                    context,
+                    surface,
+                },
+                track,
+            },
+            generation,
+            None,
+        )
+    }
+
+    /// Stops this pane’s current native output stream for recovery testing.
+    ///
+    /// The supplied status must originate from this live presenter and still
+    /// name the hosted track, revision, epoch and channel generation.
+    /// This stops only the bound output's callbacks. The worker retires its stream;
+    /// the system output device and streams belonging to other callers stay available.
+    #[cfg(all(feature = "testing", feature = "vector-audio"))]
+    pub fn stop_native_output_for_test(
+        &self,
+        track: &crate::presenter::PaneMediaTrackStatus,
+    ) -> bool {
+        let key = super::super::TrackKey {
+            surface: super::super::SurfaceKey {
+                session: track.producer_id,
+                context: track.context_id,
+                surface: track.surface_id,
+            },
+            track: track.track_id,
+        };
+        self.stop_bound_audio(key, track.inner_channel_generation, Some(track))
+    }
+
+    #[cfg(all(feature = "testing", feature = "vector-audio"))]
+    fn stop_bound_audio(
+        &self,
+        key: super::super::TrackKey,
+        generation: u64,
+        native_status: Option<&crate::presenter::PaneMediaTrackStatus>,
+    ) -> bool {
         let (Some(shared), Some(alive)) = (self.state.upgrade(), self.alive.upgrade()) else {
             return false;
         };
         let state = lock(&shared);
         if !alive.load(Ordering::Acquire)
+            || native_status.is_some_and(|s| s.observed_presenter != Some(state.presenter))
+            || state.audio_test_device.clocked() != native_status.is_none()
             || state
                 .sessions
-                .get(&owner)
+                .get(&key.surface.session)
                 .is_none_or(|session| session.pane != self.pane)
         {
             return false;
         }
-        let key = super::super::TrackKey {
-            surface: super::super::SurfaceKey {
-                session: owner,
-                context,
-                surface,
-            },
-            track,
-        };
-        if state
-            .tracks
-            .get(&key)
-            .is_none_or(|entry| entry.state.channel_generation.get() != generation)
-        {
+        if state.tracks.get(&key).is_none_or(|entry| {
+            entry.state.channel_generation.get() != generation
+                || native_status.is_some_and(|track| {
+                    track.epoch != entry.state.media_epoch
+                        || track.track_revision != entry.state.revision.get()
+                })
+        }) {
             return false;
         }
-        super::super::native_audio::fail_output_for_test(&state, key)
+        super::super::native_audio::stop_bound_output_for_test(&state, key)
     }
 }
 

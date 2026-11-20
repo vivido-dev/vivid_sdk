@@ -780,6 +780,8 @@ pub struct PaintSurface {
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub lease: Option<std::sync::Arc<dyn SurfaceLease>>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub packed_mapping: Option<objc2_core_foundation::CFRetained<objc2_core_video::CVMetalTexture>>,
 }
 
 impl From<PaintSurface> for Primitive {

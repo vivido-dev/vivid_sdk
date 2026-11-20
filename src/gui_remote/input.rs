@@ -167,7 +167,12 @@ pub(super) struct Translator {
     binding: Option<crate::InputTuple>,
     repeat: keyboard::Repeating,
     policy: KeyRepeat,
+    host_policy: Option<KeyRepeat>,
+    next_system_sample: Option<Duration>,
     native_text: bool,
+    caps_lock: bool,
+    layout: Option<Arc<keyboard::CharacterLayout>>,
+    launch_layout: Option<Arc<keyboard::CharacterLayout>>,
 }
 impl Default for Translator {
     fn default() -> Self {
@@ -179,16 +184,29 @@ impl Default for Translator {
             binding: None,
             repeat: Default::default(),
             policy: KeyRepeat::default(),
+            host_policy: None,
+            next_system_sample: None,
             native_text: false,
+            caps_lock: false,
+            layout: None,
+            launch_layout: None,
         }
     }
 }
 
 impl Translator {
-    pub(super) fn new(policy: KeyRepeat, native_text: bool) -> Self {
+    pub(super) fn new(
+        (policy, follow_system): (KeyRepeat, bool),
+        native_text: bool,
+        layout: Option<keyboard::CharacterLayout>,
+    ) -> Self {
+        let layout = layout.map(Arc::new);
         Self {
+            launch_layout: layout.clone(),
             policy,
+            next_system_sample: follow_system.then_some(Duration::ZERO),
             native_text,
+            layout,
             ..Default::default()
         }
     }
@@ -202,18 +220,27 @@ impl Translator {
         }
     }
     fn key(&self, usage: u16) -> Option<Keystroke> {
-        let key = key_name(usage)?;
         let modifiers = self.modifiers();
+        if let Some(key) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.keystroke(usage, modifiers, self.caps_lock))
+        {
+            return Some(key);
+        }
+        let key = key_name(usage)?;
         let key_char = if modifiers.control || modifiers.platform || modifiers.alt {
             None
         } else if key == "space" {
             Some(" ".into())
         } else if key.len() == 1 {
-            Some(if modifiers.shift {
-                shifted(&key)
-            } else {
-                key.clone()
-            })
+            Some(
+                if modifiers.shift ^ (self.caps_lock && key.as_bytes()[0].is_ascii_lowercase()) {
+                    shifted(&key)
+                } else {
+                    key.clone()
+                },
+            )
         } else {
             None
         };
@@ -261,15 +288,23 @@ impl Translator {
                 );
             }
         }
+        self.caps_lock = false;
         self.held.fill(false);
         self.buttons.fill(false);
         self.repeat = Default::default();
+        self.host_policy = None;
         window.dispatch_cancelled_input(
             PlatformInput::ModifiersChanged(gui::ModifiersChangedEvent::default()),
             cx,
         );
     }
-    pub(super) fn apply(&mut self, injection: &mut Injection, window: &mut Window, cx: &mut App) {
+    pub(super) fn apply(
+        &mut self,
+        injection: &mut Injection,
+        ime: Option<&ime::Producer>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> io::Result<()> {
         if injection.guard.is_expired(injection.now())
             || (injection.guard.grant().is_some()
                 && injection
@@ -285,6 +320,27 @@ impl Translator {
             self.binding = injection.guard.current_tag();
         }
         injection.clipboard.refresh(injection);
+        let mut lock_service = None;
+        if let (Some(ime), Some(tag)) = (ime, self.binding) {
+            // The private service and the HID lane may arrive in either order.
+            // Leave bounded reports queued until their exact grant has its map.
+            let Some((mapping, repeat)) = ime.mapping(tag) else {
+                return Ok(());
+            };
+            if self.host_policy != repeat {
+                self.repeat
+                    .rearm(injection.origin.elapsed(), repeat.unwrap_or(self.policy));
+                self.host_policy = repeat;
+            }
+            self.layout = match mapping {
+                ime::Mapping::Launch => self.launch_layout.clone(),
+                ime::Mapping::Host(layout) => layout,
+                ime::Mapping::HostWithLocks(layout) => {
+                    lock_service = Some((ime, tag));
+                    layout
+                }
+            };
+        }
         for _ in 0..INPUT_CAPACITY {
             if injection
                 .lifecycle
@@ -298,6 +354,38 @@ impl Translator {
                     self.binding = None;
                 }
                 break;
+            }
+            if let Some((service, tag)) = lock_service
+                && injection.guard.is_armed(injection.now())
+                && injection
+                    .guard
+                    .grant()
+                    .is_some_and(|g| g.effective_classes & crate::INPUT_CLASS_KEYBOARD != 0)
+            {
+                let key = match injection.events.front() {
+                    Some(InputEvent::Key {
+                        binding,
+                        usage,
+                        pressed,
+                    }) if *binding == tag => Some((*usage, *pressed)),
+                    _ => None,
+                };
+                let (caps, ready) = service.lock_state(tag, key)?;
+                if let Some(on) = caps
+                    && self.caps_lock != on
+                {
+                    self.caps_lock = on;
+                    window.dispatch_event(
+                        PlatformInput::ModifiersChanged(gui::ModifiersChangedEvent {
+                            modifiers: self.modifiers(),
+                            capslock: gui::Capslock { on },
+                        }),
+                        cx,
+                    );
+                }
+                if !ready {
+                    return Ok(());
+                }
             }
             let Some(event) = injection.events.pop_front() else {
                 break;
@@ -318,17 +406,27 @@ impl Translator {
                         continue;
                     }
                     *held = pressed;
-                    self.repeat
-                        .transition(usage, pressed, injection.origin.elapsed(), self.policy);
-                    if usage >= 224 {
+                    self.repeat.transition(
+                        usage,
+                        pressed,
+                        injection.origin.elapsed(),
+                        self.host_policy.unwrap_or(self.policy),
+                    );
+                    if usage == 57 && pressed && lock_service.is_none() {
+                        self.caps_lock = !self.caps_lock;
+                    }
+                    if usage >= 224 || (usage == 57 && pressed && lock_service.is_none()) {
                         window.dispatch_event(
                             PlatformInput::ModifiersChanged(gui::ModifiersChangedEvent {
                                 modifiers: self.modifiers(),
-                                ..Default::default()
+                                capslock: gui::Capslock { on: self.caps_lock },
                             }),
                             cx,
                         );
-                    } else if let Some(keystroke) = self.key(usage) {
+                    }
+                    if usage < 224
+                        && let Some(keystroke) = self.key(usage)
+                    {
                         if pressed {
                             self.key_down(window, keystroke, false, cx);
                         } else {
@@ -429,14 +527,24 @@ impl Translator {
                 .lifecycle
                 .as_ref()
                 .is_some_and(|state| !state.closed.load(Ordering::Acquire))
-            && let Some(usage) = self
-                .repeat
-                .take_due(injection.origin.elapsed(), self.policy)
-            && self.held[usize::from(usage)]
-            && let Some(key) = self.key(usage)
         {
-            self.key_down(window, key, true, cx);
+            let now = injection.origin.elapsed();
+            if self.host_policy.is_none() {
+                self.repeat
+                    .refresh(now, &mut self.next_system_sample, &mut self.policy, || {
+                        cx.key_repeat_timing()
+                    });
+            }
+            if let Some(usage) = self
+                .repeat
+                .take_due(now, self.host_policy.unwrap_or(self.policy))
+                && self.held[usize::from(usage)]
+                && let Some(key) = self.key(usage)
+            {
+                self.key_down(window, key, true, cx);
+            }
         }
+        Ok(())
     }
 }
 
@@ -570,9 +678,13 @@ mod tests {
         for index in 0..2 {
             cx.update_window(windows[index].into(), |_, window, cx| {
                 window.draw(cx).clear(cx);
-                translators[index].apply(&mut inputs[index], window, cx);
+                translators[index]
+                    .apply(&mut inputs[index], None, window, cx)
+                    .unwrap();
                 inputs[index].origin = Instant::now() - Duration::from_millis(600);
-                translators[index].apply(&mut inputs[index], window, cx);
+                translators[index]
+                    .apply(&mut inputs[index], None, window, cx)
+                    .unwrap();
             })
             .unwrap();
             assert_eq!(
@@ -593,7 +705,9 @@ mod tests {
         inputs[1].origin = Instant::now() - Duration::from_secs(1);
         for index in 0..2 {
             cx.update_window(windows[index].into(), |_, window, cx| {
-                translators[index].apply(&mut inputs[index], window, cx);
+                translators[index]
+                    .apply(&mut inputs[index], None, window, cx)
+                    .unwrap();
             })
             .unwrap();
         }
@@ -605,7 +719,9 @@ mod tests {
         // Expiration is checked on an idle GUI turn, without any new lane event.
         inputs[1].origin = Instant::now() - Duration::from_secs(3);
         cx.update_window(windows[1].into(), |_, window, cx| {
-            translators[1].apply(&mut inputs[1], window, cx);
+            translators[1]
+                .apply(&mut inputs[1], None, window, cx)
+                .unwrap();
         })
         .unwrap();
         assert_eq!(reports[1].borrow().down.len(), 3);

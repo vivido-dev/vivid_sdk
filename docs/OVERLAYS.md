@@ -78,7 +78,9 @@ With a custom carrier, release its old blocking I/O before calling resume, as
 required by `Session::cancel_handle`; native endpoint transports close directly.
 
 Windows support `set_bounds`, `set_visible`, `center`, `request_focus`, `raise`, `lower`, and
-explicit `close`. `bounds()` and `viewport()` query host truth, including DPI scale. Use
+explicit `close`. To ask the presenter to dismiss a window and its descendants, use
+`request_close()` (TypeScript `requestClose()`). The surface remains owned by the
+producer until `close()` releases it. `bounds()` and `viewport()` query host truth, including DPI scale. Use
 `create_child(&parent, options)` for parent-scoped popup or modal windows. Foreign-session parent
 handles are rejected before sending anything. Coordinates are viewport logical pixels and do
 not follow terminal scrollback. `min_width` / `min_height` (Python `min_width`/`min_height`,

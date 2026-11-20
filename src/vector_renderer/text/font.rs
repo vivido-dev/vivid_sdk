@@ -49,20 +49,7 @@ impl FontSystem {
     /// # Errors
     /// Rejects invalid text, excessive measurement input or unbounded geometry.
     pub fn measure_plain(&mut self, text: &Text) -> Result<TextMeasurement, InvalidScene> {
-        if text.text.len() > MAX_MEASURE_TEXT_BYTES {
-            return Err(InvalidScene::new("text measurement source exceeds limit"));
-        }
-        let mut canvas = vivid_protocol::vector::Canvas::new();
-        canvas.push(vivid_protocol::vector::Command::Text(text.clone()))?;
-        let layout = self.shape_overlay(text);
-        let mut measured = layout_geometry(&layout, &text.text, usize::MAX)?;
-        measured.width = Scalar::new(if text.text.is_empty() {
-            0.
-        } else {
-            f64::from(layout.full_width())
-        })?;
-        measured.height = Scalar::new(f64::from(layout.height()))?;
-        Ok(measured)
+        super::measure_plain(self, text)
     }
 }
 impl TextShaper for FontSystem {

@@ -485,6 +485,7 @@ impl OverlayWindow {
                 "focus" => window.request_focus(),
                 "raise" => window.raise(),
                 "lower" => window.lower(),
+                "request-close" => window.request_close(),
                 "close" => window.close(),
                 _ => Err(model::invalid("unknown window action")),
             }

@@ -372,6 +372,13 @@ pub struct PaneMediaSurfaceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneMediaTrackStatus {
+    #[cfg(feature = "testing")]
+    #[serde(skip)]
+    pub(super) observed_presenter: Option<vivid_protocol::identity::PresenterInstanceId>,
+    /// Local position sampled with this track identity during native timing checks.
+    #[cfg(feature = "testing")]
+    #[serde(skip)]
+    pub test_position: Option<BridgePositionSnapshot>,
     pub producer_id: u64,
     pub context_id: u64,
     pub surface_id: u64,

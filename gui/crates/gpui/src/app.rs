@@ -364,6 +364,23 @@ impl Application {
         self
     }
 
+    /// Consults the application before AppKit begins termination.
+    ///
+    /// Return false to keep the event loop running while awaiting a close decision.
+    #[cfg(target_os = "macos")]
+    pub fn on_should_terminate(&self, callback: impl Fn(&mut App) -> bool + 'static) {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow()
+            .platform
+            .on_should_terminate(Rc::new(move || {
+                let Some(app) = this.upgrade() else {
+                    return true;
+                };
+                app.try_borrow_mut().is_ok_and(|mut cx| callback(&mut cx))
+            }));
+    }
+
     /// Invokes a handler when an already-running application is launched.
     /// On macOS, this can occur when the application icon is double-clicked or the app is launched via the dock.
     pub fn on_reopen<F>(&self, mut callback: F) -> &Self
@@ -400,6 +417,19 @@ impl Application {
     }
 }
 
+/// Routes file selections through the embedding presenter.
+pub trait HostedPathPrompts {
+    /// Requests existing files or directories.
+    fn open(&self, options: PathPromptOptions) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
+    /// Requests a destination for saving a file.
+    fn save(
+        &self,
+        directory: &Path,
+        name: Option<&str>,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
+}
+
+type HostedUrlOpener = Box<dyn Fn(&str)>;
 type Handler = Box<dyn FnMut(&mut App) -> bool + 'static>;
 type AppLifecycleHandler = Box<dyn FnMut(AppLifecyclePhase, &mut App) -> bool + 'static>;
 type DisplayHandler = Box<dyn FnMut(DisplayEvent, &mut App) -> bool + 'static>;
@@ -882,6 +912,8 @@ enum PlatformOwnedDragState {
 /// Other [Context] derefs to this type.
 /// You need a reference to an `App` to access the state of a [Entity].
 pub struct App {
+    hosted_url_opener: Option<HostedUrlOpener>,
+    hosted_path_prompts: Option<Rc<dyn HostedPathPrompts>>,
     pub(crate) this: Weak<AppCell>,
     pub(crate) platform: Rc<dyn Platform>,
     hosted_clipboard: Option<Rc<dyn crate::HostedClipboard>>,
@@ -1023,6 +1055,8 @@ impl App {
             app: RefCell::new(App {
                 this: this.clone(),
                 platform: platform.clone(),
+                hosted_url_opener: None,
+                hosted_path_prompts: None,
                 hosted_clipboard: None,
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
@@ -1318,6 +1352,11 @@ impl App {
         self.foreground_executor.spawn(futures).detach();
 
         self.quitting = false;
+    }
+
+    /// Reads the current system key-repeat delay and interval.
+    pub fn key_repeat_timing(&self) -> Option<(Duration, Duration)> {
+        self.platform.key_repeat_timing()
     }
 
     /// Get the id of the current keyboard layout
@@ -1875,18 +1914,28 @@ impl App {
             .read_clipboard_text_async(selection, max_bytes)
     }
 
+    /// Reads bounded media for an explicit paste without borrowing a hosted app's native clipboard.
+    pub fn read_clipboard_media_async(
+        &self,
+    ) -> Task<Result<Option<crate::ClipboardPasteMedia>, ClipboardReadError>> {
+        if let Some(provider) = &self.hosted_clipboard {
+            return provider.read_media(self);
+        }
+        self.platform.read_clipboard_media_async()
+    }
+
     /// Reports bounded local file-list clipboard support on this platform.
     pub fn supports_uri_list_clipboard(&self) -> bool {
-        if self.hosted_clipboard.is_some() {
-            return false;
+        if let Some(provider) = &self.hosted_clipboard {
+            return provider.supports_file_lists();
         }
         self.platform.supports_uri_list_clipboard()
     }
 
     /// Reports an explicit file-list offer without reading external clipboard data.
     pub fn clipboard_has_file_list(&self) -> bool {
-        if self.hosted_clipboard.is_some() {
-            return false;
+        if let Some(provider) = &self.hosted_clipboard {
+            return provider.has_file_offer();
         }
         self.platform.clipboard_has_file_list()
     }
@@ -1896,8 +1945,8 @@ impl App {
         &self,
         max_bytes: usize,
     ) -> Task<Result<Option<String>, ClipboardReadError>> {
-        if self.hosted_clipboard.is_some() {
-            return Task::ready(Err(ClipboardReadError::Unavailable));
+        if let Some(provider) = &self.hosted_clipboard {
+            return provider.read_file_uris(self, max_bytes);
         }
         self.platform.read_clipboard_uri_list_async(max_bytes)
     }
@@ -2016,9 +2065,18 @@ impl App {
         self.platform.delete_credentials(url)
     }
 
+    /// Routes URL requests through the embedding host for this app.
+    pub fn set_hosted_url_opener(&mut self, open: impl Fn(&str) + 'static) {
+        self.hosted_url_opener = Some(Box::new(open));
+    }
+
     /// Directs the platform's default browser to open the given URL.
     pub fn open_url(&self, url: &str) {
-        self.platform.open_url(url);
+        if let Some(open) = &self.hosted_url_opener {
+            open(url);
+        } else {
+            self.platform.open_url(url);
+        }
     }
 
     /// Registers the given URL scheme (e.g. `zed` for `zed://` urls) to be
@@ -2099,6 +2157,11 @@ impl App {
         self.platform.path_for_auxiliary_executable(name)
     }
 
+    /// Installs the file-picker provider for an embedded application.
+    pub fn set_hosted_path_prompts(&mut self, provider: Rc<dyn HostedPathPrompts>) {
+        self.hosted_path_prompts = Some(provider);
+    }
+
     /// Displays a platform modal for selecting paths.
     ///
     /// When one or more paths are selected, they'll be relayed asynchronously via the returned oneshot channel.
@@ -2108,6 +2171,9 @@ impl App {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        if let Some(host) = &self.hosted_path_prompts {
+            return host.open(options);
+        }
         self.platform.prompt_for_paths(options)
     }
 
@@ -2122,6 +2188,9 @@ impl App {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        if let Some(host) = &self.hosted_path_prompts {
+            return host.save(directory, suggested_name);
+        }
         self.platform.prompt_for_new_path(directory, suggested_name)
     }
 

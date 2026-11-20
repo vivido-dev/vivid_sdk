@@ -50,12 +50,15 @@ vector-audio = ["vector-render", "audio-decode", "audio-output"]
 local-control = ["dep:vivid_local_control"]
 # Experimental bounded Metal/IOSurface frame sharing; does not enable GUI.
 gpu-share = ["dep:vivid_gpu_share"]
+gpu-share-testing = ["gpu-share", "vivid_gpu_share/test-util"]
 # Shared portable display-list compilation; independent of GPUI and a GPU device.
 vector-render = [
   "dep:vello",
   "dep:parley",
   "dep:bytemuck",
   "dep:unicode-segmentation",
+  "dep:icu_properties",
+  "dep:skrifa",
 ]
 # Bounded PNG/JPEG decoding on a separate native presenter worker.
 vector-images = ["vector-render", "dep:image", "dep:moxcms", "dep:crc32fast"]
@@ -86,7 +89,7 @@ gui-runtime-shaders = ["gui", "gpui_platform/runtime_shaders"]
 # Production frame readback without enabling deterministic test runtimes.
 gui-offscreen = ["gui", "gpui/offscreen", "gpui_platform/offscreen"]
 # Production GUI application rendered into an authenticated desktop surface.
-gui-remote = ["gui-offscreen", "local-control"]
+gui-remote = ["gui-offscreen", "local-control", "dep:url", "dep:futures-channel"]
 # Optional Linux nested Wayland server; independent of Vivid wire authority.
 gui-wayland = [
   "gui",
@@ -111,7 +114,9 @@ presenter = ["dep:log", "dep:serde", "dep:sha2"]
 testing = ["presenter", "vivid_audio_output?/testing"]
 
 [dependencies]
+url = { version = "2.5", optional = true }
 vivid_gpu_share = { version = "0.1.0", path = "gpu-share", optional = true, default-features = false }
+futures-channel = { version = "0.3", optional = true }
 async-channel = { version = "2.5", optional = true }
 vivid_audio = { version = "0.1.0", path = "audio", optional = true }
 vivid_audio_output = { version = "0.1.0", path = "audio-output", optional = true }
@@ -123,6 +128,8 @@ image = { version = "0.25.10", optional = true, default-features = false, featur
   "png",
   "jpeg",
 ] }
+skrifa = { version = "0.49", optional = true }
+icu_properties = { version = "2.3", optional = true }
 unicode-segmentation = { version = "1.12", optional = true }
 bytemuck = { version = "1.25", optional = true }
 parley = { version = "0.12", path = "vendor/parley", optional = true, features = [
@@ -145,7 +152,7 @@ gpui_platform = { path = "gui/crates/gpui_platform", optional = true, default-fe
 ] }
 getrandom = "0.4"
 log = { version = "0.4", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.11", optional = true }
 vivid_protocol = { version = "1.5.13", path = "../vivid_protocol", default-features = false, features = [

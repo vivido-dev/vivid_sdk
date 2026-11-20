@@ -59,6 +59,8 @@ mod path_builder;
 ))]
 pub use offscreen::validate_offscreen_size;
 mod clipboard_files;
+mod clipboard_media;
+pub use clipboard_media::{ClipboardPasteMedia, ClipboardPng, MAX_CLIPBOARD_IMAGE_BYTES};
 mod platform;
 #[doc(inline)]
 pub use clipboard_files::{
@@ -133,8 +135,8 @@ pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 
 pub use accesskit::{Action as AccessibleAction, Orientation, Role, Toggled};
 pub use accesskit::{
-    Node as AccessibleNode, NodeId as AccessibleNodeId, TextPosition as AccessibleTextPosition,
-    TextSelection as AccessibleTextSelection,
+    Node as AccessibleNode, NodeId as AccessibleNodeId, TextDirection as AccessibleTextDirection,
+    TextPosition as AccessibleTextPosition, TextSelection as AccessibleTextSelection,
 };
 pub use action::*;
 pub use anyhow::Result;

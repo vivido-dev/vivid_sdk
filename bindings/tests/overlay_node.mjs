@@ -68,6 +68,9 @@ try {
   await window.releaseTextLayout(ellipsis);
   await assert.rejects(window.submit(replacementCanvas));
   const popup = await session.createWindow({ bounds: { x: 40, y: 40, width: 20, height: 20 }, mode: "popup" }, window);
-  await popup.present(new Canvas()); await popup.close();
+  await popup.present(new Canvas());
+  await popup.requestClose();
+  await assert.rejects(popup.submit(new Canvas()));
+  await popup.close();
   await window.present(new Canvas()); await window.close();
 } finally { await session.close(); input.close(); }

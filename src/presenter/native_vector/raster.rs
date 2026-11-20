@@ -47,6 +47,8 @@ impl Pixels {
 enum Content {
     #[cfg(feature = "vector-video")]
     Video {
+        #[cfg(feature = "testing")]
+        selected: Option<(Instant, i64)>,
         epoch: u32,
         frame: u64,
         pts: i64,
@@ -272,6 +274,33 @@ pub(super) struct Entry {
     config: ProtocolSceneNode,
     scope: Scope,
 }
+#[cfg(all(feature = "testing", feature = "vector-video"))]
+impl VectorFrame {
+    /// Returns scheduler selection and media timestamps for a single timed video receipt.
+    ///
+    /// Fields are selection time, scheduler clock PTS, frame PTS, epoch and
+    /// presentation ID. PTS values use microseconds. Multiple video entries
+    /// make this diagnostic ambiguous and return `None`.
+    pub fn single_video_selection_for_test(&self) -> Option<(Instant, i64, i64, u32, u64)> {
+        let mut videos =
+            self.0
+                .raster_entries
+                .iter()
+                .filter_map(|entry| match entry.scope.content {
+                    Content::Video {
+                        selected,
+                        pts,
+                        epoch,
+                        frame,
+                        ..
+                    } => Some(selected.map(|(at, clock)| (at, clock, pts, epoch, frame))),
+                    _ => None,
+                });
+        let first = videos.next()??;
+        videos.next().is_none().then_some(first)
+    }
+}
+
 impl Entry {
     pub(super) fn same(&self, other: &Self) -> bool {
         self.node == other.node && self.config == other.config && self.scope.same(&other.scope)
@@ -401,6 +430,8 @@ pub(super) fn snapshot(state: &State, pane: PaneId) -> Vec<Candidate> {
                 (
                     Pixels::Video(frame.image.clone()),
                     Content::Video {
+                        #[cfg(feature = "testing")]
+                        selected: frame.selected,
                         epoch: frame.epoch,
                         frame: frame.id,
                         pts: frame.pts,

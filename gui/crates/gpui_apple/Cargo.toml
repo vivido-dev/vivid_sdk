@@ -15,7 +15,7 @@ doctest = false
 [features]
 default = []
 bench-support = ["gpui/bench-support"]
-test-support = ["gpui/test-support"]
+test-support = ["gpui/test-support", "objc2-metal/objc2-core-foundation"]
 runtime_shaders = []
 font-kit = ["dep:font-kit", "dep:core-text", "dep:objc2-core-text", "dep:pathfinder_geometry"]
 offscreen = ["gpui/offscreen"]
@@ -48,11 +48,14 @@ objc2.workspace = true
 objc2-core-foundation = { workspace = true, features = ["std", "CFData", "CFDictionary", "CFString", "CFNumber", "CFBase", "CFCGTypes"] }
 objc2-core-graphics = { workspace = true, features = ["CGColorSpace"] }
 objc2-core-text = { workspace = true, optional = true }
-objc2-core-video = { workspace = true, features = ["CVBase", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVReturn", "objc2", "objc2-metal"] }
+objc2-core-video = { workspace = true, features = ["CVBase", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBufferIOSurface", "objc2-io-surface", "CVReturn", "objc2", "objc2-metal"] }
+# CoreVideo returns a CFRetained IOSurface when checking a supplied mapping.
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
     "dispatch2",
+    "objc2-io-surface",
     "MTLAllocation",
     "MTLBlitCommandEncoder",
     "MTLBuffer",
@@ -84,3 +87,4 @@ cbindgen.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 objc2-core-video = { workspace = true, features = ["CVBase"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLEvent"] }

@@ -70,6 +70,8 @@ pub trait TextShaper {
 
 #[cfg(feature = "vector-gpu")]
 pub mod compositor;
+pub mod marks;
+mod plain;
 mod raster;
 pub mod text;
 pub mod text_layout;
@@ -432,7 +434,8 @@ fn compile_bounded(
                         draw_shadow(&mut result.scene, shadow, state.transform)?;
                     }
                     Command::Text(value) => {
-                        let layout = text.shape_overlay(value);
+                        let plain = plain::Plain::shape(text, value);
+                        let layout = &plain.layout;
                         let transform = state.transform
                             * Affine::translate((value.origin.x.get(), value.origin.y.get()));
                         check_bounds(
@@ -478,6 +481,7 @@ fn compile_bounded(
                                     );
                             }
                         }
+                        plain.paint_marks(&mut result.scene, transform, color(value.color));
                     }
                     Command::Image { asset, rect, .. } => {
                         let image = images

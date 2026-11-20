@@ -647,6 +647,12 @@ enum FrameSource {
     DisplayLink(Option<WindowFrameSource>),
 }
 
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn EnableSecureEventInput() -> i32;
+    fn DisableSecureEventInput() -> i32;
+}
+
 struct MacWindowState {
     handle: AnyWindowHandle,
     foreground_executor: ForegroundExecutor,
@@ -673,6 +679,7 @@ struct MacWindowState {
     close_callback: Option<Box<dyn FnOnce()>>,
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    secure_keyboard_held: bool,
     last_key_equivalent: Option<KeyDownEvent>,
     last_left_mouse_down_event: Option<Retained<AnyObject>>,
     synthetic_drag_counter: usize,
@@ -686,6 +693,8 @@ struct MacWindowState {
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
+    dispatching_control_click: bool,
+    physical_character_key: Option<(u16, Modifiers)>,
     // When true, the whole content view is reported as app-owned titlebar content via
     // `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from
     // the titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such
@@ -707,6 +716,29 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
+    /// Balances only this window's successful Carbon enable call.
+    fn set_secure_keyboard_input(&mut self, enabled: bool) {
+        if self.secure_keyboard_held == enabled {
+            return;
+        }
+        let _main =
+            crate::main_thread_marker().expect("secure keyboard input requires the main thread");
+        // SAFETY: Carbon secure event input calls have no arguments and run on
+        // the AppKit main thread. Other windows may hold separate references.
+        let status = unsafe {
+            if enabled {
+                EnableSecureEventInput()
+            } else {
+                DisableSecureEventInput()
+            }
+        };
+        if status == 0 {
+            self.secure_keyboard_held = enabled;
+        } else {
+            log::warn!("macOS secure event input transition failed ({status})");
+        }
+    }
+
     fn move_traffic_light(&mut self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() && !self.is_exiting_fullscreen {
@@ -1132,6 +1164,7 @@ impl MacWindow {
                 close_callback: None,
                 appearance_changed_callback: None,
                 input_handler: None,
+                secure_keyboard_held: false,
                 last_key_equivalent: None,
                 last_left_mouse_down_event: None,
                 synthetic_drag_counter: 0,
@@ -1148,6 +1181,8 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
+                dispatching_control_click: false,
+                physical_character_key: None,
                 app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
                 is_exiting_fullscreen: false,
@@ -1404,6 +1439,7 @@ impl Drop for MacWindow {
         // a cycle the delegate/`frame_source` teardown below cannot break. Drop
         // the adapter here so the native view, its `CAMetalLayer` and the
         // renderer's command queue are actually released with the window.
+        this.set_secure_keyboard_input(false);
         drop(this.accesskit_adapter.take());
         this.renderer.destroy();
         let window = this.native_window;
@@ -1688,6 +1724,14 @@ impl PlatformWindow for MacWindow {
         convert_mouse_position(position, self.content_size().height)
     }
 
+    fn physical_character_key(&self) -> Option<(u16, Modifiers)> {
+        self.0.lock().physical_character_key
+    }
+
+    fn is_control_click(&self) -> bool {
+        self.0.lock().dispatching_control_click
+    }
+
     fn modifiers(&self) -> Modifiers {
         unsafe {
             let modifiers: NSEventModifierFlags = msg_send![class!(NSEvent), modifierFlags];
@@ -1716,6 +1760,16 @@ impl PlatformWindow for MacWindow {
                 on: modifiers.contains(NSEventModifierFlags::CapsLock),
             }
         }
+    }
+
+    fn set_secure_keyboard_input(&mut self, requested: bool) {
+        let mut state = self.0.lock();
+        let enabled = requested
+            && !state.closed.load(Ordering::Acquire)
+            && NSApplication::sharedApplication(self.1).isActive()
+            && state.native_window().isKeyWindow()
+            && visibility(&state).is_visible();
+        state.set_secure_keyboard_input(enabled);
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -2740,6 +2794,26 @@ extern "C" fn handle_key_event(
     key_equivalent: bool,
 ) -> Bool {
     let window_state = unsafe { get_window_state(this) };
+    // SAFETY: AppKit passes an NSEvent for the lifetime of this callback.
+    let Some(event) = (unsafe { native_event.cast::<objc2_app_kit::NSEvent>().as_ref() }) else {
+        return Bool::NO;
+    };
+    let physical = crate::keyboard::character_usage(event.keyCode())
+        .map(|usage| (usage, crate::events::read_modifiers(event)));
+    let previous = std::mem::replace(
+        &mut window_state.as_ref().lock().physical_character_key,
+        physical,
+    );
+    let result = dispatch_key_event(this, native_event, key_equivalent);
+    window_state.as_ref().lock().physical_character_key = previous;
+    result
+}
+fn dispatch_key_event(
+    this: &AnyObject,
+    native_event: *mut AnyObject,
+    key_equivalent: bool,
+) -> Bool {
+    let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
 
     let window_height = lock.content_size().height;
@@ -2921,6 +2995,7 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
             lock.cursor_visible.store(true, Ordering::Relaxed);
         }
 
+        let mut control_click = false;
         match &mut event {
             PlatformInput::MouseDown(
                 event @ MouseDownEvent {
@@ -2929,6 +3004,7 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
                     ..
                 },
             ) => {
+                control_click = true;
                 // On mac, a ctrl-left click should be handled as a right click.
                 *event = MouseDownEvent {
                     button: MouseButton::Right,
@@ -2965,6 +3041,7 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
                     ..
                 },
             ) => {
+                control_click = true;
                 *event = MouseUpEvent {
                     button: MouseButton::Right,
                     modifiers: Modifiers {
@@ -3039,9 +3116,12 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
         }
 
         if let Some(mut callback) = lock.event_callback.take() {
+            lock.dispatching_control_click = control_click;
             drop(lock);
             callback(event);
-            window_state.lock().event_callback = Some(callback);
+            let mut lock = window_state.lock();
+            lock.dispatching_control_click = false;
+            lock.event_callback = Some(callback);
         }
     }
 }
@@ -3066,7 +3146,10 @@ fn visibility(state: &MacWindowState) -> WindowVisibility {
 }
 
 fn report_visibility(window_state: &Rc<Mutex<MacWindowState>>) {
-    let state = window_state.lock();
+    let mut state = window_state.lock();
+    if state.secure_keyboard_held && !visibility(&state).is_visible() {
+        state.set_secure_keyboard_input(false);
+    }
     if state.last_visibility.is_none() {
         return;
     }
@@ -3258,8 +3341,11 @@ fn report_display_change(window_state: &Rc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *mut AnyObject) {
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = lock.native_window().isKeyWindow();
+    if !is_active || selector == sel!(windowDidResignKey:) {
+        lock.set_secure_keyboard_input(false);
+    }
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
@@ -3360,6 +3446,7 @@ extern "C" fn close_window(this: &AnyObject, _: Sel) {
         let (close_callback, simple_fullscreen_state) = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
+            lock.set_secure_keyboard_input(false);
             lock.closed.store(true, Ordering::Release);
             (
                 lock.close_callback.take(),

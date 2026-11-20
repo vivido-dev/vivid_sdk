@@ -274,6 +274,16 @@ video member and an independent owner reusing the same local IDs. Its linked
 and video-only tests also cover host replacement, paused priming, early resume,
 independent member epochs, repeated replacement and quit while unavailable.
 
+The developer-only `stop_native_output_for_test(&track_status)` silences a
+host-owned native output and lets its worker retire the stream. It requires
+the live pane, owner, context, surface, track, revision, epoch and channel
+generation. The default system device remains available for the replacement
+stream. On macOS the native conformance fixture exercised this with a real
+CoreAudio callback, an independent Vivi process and a peer handling input.
+The test observation carries its originating presenter in memory. A status from a second presenter with the
+same local IDs, or one reconstructed from serialized diagnostics, cannot
+stop this stream.
+
 Each owning surface has a nonzero checked transition serial. Visibility,
 producer play/pause intent, and qualified position refinements emit actionable
 `PLAYBACK_HOLD` records through the bounded control writer. `TRACK_STATUS` key 24

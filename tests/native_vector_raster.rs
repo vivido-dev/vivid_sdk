@@ -495,6 +495,9 @@ fn native_gpu_preserves_raster_alpha_modes_deltas_and_same_id_peer() {
 fn malformed_premultiplied_full_and_delta_leave_same_id_peer_and_retained_revision_intact() {
     for invalid_pixel in [[1, 0, 0, 0], [65, 0, 0, 64]] {
         for (delta, compressed) in [(false, false), (false, true), (true, false), (true, true)] {
+            if compressed && !cfg!(feature = "native-media") {
+                continue;
+            }
             let (presenter, mut host) = fixture();
             let a = Peer::new_alpha(&presenter, 0, [9, 47, 16, 64], 2);
             let b = Peer::new(&presenter, 16, [96, 48, 192, 128]);

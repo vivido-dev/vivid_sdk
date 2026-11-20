@@ -123,6 +123,22 @@ impl AppContext for TestAppContext {
 }
 
 impl TestAppContext {
+    /// Replaces the host keyboard layout and notifies running observers.
+    pub fn set_keyboard_layout(&mut self, layout: Box<dyn crate::PlatformKeyboardLayout>) {
+        let mut cx = self.app.borrow_mut();
+        cx.keyboard_layout = layout;
+        cx.keyboard_layout_observers
+            .clone()
+            .retain(|callback| callback(&mut cx));
+    }
+
+    /// Supplies the platform repeat timing observed by this application.
+    pub fn set_key_repeat_timing(&self, delay: Duration, interval: Duration) {
+        self.test_platform
+            .repeat_timing
+            .set(Some((delay, interval)));
+    }
+
     /// Sets the runtime identity used by this test's application.
     pub fn set_platform_info(&mut self, platform_info: crate::PlatformInfo) {
         self.test_platform.platform_info.set(platform_info);
@@ -517,8 +533,30 @@ impl TestAppContext {
         node: crate::AccessibleNodeId,
         action: crate::AccessibleAction,
     ) -> bool {
+        self.simulate_accessibility_request(
+            window,
+            accesskit::ActionRequest {
+                action,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: node,
+                data: None,
+            },
+        )
+    }
+
+    /// Delivers a complete assistive technology request, including text selection endpoints.
+    pub fn simulate_accessibility_request(
+        &self,
+        window: AnyWindowHandle,
+        request: accesskit::ActionRequest,
+    ) -> bool {
         self.test_window(window)
-            .simulate_accessibility_action(node, action)
+            .simulate_accessibility_request(request)
+    }
+
+    /// Returns the focused handler's last native secure keyboard request.
+    pub fn secure_keyboard_input_requested(&self, window: AnyWindowHandle) -> bool {
+        self.test_window(window).0.lock().secure_keyboard_input
     }
 
     /// Simulates the platform pointer entering or leaving a window.

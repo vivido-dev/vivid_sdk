@@ -7,14 +7,16 @@
 #![cfg(target_os = "macos")]
 
 // Rust guideline compliant 2026-10-07
-use objc2::runtime::ProtocolObject;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBuffer,
     CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
     kCVPixelFormatType_32BGRA, kCVReturnSuccess,
 };
-use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResource, MTLTextureType};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLResource, MTLSharedEvent, MTLTextureType,
+};
 use std::{
     fmt, io, ptr,
     sync::{
@@ -23,6 +25,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[cfg(any(test, feature = "test-util"))]
+mod test_gate;
+#[cfg(any(test, feature = "test-util"))]
+pub use test_gate::WithheldSignal;
 
 /// Maximum bytes in one immutable shared frame (2048 square RGBA).
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -124,6 +131,8 @@ impl Drop for Active {
 /// Bounds immutable frames retained by one producer and its GUI consumers.
 #[derive(Clone, Debug)]
 pub struct Pool {
+    #[cfg(any(test, feature = "test-util"))]
+    gate: Arc<test_gate::Gate>,
     local: Arc<Local>,
     budget: Budget,
     // Separate from Local: submitted storage must not retain a device/pipeline
@@ -168,6 +177,8 @@ impl Pool {
             return Err(invalid("invalid shared frame capacity"));
         }
         Ok(Self {
+            #[cfg(any(test, feature = "test-util"))]
+            gate: Arc::default(),
             local: Arc::new(Local {
                 allocated: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
@@ -428,6 +439,8 @@ impl Pool {
                 wgpu::TextureUses::UNINITIALIZED,
             )
         };
+        #[cfg(any(test, feature = "test-util"))]
+        let gate = self.gate.stage(queue)?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vivid.shared-frame.copy"),
         });
@@ -444,21 +457,35 @@ impl Pool {
         } else {
             encoder.copy_texture_to_texture(source.as_image_copy(), output.as_image_copy(), size);
         }
-        let submission = queue.submit([encoder.finish()]);
-        // Retain native wrappers even on timeout/device-error return. The callback
-        // retires only after the submitted work completes (or is abandoned on loss).
-        let pending = storage.clone();
-        let completed = Arc::new(AtomicBool::new(false));
-        let notification = completed.clone();
-        queue.on_submitted_work_done(move || {
-            drop(pending);
-            notification.store(true, Ordering::Release);
+        let command = encoder.finish();
+        // The imported HAL texture retains the CoreVideo wrappers and permit
+        // through GPU retirement, including abandoned or timed-out exports.
+        let ready = &storage.allocation().ready;
+        let mut signal = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vivid.shared-frame.signal"),
         });
+        // SAFETY: This separate encoder records only the native signal. No active
+        // pass or resource is touched. WGPU owns, ends and submits the buffer.
+        unsafe {
+            signal.as_hal_mut::<wgpu::hal::api::Metal, _, _>(|encoder| {
+                let buffer = encoder
+                    .and_then(|e| e.raw_command_buffer())
+                    .ok_or_else(|| invalid("Metal export signal encoder unavailable"))?;
+                buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&**ready), id);
+                Ok::<_, io::Error>(())
+            })
+        }?;
+        let signal = signal.finish();
+        let started = Instant::now();
+        let submission = queue.submit([command, signal]);
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some((sender, signal)) = gate {
+            let _ = sender.try_send(signal);
+        }
         Ok(Pending {
             device: device.clone(),
             submission,
-            started: Instant::now(),
-            completed,
+            started,
             output: Some(output),
             frame: Some(Arc::new(Frame {
                 id,
@@ -477,7 +504,6 @@ pub struct Pending {
     device: wgpu::Device,
     submission: wgpu::SubmissionIndex,
     started: Instant,
-    completed: Arc<AtomicBool>,
     output: Option<wgpu::Texture>,
     frame: Option<Arc<Frame>>,
 }
@@ -489,17 +515,8 @@ impl Pending {
     /// # Errors
     /// Returns an error after consumption, GPU wait failure or deadline expiry.
     pub fn wait(mut self) -> io::Result<Arc<Frame>> {
-        if self.frame.is_none() {
-            return Err(invalid("shared frame operation consumed"));
-        }
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(self.submission.clone()),
-                timeout: Some(GPU_TIMEOUT.saturating_sub(self.started.elapsed())),
-            })
-            .map_err(|_| io::Error::other("shared frame GPU completion failed"))?;
-        self.poll()?
-            .ok_or_else(|| io::Error::other("shared frame completion absent"))
+        self.complete(GPU_TIMEOUT.saturating_sub(self.started.elapsed()))?
+            .ok_or_else(expired)
     }
     /// Observes GPU progress without waiting, returning the completed frame once.
     ///
@@ -511,29 +528,47 @@ impl Pending {
     /// Returns `TimedOut` after the deadline, `InvalidInput` after consumption,
     /// or another error when device polling or resource retirement fails.
     pub fn poll(&mut self) -> io::Result<Option<Arc<Frame>>> {
-        if self.frame.is_none() {
-            return Err(invalid("shared frame operation consumed"));
-        }
+        self.complete(Duration::ZERO)
+    }
+
+    fn complete(&mut self, timeout: Duration) -> io::Result<Option<Arc<Frame>>> {
         let result = (|| {
-            if self.started.elapsed() > GPU_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "shared frame GPU deadline expired",
-                ));
+            let frame = self
+                .frame
+                .as_ref()
+                .ok_or_else(|| invalid("shared frame operation consumed"))?;
+            if self.started.elapsed() >= GPU_TIMEOUT {
+                return Err(expired());
             }
-            self.device
-                .poll(wgpu::PollType::Poll)
-                .map_err(|_| io::Error::other("shared frame GPU polling failed"))?;
-            if !self.completed.load(Ordering::Acquire) {
-                return Ok(None);
+            // Query the fence for this copy. Concurrent submissions on the
+            // producer queue must never change which work authorizes this lease.
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(self.submission.clone()),
+                timeout: Some(timeout),
+            }) {
+                Err(wgpu::PollError::Timeout) if self.started.elapsed() >= GPU_TIMEOUT => {
+                    return Err(expired());
+                }
+                Err(wgpu::PollError::Timeout) => return Ok(None),
+                Err(error) => return Err(io::Error::other(error)),
+                Ok(_) => {}
+            }
+            if self.started.elapsed() >= GPU_TIMEOUT {
+                return Err(expired());
+            }
+            if frame._storage.allocation().ready.signaledValue() != frame.id {
+                return Err(io::Error::other(
+                    "Metal export finished without its ready signal",
+                ));
             }
             self.output.take();
             self.device
                 .poll(wgpu::PollType::Poll)
                 .map_err(|_| io::Error::other("shared frame retirement failed"))?;
-            if let Some(frame) = &self.frame {
-                frame._storage.reusable.store(true, Ordering::Release);
+            if self.started.elapsed() >= GPU_TIMEOUT {
+                return Err(expired());
             }
+            frame._storage.reusable.store(true, Ordering::Release);
             Ok(self.frame.take())
         })();
         if result.is_err() {
@@ -545,6 +580,10 @@ impl Pending {
         result
     }
 }
+fn expired() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "shared frame GPU deadline expired")
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -575,6 +614,7 @@ impl Drop for Storage {
     }
 }
 struct Allocation {
+    ready: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     _buffer: CFRetained<CVPixelBuffer>,
     texture: CFRetained<CVMetalTexture>,
     _permit: Permit,
@@ -686,6 +726,9 @@ impl Allocation {
             )
         };
         Ok(Self {
+            ready: device
+                .newSharedEvent()
+                .ok_or_else(|| io::Error::other("Metal export event unavailable"))?,
             _buffer: buffer,
             texture,
             _permit: permit,
@@ -729,9 +772,10 @@ impl Frame {
     /// Must be called during the window's paint phase, as for other GUI paint APIs.
     #[cfg(feature = "gui")]
     pub fn paint(self: &Arc<Self>, bounds: gpui::Bounds<gpui::Pixels>, window: &mut gpui::Window) {
-        window.paint_surface_with_lease(
+        window.paint_mapped_surface_with_lease(
             bounds,
             self._storage.allocation()._buffer.clone(),
+            self._storage.allocation().texture.clone(),
             self.clone(),
         );
     }
@@ -759,6 +803,226 @@ mod tests {
             assert!(Budget::new(limit).is_err());
         }
         assert_eq!(Pool::new(8).unwrap().retained(), 0);
+    }
+
+    struct NativeRead {
+        command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        destination: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        _frame: Arc<Frame>,
+    }
+
+    impl NativeRead {
+        fn submit(queue: &ProtocolObject<dyn MTLCommandQueue>, frame: &Arc<Frame>) -> Self {
+            use objc2_metal::{
+                MTLBlitCommandEncoder, MTLCommandEncoder, MTLOrigin, MTLResourceOptions, MTLSize,
+            };
+
+            assert_eq!(frame.size(), [64, 8]);
+            let storage = frame._storage.allocation();
+            let texture = CVMetalTextureGetTexture(&storage.texture).unwrap();
+            let command = queue.commandBuffer().unwrap();
+            let destination = queue
+                .device()
+                .newBufferWithLength_options(2048, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            command.encodeWaitForEvent_value(ProtocolObject::from_ref(&*storage.ready), frame.id);
+            let blit = command.blitCommandEncoder().unwrap();
+            // SAFETY: The entire 64×8 BGRA texture fits the destination at 256 bytes
+            // per row. Both resources and the exact mapping remain live through retirement.
+            unsafe {
+                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                    &texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+                    MTLSize { width: 64, height: 8, depth: 1 }, &destination, 0, 256, 2048,
+                );
+            }
+            blit.endEncoding();
+            command.commit();
+            Self {
+                command,
+                destination,
+                _frame: frame.clone(),
+            }
+        }
+
+        fn finish(self) -> io::Result<Vec<u8>> {
+            use objc2_metal::{MTLBuffer, MTLCommandBufferStatus};
+            let deadline = Instant::now() + 2 * GPU_TIMEOUT;
+            loop {
+                match self.command.status() {
+                    MTLCommandBufferStatus::Completed => break,
+                    MTLCommandBufferStatus::Error => {
+                        let error = self.command.error().unwrap();
+                        assert_eq!(error.domain().to_string(), "MTLCommandBufferErrorDomain");
+                        assert_eq!(
+                            error.code(),
+                            objc2_metal::MTLCommandBufferError::Timeout.0 as isize
+                        );
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    _ => assert!(
+                        Instant::now() < deadline,
+                        "private Metal import did not retire"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: GPU completion initialized the 2048-byte shared destination;
+            // it stays live and has no further writers while the pixels are copied.
+            Ok(unsafe {
+                std::slice::from_raw_parts(self.destination.contents().cast::<u8>().as_ptr(), 2048)
+            }
+            .to_vec())
+        }
+    }
+
+    // Long withheld events exercise the hardware watchdog on the same physical GPU.
+    static WITHHELD_DEVICE: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[ignore = "requires native Metal producer and consumer queues"]
+    fn prequeued_gpu_read_recovers_after_expiry_and_same_id_replacement() {
+        let _exclusive = WITHHELD_DEVICE.lock().unwrap();
+        let (device, queue) = native_device();
+        let (new_device, new_queue) = native_device();
+        let pool = Pool::new(2).unwrap();
+        let source = solid_source(&device, &queue, 64, [14, 29, 43, 255]);
+        let other = solid_source(&device, &queue, 64, [70, 80, 90, 255]);
+        let previous = pool.copy(&device, &queue, &other).unwrap();
+        let previous_id = previous.id();
+        let previous_buffer = buffer_identity(&previous);
+        let consumer = CVMetalTextureGetTexture(&previous._storage.allocation().texture)
+            .unwrap()
+            .device()
+            .newCommandQueue()
+            .unwrap();
+        drop(previous);
+
+        for expire in [false, true] {
+            let armed = pool.withhold_next_copy_for_test().unwrap();
+            let pending = pool.begin_copy(&device, &queue, &source).unwrap();
+            let gate = armed.try_recv().unwrap();
+            let frame = pending.frame.as_ref().unwrap().clone();
+            assert_eq!(buffer_identity(&frame), previous_buffer);
+            assert!(frame.id > previous_id);
+            let read = NativeRead::submit(&consumer, &frame);
+            assert!(frame._storage.allocation().ready.signaledValue() < frame.id);
+            if !expire {
+                drop(gate);
+                assert_eq!(read.finish().unwrap(), [43, 29, 14, 255].repeat(512));
+                assert_eq!(
+                    read_bgra(&pending.wait().unwrap()),
+                    [43, 29, 14, 255].repeat(512)
+                );
+                continue;
+            }
+            let error = pending.wait().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            let replacement = Pool::new(1).unwrap();
+            let fresh_source = solid_source(&new_device, &new_queue, 64, [7, 20, 51, 255]);
+            for _ in 1..frame.id {
+                drop(
+                    replacement
+                        .copy(&new_device, &new_queue, &fresh_source)
+                        .unwrap(),
+                );
+            }
+            let fresh = replacement
+                .copy(&new_device, &new_queue, &fresh_source)
+                .unwrap();
+            assert_eq!(fresh.id(), frame.id());
+            assert_eq!(read_bgra(&fresh), [51, 20, 7, 255].repeat(512));
+            assert!(frame._storage.allocation().ready.signaledValue() < frame.id);
+            drop(gate);
+            match read.finish() {
+                Ok(pixels) => assert_eq!(pixels, [43, 29, 14, 255].repeat(512)),
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                    eprintln!("retired import reported Metal watchdog timeout");
+                }
+            }
+            assert_eq!(
+                NativeRead::submit(&consumer, &fresh).finish().unwrap(),
+                [51, 20, 7, 255].repeat(512)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires independent native Metal queues"]
+    fn withheld_shared_event_expires_only_its_original_frame_lease() {
+        let _exclusive = WITHHELD_DEVICE.lock().unwrap();
+        let (device, queue) = native_device();
+        let (other, other_queue) = native_device();
+        let source = solid_source(&device, &queue, 16, [14, 29, 43, 255]);
+        let other_source = solid_source(&other, &other_queue, 16, [70, 80, 90, 255]);
+        let replacement_source = solid_source(&other, &other_queue, 32, [12, 34, 56, 255]);
+        let peer_pixels = [90, 80, 70, 255].repeat(128);
+        let replacement_pixels = [56, 34, 12, 255].repeat(256);
+        let budget = Budget::new(3).unwrap();
+        let original = Pool::with_budget(1, budget.clone()).unwrap();
+        let peer = Pool::with_budget(1, budget.clone()).unwrap();
+        let armed = original.withhold_next_copy_for_test().unwrap();
+        let mut blocked = original.begin_copy(&device, &queue, &source).unwrap();
+        let gate = armed.try_recv().unwrap();
+        assert!(blocked.poll().unwrap().is_none());
+        let live = peer.copy(&other, &other_queue, &other_source).unwrap();
+        assert_eq!(read_bgra(&live), peer_pixels);
+        assert!(blocked.poll().unwrap().is_none());
+
+        let error = blocked.wait().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(original.retained(), 1);
+        let replacement = Pool::with_budget(1, budget.clone()).unwrap();
+        let fresh = replacement
+            .copy(&other, &other_queue, &replacement_source)
+            .unwrap();
+        assert_eq!(fresh.id(), live.id());
+        assert_eq!(budget.retained(), 3);
+        drop(gate);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(GPU_TIMEOUT),
+            })
+            .unwrap();
+        assert_eq!((original.allocated(), original.retained()), (0, 0));
+        assert_eq!(budget.retained(), 2);
+        assert_eq!(fresh.size(), [32, 8]);
+        assert_eq!(read_bgra(&fresh), replacement_pixels);
+        assert_eq!(read_bgra(&live), peer_pixels);
+        drop((fresh, live, replacement, peer));
+        assert_eq!((budget.allocated(), budget.retained()), (0, 0));
+    }
+
+    #[test]
+    #[ignore = "requires a native Metal device and shared event"]
+    fn stalled_resize_preserves_earlier_submission_on_the_same_queue() {
+        let (device, queue) = native_device();
+        let pool = Pool::new(2).unwrap();
+        let small = solid_source(&device, &queue, 16, [14, 29, 43, 255]);
+        let large = solid_source(&device, &queue, 32, [70, 80, 90, 255]);
+        let before_resize = pool.begin_copy(&device, &queue, &small).unwrap();
+        let armed = pool.withhold_next_copy_for_test().unwrap();
+        let mut after_resize = pool.begin_copy(&device, &queue, &large).unwrap();
+        let gate = armed.try_recv().unwrap();
+
+        let original = before_resize.wait().unwrap();
+        assert!(after_resize.poll().unwrap().is_none());
+        assert_eq!(original.size(), [16, 8]);
+        assert_eq!(read_bgra(&original), [43, 29, 14, 255].repeat(128));
+        assert_eq!((pool.retained(), pool.allocated()), (2, 2));
+        drop(gate);
+
+        let resized = after_resize.wait().unwrap();
+        assert_eq!(resized.size(), [32, 8]);
+        assert!(resized.id() > original.id());
+        assert_eq!(read_bgra(&resized), [90, 80, 70, 255].repeat(256));
+        assert_eq!(read_bgra(&original), [43, 29, 14, 255].repeat(128));
+        drop(original);
+        assert_eq!((pool.retained(), pool.allocated()), (1, 1));
+        drop(resized);
+        pool.clear_cache();
+        assert_eq!((pool.retained(), pool.allocated()), (0, 0));
     }
 
     #[test]

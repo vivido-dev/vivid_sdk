@@ -90,7 +90,12 @@ def blocking():
             except (ValueError, OSError): pass
             else: raise AssertionError("released layout was accepted")
             popup = session.create_window(OverlayWindowOptions(Rect(40, 40, 20, 20), "popup"), parent=window)
-            popup.present(Canvas()); popup.close()
+            popup.present(Canvas())
+            popup.request_close()
+            try: popup.submit(Canvas())
+            except (ValueError, OSError): pass
+            else: raise AssertionError("dismissed popup accepted a submission")
+            popup.close()
             window.present(canvas())
 
 async def asynchronous():
@@ -148,7 +153,12 @@ async def asynchronous():
             except (ValueError, OSError): pass
             else: raise AssertionError("released layout was accepted")
             popup = await session.create_window(OverlayWindowOptions(Rect(40, 40, 20, 20), "popup"), parent=window)
-            await popup.present(Canvas()); await popup.close()
+            await popup.present(Canvas())
+            await popup.request_close()
+            try: await popup.submit(Canvas())
+            except (ValueError, OSError): pass
+            else: raise AssertionError("dismissed popup accepted a submission")
+            await popup.close()
             await window.present(canvas())
 
 if sys.argv[-1] == "async": asyncio.run(asynchronous())

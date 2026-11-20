@@ -133,8 +133,8 @@ fn finish(state: &mut State, id: u64, response: Result<Vec<u8>, String>) {
             return;
         }
         grant.finished = true;
-        if let Some(sender) = state.overlay_relay.pending.get(&id) {
-            let _ = sender.try_send(response);
+        if let Some(pending) = state.overlay_relay.pending.get(&id) {
+            let _ = pending.reply.try_send(response);
         }
     }
 }

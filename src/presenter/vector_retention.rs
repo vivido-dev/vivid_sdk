@@ -1,5 +1,6 @@
 //! Retain a bounded, self-contained vector scene for replacement outer attachments.
 
+// Rust guideline compliant 2026-10-07
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
@@ -12,7 +13,14 @@ use vivid_protocol::{
 pub(super) struct VectorRetention {
     assets: BTreeMap<u64, Arc<[u8]>>,
     scene_assets: BTreeMap<u64, Arc<[u8]>>,
-    frame: Option<Arc<[u8]>>,
+    frame: Option<RetainedFrame>,
+}
+
+#[derive(Clone)]
+struct RetainedFrame {
+    body: Arc<[u8]>,
+    #[cfg(feature = "vector-render")]
+    identity: (u32, u64),
 }
 
 impl VectorRetention {
@@ -21,7 +29,15 @@ impl VectorRetention {
         self.assets.contains_key(&id) || self.scene_assets.contains_key(&id)
     }
     pub fn frame(&self) -> Option<Arc<[u8]>> {
-        self.frame.clone()
+        self.frame.as_ref().map(|frame| frame.body.clone())
+    }
+
+    #[cfg(feature = "vector-render")]
+    pub fn frame_identity(&self, body: &Arc<[u8]>) -> Option<(u32, u64)> {
+        self.frame
+            .as_ref()
+            .filter(|frame| Arc::ptr_eq(&frame.body, body))
+            .map(|frame| frame.identity)
     }
 
     pub fn bytes(&self) -> u64 {
@@ -35,7 +51,10 @@ impl VectorRetention {
                 .filter(|(id, _)| !self.assets.contains_key(id))
                 .map(|(_, body)| body.len() as u64)
                 .sum::<u64>()
-            + self.frame.as_ref().map_or(0, |body| body.len() as u64)
+            + self
+                .frame
+                .as_ref()
+                .map_or(0, |frame| frame.body.len() as u64)
     }
 
     pub fn accept(&mut self, kind: u16, body: &[u8]) -> io::Result<()> {
@@ -75,7 +94,11 @@ impl VectorRetention {
                     }
                 }
                 self.scene_assets = assets;
-                self.frame = Some(Arc::from(body));
+                self.frame = Some(RetainedFrame {
+                    body: Arc::from(body),
+                    #[cfg(feature = "vector-render")]
+                    identity: (frame.epoch, frame.revision),
+                });
             }
             _ => return Err(io::Error::other("unexpected vector record")),
         }
@@ -90,7 +113,7 @@ impl VectorRetention {
             .map(|body| (messages::VECTOR_ASSET, body))
             .collect::<Vec<_>>();
         if let Some(frame) = &self.frame {
-            records.push((messages::VECTOR_FRAME, frame.clone()));
+            records.push((messages::VECTOR_FRAME, frame.body.clone()));
         }
         for id in self
             .scene_assets
@@ -107,6 +130,30 @@ impl VectorRetention {
 mod tests {
     use super::*;
     use vivid_protocol::vector::{Canvas, Rect};
+
+    #[cfg(feature = "vector-render")]
+    #[test]
+    fn snapshot_identity_belongs_to_the_exact_accepted_allocation() {
+        let mut retained = VectorRetention::default();
+        let body = Frame {
+            epoch: 3,
+            revision: 11,
+            canvas: Canvas::new(),
+        }
+        .encode()
+        .unwrap();
+        retained.accept(messages::VECTOR_FRAME, &body).unwrap();
+        let first = retained.frame().unwrap();
+        assert_eq!(retained.frame_identity(&first), Some((3, 11)));
+        assert!(retained.accept(messages::VECTOR_FRAME, &[]).is_err());
+        assert_eq!(retained.frame_identity(&first), Some((3, 11)));
+        retained.accept(messages::VECTOR_FRAME, &body).unwrap();
+        assert_eq!(retained.frame_identity(&first), None);
+        assert_eq!(
+            retained.frame_identity(&retained.frame().unwrap()),
+            Some((3, 11))
+        );
+    }
 
     #[test]
     fn released_displayed_assets_rehydrate_before_the_frame_then_release() {

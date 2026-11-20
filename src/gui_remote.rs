@@ -18,7 +18,7 @@ mod transport;
 #[doc(inline)]
 pub use input::hid_usage;
 #[doc(inline)]
-pub use keyboard::KeyRepeat;
+pub use keyboard::{CharacterLayout, KeyRepeat};
 
 use crate::{
     InputBindingGuard, InputEvent, ProducerConfig,
@@ -243,6 +243,7 @@ pub fn run<V: Render + 'static>(
     build: impl FnOnce(&mut Window, &mut gui::App) -> Entity<V> + 'static,
 ) -> io::Result<()> {
     let repeat = KeyRepeat::from_env()?;
+    let layout = CharacterLayout::from_env()?;
     let (mut ime, ime_service) = ime::Producer::from_env()?;
     let shared = Arc::new(Shared::new());
     let gate = shared
@@ -278,7 +279,12 @@ pub fn run<V: Render + 'static>(
     };
     let app_state = shared.clone();
     crate::gui_platform::headless().run(move |cx| {
-        cx.set_hosted_clipboard(std::rc::Rc::new(clipboard));
+        // The native producer window is hidden. Draw prompts into the published canvas.
+        cx.set_prompt_builder(gui::fallback_prompt_renderer);
+        let services = std::rc::Rc::new(clipboard);
+        cx.set_hosted_clipboard(services.clone());
+        cx.set_hosted_path_prompts(services.clone());
+        cx.set_hosted_url_opener(move |url| services.open_url(url));
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -302,7 +308,7 @@ pub fn run<V: Render + 'static>(
             let mut geometry = None;
             let mut last_pixels = None;
             let mut render_revision = 0;
-            let mut input = input::Translator::new(repeat, ime.enabled());
+            let mut input = input::Translator::new(repeat, ime.enabled(), layout);
             while !app_state.stopped.load(Ordering::Acquire) {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
                 let requested = *app_state.geometry.lock().expect("geometry mutex");
@@ -316,7 +322,7 @@ pub fn run<V: Render + 'static>(
                         if changed {
                             injection.revoke();
                         }
-                        input.apply(&mut injection, window, cx);
+                        input.apply(&mut injection, Some(&ime), window, cx)?;
                         ime.pump(&injection, window, cx)?;
                     }
                     let Some(requested) = requested else {
@@ -375,7 +381,7 @@ pub fn run<V: Render + 'static>(
             let _ = handle.update(cx, |_, window, cx| {
                 let mut injection = app_state.injection.lock().expect("input mutex");
                 injection.revoke();
-                input.apply(&mut injection, window, cx);
+                let _ = input.apply(&mut injection, Some(&ime), window, cx);
                 let _ = ime.pump(&injection, window, cx);
             });
             if app_state.error.lock().expect("error mutex").is_some() {
@@ -418,6 +424,34 @@ pub fn run_persistent<V: Render + 'static>(
     + 'static,
     capture: impl Fn(&V, &gui::App) -> io::Result<Option<crate::gui_host::AppState>> + 'static,
 ) -> io::Result<()> {
+    run_with_methods(config, build, capture, &[], |_, _, _| {
+        Err(crate::gui_host::automation::Error::Unsupported)
+    })
+}
+
+/// Runs a GUI root with durable state and app-defined automation.
+///
+/// Calls run on the producer's model thread after the host admits the exact owner.
+///
+/// # Errors
+/// Returns the same launch and transport errors as `run_persistent`.
+pub fn run_with_methods<V: Render + 'static>(
+    config: ProducerConfig,
+    build: impl FnOnce(
+        Option<&crate::gui_host::AppState>,
+        &mut Window,
+        &mut gui::App,
+    ) -> io::Result<Entity<V>>
+    + 'static,
+    capture: impl Fn(&V, &gui::App) -> io::Result<Option<crate::gui_host::AppState>> + 'static,
+    methods: &'static [crate::gui_host::automation::Method],
+    call: impl Fn(
+        &mut V,
+        crate::gui_host::automation::Request,
+        &mut gui::Context<V>,
+    ) -> Result<crate::gui_host::automation::Data, crate::gui_host::automation::Error>
+    + 'static,
+) -> io::Result<()> {
     let mut connection = state::Connection::from_env()?;
     // Retire native I/O after the GUI loop returns, outside GUI callbacks.
     let service = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -432,7 +466,7 @@ pub fn run_persistent<V: Render + 'static>(
         };
         if let Some(mut connection) = connection.take() {
             connection.initial.take();
-            match connection.attach(view.clone(), capture, cx) {
+            match connection.attach(view.clone(), capture, methods, call, cx) {
                 Ok(worker) => *setup.borrow_mut() = Some(worker),
                 Err(_) => std::process::exit(1),
             }

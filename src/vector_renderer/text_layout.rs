@@ -29,7 +29,7 @@ pub fn paint(
 ) -> Result<MeasuredLayout, InvalidScene> {
     text.validate()
         .map_err(|_| InvalidScene::new("invalid styled text"))?;
-    paint_prepared(layout, text, width, height)
+    paint_prepared(layout, text, width, height, None)
 }
 
 // Only shared preparation may exceed the wire source limit, by its bounded
@@ -39,6 +39,7 @@ pub(super) fn paint_prepared(
     text: &StyledText,
     width: f64,
     height: f64,
+    prepared: Option<&super::text::PreparedText>,
 ) -> Result<MeasuredLayout, InvalidScene> {
     if width < 0.0 || height < 0.0 {
         return Err(InvalidScene::new("negative shaped layout extent"));
@@ -118,6 +119,31 @@ pub(super) fn paint_prepared(
                             y + f64::from(thickness.max(0.5)),
                         ),
                     );
+                }
+            }
+        }
+        if let Some(p) = prepared.filter(|p| !p.marks.is_empty()) {
+            let mut x = line.metrics().offset;
+            for run in line.runs() {
+                for cluster in run.visual_clusters() {
+                    if let Some(offset) = cluster.text_range().start.checked_sub(p.prefix_bytes)
+                        && p.truncated_at
+                            .is_none_or(|cut| p.marks.original_offset(offset) < cut)
+                    {
+                        let style = text
+                            .runs
+                            .get(cluster.style().brush)
+                            .ok_or(InvalidScene::new("absent mark style"))?;
+                        p.marks.paint_cluster(
+                            &mut scene,
+                            Affine::IDENTITY,
+                            offset,
+                            x + cluster.advance() / 2.,
+                            line.metrics().baseline,
+                            color(style.style.color),
+                        );
+                    }
+                    x += cluster.advance();
                 }
             }
         }

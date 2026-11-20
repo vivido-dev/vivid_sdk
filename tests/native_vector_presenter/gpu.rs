@@ -266,3 +266,124 @@ fn native_gpu_preserves_reserved_pixels_and_same_id_peer_after_owner_retirement(
     assert_eq!(b.reconcile().unwrap().presented_revision, 1);
     peer.close().unwrap();
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires native Mac fonts and Metal readback"]
+fn plain_vector_emoji_renders_both_fallback_marks_without_moving_following_text() {
+    check_vector_marks(false);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires native Mac fonts and Metal readback"]
+fn retained_vector_marks_preserve_split_span_colors_and_following_text() {
+    check_vector_marks(true);
+}
+
+#[cfg(target_os = "macos")]
+fn check_vector_marks(retained: bool) {
+    use vivid_protocol::overlay::wire::text::styled::{StyledText, TextRun, TextStyle};
+    use vivid_sdk::OverlayWindowOptions;
+    use vivid_sdk::overlay::{Canvas, Color, Command, Point, Rect, Scalar, Text, WindowMode};
+
+    let (presenter, mut host) = fixture();
+    let producer = connect(&presenter);
+    let window = producer
+        .create_window(OverlayWindowOptions::new(
+            Rect::new(0., 0., 128., 48.).unwrap(),
+            WindowMode::Floating,
+        ))
+        .unwrap();
+    let mut canvas = Canvas::new();
+    let mut layouts = Vec::new();
+    for (column, source) in ["🦇X", "🦇́X", "🦇़X", "🦇़́X"].into_iter().enumerate() {
+        if retained {
+            let mut text = StyledText::new("", TextStyle::default());
+            text.runs = source
+                .chars()
+                .map(|ch| TextRun {
+                    text: ch.to_string(),
+                    style: TextStyle {
+                        color: match ch {
+                            '́' => Color(0xff0000ff),
+                            '़' => Color(0x00ff00ff),
+                            _ => Color(0xffffffff),
+                        },
+                        ..TextStyle::default()
+                    },
+                })
+                .collect();
+            let layout = std::thread::scope(|scope| {
+                let task = scope.spawn(|| window.layout_text(&text));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !task.is_finished() {
+                    assert!(host.poll().is_none());
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                task.join().unwrap().unwrap()
+            });
+            window
+                .draw_text_layout(
+                    &mut canvas,
+                    &layout,
+                    Point::new((column * 32) as f64, 4.).unwrap(),
+                )
+                .unwrap();
+            layouts.push(layout);
+            continue;
+        }
+        canvas
+            .push(Command::Text(Text {
+                text: source.into(),
+                origin: Point::new((column * 32) as f64, 4.).unwrap(),
+                size: Scalar::new(16.).unwrap(),
+                family: String::new(),
+                weight: 400,
+                italic: false,
+                color: Color(0xffffffff),
+                max_width: None,
+            }))
+            .unwrap();
+    }
+    let receipt = window.submit(canvas).unwrap();
+    let frame = prepare(&mut host, 1);
+    let mut gpu = pollster::block_on(Offscreen::new()).unwrap();
+    assert!(gpu.render(frame.drawings(), 128, 128).unwrap());
+    let image = pixels(&mut gpu);
+    let pixel = |x: usize, y: usize| &image.rgba[4 * (y * 128 + x)..4 * (y * 128 + x + 1)];
+    let distance = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    let mut ink = [0; 2];
+    let mut following = 0;
+    for y in 0..48 {
+        for x in 0..32 {
+            let [base, acute, nukta, combined] = [0, 32, 64, 96].map(|offset| pixel(x + offset, y));
+            if x >= 16 {
+                for marked in [acute, nukta, combined] {
+                    assert_eq!(marked, base, "mark changed the following glyph region");
+                }
+                following += usize::from(base[3] > 0);
+            } else {
+                for (i, mark, other) in [(0, acute, nukta), (1, nukta, acute)] {
+                    if distance(mark, base) >= 32
+                        && distance(other, base) <= 8
+                        && distance(combined, mark) <= 12
+                        && (!retained || mark[i] > mark[1 - i].saturating_add(24))
+                    {
+                        ink[i] += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        ink.iter().all(|&pixels| pixels >= 2) && following > 4,
+        "mark ink {ink:?}, following ink {following}"
+    );
+    assert!(host.presented(&frame).unwrap());
+    assert_eq!(
+        receipt.wait(Duration::from_secs(2)).unwrap(),
+        Some(PresentationOutcome::Presented)
+    );
+}

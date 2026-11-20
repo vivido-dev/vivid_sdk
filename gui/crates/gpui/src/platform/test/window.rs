@@ -53,6 +53,7 @@ pub(crate) struct TestWindowState {
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
+    pub(crate) secure_keyboard_input: bool,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
     is_fullscreen: bool,
@@ -129,6 +130,7 @@ impl TestWindow {
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
+            secure_keyboard_input: false,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
             is_fullscreen: false,
@@ -158,20 +160,11 @@ impl TestWindow {
         self.0.lock().a11y_callbacks = Some(callbacks);
         true
     }
-    pub fn simulate_accessibility_action(
-        &self,
-        node: accesskit::NodeId,
-        action: accesskit::Action,
-    ) -> bool {
+    pub fn simulate_accessibility_request(&self, request: accesskit::ActionRequest) -> bool {
         let Some(callbacks) = self.0.lock().a11y_callbacks.take() else {
             return false;
         };
-        (callbacks.action)(accesskit::ActionRequest {
-            action,
-            target_tree: accesskit::TreeId::ROOT,
-            target_node: node,
-            data: None,
-        });
+        (callbacks.action)(request);
         self.0.lock().a11y_callbacks = Some(callbacks);
         true
     }
@@ -436,6 +429,10 @@ impl PlatformWindow for TestWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.lock().input_handler.take()
+    }
+
+    fn set_secure_keyboard_input(&mut self, enabled: bool) {
+        self.0.lock().secure_keyboard_input = enabled;
     }
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {

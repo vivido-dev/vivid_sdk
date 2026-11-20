@@ -98,7 +98,7 @@ pub(crate) fn key_to_menu_equivalent(key: &str) -> Cow<'_, str> {
     Cow::Owned(String::from_utf16(&[code as u16]).unwrap())
 }
 
-fn read_modifiers(native_event: &NSEvent) -> Modifiers {
+pub(crate) fn read_modifiers(native_event: &NSEvent) -> Modifiers {
     let modifiers = native_event.modifierFlags();
     let control = modifiers.contains(NSEventModifierFlags::Control);
     let alt = modifiers.contains(NSEventModifierFlags::Option);
@@ -470,6 +470,9 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
                     mods |= OPTION_MOD;
                 }
 
+                if modifiers.contains(NSEventModifierFlags::CapsLock) {
+                    mods |= CAPS_LOCK_MOD;
+                }
                 key_char = Some(chars_for_modified_key(native_event.keyCode(), mods));
             }
 
@@ -512,24 +515,10 @@ fn always_use_command_layout() -> bool {
 const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
 const SHIFT_MOD: u32 = 2;
+pub(crate) const CAPS_LOCK_MOD: u32 = 4;
 const OPTION_MOD: u32 = 8;
 
 fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
-    // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
-    // shifted >> 8 for UCKeyTranslate
-    const CG_SPACE_KEY: u16 = 49;
-    // https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/Headers/UnicodeUtilities.h#L278
-    #[allow(non_upper_case_globals)]
-    const kUCKeyActionDown: u16 = 0;
-    #[allow(non_upper_case_globals)]
-    const kUCKeyTranslateNoDeadKeysMask: u32 = 0;
-
-    let keyboard_type = unsafe { LMGetKbdType() as u32 };
-    const BUFFER_SIZE: usize = 4;
-    let mut dead_key_state = 0;
-    let mut buffer: [u16; BUFFER_SIZE] = [0; BUFFER_SIZE];
-    let mut buffer_size: usize = 0;
-
     let keyboard = unsafe { TISCopyCurrentKeyboardLayoutInputSource() };
     if keyboard.is_null() {
         return "".to_string();
@@ -546,9 +535,45 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     }
     let keyboard_layout = unsafe { CFDataGetBytePtr(layout_data) };
 
+    // SAFETY: the retained input source owns its layout data until release below.
+    let result = unsafe {
+        layout_characters(
+            keyboard_layout.cast(),
+            code,
+            modifiers,
+            LMGetKbdType() as u32,
+        )
+    };
+    unsafe {
+        let _: () = msg_send![keyboard, release];
+    }
+    result
+}
+
+/// The caller retains the Carbon layout data for the duration of translation.
+pub(crate) unsafe fn layout_characters(
+    keyboard_layout: *const c_void,
+    code: CGKeyCode,
+    modifiers: u32,
+    keyboard_type: u32,
+) -> String {
+    // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
+    // shifted >> 8 for UCKeyTranslate
+    const CG_SPACE_KEY: u16 = 49;
+    // https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/Headers/UnicodeUtilities.h#L278
+    #[allow(non_upper_case_globals)]
+    const kUCKeyActionDown: u16 = 0;
+    #[allow(non_upper_case_globals)]
+    const kUCKeyTranslateNoDeadKeysMask: u32 = 0;
+
+    const BUFFER_SIZE: usize = 4;
+    let mut dead_key_state = 0;
+    let mut buffer: [u16; BUFFER_SIZE] = [0; BUFFER_SIZE];
+    let mut buffer_size: usize = 0;
+
     unsafe {
         UCKeyTranslate(
-            keyboard_layout as *const c_void,
+            keyboard_layout,
             code,
             kUCKeyActionDown,
             modifiers,
@@ -561,7 +586,7 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
         );
         if dead_key_state != 0 {
             UCKeyTranslate(
-                keyboard_layout as *const c_void,
+                keyboard_layout,
                 CG_SPACE_KEY,
                 kUCKeyActionDown,
                 modifiers,
@@ -573,7 +598,9 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
                 &mut buffer as *mut u16,
             );
         }
-        let _: () = msg_send![keyboard, release];
     }
-    String::from_utf16(&buffer[..buffer_size]).unwrap_or_default()
+    buffer
+        .get(..buffer_size)
+        .and_then(|chars| String::from_utf16(chars).ok())
+        .unwrap_or_default()
 }

@@ -865,7 +865,7 @@ struct State {
     #[cfg(feature = "vector-audio")]
     audio_workers: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(all(feature = "vector-audio", feature = "testing"))]
-    audio_test_device: bool,
+    audio_test_device: native_audio::DeviceSelection,
     #[cfg(feature = "vector-video")]
     video_host: bool,
     #[cfg(feature = "vector-render")]
@@ -1011,11 +1011,31 @@ pub struct VirtualVivid {
 /// An opaque relay input destination pinned to one original inner editor incarnation.
 #[derive(Clone)]
 pub struct OverlayDocumentTarget {
-    state: Arc<Mutex<State>>,
+    state: std::sync::Weak<Mutex<State>>,
     surface: BridgeSurfaceKey,
     stamp: super::overlay_host::EditorStamp,
     writer: Arc<Writer>,
     resume: u64,
+}
+impl OverlayDocumentTarget {
+    fn is_current(&self, state: &State) -> bool {
+        let surface = self.surface;
+        state.overlay_relay.enabled
+            && state.overlays.document_relay
+            && document_source_current(state, surface)
+            && state
+                .sessions
+                .get(&surface.producer)
+                .is_some_and(|session| {
+                    !session.closed
+                        && session.resume_generation == self.resume
+                        && Arc::ptr_eq(&session.writer, &self.writer)
+                })
+            && state
+                .overlays
+                .editor_stamp(surface.producer, surface.context, surface.surface)
+                == Some(self.stamp)
+    }
 }
 impl std::fmt::Debug for OverlayDocumentTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1057,6 +1077,33 @@ fn forward_overlay_input(
     }
     flush_overlay_lane(state, surface.producer);
     accepted
+}
+
+fn capture_document_target(
+    shared: &Arc<Mutex<State>>,
+    state: &State,
+    surface: BridgeSurfaceKey,
+) -> Option<OverlayDocumentTarget> {
+    if !state.overlay_relay.enabled || !state.overlays.document_relay {
+        return None;
+    }
+    let stamp = state
+        .overlays
+        .editor_stamp(surface.producer, surface.context, surface.surface)?;
+    let session = state.sessions.get(&surface.producer)?;
+    if session.closed
+        || !session.accepted_profiles.contains(registry::OVERLAY_EDITOR)
+        || !document_source_current(state, surface)
+    {
+        return None;
+    }
+    Some(OverlayDocumentTarget {
+        state: Arc::downgrade(shared),
+        surface,
+        stamp,
+        writer: session.writer.clone(),
+        resume: session.resume_generation,
+    })
 }
 
 fn document_source_current(state: &State, surface: BridgeSurfaceKey) -> bool {
@@ -1117,36 +1164,35 @@ impl VirtualVivid {
     /// Captures the exact inner editor, input lane and authenticated session incarnation.
     ///
     /// Only available for a negotiated document relay with a current displayed
-    /// context. Capture while servicing that context's host request; never replace
-    /// this target when forwarding a delayed native callback. Ordinary repaint
-    /// preserves the editor grant; delivery still checks the exact mapped scene.
+    /// context. Queued host requests must use [`Self::take_overlay_document_target`]
+    /// to obtain the grant from admission. Ordinary repaint preserves this target,
+    /// and delivery checks the exact mapped scene.
     pub fn overlay_document_target(
         &self,
         surface: BridgeSurfaceKey,
     ) -> Option<OverlayDocumentTarget> {
         let mut state = lock(&self.state);
         overlay_input::maintain(&mut state);
-        if !state.overlay_relay.enabled || !state.overlays.document_relay {
+        capture_document_target(&self.state, &state, surface)
+    }
+
+    /// Claims the original editor grant captured when a document publication was admitted.
+    /// A cleared, completed, foreign or previously claimed publication yields no target.
+    pub fn take_overlay_document_target(
+        &self,
+        id: u64,
+        surface: BridgeSurfaceKey,
+    ) -> Option<OverlayDocumentTarget> {
+        let mut state = lock(&self.state);
+        overlay_input::maintain(&mut state);
+        let pending = state.overlay_relay.pending.get_mut(&id)?;
+        if pending.document.as_ref()?.surface != surface {
             return None;
         }
-        let stamp =
-            state
-                .overlays
-                .editor_stamp(surface.producer, surface.context, surface.surface)?;
-        let session = state.sessions.get(&surface.producer)?;
-        if session.closed
-            || !session.accepted_profiles.contains(registry::OVERLAY_EDITOR)
-            || !document_source_current(&state, surface)
-        {
-            return None;
-        }
-        Some(OverlayDocumentTarget {
-            state: self.state.clone(),
-            surface,
-            stamp,
-            writer: session.writer.clone(),
-            resume: session.resume_generation,
-        })
+        pending
+            .document
+            .take()
+            .filter(|target| target.is_current(&state))
     }
 
     /// Revalidates one typed document edit against its original inner grant.
@@ -1162,29 +1208,41 @@ impl VirtualVivid {
         target: &OverlayDocumentTarget,
         edit: &vivid_protocol::overlay::wire::text::editor::Edit,
     ) -> io::Result<bool> {
+        self.deliver_overlay_document_edit(target, edit, None)
+    }
+
+    /// Delivers a queued edit only before its original physical input deadline.
+    /// Checks expiry while holding the same state lock used for admission.
+    ///
+    /// # Errors
+    /// Returns the same edit and ownership errors as [`Self::relay_overlay_document_edit`].
+    pub fn relay_overlay_document_edit_before(
+        &self,
+        target: &OverlayDocumentTarget,
+        edit: &vivid_protocol::overlay::wire::text::editor::Edit,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        self.deliver_overlay_document_edit(target, edit, Some(deadline))
+    }
+
+    fn deliver_overlay_document_edit(
+        &self,
+        target: &OverlayDocumentTarget,
+        edit: &vivid_protocol::overlay::wire::text::editor::Edit,
+        deadline: Option<Instant>,
+    ) -> io::Result<bool> {
         edit.validate().map_err(io::Error::other)?;
         let surface = target.surface;
         if edit.address.context_id != surface.context || edit.address.surface_id != surface.surface
         {
             return Err(invalid("overlay document owner mismatch"));
         }
-        if !Arc::ptr_eq(&self.state, &target.state) {
+        if !target.state.ptr_eq(&Arc::downgrade(&self.state)) {
             return Ok(false);
         }
         let mut state = lock(&self.state);
         overlay_input::maintain(&mut state);
-        if !state.overlay_relay.enabled
-            || !document_source_current(&state, surface)
-            || state.sessions.get(&surface.producer).is_none_or(|session| {
-                session.closed
-                    || session.resume_generation != target.resume
-                    || !Arc::ptr_eq(&session.writer, &target.writer)
-            })
-            || state
-                .overlays
-                .editor_stamp(surface.producer, surface.context, surface.surface)
-                != Some(target.stamp)
-        {
+        if !target.is_current(&state) || deadline.is_some_and(|end| Instant::now() >= end) {
             return Ok(false);
         }
         let accepted = state.overlays.relay_editor_edit(surface.producer, edit);
@@ -1262,11 +1320,27 @@ impl VirtualVivid {
     }
 
     pub fn complete_overlay_host_request(&self, id: u64, response: Result<Vec<u8>, String>) {
+        self.try_complete_overlay_host_request(id, response);
+    }
+
+    /// Whether an original host request still has a waiter registered.
+    pub fn overlay_host_request_pending(&self, id: u64) -> bool {
+        lock(&self.state).overlay_relay.pending.contains_key(&id)
+    }
+
+    /// Delivers a host reply, returning false when its original waiter has retired
+    /// or has already received a reply.
+    pub fn try_complete_overlay_host_request(
+        &self,
+        id: u64,
+        response: Result<Vec<u8>, String>,
+    ) -> bool {
         let mut state = lock(&self.state);
         if let Some(grant) = state.overlay_relay.clipboard.get_mut(&id) {
             grant.finished = true;
         }
-        if let Some(sender) = state.overlay_relay.pending.get(&id) {
+        if let Some(pending) = state.overlay_relay.pending.get_mut(&id) {
+            pending.document = None;
             let response = response.and_then(|body| {
                 if body.len() > super::overlay_relay::MAX_OVERLAY_HOST_BODY {
                     Err("overlay host reply exceeds transport budget".into())
@@ -1274,8 +1348,9 @@ impl VirtualVivid {
                     Ok(body)
                 }
             });
-            let _ = sender.try_send(response);
+            return pending.reply.try_send(response).is_ok();
         }
+        false
     }
 
     /// Microphones are independent of viewport visibility and presentation-slot projection.
@@ -1482,7 +1557,7 @@ impl VirtualVivid {
             #[cfg(feature = "vector-audio")]
             audio_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "vector-audio", feature = "testing"))]
-            audio_test_device: false,
+            audio_test_device: native_audio::DeviceSelection::Default,
             #[cfg(feature = "vector-video")]
             video_host: false,
             #[cfg(feature = "vector-render")]
@@ -3097,6 +3172,10 @@ impl VirtualVivid {
             .map(|(key, track)| {
                 let source = bridge_track_key(*key);
                 PaneMediaTrackStatus {
+                    #[cfg(feature = "testing")]
+                    observed_presenter: Some(state.presenter),
+                    #[cfg(feature = "testing")]
+                    test_position: track_position(track),
                     producer_id: source.producer,
                     context_id: source.context,
                     surface_id: source.surface,
@@ -3735,7 +3814,13 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<Mutex<State>>) -> io::Result<()
                     .ok_or_else(|| invalid("host request ID exhausted"))?;
                 state.overlay_relay.next_id = id;
                 let (sender, receiver) = mpsc::sync_channel(1);
-                state.overlay_relay.pending.insert(id, sender);
+                state.overlay_relay.pending.insert(
+                    id,
+                    super::overlay_relay::PendingRequest {
+                        reply: sender,
+                        document: None,
+                    },
+                );
                 state
                     .overlay_relay
                     .queued
@@ -4946,6 +5031,7 @@ fn dispatch_control_for_connection(
             ));
         }
         let mut clipboard = None;
+        let mut publishes_document = false;
         let address = match record.record_type {
             messages::OVERLAY_ACTION => {
                 let query = vivid_protocol::overlay::wire::Action::decode(record.object_id, &value)
@@ -4993,12 +5079,13 @@ fn dispatch_control_for_connection(
                     .overlays
                     .set_text_context(session_id, record.object_id, &envelope.payload)
                     .map_err(ControlError::state)?;
-                vivid_protocol::overlay::wire::text::editor::SetContext::decode(
+                let publication = vivid_protocol::overlay::wire::text::editor::SetContext::decode(
                     record.object_id,
                     &value,
                 )
-                .map_err(|_| ControlError::bad("invalid editor context"))?
-                .address
+                .map_err(|_| ControlError::bad("invalid editor context"))?;
+                publishes_document = publication.context.is_some();
+                publication.address
             }
             messages::SET_OVERLAY_CLIPBOARD => {
                 let request = state
@@ -5155,7 +5242,16 @@ fn dispatch_control_for_connection(
             ),
         );
         let (sender, receiver) = mpsc::sync_channel(1);
-        state.overlay_relay.pending.insert(id, sender);
+        let document = publishes_document
+            .then(|| capture_document_target(shared, &state, host_request.surface))
+            .flatten();
+        state.overlay_relay.pending.insert(
+            id,
+            super::overlay_relay::PendingRequest {
+                reply: sender,
+                document,
+            },
+        );
         if let Some(clipboard) = clipboard {
             state.overlay_relay.clipboard.insert(id, clipboard);
         }
@@ -8739,16 +8835,21 @@ fn set_playback_hold(state: &mut State, key: SurfaceKey, held: bool, reason: u64
     state.wake_waits();
 }
 
-fn track_status_payload(
-    key: TrackKey,
-    track: &TrackEntry,
-    gain_supported: bool,
-) -> Vec<(u64, Value)> {
+fn track_position(track: &TrackEntry) -> Option<super::BridgePositionSnapshot> {
     let position = track
         .outer_position
         .filter(|p| p.decoder_reset_serial == track.decoder_reset_serial);
     #[cfg(feature = "vector-video")]
     let position = native_video::playback_position(track, Instant::now()).or(position);
+    position
+}
+
+fn track_status_payload(
+    key: TrackKey,
+    track: &TrackEntry,
+    gain_supported: bool,
+) -> Vec<(u64, Value)> {
+    let position = track_position(track);
     let timed_video = matches!(track.configuration.kind, KindConfiguration::Video(_));
     let mut payload = vec![
         (0, Value::Unsigned(key.surface.context)),

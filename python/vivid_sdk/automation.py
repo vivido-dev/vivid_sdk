@@ -216,13 +216,33 @@ def _peer_uid(stream: socket.socket) -> Optional[int]:
         return None
 
 
-def _birth_check_supported() -> bool:
-    """Whether this platform can recompute the process-birth record a registry carries."""
+def _process_birth(pid: int) -> Optional[Dict[str, Any]]:
+    if os.uname().sysname == "Darwin":
+        return _macos_birth(pid)
+    return _linux_birth(pid)
 
-    return os.uname().sysname == "Linux"
+
+def _macos_birth(pid: int) -> Optional[Dict[str, Any]]:
+    """Read the same PROC_PIDTBSDINFO timestamp as Vivido's session registry."""
+    import ctypes
+
+    # sys/proc_info.h: twelve 32-bit fields, two command names, six more
+    # 32-bit fields and the start timeval expressed as two 64-bit integers.
+    layout = struct.Struct("@12I16s32s5IiQQ")
+    info = ctypes.create_string_buffer(layout.size)
+    try:
+        query = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        query.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        query.restype = ctypes.c_int
+        if query(pid, 3, 0, info, layout.size) != layout.size:
+            return None
+    except (AttributeError, OSError):
+        return None
+    seconds, micros = layout.unpack(info.raw)[-2:]
+    return {"platform": "macos", "start_micros": seconds * 1_000_000 + micros}
 
 
-def _linux_birth(pid: int) -> Any:
+def _linux_birth(pid: int) -> Optional[Dict[str, Any]]:
     """The `ProcessBirth::Linux` record the server wrote, recomputed from the same field of the
     same file: the process's start time in clock ticks. This is what makes a recycled pid a
     stale registry rather than someone else's session."""
@@ -241,21 +261,17 @@ def _linux_birth(pid: int) -> Any:
 
 
 def _process_matches(registry: Mapping[str, Any]) -> bool:
-    """Whether the registry's pid is still the process that wrote it.
-
-    On Linux the birth record must match, exactly as the CLI demands. Elsewhere that record has
-    a shape this module cannot recompute, so liveness alone decides — a documented weaker check,
-    not a silent one."""
-
+    """Check liveness and match the kernel start time on Linux and macOS."""
     pid = registry.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+    if type(pid) is not int or not 0 < pid <= 0x7fffffff:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    if _birth_check_supported():
-        return bool(_linux_birth(pid) == registry.get("process_birth"))
+    if os.uname().sysname in ("Linux", "Darwin"):
+        birth = _process_birth(pid)
+        return birth is not None and birth == registry.get("process_birth")
     return True
 
 

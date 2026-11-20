@@ -1,3 +1,5 @@
+mod files;
+
 use std::ffi::CStr;
 use std::path::PathBuf;
 
@@ -28,6 +30,44 @@ pub struct Pasteboard {
 }
 
 impl Pasteboard {
+    pub(crate) fn read_media_bounded(
+        &self,
+    ) -> Result<Option<gpui::ClipboardPasteMedia>, gpui::ClipboardReadError> {
+        use gpui::{ClipboardPasteMedia, ClipboardReadError};
+        let revision = self.inner.changeCount();
+        let offer =
+            if let Some(files) = self.read_file_uris_bounded(gpui::MAX_CLIPBOARD_URI_BYTES)? {
+                Some(ClipboardPasteMedia::Files(files))
+            } else {
+                let types = self.inner.types();
+                let mut image = None;
+                for format in [ImageFormat::Png, ImageFormat::Tiff, ImageFormat::Jpeg] {
+                    let kind = UTType::from(format);
+                    if types
+                        .as_ref()
+                        .is_some_and(|types| types.containsObject(kind.inner()))
+                    {
+                        let data = self
+                            .inner
+                            .dataForType(kind.inner())
+                            .ok_or(ClipboardReadError::Unavailable)?;
+                        if data.len() > gpui::MAX_CLIPBOARD_IMAGE_BYTES {
+                            return Err(ClipboardReadError::UnsupportedContent);
+                        }
+                        image = Some(ClipboardPasteMedia::Image(
+                            gpui::ClipboardPng::from_encoded(format, &data.to_vec())?,
+                        ));
+                        break;
+                    }
+                }
+                image
+            };
+        if self.inner.changeCount() != revision {
+            return Err(ClipboardReadError::Unavailable);
+        }
+        Ok(offer)
+    }
+
     pub fn read_text_bounded(
         &self,
         max_bytes: usize,
@@ -73,6 +113,17 @@ impl Pasteboard {
 
     pub fn read(&self) -> Option<ClipboardItem> {
         unsafe {
+            if let Some(uris) = self
+                .read_file_uris_bounded(gpui::MAX_CLIPBOARD_URI_BYTES)
+                .ok()?
+            {
+                let paths = gpui::parse_file_uri_list(&uris, gpui::MAX_CLIPBOARD_URI_BYTES).ok()?;
+                let mut entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    paths.into_iter().collect(),
+                ))];
+                entries.extend(self.read_string_from_pasteboard());
+                return Some(ClipboardItem { entries });
+            }
             // Check for file paths first
             #[expect(
                 deprecated,
@@ -186,7 +237,7 @@ impl Pasteboard {
             [ClipboardEntry::Image(image)] => {
                 self.write_image(image);
             }
-            [ClipboardEntry::ExternalPaths(_)] => {}
+            [ClipboardEntry::ExternalPaths(paths)] => self.write_files(paths.paths()),
             _ => {
                 // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
                 //
@@ -359,6 +410,78 @@ mod tests {
         });
     }
 
+    #[test]
+    fn native_bitmap_paste_normalizes_pixels_and_prefers_local_file_metadata() {
+        use gpui::ClipboardPasteMedia;
+        objc2::rc::autoreleasepool(|_| {
+            let board = Pasteboard::unique();
+            let rgba = image::RgbaImage::from_pixel(2, 3, image::Rgba([4, 71, 211, 255]));
+            for (format, native) in [
+                (image::ImageFormat::Tiff, ImageFormat::Tiff),
+                (image::ImageFormat::Png, ImageFormat::Png),
+            ] {
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                rgba.write_to(&mut bytes, format).unwrap();
+                board.inner.clearContents();
+                let kind = UTType::from(native);
+                board
+                    .inner
+                    .setData_forType(Some(&NSData::with_bytes(bytes.get_ref())), kind.inner());
+                let Some(ClipboardPasteMedia::Image(png)) = board.read_media_bounded().unwrap()
+                else {
+                    panic!("expected bitmap offer")
+                };
+                assert_eq!(
+                    image::load_from_memory_with_format(&png.into_bytes(), image::ImageFormat::Png)
+                        .unwrap()
+                        .to_rgba8(),
+                    rgba
+                );
+            }
+            let mut jpeg = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(rgba)
+                .into_rgb8()
+                .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+                .unwrap();
+            board.inner.clearContents();
+            board.inner.setData_forType(
+                Some(&NSData::with_bytes(jpeg.get_ref())),
+                UTType::from(ImageFormat::Jpeg).inner(),
+            );
+            let Some(ClipboardPasteMedia::Image(png)) = board.read_media_bounded().unwrap() else {
+                panic!("expected JPEG offer")
+            };
+            assert_eq!(
+                image::load_from_memory(&png.into_bytes())
+                    .unwrap()
+                    .to_rgb8(),
+                image::load_from_memory(jpeg.get_ref()).unwrap().to_rgb8()
+            );
+            board.write_files(&[PathBuf::from("/tmp/fixture.png")]);
+            // A malformed thumbnail must not mask the actual file copied by Finder.
+            board.inner.setData_forType(
+                Some(&NSData::with_bytes(b"thumbnail")),
+                UTType::from(ImageFormat::Png).inner(),
+            );
+            assert!(
+                matches!(board.read_media_bounded(), Ok(Some(ClipboardPasteMedia::Files(list))) if list.contains("fixture.png"))
+            );
+            board.inner.clearContents();
+            board.inner.setData_forType(
+                Some(&NSData::with_bytes(b"not a png")),
+                UTType::from(ImageFormat::Png).inner(),
+            );
+            assert!(board.read_media_bounded().is_err());
+            let wide = image::RgbaImage::new(8193, 1);
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            wide.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            board.inner.setData_forType(
+                Some(&NSData::with_bytes(bytes.get_ref())),
+                UTType::from(ImageFormat::Png).inner(),
+            );
+            assert!(board.read_media_bounded().is_err());
+        });
+    }
     #[test]
     fn test_string() {
         let pasteboard = Pasteboard::unique();

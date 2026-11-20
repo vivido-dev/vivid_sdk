@@ -29,6 +29,7 @@ use std::{
 
 /// TestPlatform implements the Platform trait for use in tests.
 pub(crate) struct TestPlatform {
+    pub(crate) repeat_timing: Cell<Option<(Duration, Duration)>>,
     pub(crate) platform_info: Cell<crate::PlatformInfo>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
@@ -216,6 +217,7 @@ impl TestPlatform {
         >,
     ) -> Rc<Self> {
         Rc::new_cyclic(|weak| TestPlatform {
+            repeat_timing: Cell::new(None),
             platform_info: Cell::new(crate::PlatformInfo {
                 os: std::cfg_select! {
                     target_os = "macos" => { crate::OperatingSystem::Mac }
@@ -487,6 +489,10 @@ impl Platform for TestPlatform {
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
         self.text_system.clone()
+    }
+
+    fn key_repeat_timing(&self) -> Option<(Duration, Duration)> {
+        self.repeat_timing.get()
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -799,6 +805,32 @@ impl Platform for TestPlatform {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.current_clipboard_item.lock().clone()
+    }
+    fn read_clipboard_media_async(
+        &self,
+    ) -> Task<Result<Option<crate::ClipboardPasteMedia>, crate::ClipboardReadError>> {
+        let item = self.read_from_clipboard();
+        self.background_executor().spawn(async move {
+            let Some(item) = item else { return Ok(None) };
+            if item
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, crate::ClipboardEntry::ExternalPaths(_)))
+            {
+                return crate::clipboard_uri_list(Some(item), crate::MAX_CLIPBOARD_URI_BYTES)
+                    .map(|offer| offer.map(crate::ClipboardPasteMedia::Files));
+            }
+            item.entries
+                .into_iter()
+                .find_map(|entry| match entry {
+                    crate::ClipboardEntry::Image(image) => Some(
+                        crate::ClipboardPng::from_encoded(image.format, &image.bytes)
+                            .map(crate::ClipboardPasteMedia::Image),
+                    ),
+                    _ => None,
+                })
+                .transpose()
+        })
     }
     fn supports_uri_list_clipboard(&self) -> bool {
         true

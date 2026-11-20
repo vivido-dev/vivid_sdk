@@ -802,12 +802,22 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "ringbuf",
+ "vivid_coreaudio_fixture",
  "vivid_protocol",
 ]
 
 [[package]]
+name = "vivid_coreaudio_fixture"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "objc2-core-audio",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "vivid_protocol"
-version = "1.5.12"
+version = "1.5.13"
 dependencies = [
  "base64",
  "hmac",

@@ -2201,6 +2201,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.platform_window.set_secure_keyboard_input(false);
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2515,6 +2518,9 @@ impl Window {
         let visibility = self.platform_window.visibility();
         if self.visibility != visibility {
             self.visibility = visibility;
+            if !visibility.is_visible() {
+                self.platform_window.set_secure_keyboard_input(false);
+            }
             #[cfg(feature = "profiler")]
             profiler::journal::record_window_visibility(self.handle.window_id(), visibility);
             self.visibility_observers
@@ -2645,6 +2651,7 @@ impl Window {
         }
 
         *self.hosted_text_scope.get_mut() = Arc::new(());
+        self.platform_window.set_secure_keyboard_input(false);
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
@@ -2664,6 +2671,7 @@ impl Window {
             *self.hosted_text_scope.get_mut() = Arc::new(());
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
+        self.platform_window.set_secure_keyboard_input(false);
         self.focus = None;
         self.refresh();
     }
@@ -3707,6 +3715,26 @@ impl Window {
         self.modifiers
     }
 
+    /// Returns the physical printable key and unnormalized modifiers of the native event being delivered.
+    pub fn physical_character_key(&self) -> Option<(u16, Modifiers)> {
+        self.platform_window.physical_character_key()
+    }
+
+    /// Recovers the physical button and modifiers while forwarding a mouse edge
+    /// to an embedded application that handles Control-left gestures itself.
+    pub fn physical_mouse_button(
+        &self,
+        button: MouseButton,
+        mut modifiers: Modifiers,
+    ) -> (MouseButton, Modifiers) {
+        if button == MouseButton::Right && self.platform_window.is_control_click() {
+            modifiers.control = true;
+            (MouseButton::Left, modifiers)
+        } else {
+            (button, modifiers)
+        }
+    }
+
     /// Returns true if the last input event was keyboard-based (key press, tab navigation, etc.)
     /// This is used for focus-visible styling to show focus indicators only for keyboard navigation.
     pub fn last_input_was_keyboard(&self) -> bool {
@@ -3785,6 +3813,7 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
+        let mut secure_keyboard = false;
         let focused_text_input = if let Some(mut input_handler) = self
             .next_frame
             .input_handlers
@@ -3793,11 +3822,19 @@ impl Window {
             .find_map(|h| h.take())
         {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            secure_keyboard = accepts_text_input
+                && self.is_window_active()
+                && self.is_visible()
+                && self.focus.is_some()
+                && input_handler.focus_id() == self.focus
+                && input_handler.requires_secure_keyboard_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
             self.focus.filter(|_| accepts_text_input)
         } else {
             None
         };
+        self.platform_window
+            .set_secure_keyboard_input(secure_keyboard);
         self.apply_text_input_configuration(cx);
         let previous = mem::replace(&mut self.focused_text_input, focused_text_input);
         if previous.is_some() != focused_text_input.is_some() {
@@ -4007,6 +4044,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
+        self.a11y.behind_prompt = self.prompt.is_some();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         #[cfg(feature = "profiler")]
@@ -4022,6 +4060,7 @@ impl Window {
 
         self.prepaint_deferred_draws(cx);
 
+        self.a11y.behind_prompt = false;
         let mut prompt_element = None;
         let mut active_drag_element = None;
         let mut tooltip_element = None;
@@ -4051,6 +4090,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
+        self.a11y.behind_prompt = prompt_element.is_some();
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4058,6 +4098,7 @@ impl Window {
 
         self.paint_deferred_draws(cx);
 
+        self.a11y.behind_prompt = false;
         if let Some(mut prompt_element) = prompt_element {
             prompt_element.paint(self, cx);
         } else if let Some(mut drag_element) = active_drag_element {
@@ -4095,7 +4136,16 @@ impl Window {
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
 
-            if should_send_a11y_update {
+            if should_send_a11y_update && let Some(observer) = &mut self.a11y.hosted_observer {
+                observer(
+                    &tree_update,
+                    [
+                        f32::from(self.viewport_size.width) * self.scale_factor,
+                        f32::from(self.viewport_size.height) * self.scale_factor,
+                    ],
+                );
+            }
+            if should_send_a11y_update && self.a11y.platform_active() {
                 log::debug!(
                     "Sending a11y tree update: {} nodes",
                     tree_update.nodes.len()
@@ -5499,7 +5549,7 @@ impl Window {
         bounds: Bounds<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
     ) {
-        self.paint_surface_inner(bounds, image_buffer, None);
+        self.paint_surface_inner(bounds, image_buffer, None, None);
     }
 
     /// Paints an immutable surface, retaining its allocation until GPU completion.
@@ -5510,7 +5560,22 @@ impl Window {
         image_buffer: CFRetained<CVPixelBuffer>,
         lease: Arc<dyn crate::SurfaceLease>,
     ) {
-        self.paint_surface_inner(bounds, image_buffer, Some(lease));
+        self.paint_surface_inner(bounds, image_buffer, Some(lease), None);
+    }
+
+    /// Paints a packed IOSurface with its existing CoreVideo Metal mapping.
+    ///
+    /// The renderer verifies the device, IOSurface, plane, format and size.
+    /// The scene retains the lease and mapping until GPU sampling completes.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn paint_mapped_surface_with_lease(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CFRetained<CVPixelBuffer>,
+        mapping: CFRetained<objc2_core_video::CVMetalTexture>,
+        lease: Arc<dyn crate::SurfaceLease>,
+    ) {
+        self.paint_surface_inner(bounds, image_buffer, Some(lease), Some(mapping));
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -5519,6 +5584,7 @@ impl Window {
         bounds: Bounds<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
         lease: Option<Arc<dyn crate::SurfaceLease>>,
+        packed_mapping: Option<CFRetained<objc2_core_video::CVMetalTexture>>,
     ) {
         use crate::PaintSurface;
 
@@ -5532,6 +5598,7 @@ impl Window {
             content_mask,
             image_buffer,
             lease,
+            packed_mapping,
         });
     }
 
@@ -7163,6 +7230,7 @@ impl Window {
         let (sender, receiver) = oneshot::channel();
         let handle = PromptHandle::new(sender);
         let handle = (prompt_builder)(level, message, detail, answers, handle, self, cx);
+        self.a11y.clear_action_targets();
         self.prompt = Some(handle);
         receiver
     }
@@ -7456,6 +7524,27 @@ impl Window {
         self.a11y.is_active()
     }
 
+    /// Requests completed accessibility trees for an embedding presenter. The
+    /// second argument gives the physical viewport extent in the tree’s coordinate system. The
+    /// observer runs on the window thread and should return without blocking.
+    /// Replacing the observer requests a fresh frame. An inaccessible app
+    /// never delivers trees, even with an observer installed.
+    pub fn observe_hosted_accessibility(
+        &mut self,
+        observer: impl FnMut(&accesskit::TreeUpdate, [f32; 2]) + 'static,
+    ) {
+        self.a11y.hosted_observer = Some(Box::new(observer));
+        self.refresh();
+    }
+
+    /// Removes the embedding presenter's interest. A connected native
+    /// accessibility adapter continues receiving its own window updates.
+    pub fn stop_observing_hosted_accessibility(&mut self) {
+        if self.a11y.hosted_observer.take().is_some() {
+            self.refresh();
+        }
+    }
+
     /// Debug representation of the last frame's accessibility information.
     pub fn debug_a11y_tree_json(&self) -> Option<String> {
         self.a11y.debug_tree_json()
@@ -7472,11 +7561,35 @@ impl Window {
         action: accesskit::Action,
         listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
     ) {
+        if self.a11y.behind_prompt {
+            return;
+        }
         self.a11y
             .action_listeners
             .entry(node_id)
             .or_default()
             .push((action, Box::new(listener)));
+    }
+
+    /// Delivers an embedding presenter's action to the current hosted tree.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn dispatch_hosted_accessibility_action(
+        &mut self,
+        node: accesskit::NodeId,
+        action: accesskit::Action,
+        cx: &mut App,
+    ) {
+        if self.a11y.hosted_observer.is_some() && self.is_a11y_active() {
+            self.handle_a11y_action(
+                accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node,
+                    action,
+                    data: None,
+                },
+                cx,
+            );
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -7530,7 +7643,11 @@ impl Window {
                 }
             }
             accesskit::Action::Blur => {
-                self.blur(cx);
+                if self.focus.is_some_and(|focused| {
+                    self.a11y.focus_ids.get(&request.target_node) == Some(&focused)
+                }) {
+                    self.blur(cx);
+                }
             }
             _ => {
                 log::debug!(

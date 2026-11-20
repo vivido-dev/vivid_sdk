@@ -1,4 +1,8 @@
 use collections::HashMap;
+use core_foundation::{
+    base::TCFType,
+    data::{CFData, CFDataRef},
+};
 use std::ffi::c_void;
 
 use objc2::msg_send;
@@ -13,6 +17,7 @@ use crate::{
 pub(crate) struct MacKeyboardLayout {
     id: String,
     name: String,
+    layout_data: Option<CFData>,
 }
 
 pub(crate) struct MacKeyboardMapper {
@@ -26,6 +31,41 @@ impl PlatformKeyboardLayout for MacKeyboardLayout {
 
     fn name(&self) -> &str {
         &self.name
+    }
+    fn character_keys(&self) -> Vec<gpui::KeyboardCharacterKey> {
+        let Some(data) = &self.layout_data else {
+            return Vec::new();
+        };
+        // SAFETY: the keyboard layout retains this native layout data throughout the sample.
+        let keyboard_type = unsafe { crate::LMGetKbdType() } as u32;
+        PRINTABLE
+            .iter()
+            .map(|&(usage, code)| {
+                let translate = |mods| {
+                    // SAFETY: data is retained by this MacKeyboardLayout.
+                    let text = unsafe {
+                        crate::events::layout_characters(
+                            data.bytes().as_ptr().cast(),
+                            code,
+                            mods,
+                            keyboard_type,
+                        )
+                    };
+                    if text.chars().any(char::is_control) {
+                        String::new()
+                    } else {
+                        text
+                    }
+                };
+                gpui::KeyboardCharacterKey {
+                    usage,
+                    layers: [0, 2, 8, 10, 1, 3].map(translate),
+                    caps_lock_layers: Some(
+                        [0, 2, 8, 10].map(|mods| translate(mods | crate::events::CAPS_LOCK_MOD)),
+                    ),
+                }
+            })
+            .collect()
     }
 }
 
@@ -50,6 +90,84 @@ impl PlatformKeyboardMapper for MacKeyboardMapper {
     }
 }
 
+// Carbon Events.h virtual key positions indexed by USB HID keyboard usage
+// 0x04–0x38. The ISO section and JIS-only positions are outside that range.
+const PRINTABLE: &[(u16, u16)] = &[
+    (0x04, 0x00), // A
+    (0x05, 0x0b), // B
+    (0x06, 0x08), // C
+    (0x07, 0x02), // D
+    (0x08, 0x0e), // E
+    (0x09, 0x03), // F
+    (0x0a, 0x05), // G
+    (0x0b, 0x04), // H
+    (0x0c, 0x22), // I
+    (0x0d, 0x26), // J
+    (0x0e, 0x28), // K
+    (0x0f, 0x25), // L
+    (0x10, 0x2e), // M
+    (0x11, 0x2d), // N
+    (0x12, 0x1f), // O
+    (0x13, 0x23), // P
+    (0x14, 0x0c), // Q
+    (0x15, 0x0f), // R
+    (0x16, 0x01), // S
+    (0x17, 0x11), // T
+    (0x18, 0x20), // U
+    (0x19, 0x09), // V
+    (0x1a, 0x0d), // W
+    (0x1b, 0x07), // X
+    (0x1c, 0x10), // Y
+    (0x1d, 0x06), // Z
+    (0x1e, 0x12), // 1
+    (0x1f, 0x13), // 2
+    (0x20, 0x14), // 3
+    (0x21, 0x15), // 4
+    (0x22, 0x17), // 5
+    (0x23, 0x16), // 6
+    (0x24, 0x1a), // 7
+    (0x25, 0x1c), // 8
+    (0x26, 0x19), // 9
+    (0x27, 0x1d), // 0
+    (0x2d, 0x1b), // minus
+    (0x2e, 0x18), // equal
+    (0x2f, 0x21), // left bracket
+    (0x30, 0x1e), // right bracket
+    (0x31, 0x2a), // backslash
+    (0x33, 0x29), // semicolon
+    (0x34, 0x27), // quote
+    (0x35, 0x32), // grave
+    (0x36, 0x2b), // comma
+    (0x37, 0x2f), // period
+    (0x38, 0x2c), // slash
+    (0x54, 0x4b), // keypad divide
+    (0x55, 0x43), // keypad multiply
+    (0x56, 0x4e), // keypad minus
+    (0x57, 0x45), // keypad plus
+    (0x59, 0x53), // keypad 1
+    (0x5a, 0x54), // keypad 2
+    (0x5b, 0x55), // keypad 3
+    (0x5c, 0x56), // keypad 4
+    (0x5d, 0x57), // keypad 5
+    (0x5e, 0x58), // keypad 6
+    (0x5f, 0x59), // keypad 7
+    (0x60, 0x5b), // keypad 8
+    (0x61, 0x5c), // keypad 9
+    (0x62, 0x52), // keypad 0
+    (0x63, 0x41), // keypad decimal
+    (0x64, 0x0a), // ISO section
+    (0x67, 0x51), // keypad equals
+    (0x85, 0x5f), // JIS keypad comma
+    (0x87, 0x5e), // JIS underscore
+    (0x89, 0x5d), // JIS yen
+];
+
+pub(crate) fn character_usage(code: u16) -> Option<u16> {
+    PRINTABLE
+        .iter()
+        .find_map(|&(usage, position)| (position == code).then_some(usage))
+}
+
 impl MacKeyboardLayout {
     pub(crate) fn new() -> Self {
         unsafe {
@@ -58,9 +176,48 @@ impl MacKeyboardLayout {
                 return Self {
                     id: String::new(),
                     name: String::new(),
+                    layout_data: None,
                 };
             }
 
+            let layout = Self::from_source(current_keyboard);
+            let _: () = msg_send![current_keyboard, release];
+            layout
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn installed(id: &str) -> Option<Self> {
+        use core_foundation::{
+            array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
+            base::CFRelease,
+            dictionary::{CFDictionary, CFDictionaryRef},
+            string::CFString,
+        };
+        unsafe extern "C" {
+            fn TISCreateInputSourceList(
+                properties: CFDictionaryRef,
+                all_installed: u8,
+            ) -> CFArrayRef;
+        }
+        // SAFETY: Core Foundation retains the query values, and the array owns its
+        // borrowed source until from_source has copied its strings and retained its data.
+        unsafe {
+            let key = CFString::wrap_under_get_rule(kTISPropertyInputSourceID);
+            let query = CFDictionary::from_CFType_pairs(&[(key, CFString::new(id))]);
+            let sources = TISCreateInputSourceList(query.as_concrete_TypeRef(), 1);
+            if sources.is_null() {
+                return None;
+            }
+            let layout = (CFArrayGetCount(sources) != 0)
+                .then(|| Self::from_source(CFArrayGetValueAtIndex(sources, 0).cast_mut().cast()));
+            CFRelease(sources.cast());
+            layout
+        }
+    }
+
+    unsafe fn from_source(current_keyboard: *mut objc2::runtime::AnyObject) -> Self {
+        unsafe {
             let id = TISGetInputSourceProperty(
                 current_keyboard,
                 kTISPropertyInputSourceID as *const c_void,
@@ -75,9 +232,17 @@ impl MacKeyboardLayout {
             .to_str()
             .to_string();
 
-            let _: () = msg_send![current_keyboard, release];
+            let data = TISGetInputSourceProperty(
+                current_keyboard,
+                crate::kTISPropertyUnicodeKeyLayoutData as *const c_void,
+            ) as CFDataRef;
+            let layout_data = (!data.is_null()).then(|| CFData::wrap_under_get_rule(data));
 
-            Self { id, name }
+            Self {
+                id,
+                name,
+                layout_data,
+            }
         }
     }
 }
@@ -1505,4 +1670,22 @@ fn get_key_equivalents(layout_id: &str) -> Option<HashMap<char, char>> {
     };
 
     Some(HashMap::from_iter(mappings.iter().cloned()))
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+    #[test]
+    fn carbon_positions_have_distinct_usb_usages_independent_of_character_labels() {
+        let mut codes = std::collections::BTreeSet::new();
+        assert!(PRINTABLE.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for &(usage, carbon) in PRINTABLE {
+            assert!(codes.insert(carbon));
+            assert_eq!(character_usage(carbon), Some(usage));
+        }
+        assert_eq!(character_usage(0x22), Some(0x0c)); // I position, C in Dvorak.
+        assert_eq!(character_usage(0x0c), Some(0x14)); // Q position, A in French.
+        assert_eq!(character_usage(0x12), Some(0x1e)); // 1 position, & in French.
+        assert_eq!(character_usage(0x3f), None); // Fn is a modifier.
+    }
 }

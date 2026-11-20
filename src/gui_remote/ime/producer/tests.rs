@@ -167,6 +167,7 @@ fn producer(input: &Injection) -> Producer {
     Producer {
         state,
         configured: true,
+        accessible_tree: None,
         target: None,
         editor: 0,
         generation: 0,
@@ -177,6 +178,73 @@ fn producer(input: &Injection) -> Producer {
         revision: 0,
     }
 }
+#[test]
+fn stopping_one_keyboard_service_retires_its_repeat_policy_before_gui_dispatch() {
+    let input = input();
+    let tag = input.guard.current_tag().unwrap();
+    let first = producer(&input);
+    let peer = producer(&input);
+    let fast = KeyRepeat::new(120, 80).unwrap();
+    for service in [&first, &peer] {
+        let mut bound = service.state.bound.lock().unwrap();
+        bound.repeat = Some(fast);
+        bound.keyboard.push_back(KeyboardContext {
+            key: None,
+            caps_lock: true,
+        });
+    }
+    first.state.stop();
+    assert!(first.mapping(tag).is_none());
+    assert_eq!(first.lock_state(tag, None).unwrap(), (None, false));
+    assert_eq!(peer.mapping(tag).unwrap().1, Some(fast));
+    assert_eq!(peer.lock_state(tag, None).unwrap(), (Some(true), true));
+}
+
+#[test]
+fn ordered_lock_changes_wait_for_physical_reports_and_do_not_cross_owners() {
+    let input = input();
+    let tag = input.guard.current_tag().unwrap();
+    let first = producer(&input);
+    let peer = producer(&input);
+    let record = |key, caps_lock| KeyboardContext { key, caps_lock };
+    first.state.bound.lock().unwrap().keyboard.extend([
+        record(None, true),
+        record(Some((4, true)), true),
+        record(None, false),
+        record(Some((4, false)), false),
+    ]);
+    peer.state
+        .bound
+        .lock()
+        .unwrap()
+        .keyboard
+        .push_back(record(None, true));
+    assert_eq!(first.lock_state(tag, None).unwrap(), (Some(true), true));
+    assert_eq!(first.lock_state(tag, None).unwrap(), (None, true));
+    assert_eq!(
+        first.lock_state(tag, Some((4, true))).unwrap(),
+        (Some(true), true)
+    );
+    assert_eq!(first.lock_state(tag, None).unwrap(), (Some(false), true));
+    assert_eq!(
+        first.lock_state(tag, Some((4, false))).unwrap(),
+        (Some(false), true)
+    );
+    assert_eq!(
+        first.lock_state(tag, Some((5, true))).unwrap(),
+        (None, false)
+    );
+    assert_eq!(peer.lock_state(tag, None).unwrap(), (Some(true), true));
+    first
+        .state
+        .bound
+        .lock()
+        .unwrap()
+        .keyboard
+        .push_back(record(Some((4, true)), true));
+    assert!(first.lock_state(tag, Some((5, true))).is_err());
+}
+
 fn queue(producer: &Producer, edit: Edit, end: Instant) {
     producer.state.bound.lock().unwrap().jobs.push_back(Job {
         operation: Operation {
@@ -383,4 +451,104 @@ fn queued_absolute_edits_recheck_document_revision_and_sensitive_mode_per_owner(
     assert_eq!(reports[0].borrow().commits, ["relative"]);
     assert_eq!(reports[1].borrow().commits, ["relative", "late"]);
     assert!(producers[0].snapshot().unwrap().text.is_empty());
+}
+
+#[test]
+fn assistive_dispatch_rechecks_the_current_draw_grant_and_deadline() {
+    use crate::gui::{
+        AccessibleAction, InteractiveElement as _, Role, StatefulInteractiveElement as _,
+    };
+    struct Button {
+        label: &'static str,
+        calls: Rc<RefCell<Vec<AccessibleAction>>>,
+    }
+    impl Render for Button {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut button = div().id("button").role(Role::Button).aria_label(self.label);
+            for action in [AccessibleAction::Click, AccessibleAction::Focus] {
+                let calls = self.calls.clone();
+                button =
+                    button.on_a11y_action(action, move |_, _, _| calls.borrow_mut().push(action));
+            }
+            button
+        }
+    }
+    let mut test = TestAppContext::single();
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let window = test.add_window(|_, _| Button {
+        label: "Initial button",
+        calls: calls.clone(),
+    });
+    let mut input = input(); // This grant admits keyboard focus only.
+    let mut producer = producer(&input);
+    producer.state.bound.lock().unwrap().request_tree = true;
+    test.update_window(window.into(), |_, window, cx| {
+        producer.pump(&input, window, cx).unwrap();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let queue = |producer: &Producer, action, lifetime| {
+        let tree = producer
+            .accessible_tree
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .clone()
+            .unwrap();
+        let entries = serde_json::to_value(&*tree).unwrap();
+        let node = entries["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["role"] == Role::Button as u8)
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            tree.supports(node, action),
+            matches!(action, TreeAction::Focus)
+        );
+        // Inject the suppressed Click as well to exercise final grant admission.
+        producer
+            .state
+            .bound
+            .lock()
+            .unwrap()
+            .assist
+            .push_back(AssistJob {
+                tree,
+                request: AssistRequest {
+                    node,
+                    action,
+                    deadline_ms: AssistRequest::now_ms().unwrap() + 1000,
+                },
+                end: Instant::now() + lifetime,
+            });
+    };
+    queue(&producer, TreeAction::Focus, BUDGET);
+    window
+        .update(&mut test, |view, _, cx| {
+            view.label = "Replacement button";
+            cx.notify();
+        })
+        .unwrap();
+    let pump = |test: &mut TestAppContext, producer: &mut Producer, input: &Injection| {
+        test.update_window(window.into(), |_, window, cx| {
+            producer.pump(input, window, cx).unwrap()
+        })
+        .unwrap();
+    };
+    pump(&mut test, &mut producer, &input);
+    queue(&producer, TreeAction::Click, BUDGET);
+    pump(&mut test, &mut producer, &input);
+    queue(&producer, TreeAction::Focus, Duration::ZERO);
+    pump(&mut test, &mut producer, &input);
+    assert!(calls.borrow().is_empty());
+    queue(&producer, TreeAction::Focus, BUDGET);
+    pump(&mut test, &mut producer, &input);
+    assert_eq!(&*calls.borrow(), &[AccessibleAction::Focus]);
+    queue(&producer, TreeAction::Focus, BUDGET);
+    input.revoke();
+    pump(&mut test, &mut producer, &input);
+    assert_eq!(&*calls.borrow(), &[AccessibleAction::Focus]);
 }

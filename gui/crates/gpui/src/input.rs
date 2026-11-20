@@ -123,6 +123,18 @@ pub trait EntityInputHandler: 'static + Sized {
     ) {
     }
 
+    /// Applies an ordered UTF-16 range with its active endpoint. Override this
+    /// method to preserve backward selections. Range-only handlers keep their
+    /// existing selection behavior.
+    fn set_text_selection(
+        &mut self,
+        selection: crate::UTF16Selection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selected_text_range(selection.range, window, cx);
+    }
+
     /// See [`InputHandler::text_length_utf16`] for details
     fn text_length_utf16(
         &mut self,
@@ -135,6 +147,15 @@ pub trait EntityInputHandler: 'static + Sized {
     /// See [`InputHandler::accepts_text_input`] for details
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
+    }
+
+    /// See [`InputHandler::requires_secure_keyboard_input`].
+    fn requires_secure_keyboard_input(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        false
     }
 
     /// See [`InputHandler::text_input_configuration`] for details
@@ -311,6 +332,17 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         })
     }
 
+    fn set_text_selection(
+        &mut self,
+        selection: crate::UTF16Selection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| {
+            view.set_text_selection(selection, window, cx)
+        })
+    }
+
     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
         Some(self.element_bounds)
     }
@@ -328,6 +360,12 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.view
             .update(cx, |view, cx| view.accepts_text_input(window, cx))
+    }
+
+    fn requires_secure_keyboard_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.view.update(cx, |view, cx| {
+            view.requires_secure_keyboard_input(window, cx)
+        })
     }
 
     fn text_input_configuration(

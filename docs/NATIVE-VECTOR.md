@@ -46,6 +46,11 @@ arrives, provided no newer physical scene has been published. Placement, surface
 channel/writer incarnation, resume, visibility and input-lane fences still apply.
 Retained track bytes alone cannot authorize a recreated native window.
 
+Vector ingestion retains the validated epoch and revision with the immutable
+encoded frame. Preparation reads those values only for that same allocation,
+so repeated snapshots can identify a scene without decoding its canvas while
+holding the presenter lock.
+
 Encoded scene reservations share the existing native resource budget, with one
 charge reused by duplicate prepares of the same incarnation. Frame objects and
 the current displayed-scene cache keep that charge until their last reference
@@ -324,6 +329,13 @@ retains identity metadata and weak channel references, not compiled scenes or
 frame-receipt capacity. New presses and independent committed text require the
 current displayed target. `retire_input_target` prevents further new input from
 an image while preserving its existing held transitions.
+
+When a producer requests a change of focus to an already displayed overlay,
+the action can change stacking and advance the window revision. The native host
+publishes that gain on the interactive lane and through window status after it
+presents the matching placement. Producers can still request focus before their
+first drawing. Loss and cancellation remain immediate. A superseding focus
+transition, lane replacement or invalidation retires an outstanding gain.
 
 Keep the original target on each held key and pointer gesture. A later image
 can replace the scene while key repeats/releases and pointer motion/releases
@@ -637,6 +649,10 @@ with no peer keys, retries or increased action deadline. Physical input, sustain
 production startup/load, static shaders and other platform/device gates remain unrun.
 The [Unicode composition follow-up](../../vivid_compositor/docs/performance/2026-11-12-sdk-vector-unicode-macos.json)
 addresses the overlapping-workload timeout with two controlled two-hop regressions.
+For a relayed excerpt publication, claim `take_overlay_document_target(id, surface)`
+while the request is pending. The presenter pins the grant at admission under the
+same lock as the editor update. A foreign surface cannot consume it. Completion,
+timeout and teardown retire unclaimed targets. Clears carry no target.
 An opaque `OverlayDocumentTarget` preserves its original editor grant across ordinary
 repaint, retaining the window/source, track/channel/epoch, focus, lane and authenticated
 session incarnation. Delivery still checks the edit's exact mapped displayed scene;
@@ -915,9 +931,15 @@ remaining coverage and configured family order. An unsupported accent therefore
 keeps a supported emoji base instead of replacing it with the primary font's
 missing-glyph box. Complete matches avoid an extra base charmap lookup.
 
-This policy does not compose one grapheme from multiple fonts. Marks absent from
-the selected font may still show missing-mark glyphs. Source text and measurement contracts remain intact; custom providers use the
-SDK facade for the bundled layout type identity. Deterministic licensed COLR/CBDT fixtures
+The SDK vector renderer can supplement an emoji followed by combining marks
+when native shaping leaves a glyph missing or splits the emoji and marks into
+separate clusters. It shapes missing marks around a dotted circle, paints the
+marks at the emoji and measures the repaired paragraph against the producer's
+UTF-8 offsets. Retained text preserves each mark's style, wraps at the repaired
+advances and fits ellipsis at original grapheme boundaries. The public
+`PreparedText::layout_source` supplies the string indexed by native clusters.
+`PreparedText::paint` draws the complete visible paragraph including fallback
+marks. Other complex sequences continue to use the native shaper. Deterministic licensed COLR/CBDT fixtures
 cover base selection with one and multiple marks; the same fixtures keep the
 vendor's existing layout/metric tests runnable without its unpublished test helper.
 Archive, patch and fixture provenance can be verified with the bundled script.

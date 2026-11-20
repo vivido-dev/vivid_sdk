@@ -42,6 +42,8 @@ pub enum Format {
     Text,
     /// Bounded local file URI metadata, never file contents.
     Files,
+    /// One explicit paste offer, preferring paths to a normalized bitmap.
+    Media,
 }
 
 /// Canonical bounded local file metadata without filesystem authority.
@@ -101,6 +103,7 @@ fn invalid_files() -> io::Error {
 }
 
 enum Contents {
+    Image(gpui::ClipboardPng),
     Text(String),
     Files(FileList),
 }
@@ -114,6 +117,7 @@ struct State {
     in_flight: AtomicBool,
     primary: bool,
     files: bool,
+    media: bool,
     files_available: AtomicBool,
 }
 impl State {
@@ -163,8 +167,8 @@ impl fmt::Debug for Scope {
 }
 
 /// A cancellable clipboard read polled without blocking an application worker.
-pub struct PendingRead {
-    receiver: mpsc::Receiver<io::Result<String>>,
+pub struct PendingRead<T = String> {
+    receiver: mpsc::Receiver<io::Result<T>>,
     lease: Lease,
     finished: bool,
 }
@@ -183,12 +187,12 @@ impl PendingFileRead {
             .map(|result| result.map(|uris| FileList { uris }))
     }
 }
-impl PendingRead {
+impl<T> PendingRead<T> {
     /// Takes a completed result, or returns `None` while waiting or after consumption.
     ///
     /// Revocation, timeout and service loss complete with an error. Late replies
     /// cannot restore a cancelled request. Dropping the read cancels platform work.
-    pub fn poll(&mut self) -> Option<io::Result<String>> {
+    pub fn poll(&mut self) -> Option<io::Result<T>> {
         if self.finished {
             return None;
         }
@@ -220,12 +224,12 @@ impl PendingRead {
         Some(result)
     }
 }
-impl Drop for PendingRead {
+impl<T> Drop for PendingRead<T> {
     fn drop(&mut self) {
         self.lease.cancelled.store(true, Ordering::SeqCst);
     }
 }
-impl fmt::Debug for PendingRead {
+impl<T> fmt::Debug for PendingRead<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingClipboardRead")
             .field("finished", &self.finished)
@@ -276,11 +280,15 @@ impl Lease {
         self.is_live().then(operation)
     }
 }
+enum Reply {
+    Text(mpsc::SyncSender<io::Result<String>>),
+    Media(mpsc::SyncSender<io::Result<Option<gpui::ClipboardPasteMedia>>>),
+}
 struct RequestData {
     target: Target,
     format: Format,
     write: Option<Contents>,
-    reply: Option<mpsc::SyncSender<io::Result<String>>>,
+    reply: Option<Reply>,
     lease: Lease,
 }
 /// Holds the sole in-flight platform operation for an owner.
@@ -310,6 +318,15 @@ impl Request {
             _ => None,
         }
     }
+    /// Takes a normalized PNG for a native bitmap write without cloning its pixels.
+    pub fn take_write_image(&mut self) -> Option<gpui::Image> {
+        if matches!(self.data.write, Some(Contents::Image(_)))
+            && let Some(Contents::Image(image)) = self.data.write.take()
+        {
+            return Some(image.into_image());
+        }
+        None
+    }
     /// Returns a cancellation guard for an asynchronous platform task.
     pub fn lease(&self) -> Lease {
         self.data.lease.clone()
@@ -337,7 +354,21 @@ impl Request {
                 Ok(text)
             }
         });
-        if let Some(reply) = self.data.reply.take() {
+        if let Some(Reply::Text(reply)) = self.data.reply.take() {
+            let _ = reply.try_send(result);
+        }
+    }
+    /// Completes a media read with validated local files or a bounded raster image.
+    pub fn complete_media(mut self, result: io::Result<Option<gpui::ClipboardPasteMedia>>) {
+        if !self.is_live() {
+            return;
+        }
+        if let Some(Reply::Media(reply)) = self.data.reply.take() {
+            let result = result.and_then(|media| match media {
+                Some(gpui::ClipboardPasteMedia::Files(uris)) => FileList::from_uri_list(&uris)
+                    .map(|files| Some(gpui::ClipboardPasteMedia::Files(files.into_uri_list()))),
+                other => Ok(other),
+            });
             let _ = reply.try_send(result);
         }
     }
@@ -356,16 +387,20 @@ impl Drop for Request {
 impl Host {
     /// Creates an inactive, isolated channel with optional primary-selection support.
     pub fn new(primary: bool) -> (Self, Client) {
-        Self::create(primary, false)
+        Self::create(primary, false, false)
     }
     /// Creates an inactive service whose provider handles local file lists too.
     ///
     /// Providers must dispatch [`Request::format`] and perform only bounded
     /// platform operations under the request lease. Primary remains text-only.
     pub fn with_file_lists(primary: bool) -> (Self, Client) {
-        Self::create(primary, true)
+        Self::create(primary, true, false)
     }
-    fn create(primary: bool, files: bool) -> (Self, Client) {
+    /// Creates a provider for explicit media paste, file lists and text.
+    pub fn with_media(primary: bool) -> (Self, Client) {
+        Self::create(primary, true, true)
+    }
+    fn create(primary: bool, files: bool, media: bool) -> (Self, Client) {
         let state = Arc::new(State {
             access: Mutex::new(()),
             queue: Mutex::new(VecDeque::new()),
@@ -375,6 +410,7 @@ impl Host {
             in_flight: AtomicBool::new(false),
             primary,
             files,
+            media,
             files_available: AtomicBool::new(false),
         });
         (
@@ -508,9 +544,24 @@ impl Client {
         self.begin_read_format(Target::Clipboard, Format::Files)
             .map(|inner| PendingFileRead { inner })
     }
+    /// Starts one cancellable media paste without waiting on the platform thread.
+    ///
+    /// # Errors
+    /// Rejects inactive owners, unsupported media or exhausted request capacity.
+    pub fn begin_read_media(&self) -> io::Result<PendingRead<Option<gpui::ClipboardPasteMedia>>> {
+        self.begin_reply(Target::Clipboard, Format::Media, Reply::Media)
+    }
     fn begin_read_format(&self, target: Target, format: Format) -> io::Result<PendingRead> {
+        self.begin_reply(target, format, Reply::Text)
+    }
+    fn begin_reply<T>(
+        &self,
+        target: Target,
+        format: Format,
+        wrap: fn(mpsc::SyncSender<io::Result<T>>) -> Reply,
+    ) -> io::Result<PendingRead<T>> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        let lease = self.enqueue(target, format, None, Some(reply))?;
+        let lease = self.enqueue(target, format, None, Some(wrap(reply)))?;
         Ok(PendingRead {
             receiver,
             lease,
@@ -534,8 +585,11 @@ impl Client {
         target: Target,
         format: Format,
         write: Option<Contents>,
-        reply: Option<mpsc::SyncSender<io::Result<String>>>,
+        reply: Option<Reply>,
     ) -> io::Result<Lease> {
+        if format == Format::Media && (!self.state.media || target != Target::Clipboard) {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
         if format == Format::Files && (!self.state.files || target != Target::Clipboard) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -549,6 +603,7 @@ impl Client {
             ));
         }
         if write.as_ref().is_some_and(|data| match data {
+            Contents::Image(_) => false, // ClipboardPng already bounds encoded and decoded sizes.
             Contents::Text(text) => text.len() > MAX_TEXT_BYTES,
             Contents::Files(files) => files.as_uri_list().len() > MAX_TEXT_BYTES,
         }) {
@@ -600,6 +655,19 @@ impl Client {
         self.enqueue(target, Format::Text, Some(Contents::Text(text)), None)
             .map(|_| ())
     }
+    /// Queues an already normalized image for the ordinary clipboard.
+    ///
+    /// # Errors
+    /// Rejects an inactive owner, a provider without media support or exhausted queue capacity.
+    pub fn write_image(&self, image: gpui::ClipboardPng) -> io::Result<()> {
+        self.enqueue(
+            Target::Clipboard,
+            Format::Media,
+            Some(Contents::Image(image)),
+            None,
+        )
+        .map(|_| ())
+    }
     /// Queues validated local file metadata for the ordinary clipboard.
     ///
     /// # Errors
@@ -633,9 +701,26 @@ impl Client {
         self.read_format(Target::Clipboard, Format::Files)
             .map(|uris| FileList { uris })
     }
+    /// Reads files or image pixels from one explicit clipboard paste.
+    ///
+    /// # Errors
+    /// Rejects unsupported providers, invalid media, timeouts and revoked authority.
+    pub fn read_media(&self) -> io::Result<Option<gpui::ClipboardPasteMedia>> {
+        self.read_reply(Target::Clipboard, Format::Media, Reply::Media)
+    }
+
     fn read_format(&self, target: Target, format: Format) -> io::Result<String> {
+        self.read_reply(target, format, Reply::Text)
+    }
+
+    fn read_reply<T>(
+        &self,
+        target: Target,
+        format: Format,
+        wrap: fn(mpsc::SyncSender<io::Result<T>>) -> Reply,
+    ) -> io::Result<T> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        let lease = self.enqueue(target, format, None, Some(reply))?;
+        let lease = self.enqueue(target, format, None, Some(wrap(reply)))?;
         struct Cancel(Arc<AtomicBool>);
         impl Drop for Cancel {
             fn drop(&mut self) {
@@ -735,6 +820,26 @@ mod tests {
         current.complete(Ok("second owner contents".into()));
         assert!(worker_a.join().unwrap().is_err());
         assert_eq!(worker_b.join().unwrap().unwrap(), "second owner contents");
+    }
+    #[test]
+    fn a_stale_media_reply_cannot_cross_focus_or_cancel_the_peer_read() {
+        let (one, a) = Host::with_media(false);
+        let (two, b) = Host::with_media(false);
+        one.set_active(true);
+        two.set_active(true);
+        let first = thread::spawn(move || a.read_media());
+        let second = thread::spawn(move || b.read_media());
+        let stale = next(&one);
+        let peer = next(&two);
+        assert_eq!(stale.format(), Format::Media);
+        one.set_active(false);
+        one.set_active(true);
+        stale.complete_media(Ok(None));
+        peer.complete_media(Ok(None));
+        assert!(first.join().unwrap().is_err());
+        assert!(matches!(second.join().unwrap(), Ok(None)));
+        let (_, text_only) = Host::with_file_lists(false);
+        assert!(matches!(text_only.read_media(), Err(e) if e.kind() == io::ErrorKind::Unsupported));
     }
     #[test]
     fn capacity_includes_in_flight_work_and_diagnostics_redact_contents() {

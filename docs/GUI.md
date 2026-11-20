@@ -105,10 +105,20 @@ rendering, physical display, PTY delivery or Vivid presentation.
 schema errors use content-free stable `automation::Error` codes. Hosts remain
 responsible for authenticating their endpoint and protecting successful result
 data. The compositor's [local control contract](../../vivid_compositor/docs/CONTROL.md)
-shows one embedding of this API. Independent-process and Wayland adapters do
-not acquire app methods automatically.
+shows one embedding of this API. A process adapter can expose its current
+registration through `HostedApp::process_automation_methods`. The host validates
+the same count, names, descriptions and access modes used by linked apps.
 
 ## Independent application processes
+
+Raster applications can register model methods with `gui_remote::run_with_methods`.
+Provide the same build and capture callbacks as `run_persistent`, a static
+method list, and a handler receiving the view, request and GUI context. Native
+vector producers register with `gui_remote::state::Producer::with_methods` and
+service requests with `poll_with_methods` between model updates. Decode the
+app's argument schema before changing the model. A successful reply can carry
+the updated model value. The [private process channel](GUI-STATE.md#independent-processes)
+handles identity, correlation, bounded data and native I/O.
 
 The independent-process overlay path can use the optional
 [shared vector renderer](VECTOR-RENDERER.md), also used by Vivido. Its compiler
@@ -162,7 +172,24 @@ queued events and releases held keys/buttons. `Window::dispatch_cancelled_input`
 delivers release listeners while suppressing GPUI's default activation clicks.
 Custom release handlers can inspect `Window::is_input_cancelled` before
 committing a release-triggered action.
-Basic US physical keys, modifiers, pointer buttons/motion, and scroll are carried.
+A Mac raster launch captures the host keyboard layout. When the host receives a
+layout-change notification, it revokes the old grant and sends the new map with the next
+grant on the owner-private input-method channel (version 4). The child holds queued input
+until the map matches its authenticated grant. Native character events
+carry the actual USB keyboard position and physical modifiers. The producer
+interprets that position using the captured base, Shift, Option, Shift-Option,
+Command and Shift-Command layers. On macOS it also captures the four native
+Caps Lock text layers. The host sends the window’s latch state on a new grant,
+on lock changes and alongside each admitted key report. The child pairs
+key metadata with the matching authenticated HID usage and transition before
+dispatch. Lock changes update the child window without ending a drag or
+restarting typematic. The host and child each buffer up to 64 lock records per
+grant. Layout-based shortcuts continue to use their ordinary logical names.
+This covers letter rows, punctuation and
+keypad characters, including layouts with separate Command shortcuts.
+Launchers can install the same bounded map using `CharacterLayout::sample`
+and `configure`. Hosts without a map retain the basic US mapping. Pointer
+buttons, motion and scroll use the same authenticated input binding.
 Native physical-key repeats are suppressed. The producer applies bounded local typematic:
 500 ms initial delay and 50 ms interval by default, with at most one repeat per
 GUI turn and no catch-up burst after a stall. Repeats pass through the ordinary
@@ -174,16 +201,96 @@ and clear the timer. Each producer owns its timer even when peers reuse local ID
 `gui_remote::KeyRepeat::new(delay_ms, interval_ms)` accepts 100–5,000 ms delay and
 33–1,000 ms interval, or two zeros to disable repeat. A local launcher calls
 `KeyRepeat::configure(&mut command)` to supply `VIVID_GUI_KEY_REPEAT` only to its
-child. `run` and `run_persistent` validate this strict bounded JSON envelope before
+child. The compositor on macOS uses `KeyRepeat::from_system_timing` to inherit
+AppKit’s current values at launch. The macOS presenter sends its selected
+policy with the authenticated private keyboard grant. While a key is held it
+samples AppKit at most four times per second. A changed policy re-arms the
+child’s held key from the initial delay. Explicit overrides stay fixed.
+Embedders can publish live policy through
+`ime::Host::set_binding_with_keyboard_policy`. With a launch-only policy,
+`configure_system` retains producer-side sampling.
+Short timers use the supported minimum. Zero or over-limit timers disable repeat.
+`run` and `run_persistent` validate this strict bounded JSON envelope before
 starting GUI or transport workers. This is a local launch policy, not wire layout
 negotiation; remote GUI pacing can make observed intervals longer than requested.
 The local-process clipboard and native composition bridges are described below.
 In a native text field, character insertion comes from the host's input method;
 producer physical repeats do not synthesize duplicate text. Native text repeat
-still follows the input method/OS policy. Negotiated layouts and repeat policies,
-Caps Lock state, surrounding-document services, clipboard images/files, popups,
-accessibility and multiple windows remain unsupported by this remote backend.
+still follows the input method/OS policy. Cross-machine layout and repeat-policy negotiation,
+popups and multiple windows remain unsupported by this remote backend. Raster accessibility supports inspection, control actions and directed selection
+in opted-in text editors under the current input grant.
 Linked/native applications retain their native platform services.
+
+### Raster window prompts
+
+The remote runner installs GPUI’s in-window prompt renderer before constructing
+the app root. A call to `Window::prompt` draws its message and buttons into the
+owner’s published canvas. The backdrop intercepts pointer input over the
+underlying view. Tab and Shift+Tab cycle through the prompt's buttons. Enter
+or Space selects the focused button. With focus on the dialog itself, Enter
+selects a typed `PromptButton::Ok`. Escape selects a typed
+`PromptButton::Cancel`. Apps receive the original button index. Each
+child owns its prompt and the receiver for its answer. Replacing an in-window
+prompt cancels its pending answer, even when application code retains the old
+prompt view. Dismissing the replacement restores the focus held before the
+first prompt opened. The host grants input to
+the focused pane. File pickers and secondary windows are separate platform services.
+
+When accessibility is active on the GPUI window, the prompt publishes a
+focused modal dialog or alert dialog with its message, detail and named
+buttons. The underlying controls leave the accessibility tree until dismissal.
+A replacement prompt has fresh node IDs. The presenter exposes the focused
+child’s dialog and its buttons. Assistive Focus and Click reach the original
+child through the private process channel.
+
+From `vivid_compositor/`, run
+`cargo run --features gui-testing -- --remote-render-check /tmp/raster.png`
+to exercise the built-in counter producers. The first child replaces an
+unanswered prompt. The second keeps its own prompt. The fixture saves both open
+prompts to `/tmp/raster.dialogs.png` and checks the answering PID and button
+index after switching focus between panes.
+
+The macOS GPUI open and save panels follow the lifetime of the receiver
+returned by `App::prompt_for_paths` or `App::prompt_for_new_path`. Dropping
+the receiver dismisses its panel. A user pressing Cancel still returns
+`Ok(None)` to a live caller. To exercise overlapping native panels in both
+orders and verify the native save directory and suggested filename, run
+`cargo run -p gpui_macos --example path_panel_lifetime` from `vivid_sdk/gui/`.
+
+The macOS compositor routes both calls from independent raster processes to
+its own GUI. A presenter enables this with
+`clipboard::Host::enable_path_panels` after configuring the child environment.
+Drive one `PathPanels` per child from the GUI thread and call
+`Host::retire_path_panel` when the child's Vivid session retires. Showing a
+panel consumes one recent input gesture and requires the exact current binding.
+Once visible, the panel belongs to the initiating child session while AppKit
+owns keyboard focus. Child disconnect, caller cancellation or the ten-minute
+deadline retires it. Native user cancellation returns `Ok(None)`.
+
+There is one pending picker per process. The worker checks the answer at
+most once per 50 ms and continues servicing clipboard requests between checks.
+Open options preserve file/directory and multiple-selection flags. Prompt
+labels and suggested names allow up to 256 UTF-8 bytes. The initial save
+directory is an absolute UTF-8 path of up to 4 KiB. Selected paths use the
+bounded local file URI-list representation, including spaces and multiple
+files. The service returns path metadata and does no file I/O.
+
+### Opening web links from a raster pane
+
+`App::open_url` in a remote app routes a web link to the presenter's platform.
+The local compositor enables this service on the child's authenticated private
+channel. It accepts absolute HTTP and HTTPS URLs up to 8 KiB, with a host
+and without embedded credentials, whitespace, control characters or backslashes.
+The presenter accepts one open per delivered non-modifier key press or primary
+pointer release. The original input grant and its one-second gesture deadline
+must still be live on the GUI thread. Focus loss, hide, disconnect or owner
+replacement discards a queued URL. A child without a supporting host cannot
+launch a browser through this GPUI call.
+
+An embedding presenter opts in with `clipboard::Host::configure_with_web_urls`,
+wraps gesture delivery with `deliver_web_gesture`, and calls `dispatch_web_url`
+with the current visible pane's input binding. Existing clipboard-only hosts
+can continue to use `configure`.
 
 ### Local-process native composition
 
@@ -238,10 +345,61 @@ producer-local UTF-16 offset remains in the producer. Opt-in handlers must imple
 ordinary text/mark callbacks. Host queries use virtual
 coordinates beginning at zero, independently of the full document's size.
 Sensitive fields must return empty text, zero offsets/selection and `sensitive=true`;
-they expose only composition and refuse absolute document edits. This masking
-contract does not enable OS secure-input mode.
+they expose only composition and refuse absolute document edits. The macOS
+compositor requests Secure Event Input for a live sensitive raster or vector
+editor in the active, visible key window. The AppKit backend balances each
+window’s successful acquisition when focus, visibility or the live handler is
+lost. Native GPUI handlers can opt in with `requires_secure_keyboard_input`.
 
-The private IME service is version 2; mismatched versions close the channel.
+The private IME service uses version 11. Rebuild presenter and producers together.
+An accessibility-active presenter requests the live keyboard owner's child tree. The presenter preserves child order, roles,
+accessible names and descriptions, modal and disabled state, and maps clipped
+child bounds into the pane. The child’s focused node becomes the host pane’s
+active descendant. The tree carries selected, expanded and three-state toggle
+values. Sliders, spin buttons, meters, progress indicators and scroll bars
+can publish a finite numeric value, minimum, maximum and positive step.
+Enabled nodes advertise the Focus, Click, Increment, Decrement, Expand and
+Collapse actions implemented by the child. A disabled ancestor suppresses
+these actions throughout its subtree. Click
+requires pointer-button permission in addition to the current keyboard grant.
+
+The presenter binds callbacks to the displayed publication. Replacing the tree
+retires its action targets even if a new control reuses the same local node ID.
+The producer checks its current grant, the original one-second deadline and the
+tree from its latest draw before invoking the window’s action handler.
+The private channel queues at most 64 actions per endpoint.
+
+A publication admits up to 128 nodes, depth 24, 1024 UTF-8 bytes per name or
+description, and 8192 UTF-8 bytes across names, descriptions and exported values.
+A read-only Document, Terminal, Paragraph or Label can expose its value and
+descendant text runs. Mark the provider read-only on its AccessKit node.
+Editable field subtrees suppress value export, including nested read-only labels.
+Password descendants and hidden branches are omitted.
+
+Text runs preserve selectable character boundaries in UTF-8 bytes, word starts
+and direction. Reported selection anchor and focus retain their order, including
+backward selections, and resolve to text runs inside the same published provider.
+Character positions and widths are clipped to the producer viewport and scaled
+to the host pane for positive axis-aligned transforms. Rotated and reflected runs
+retain their text without per-character bounds. The child tree reports existing
+selections in read-only content.
+
+The compositor also presents a separate native text input for a focused raster
+editor that opts into committed document queries. It exposes the bounded excerpt
+and its selection while accessibility is active. A modal child tree, a focused
+password field, sensitive mode and local marked text suppress this provider.
+Its text-run ID belongs to one pane, editor incarnation and document revision.
+SetTextSelection uses Unicode scalar positions within that run. The host rejects
+foreign or retired endpoints and sends the fixed anchor and active cursor
+independently. The producer converts both to UTF-16. Implement `set_text_selection` to retain direction
+when applying the range. Existing handlers implementing only
+`set_selected_text_range` continue to receive the selected span.
+
+A clear or expired snapshot removes the child nodes. Subsequent polls acknowledge
+an unchanged tree within the same grant without resending its contents.
+
+Both ends must support the same version. Rebuild
+independent SDK children with the updated SDK when upgrading the compositor.
 This changes no Vivid wire assignment or profile. Snapshots carry a monotonic
 revision within each editor incarnation. Absolute selection/replacement requires
 the exact revision, valid UTF-8 boundaries and a replacement covering the current
@@ -260,16 +418,18 @@ host. Transition callbacks may be rejected while it refreshes; rapid field chang
 and typing during that refresh remain physical acceptance gates. Native-first
 components must leave printable insertion to their input handler; asynchronous
 producer key-disposition/shortcut negotiation remains separate work.
-Physical key reports still use the existing US HID mapping; keyboard-layout and
-repeat-policy negotiation remain separate work.
+A layout switch cancels held keys and repeat under the old grant. New input is admitted
+after the presenter establishes the replacement grant. Cross-machine layout and repeat
+negotiation remain open.
 
 The compositor's `--sdk-editor` child demonstrates a bounded text model. Developer
 `--remote-ime-render-check OUTPUT` uses actual independent GUI processes and Metal
 rendering with simulated native composition callbacks. Set
 `VIVID_COMPOSITOR_CHECK_LEASE=1` for the lease-resume variant. These checks cover
 Unicode composition/commit, surrounding text, selection/replacement, candidate
-bounds, focus return, reconnect and peer
-cleanup. Physical macOS input sources/candidate menus, OS secure-input behavior,
+bounds, focus return, reconnect and peer cleanup. Set
+`VIVID_COMPOSITOR_CHECK_PRIVATE_EDITOR=1` to verify secure-input requests on
+the GPUI test platform across visibility, focus, disconnect and close. Physical macOS input sources/candidate menus, OS secure-input behavior,
 other platforms/devices and sustained input-method performance remain unrun gates.
 
 ### Local-process text clipboard
@@ -292,6 +452,35 @@ native transfer per owner. Each transfer has a one-second budget. Native socket
 I/O runs on dedicated workers; GUI, rendering, media and Vivid input never wait
 for it. Producer delivery checks the original binding's watchdog and control
 lifecycle. Dropped/expired replies cannot acquire a newer focus grant.
+
+Private clipboard channel version 2 adds bounded native file-list transfers.
+Independent applications can call `supports_uri_list_clipboard`, request an
+explicit `read_clipboard_uri_list_async` and write a single `ExternalPaths`
+entry. These operations carry local path metadata under the text service's
+owner, watchdog, queue and byte limits. Text reads retain text semantics.
+Version 1 producers still receive the text service. Version 3 adds
+`clipboard_has_file_list()` for independent apps. The GUI thread samples native
+format metadata for the presented owner at most five times a second. The
+producer's clipboard worker refreshes a boolean for its current input grant.
+The synchronous call returns false before the first positive sample, on grant
+revocation or after its one-second cache deadline. The platform rechecks
+the clipboard during an explicit read because its contents can change between
+discovery and paste. Older hosts and producers retain their transfer versions.
+
+Version 4 adds `read_clipboard_media_async` for an explicit paste. A macOS host
+checks for files first and otherwise normalizes a supported native bitmap to PNG.
+The private clipboard socket carries a length-checked binary body up to 16 MiB.
+The child checks the request identity and validates the image on its clipboard
+worker under the same input grant. No media offer returns an empty result.
+File-only hosts retain file-list paste through this API.
+
+Version 5 adds bitmap copy through `write_to_clipboard` for a single PNG, JPEG
+or TIFF image. The host checks the declared size and exact input binding before
+accepting bytes. The child rechecks its grant before sending them. The host
+decodes and normalizes the bitmap on its worker, then rechecks the original
+binding before queuing the native write. The platform applies it under the
+clipboard lease. Invalid images and revoked copies preserve the prior clipboard.
+The byte and decoded-pixel limits match bitmap paste.
 
 Synchronous clipboard reads return None on this backend. Primary, Find, image
 and file-list APIs have no native fallback. With no private service endpoint,
@@ -890,9 +1079,20 @@ becomes a file list.
 `App::supports_uri_list_clipboard` and `clipboard_has_file_list` distinguish
 backend support from current offer metadata without external I/O.
 `App::read_clipboard_uri_list_async` supports explicit test entries and native
-Linux Wayland offers, with the same external-read permit and deadline as text.
-Native macOS, Windows and X11 bounded file transfers remain unavailable. Image
+Wayland offers and macOS pasteboard items carrying the explicit file URL type.
+On macOS, text and file reads share one background permit and deadline. File
+writes validate the complete local list before replacing the pasteboard. The
+reader checks the pasteboard revision through the transfer. Windows and X11
+bounded native file transfers remain open. Image
 clipboard and drag-and-drop contracts remain pending.
+
+For explicit hosted terminal paste, `App::read_clipboard_media_async` reads one
+offer. The AppKit backend prefers file URLs, then tries PNG, TIFF and JPEG. Its
+shared background pasteboard worker enforces the one-read budget, rechecks the
+pasteboard change count, bounds encoded input and normalized output to 16 MiB
+each, and limits the decoded image to 8192 pixels per axis and 32 MiB. A client
+using `gui_host::clipboard::Host::with_media` shares its owner lease and queue
+between media and text requests.
 
 Linux Wayland platform clipboard output also runs off-thread: at most four
 pending pipe/socket writes, 1 MiB each, with one-second absolute deadlines.
@@ -959,7 +1159,10 @@ In a GUI element's `a11y_synthetic_children` callback, call
 identified text-role parent. It adds read-only TextRun children and scalar-based
 selection, mapping normalized geometry into that parent's physical bounds. IDs
 derive from the full parent identity plus local row keys, so distinct applications
-may reuse the same keys. No actions or transport authority accompany the document.
+may reuse the same keys. For a rectangular selection, pass each row’s scalar
+range to `Builder::push_line_with_selection`. Each selected row exposes its own
+read-only text selection and the document exposes the first visible range.
+No actions or transport authority accompany the document.
 
 `HostedApp::set_activation_request` receives a GUI-thread `ActivationRequest` for
 that exact mounted instance. An app can enqueue a focus request from an accessible

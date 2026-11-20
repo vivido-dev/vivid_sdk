@@ -25,13 +25,18 @@ pub struct OverlayLayout {
     pub body: Vec<u8>,
 }
 
+pub(super) struct PendingRequest {
+    pub reply: mpsc::SyncSender<Result<Vec<u8>, String>>,
+    pub document: Option<super::service::OverlayDocumentTarget>,
+}
+
 #[derive(Default)]
 pub(super) struct OverlayRelay {
     pub enabled: bool,
     pub next_id: u64,
     pub next_layout: u64,
     pub queued: VecDeque<OverlayHostRequest>,
-    pub pending: HashMap<u64, mpsc::SyncSender<Result<Vec<u8>, String>>>,
+    pub pending: HashMap<u64, PendingRequest>,
     pub clipboard: HashMap<u64, super::service::overlay_clipboard::Grant>,
     pub action_route: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
     pub actions: HashMap<u64, super::service::overlay_actions::Grant>,

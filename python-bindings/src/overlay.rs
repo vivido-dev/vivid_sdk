@@ -432,6 +432,7 @@ impl PyOverlayWindow {
             "focus" => self.inner.request_focus(),
             "raise" => self.inner.raise(),
             "lower" => self.inner.lower(),
+            "request-close" => self.inner.request_close(),
             "close" => self.inner.close(),
             _ => Err(model::invalid("unknown window action")),
         })

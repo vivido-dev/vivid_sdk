@@ -266,11 +266,28 @@ impl NativeVectorHost {
     /// Rejects an already authenticated presenter.
     #[cfg(all(feature = "vector-audio", feature = "testing"))]
     pub fn use_test_audio_output(&mut self) -> io::Result<()> {
+        self.select_test_output(native_audio::DeviceSelection::Clocked)
+    }
+
+    /// Selects an exact native output for endpoint lifecycle tests.
+    ///
+    /// # Errors
+    /// Rejects changes after producer authentication.
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    pub fn use_test_native_audio_output(
+        &mut self,
+        id: crate::audio_output::testing::DeviceId,
+    ) -> io::Result<()> {
+        self.select_test_output(native_audio::DeviceSelection::Native(id))
+    }
+
+    #[cfg(all(feature = "vector-audio", feature = "testing"))]
+    fn select_test_output(&mut self, device: native_audio::DeviceSelection) -> io::Result<()> {
         let mut state = lock(&self.presenter.state);
         if !state.sessions.is_empty() {
             return Err(invalid("test audio must be selected before authentication"));
         }
-        state.audio_test_device = true;
+        state.audio_test_device = device;
         Ok(())
     }
 
@@ -499,6 +516,7 @@ impl NativeVectorHost {
         *serial = self.next;
         self.input.invalidate(pane);
         let mut state = lock(&self.presenter.state);
+        state.overlays.discard_action_focus(pane);
         if let Some(native) = &mut state.overlays.native {
             native.compositions.remove(&pane);
         }
@@ -824,6 +842,7 @@ impl NativeVectorHost {
             },
         );
         state.overlays.prune_native();
+        state.overlays.publish_action_focus(frame.pane);
         for owner in owners {
             flush_overlay_lane(&mut state, owner);
         }
@@ -1043,7 +1062,10 @@ impl NativeVectorHost {
             let Some(body) = &track.retained else {
                 continue;
             };
-            let frame = Frame::decode(body).map_err(io::Error::other)?;
+            let (epoch, revision) = track
+                .retained_vector
+                .frame_identity(body)
+                .ok_or_else(|| invalid("native vector retained frame identity is absent"))?;
             candidates.push(Candidate {
                 window: window.identity,
                 source: bridge_track_key(TrackKey {
@@ -1061,8 +1083,8 @@ impl NativeVectorHost {
                     },
                     track_id: *track_id,
                     channel_generation: track.state.channel_generation.get(),
-                    epoch: frame.epoch,
-                    revision: frame.revision,
+                    epoch,
+                    revision,
                 },
                 body: body.clone(),
                 assets: track.retained_vector.snapshot(),

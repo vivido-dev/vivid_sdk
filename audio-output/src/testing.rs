@@ -1,9 +1,29 @@
-//! Explicit device-free fixtures using the production callback.
+//! Explicit native-device and device-free fixtures using the production callback.
 
 // Rust guideline compliant 2026-10-07
 use super::*;
+pub use cpal::DeviceId;
 use ringbuf::HeapCons;
 use std::sync::Weak;
+
+/// Opens the exact native endpoint for a device-lifecycle fixture.
+///
+/// # Errors
+/// Returns an error for a missing endpoint, invalid generation, unsupported
+/// format, capacity refusal, or stream setup failure.
+pub fn open_device(
+    id: &cpal::DeviceId,
+    generation: u64,
+    limits: Limits,
+) -> io::Result<Arc<Output>> {
+    if generation == 0 {
+        return Err(retired_channel());
+    }
+    let device = cpal::default_host().device_by_id(id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "requested audio output is absent")
+    })?;
+    Output::open_device(device, generation, limits)
+}
 
 /// A manually driven device callback; retaining it grants no output ownership.
 pub struct Renderer {

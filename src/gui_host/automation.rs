@@ -31,7 +31,7 @@ pub const MAX_HOST_CALLS: usize = 64;
 /// Maximum lifetime of a call before admission or response delivery expires.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 // Metadata is static, but still bounded before exposure through a host transport.
-const MAX_METHODS: usize = 32;
+pub(crate) const MAX_METHODS: usize = 32;
 const MAX_METHOD_BYTES: usize = 64;
 const MAX_DESCRIPTION_BYTES: usize = 256;
 
@@ -83,7 +83,7 @@ impl Data {
 }
 
 /// Declares whether a method can change application state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     /// May inspect an owned hidden instance without activating it.
@@ -92,31 +92,39 @@ pub enum Access {
     Command,
 }
 /// Describes one application-owned operation without runtime capabilities.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Method {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Method<S = &'static str> {
     /// Application-local ASCII registration name, at most 64 bytes.
-    pub name: &'static str,
+    pub name: S,
     /// Host admission and revocation policy.
     pub access: Access,
     /// Public explanation, at most 256 UTF-8 bytes.
-    pub description: &'static str,
+    pub description: S,
 }
-pub(super) fn methods(values: &'static [Method]) -> Result<Vec<Method>, Error> {
+pub(crate) fn methods<S: AsRef<str>>(values: &[Method<S>]) -> Result<Vec<Method<&str>>, Error> {
     if values.len() > MAX_METHODS {
         return Err(Error::InvalidRequest);
     }
-    for (index, method) in values.iter().enumerate() {
+    let mut catalog = Vec::with_capacity(values.len());
+    for value in values {
+        let method = Method {
+            name: value.name.as_ref(),
+            access: value.access,
+            description: value.description.as_ref(),
+        };
         validate_method(method.name)?;
         if method.description.len() > MAX_DESCRIPTION_BYTES
             || method.description.contains('\0')
-            || values[..index]
+            || catalog
                 .iter()
-                .any(|other| other.name == method.name)
+                .any(|other: &Method<&str>| other.name == method.name)
         {
             return Err(Error::InvalidRequest);
         }
+        catalog.push(method);
     }
-    Ok(values.to_vec())
+    Ok(catalog)
 }
 fn validate_method(name: &str) -> Result<(), Error> {
     if name.len() > MAX_METHOD_BYTES {
@@ -155,7 +163,8 @@ impl Request {
 }
 
 /// Reports content-free, stable application-call failures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Error {
     /// The owner does not advertise this operation.
@@ -282,6 +291,11 @@ impl<T> fmt::Debug for Responder<T> {
     }
 }
 impl<T> Responder<T> {
+    #[cfg(feature = "gui-remote")]
+    pub(crate) fn admission_deadline(&self) -> Result<Instant, Error> {
+        self.state.valid().map(|()| self.state.deadline)
+    }
+
     /// Runs admitted work once and publishes a bounded response.
     ///
     /// The closure is skipped after cancellation, deactivation, expiry or close.

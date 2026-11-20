@@ -33,8 +33,8 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSAppearanceNameVibrantDark,
     NSAppearanceNameVibrantLight, NSApplication, NSApplicationActivationPolicy,
     NSControlStateValueOn, NSCursor, NSDocumentController, NSEventModifierFlags, NSMenu,
-    NSMenuItem, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSSavePanel, NSScroller,
-    NSScrollerStyle, NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
+    NSMenuItem, NSModalResponseOK, NSOpenPanel, NSSavePanel, NSScroller, NSScrollerStyle,
+    NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSBundle, NSError, NSInteger, NSProcessInfo, NSString, NSURL,
@@ -56,6 +56,9 @@ use std::{
     },
     time::Duration,
 };
+
+mod path_panel;
+use path_panel::present_path_panel;
 
 const MAC_PLATFORM_IVAR: &CStr = c"platform";
 // Match the bounded GUI text service; native provider allocations are separate.
@@ -90,6 +93,16 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
                 should_handle_reopen as extern "C-unwind" fn(_, Sel, *mut AnyObject, Bool) -> Bool,
+            );
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate
+                    as extern "C-unwind" fn(
+                        _,
+                        Sel,
+                        *mut AnyObject,
+                    )
+                        -> objc2_app_kit::NSApplicationTerminateReply,
             );
             decl.add_method(
                 sel!(applicationWillTerminate:),
@@ -176,8 +189,9 @@ pub(crate) struct MacPlatformState {
     activation_policy: ActivationPolicy,
     application_created: bool,
     general_pasteboard: Pasteboard,
-    clipboard_text_read: Arc<AtomicBool>,
+    clipboard_read_busy: Arc<AtomicBool>,
     find_pasteboard: Pasteboard,
+    should_terminate: Option<Rc<dyn Fn() -> bool>>,
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     thermal_observer: Option<ProcessInfoObserver>,
@@ -218,6 +232,42 @@ fn native_activation_policy(policy: ActivationPolicy) -> NSApplicationActivation
 }
 
 impl MacPlatform {
+    fn read_pasteboard_async<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Pasteboard) -> std::result::Result<Option<T>, gpui::ClipboardReadError>
+        + Send
+        + 'static,
+    ) -> Task<std::result::Result<Option<T>, gpui::ClipboardReadError>> {
+        let state = self.0.lock();
+        let busy = state.clipboard_read_busy.clone();
+        let executor = state.background_executor.clone();
+        drop(state);
+        if busy.swap(true, Ordering::AcqRel) {
+            return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
+        }
+        struct Permit(Arc<AtomicBool>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let permit = Permit(busy);
+        let end = std::time::Instant::now() + CLIPBOARD_READ_TIMEOUT;
+        executor.spawn(async move {
+            let _permit = permit;
+            if std::time::Instant::now() >= end {
+                return Err(gpui::ClipboardReadError::Unavailable);
+            }
+            // A fresh pasteboard wrapper and autorelease pool stay on this
+            // worker. No AppKit object or platform mutex crosses an await.
+            let result = autoreleasepool(|_| read(&Pasteboard::general()));
+            if std::time::Instant::now() >= end {
+                return Err(gpui::ClipboardReadError::Unavailable);
+            }
+            result
+        })
+    }
+
     pub fn new(headless: bool) -> Self {
         let marker = main_thread_marker().expect("Mac platform not created on main thread");
         let dispatcher = Arc::new(AppleDispatcher::new());
@@ -247,8 +297,9 @@ impl MacPlatform {
             foreground_executor: ForegroundExecutor::new(dispatcher),
             renderer_context: renderer::Context::default(),
             general_pasteboard: Pasteboard::general(),
-            clipboard_text_read: Arc::new(AtomicBool::new(false)),
+            clipboard_read_busy: Arc::new(AtomicBool::new(false)),
             find_pasteboard: Pasteboard::find(),
+            should_terminate: None,
             reopen: None,
             quit: None,
             menu_command: None,
@@ -886,7 +937,7 @@ impl Platform for MacPlatform {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (done_tx, done_rx) = oneshot::channel();
+        let (mut done_tx, done_rx) = oneshot::channel();
         self.foreground_executor()
             .spawn(async move {
                 // AppKit can return nil despite the nonnull annotation used by objc2's
@@ -908,31 +959,21 @@ impl Platform for MacPlatform {
                 panel.setCanCreateDirectories(true);
                 panel.setResolvesAliases(false);
 
-                let done_tx = Cell::new(Some(done_tx));
-                let handler = RcBlock::new({
-                    let panel = panel.clone();
-                    move |response: NSModalResponse| {
-                        let Some(done_tx) = done_tx.take() else {
-                            return;
-                        };
-
-                        let result = (response == NSModalResponseOK).then(|| {
-                            panel
-                                .URLs()
-                                .iter()
-                                .filter(|url| url.isFileURL())
-                                .filter_map(|url| url.to_file_path())
-                                .collect::<Vec<_>>()
-                        });
-                        _ = done_tx.send(Ok(result));
-                    }
-                });
-
                 if let Some(prompt) = options.prompt {
                     panel.setPrompt(Some(&NSString::from_str(prompt.as_str())));
                 }
 
-                panel.beginWithCompletionHandler(&handler);
+                if let Some(response) = present_path_panel(&panel, &mut done_tx).await {
+                    let result = (response == NSModalResponseOK).then(|| {
+                        panel
+                            .URLs()
+                            .iter()
+                            .filter(|url| url.isFileURL())
+                            .filter_map(|url| url.to_file_path())
+                            .collect()
+                    });
+                    let _ = done_tx.send(Ok(result));
+                }
             })
             .detach();
         done_rx
@@ -945,7 +986,7 @@ impl Platform for MacPlatform {
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let url = NSURL::from_directory_path(directory);
         let suggested_name = suggested_name.map(NSString::from_str);
-        let (done_tx, done_rx) = oneshot::channel();
+        let (mut done_tx, done_rx) = oneshot::channel();
         self.foreground_executor()
             .spawn(async move {
                 // Like openPanel, savePanel may return nil despite its nonnull annotation.
@@ -966,53 +1007,43 @@ impl Platform for MacPlatform {
                     panel.setNameFieldStringValue(&suggested_name);
                 }
 
-                let done_tx = Cell::new(Some(done_tx));
-                let handler = RcBlock::new({
-                    let panel = panel.clone();
-                    move |response: NSModalResponse| {
-                        let Some(done_tx) = done_tx.take() else {
-                            return;
-                        };
+                if let Some(response) = present_path_panel(&panel, &mut done_tx).await {
+                    let result = if response == NSModalResponseOK {
+                        panel
+                            .URL()
+                            .filter(|url| url.isFileURL())
+                            .and_then(|url| url.to_file_path())
+                            .map(|mut path| {
+                                let Some(filename) = path.file_name() else {
+                                    return path;
+                                };
+                                let chunks = filename
+                                    .as_bytes()
+                                    .split(|&b| b == b'.')
+                                    .collect::<Vec<_>>();
 
-                        let result = if response == NSModalResponseOK {
-                            panel
-                                .URL()
-                                .filter(|url| url.isFileURL())
-                                .and_then(|url| url.to_file_path())
-                                .map(|mut path| {
-                                    let Some(filename) = path.file_name() else {
-                                        return path;
-                                    };
-                                    let chunks = filename
-                                        .as_bytes()
-                                        .split(|&b| b == b'.')
-                                        .collect::<Vec<_>>();
+                                // https://github.com/zed-industries/zed/issues/16969
+                                // Workaround a bug in macOS Sequoia that adds an extra file-extension
+                                // sometimes. e.g. `a.sql` becomes `a.sql.s` or `a.txtx` becomes `a.txtx.txt`
+                                //
+                                // This is conditional on OS version because I'd like to get rid of it, so that
+                                // you can manually create a file called `a.sql.s`. That said it seems better
+                                // to break that use-case than breaking `a.sql`.
+                                if let &[_, second, third] = chunks.as_slice()
+                                    && second.starts_with(third)
+                                    && Self::os_version() >= Version::new(15, 0, 0)
+                                {
+                                    path.set_extension("");
+                                }
 
-                                    // https://github.com/zed-industries/zed/issues/16969
-                                    // Workaround a bug in macOS Sequoia that adds an extra file-extension
-                                    // sometimes. e.g. `a.sql` becomes `a.sql.s` or `a.txtx` becomes `a.txtx.txt`
-                                    //
-                                    // This is conditional on OS version because I'd like to get rid of it, so that
-                                    // you can manually create a file called `a.sql.s`. That said it seems better
-                                    // to break that use-case than breaking `a.sql`.
-                                    if let &[_, second, third] = chunks.as_slice()
-                                        && second.starts_with(third)
-                                        && Self::os_version() >= Version::new(15, 0, 0)
-                                    {
-                                        path.set_extension("");
-                                    }
+                                path
+                            })
+                    } else {
+                        None
+                    };
 
-                                    path
-                                })
-                        } else {
-                            None
-                        };
-
-                        _ = done_tx.send(Ok(result));
-                    }
-                });
-
-                panel.beginWithCompletionHandler(&handler);
+                    _ = done_tx.send(Ok(result));
+                }
             })
             .detach();
 
@@ -1055,6 +1086,10 @@ impl Platform for MacPlatform {
                     .log_err();
             })
             .detach();
+    }
+
+    fn on_should_terminate(&self, callback: Rc<dyn Fn() -> bool>) {
+        self.0.lock().should_terminate = Some(callback);
     }
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
@@ -1137,8 +1172,25 @@ impl Platform for MacPlatform {
         state.system_notifications.on_response(&executor, callback);
     }
 
+    fn key_repeat_timing(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        use objc2_app_kit::NSEvent;
+        use std::time::Duration;
+        let duration = |seconds: f64| {
+            (seconds >= 0.0).then(|| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
+        };
+        Some((
+            duration(NSEvent::keyRepeatDelay())?,
+            duration(NSEvent::keyRepeatInterval())?,
+        ))
+    }
+
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(MacKeyboardLayout::new())
+    }
+
+    #[cfg(feature = "test-support")]
+    fn installed_keyboard_layout(&self, id: &str) -> Option<Box<dyn PlatformKeyboardLayout>> {
+        MacKeyboardLayout::installed(id).map(|layout| Box::new(layout) as _)
     }
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
@@ -1241,34 +1293,32 @@ impl Platform for MacPlatform {
         {
             return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
         }
-        let state = self.0.lock();
-        let busy = state.clipboard_text_read.clone();
-        let executor = state.background_executor.clone();
-        drop(state);
-        if busy.swap(true, Ordering::AcqRel) {
+        self.read_pasteboard_async(move |board| board.read_text_bounded(max_bytes))
+    }
+
+    fn read_clipboard_media_async(
+        &self,
+    ) -> Task<std::result::Result<Option<gpui::ClipboardPasteMedia>, gpui::ClipboardReadError>>
+    {
+        self.read_pasteboard_async(Pasteboard::read_media_bounded)
+    }
+
+    fn supports_uri_list_clipboard(&self) -> bool {
+        true
+    }
+
+    fn clipboard_has_file_list(&self) -> bool {
+        self.0.lock().general_pasteboard.has_file_urls()
+    }
+
+    fn read_clipboard_uri_list_async(
+        &self,
+        max_bytes: usize,
+    ) -> Task<std::result::Result<Option<String>, gpui::ClipboardReadError>> {
+        if max_bytes > gpui::MAX_CLIPBOARD_URI_BYTES {
             return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
         }
-        struct Permit(Arc<AtomicBool>);
-        impl Drop for Permit {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let permit = Permit(busy);
-        let end = std::time::Instant::now() + CLIPBOARD_READ_TIMEOUT;
-        executor.spawn(async move {
-            let _permit = permit;
-            if std::time::Instant::now() >= end {
-                return Err(gpui::ClipboardReadError::Unavailable);
-            }
-            // A fresh pasteboard wrapper and autorelease pool stay on this
-            // worker. No AppKit object or platform mutex crosses an await.
-            let result = autoreleasepool(|_| Pasteboard::general().read_text_bounded(max_bytes));
-            if std::time::Instant::now() >= end {
-                return Err(gpui::ClipboardReadError::Unavailable);
-            }
-            result
-        })
+        self.read_pasteboard_async(move |board| board.read_file_uris_bounded(max_bytes))
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
@@ -1449,6 +1499,22 @@ extern "C-unwind" fn should_handle_reopen(
         }
     }
     Bool::YES
+}
+
+extern "C-unwind" fn should_terminate(
+    this: &AnyObject,
+    _: Sel,
+    _: *mut AnyObject,
+) -> objc2_app_kit::NSApplicationTerminateReply {
+    use objc2_app_kit::NSApplicationTerminateReply;
+    // SAFETY: AppKit invokes this registered delegate on its owning main thread.
+    let platform = unsafe { get_mac_platform(this) };
+    let callback = platform.0.lock().should_terminate.clone();
+    if callback.is_none_or(|callback| callback()) {
+        NSApplicationTerminateReply::TerminateNow
+    } else {
+        NSApplicationTerminateReply::TerminateCancel
+    }
 }
 
 extern "C-unwind" fn will_terminate(this: &AnyObject, _: Sel, _: *mut AnyObject) {

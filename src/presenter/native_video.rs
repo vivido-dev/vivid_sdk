@@ -99,6 +99,8 @@ impl Reservation {
 
 #[derive(Clone)]
 pub(crate) struct Frame {
+    #[cfg(feature = "testing")]
+    pub selected: Option<(Instant, i64)>,
     pub incarnation: Weak<()>,
     pub image: Arc<RasterImage>,
     pub epoch: u32,
@@ -458,6 +460,8 @@ fn publish_timed(
                     .checked_add(1)
                     .ok_or_else(|| invalid("native video frame IDs exhausted"))?;
                 let frame = Frame {
+                    #[cfg(feature = "testing")]
+                    selected: None,
                     incarnation: Arc::downgrade(&reservation._token),
                     image: Arc::new(image),
                     epoch: scope.epoch,
@@ -789,6 +793,8 @@ impl Decoder {
                     .checked_add(1)
                     .ok_or_else(|| invalid("native video frame IDs exhausted"))?;
                 let frame = Frame {
+                    #[cfg(feature = "testing")]
+                    selected: None,
                     incarnation: Arc::downgrade(&reservation._token),
                     image,
                     pts,

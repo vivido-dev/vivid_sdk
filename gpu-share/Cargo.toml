@@ -8,6 +8,7 @@ description = "Bounded immutable native GPU frames for Vivid application hosts"
 
 [features]
 default = []
+test-util = []
 gui = ["dep:gpui"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -38,6 +39,8 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
   "std",
   "MTLDevice",
   "MTLCommandQueue",
+  "MTLCommandBuffer",
+  "MTLEvent",
   "MTLTexture",
   "MTLResource",
   "MTLPixelFormat",
@@ -47,5 +50,6 @@ gpui = { path = "../gui/crates/gpui", optional = true, default-features = false 
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 pollster = "1"
+objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandEncoder"] }
 
 [workspace]

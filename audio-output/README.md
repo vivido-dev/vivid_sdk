@@ -99,6 +99,12 @@ compositor integration must bind them to decoder work and callback lifetimes.
 device. Its renderer holds a weak output reference and cannot keep a retired
 output alive. The feature is off by default. Vivido enables it only for tests.
 
+On macOS with a native output, run
+`cargo test --features testing --test macos_endpoint -- --ignored --nocapture`
+from this crate. The fixture creates a process-private aggregate backed by the
+current default output, streams silence, removes it and recreates its UID. It
+checks stale writes, peer progress, replacement callbacks and fixture cleanup.
+
 Migrated on 2026-11-08 from the CI worktree's `vivido/src/vivid/audio.rs`, based
 on Vivido revision `8d0f3c8881e36cad035207d12aab17defda2f54a`. The Apache-2.0
 license is included. Vivido now imports the shared SDK output and constructs its

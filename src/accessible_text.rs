@@ -1,7 +1,7 @@
 //! Bounded read-only text documents for native accessibility adapters.
 
 // Rust guideline compliant 2026-10-07
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, ops::Range};
 
 /// Maximum physical rows in one snapshot.
 pub const MAX_LINES: usize = 512;
@@ -48,8 +48,14 @@ pub struct Line {
     lengths: Vec<u8>,
     positions: Vec<f32>,
     widths: Vec<f32>,
+    selected_characters: Option<Range<usize>>,
 }
 impl Line {
+    /// Selected scalar boundaries on this row of a discontiguous selection.
+    pub fn selected_characters(&self) -> Option<Range<usize>> {
+        self.selected_characters.clone()
+    }
+
     /// Returns the local identity of this physical row.
     pub fn key(&self) -> u64 {
         self.key
@@ -177,6 +183,21 @@ impl Builder {
         rect: [f32; 4],
         characters: impl IntoIterator<Item = (char, f32, f32)>,
     ) -> Result<(), InvalidDocument> {
+        self.push_line_with_selection(key, rect, characters, None)
+    }
+    /// Appends a physical row with an optional row-local selection.
+    ///
+    /// This preserves each span of a rectangular selection, including on soft-wrapped rows.
+    ///
+    /// # Errors
+    /// Applies the same limits as `push_line` and rejects reversed or out-of-row spans.
+    pub fn push_line_with_selection(
+        &mut self,
+        key: u64,
+        rect: [f32; 4],
+        characters: impl IntoIterator<Item = (char, f32, f32)>,
+        selected_characters: Option<Range<usize>>,
+    ) -> Result<(), InvalidDocument> {
         let [x, y, w, h] = rect;
         if self.document.lines.len() >= MAX_LINES
             || self.keys.contains(&key)
@@ -195,6 +216,7 @@ impl Builder {
             lengths: Vec::new(),
             positions: Vec::new(),
             widths: Vec::new(),
+            selected_characters,
         };
         let mut previous = 0.;
         for (character, position, width) in characters {
@@ -223,6 +245,13 @@ impl Builder {
             line.positions.push(position);
             line.widths.push(width);
         }
+        if line
+            .selected_characters
+            .as_ref()
+            .is_some_and(|r| r.start > r.end || r.end > line.lengths.len())
+        {
+            return Err(InvalidDocument);
+        }
         self.bytes += line.text.len();
         self.characters += line.lengths.len();
         self.keys.insert(key);
@@ -243,6 +272,14 @@ impl Builder {
         focused: bool,
     ) -> Result<Document, InvalidDocument> {
         if let Some(selection) = selection {
+            if self
+                .document
+                .lines
+                .iter()
+                .any(|line| line.selected_characters.is_some())
+            {
+                return Err(InvalidDocument);
+            }
             for position in [selection.anchor, selection.focus] {
                 if !self.document.lines.iter().any(|line| {
                     line.key == position.line && position.character <= line.lengths.len()
@@ -285,6 +322,22 @@ mod tests {
             }
         );
         assert!(!format!("{doc:?}").contains("private"));
+    }
+    #[test]
+    fn invalid_selected_span_does_not_consume_the_row_key() {
+        let mut b = Builder::new("text").unwrap();
+        let rect = [0., 0., 1., 1.];
+        let characters = [('🌱', 0., 1.)];
+        assert!(
+            b.push_line_with_selection(7, rect, characters, Some(0..4))
+                .is_err()
+        );
+        b.push_line_with_selection(7, rect, characters, Some(0..1))
+            .unwrap();
+        assert_eq!(
+            b.finish(None, true).unwrap().lines()[0].selected_characters(),
+            Some(0..1)
+        );
     }
     #[test]
     fn invalid_rows_do_not_mutate_existing_rows_or_budget() {

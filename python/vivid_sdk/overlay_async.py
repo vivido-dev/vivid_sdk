@@ -114,6 +114,7 @@ class OverlayWindow:
     async def set_visible(self, visible: bool) -> None: await _run(self._inner.set_visible, visible)
     async def center(self) -> None: await _run(self._inner.center)
     async def request_focus(self) -> None: await _run(self._inner.request_focus)
+    async def request_close(self) -> None: await _run(self._inner.request_close)
     async def raise_window(self) -> None: await _run(self._inner.raise_window)
     async def lower(self) -> None: await _run(self._inner.lower)
     async def bounds(self) -> overlay.Rect: return await _run(self._inner.bounds)

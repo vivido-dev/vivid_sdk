@@ -1437,6 +1437,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Identifies a modal dialog to assistive technology.
+    fn aria_modal(mut self, modal: bool) -> Self {
+        self.interactivity().aria.modal = modal;
+        self
+    }
+
     /// Set the selected state for this element.
     fn aria_selected(mut self, selected: bool) -> Self {
         self.interactivity().aria.selected = Some(selected);
@@ -2154,6 +2160,7 @@ impl IntoElement for Div {
 
 #[derive(Default)]
 pub(crate) struct AriaProperties {
+    modal: bool,
     pub(crate) author_id: Option<SharedString>,
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
@@ -3604,6 +3611,9 @@ impl Interactivity {
         }
         if let Some(keyshortcuts) = &self.aria.keyshortcuts {
             node.set_keyboard_shortcut(keyshortcuts.to_string());
+        }
+        if self.aria.modal {
+            node.set_modal();
         }
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);

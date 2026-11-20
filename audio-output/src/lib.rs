@@ -395,8 +395,16 @@ impl Output {
         let device = host.default_output_device().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no default audio output device")
         })?;
+        Self::open_device(device, channel_generation, limits)
+    }
+
+    fn open_device(
+        device: cpal::Device,
+        channel_generation: u64,
+        limits: Limits,
+    ) -> io::Result<Arc<Self>> {
         let supported = device.default_output_config().map_err(|error| {
-            io::Error::other(format!("could not query the default audio output: {error}"))
+            io::Error::other(format!("could not query the audio output: {error}"))
         })?;
         let format = supported.sample_format();
         let config: StreamConfig = supported.into();

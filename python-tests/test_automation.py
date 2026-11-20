@@ -224,7 +224,7 @@ def runtime_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     a refused runtime directory, and these tests are about resolution, not about this one.
     """
 
-    root = Path(tempfile.mkdtemp(prefix="vvsdk-"))
+    root = Path(tempfile.mkdtemp(prefix="vvsdk-", dir="/tmp"))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(root))
     monkeypatch.delenv("VIVIDO_SESSION", raising=False)
     monkeypatch.delenv("VIVIDO_SOCKET", raising=False)
@@ -259,6 +259,10 @@ def write_registry(runtime: Path, name: str, socket_path: Path, *, live: bool = 
     """
 
     digest = hashlib.sha256(name.encode()).hexdigest()[:32]
+    birth = _this_birth()
+    if not live:
+        clock = "start_micros" if birth["platform"] == "macos" else "start_ticks"
+        birth[clock] += 1
     registry = {
         "schema": 1,
         "name": name,
@@ -267,7 +271,7 @@ def write_registry(runtime: Path, name: str, socket_path: Path, *, live: bool = 
         "vivido_version": "test",
         "protocol_version": auto.PROTOCOL_VERSION,
         "endpoint_id": "cd" * 32,
-        "process_birth": {"platform": "linux", "start_ticks": 1} if not live else _this_birth(),
+        "process_birth": birth,
         "socket": str(socket_path),
         "headless": True,
         "columns": 80,
@@ -277,7 +281,7 @@ def write_registry(runtime: Path, name: str, socket_path: Path, *, live: bool = 
 
 
 def _this_birth() -> Dict[str, Any]:
-    birth = auto._linux_birth(os.getpid())
+    birth = auto._process_birth(os.getpid())
     assert isinstance(birth, dict)
     return birth
 

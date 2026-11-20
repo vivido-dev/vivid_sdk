@@ -486,6 +486,11 @@ impl Overlays {
     fn drain_events(&mut self, owner: SessionIdentity) {
         while let Some(mut event) = self.windows.take_event(owner) {
             #[cfg(feature = "vector-render")]
+            if matches!(event.event, Event::Focus(true)) && self.awaiting_action_focus(event.window)
+            {
+                continue;
+            }
+            #[cfg(feature = "vector-render")]
             if matches!(event.event, Event::Cancel) {
                 self.note_native_cancel(event.window);
             }
@@ -891,12 +896,25 @@ impl Overlays {
         let Some(current) = self.viewport_of(session_id) else {
             return Err("overlay viewport is absent");
         };
+        #[cfg(feature = "vector-render")]
+        let previous = self
+            .windows
+            .pane(owner)
+            .and_then(|pane| self.windows.focus(pane));
         if self
             .windows
             .apply_action(owner, action, current.viewport)
             .is_err()
         {
             return Err("overlay action was refused");
+        }
+        #[cfg(feature = "vector-render")]
+        if action.action == vivid_protocol::overlay::wire::WindowAction::Focus
+            && let Some(pane) = self.windows.pane(owner)
+            && let Some(focused) = self.windows.focus(pane)
+            && previous != Some(focused)
+        {
+            self.defer_action_focus(pane, focused);
         }
         self.drain_events(owner);
         Ok((messages::OK, Vec::new()))
@@ -925,6 +943,9 @@ impl Overlays {
             return Err("overlay window does not exist");
         };
         let presented = self.displayed.get(&id);
+        let focused = self.windows.focus_of(id) == Some(id);
+        #[cfg(feature = "vector-render")]
+        let focused = focused && !self.awaiting_action_focus(id);
         let status = Status {
             window: SetWindow {
                 address: WindowAddress {
@@ -936,7 +957,7 @@ impl Overlays {
                 options: window.options.clone(),
             },
             viewport: current.viewport,
-            focused: self.windows.focus_of(id) == Some(id),
+            focused,
             scene_revision: presented.map_or(0, |scene| scene.revision),
             active: presented.map(|scene| scene.submission),
             viewport_revision: current.revision,
@@ -1369,6 +1390,8 @@ impl Overlays {
     }
 
     pub(crate) fn close_lane(&mut self, session_id: u64) {
+        #[cfg(feature = "vector-render")]
+        self.retire_action_focus(session_id);
         self.input_leases.remove(&session_id);
         // No reservation is needed until this owner has actual window state.
         if self.windows.has_owner(owner(session_id)) {
@@ -1944,6 +1967,8 @@ impl Overlays {
         self.drain_events_of(sessions);
     }
     pub(crate) fn remove_pane(&mut self, pane: PaneId) {
+        #[cfg(feature = "vector-render")]
+        self.discard_action_focus(pane);
         self.windows.remove_pane(pane);
         self.last_click.remove(&pane);
         self.last_gesture.remove(&pane);
