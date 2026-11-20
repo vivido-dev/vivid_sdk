@@ -6342,22 +6342,6 @@ dependencies = [
 
 [[package]]
 name = "vello"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913abde56cab6131b62c0cc69b1a93b671d3c34b3097beb3714fd1dc93be8115"
-dependencies = [
- "bytemuck",
- "log",
- "peniko",
- "png 0.18.1",
- "skrifa 0.44.0",
- "static_assertions",
- "thiserror 2.0.21",
- "vello_encoding 0.11.0",
-]
-
-[[package]]
-name = "vello"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "156df70b9435784d93a32b29a0c0a825c28a8b1de69e73f868e0414981974b6d"
@@ -6370,22 +6354,9 @@ dependencies = [
  "skrifa 0.49.0",
  "static_assertions",
  "thiserror 2.0.21",
- "vello_encoding 0.12.0",
- "vello_shaders 0.12.0",
+ "vello_encoding",
+ "vello_shaders",
  "wgpu 30.0.1",
-]
-
-[[package]]
-name = "vello_encoding"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1fb9548d2b46b0f79137b5b1d208ecbd76d432f74e7a2ba838615d117f11532"
-dependencies = [
- "bytemuck",
- "guillotiere",
- "peniko",
- "skrifa 0.44.0",
- "smallvec",
 ]
 
 [[package]]
@@ -6403,19 +6374,6 @@ dependencies = [
 
 [[package]]
 name = "vello_shaders"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e653222cee49f2571729c3e4b0fa99bc4f826c6bb9487dbb88b825d552b3a27"
-dependencies = [
- "bytemuck",
- "log",
- "naga 30.0.1",
- "thiserror 2.0.21",
- "vello_encoding 0.11.0",
-]
-
-[[package]]
-name = "vello_shaders"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8af58dc04b4e7b87a9688fa12443a49d5916814fe78fa64d93f5b2d3f3e5bcac"
@@ -6424,7 +6382,7 @@ dependencies = [
  "log",
  "naga 30.0.1",
  "thiserror 2.0.21",
- "vello_encoding 0.12.0",
+ "vello_encoding",
 ]
 
 [[package]]
@@ -6531,7 +6489,7 @@ dependencies = [
  "smithay",
  "tempfile",
  "unicode-segmentation",
- "vello 0.12.0",
+ "vello",
  "vivid_audio",
  "vivid_audio_output",
  "vivid_gpu_share",
@@ -6548,7 +6506,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_vello_backend"
-version = "0.11.0-vivid.1"
+version = "0.12.0-vivid.1"
 dependencies = [
  "bytemuck",
  "futures-intrusive",
@@ -6556,9 +6514,9 @@ dependencies = [
  "peniko",
  "static_assertions",
  "thiserror 2.0.21",
- "vello 0.11.0",
- "vello_encoding 0.11.0",
- "vello_shaders 0.11.0",
+ "vello",
+ "vello_encoding",
+ "vello_shaders",
  "wgpu 30.0.1",
 ]
 

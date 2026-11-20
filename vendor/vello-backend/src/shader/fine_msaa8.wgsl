@@ -220,10 +220,10 @@ fn clip_color(c_in: vec3<f32>) -> vec3<f32> {
     let l = lum(c);
     let n = min(c.x, min(c.y, c.z));
     let x = max(c.x, max(c.y, c.z));
-    if n < 0.0 {
+    if n < 0.0 && l - n > 0.0 {
         c = l + (((c - l) * l) / (l - n));
     }
-    if x > 1.0 {
+    if x > 1.0 && x - l > 0.0 {
         c = l + (((c - l) * (1.0 - l)) / (x - l));
     }
     return c;
@@ -517,6 +517,10 @@ struct CmdBlurRect {
 
     // Gaussian filter standard deviation
     std_dev: f32,
+
+    // Whether to paint the inverse (1 - alpha) of the blur coverage.
+    // Unpacked from the sign bit of the encoded standard deviation.
+    invert: u32,
 }
 
 struct CmdLinGrad {
@@ -1184,9 +1188,15 @@ fn read_blur_rect(cmd_ix: u32) -> CmdBlurRect {
     let width = bitcast<f32>(info[info_offset + 6u]);
     let height = bitcast<f32>(info[info_offset + 7u]);
     let radius = bitcast<f32>(info[info_offset + 8u]);
-    let std_dev = bitcast<f32>(info[info_offset + 9u]);
+    // The encoded `std_dev` carries two values: its magnitude is the standard deviation, and
+    // its sign bit is the invert flag (see `DrawBlurRoundedRect` in `vello_encoding`).
+    // The flag is read from the raw bits rather than by comparing against zero, as an inverse
+    // blur with a standard deviation of zero is encoded as `-0.0`.
+    let std_dev_bits = info[info_offset + 9u];
+    let std_dev = abs(bitcast<f32>(std_dev_bits));
+    let invert = std_dev_bits >> 31u;
 
-    return CmdBlurRect(rgba_color, matrx, xlat, width, height, radius, std_dev);
+    return CmdBlurRect(rgba_color, matrx, xlat, width, height, radius, std_dev, invert);
 }
 
 fn read_lin_grad(cmd_ix: u32) -> CmdLinGrad {
@@ -1579,7 +1589,10 @@ fn main(
                     let d_pos = pow(pow(x1, exponent) + pow(y1, exponent), inv_exponent);
                     let d_neg = min(max(x0, y0), 0.0);
                     let d = d_pos + d_neg - r1;
-                    let alpha = scale * (erf7(inv_std_dev * (min_edge + d)) - erf7(inv_std_dev * d));
+                    let blur_coverage = scale * (erf7(inv_std_dev * (min_edge + d)) - erf7(inv_std_dev * d));
+                    // When `invert` is set, paint the inverse (1 - alpha) coverage, used to
+                    // implement inset box shadows.
+                    let alpha = select(blur_coverage, 1.0 - blur_coverage, blur.invert != 0u);
 
                     let fg_rgba = blur_rgba * alpha;
                     let fg_i = fg_rgba * area[i];

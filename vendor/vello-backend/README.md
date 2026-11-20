@@ -25,7 +25,9 @@ whose contract assumes successful coarse allocation. Encoding,
 allocator sizes and scene limits remain unchanged. The SDK retains its original
 per-job dispatch limits and independently rejects missing allocation evidence.
 
-Scene/DrawGlyphs are re-exported from exactly upstream Vello 0.11.0; the original
+The backend uses Vello 0.12.0 encoding and shaders. The derived MSAA8
+shader also includes the upstream 0.12.0 blend and inverse blur changes.
+Scene/DrawGlyphs are re-exported from exactly upstream Vello 0.12.0; the original
 scene implementation is not duplicated here. SDK/compiler and application Vello
 scene identity therefore stays shared. GPU options/error types remain private
 implementation details; applications should use SDK renderer APIs. Upstream
