@@ -122,7 +122,7 @@ impl PresenterListener for SocketListener {
         match &self.kind {
             Bound::Tcp(listener) => {
                 let (stream, _) = listener.accept()?;
-                tcp_transport(stream)
+                Transport::from_tcp(stream)
             }
             #[cfg(unix)]
             Bound::Unix { listener, .. } => {
@@ -143,11 +143,24 @@ impl PresenterListener for SocketListener {
     }
 }
 
-struct TcpReader(Arc<TcpStream>);
+struct TcpReader {
+    stream: Arc<TcpStream>,
+    #[cfg(windows)]
+    timeout: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+}
 
 impl io::Read for TcpReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(buffer)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        if let Some(timeout) = *self.timeout.lock().unwrap_or_else(|p| p.into_inner())
+            && !vivid_local_control::wait_tcp_readable(&self.stream, timeout)?
+        {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        (&*self.stream).read(buffer)
     }
 }
 
@@ -156,16 +169,34 @@ pub(super) fn tcp_transport(stream: TcpStream) -> io::Result<Transport> {
     let writer = stream.try_clone()?;
     let reader = Arc::new(stream);
     let cancel = reader.clone();
-    let deadline = reader.clone();
-    // Windows receive timeouts must be set on the actual reader socket, not
-    // another Winsock handle produced by TcpStream::try_clone.
+    #[cfg(not(windows))]
+    let timeout = {
+        let deadline = reader.clone();
+        Arc::new(move |timeout| deadline.set_read_timeout(timeout))
+    };
+    #[cfg(windows)]
+    let wait = Arc::new(std::sync::Mutex::new(None));
+    #[cfg(windows)]
+    let timeout = {
+        let wait = wait.clone();
+        Arc::new(move |timeout| {
+            *wait.lock().unwrap_or_else(|p| p.into_inner()) = timeout;
+            Ok(())
+        })
+    };
+    // SO_RCVTIMEO can leave a Winsock connection unusable after expiration.
+    // Poll readiness instead, preserving both directions through idle periods.
     Ok(Transport::new(
-        Box::new(TcpReader(reader)),
+        Box::new(TcpReader {
+            stream: reader,
+            #[cfg(windows)]
+            timeout: wait,
+        }),
         Box::new(writer),
         ConnectionCancel::new(move || {
             let _ = cancel.shutdown(Shutdown::Both);
         }),
-        Arc::new(move |timeout| deadline.set_read_timeout(timeout)),
+        timeout,
     ))
 }
 

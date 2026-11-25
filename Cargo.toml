@@ -105,7 +105,7 @@ native-media = ["vivid_protocol/native"]
 # The terminating presenter. Off by default: most consumers only produce, and it roughly doubles
 # the crate. It does not require `native-media` — a build without it simply refuses compressed
 # raster frames at runtime, exactly as the producer side does.
-presenter = ["dep:log", "dep:serde", "dep:sha2"]
+presenter = ["dep:log", "dep:serde", "dep:sha2", "dep:vivid_local_control"]
 # An in-process Vivid 1.5 presenter fake for producer tests, plus the presenter test-support API
 # gateway consumers drive from their own suites. Off by default: it is only compiled into crates
 # that ask for it, and it never affects a production build of the SDK. Requires `presenter`: its
@@ -121,7 +121,6 @@ async-channel = { version = "2.5", optional = true }
 vivid_audio = { version = "0.1.0", path = "audio", optional = true }
 vivid_audio_output = { version = "0.1.0", path = "audio-output", optional = true }
 vivid_video = { version = "0.1.0", path = "video", optional = true }
-vivid_local_control = { version = "0.1.0", path = "local-control", optional = true }
 moxcms = { version = "0.9", optional = true }
 crc32fast = { version = "1.5", optional = true }
 image = { version = "0.25.10", optional = true, default-features = false, features = [
@@ -198,6 +197,9 @@ required-features = ["native-media"]
 name = "conformance"
 path = "examples/rust/conformance.rs"
 required-features = ["presenter"]
+
+[target.'cfg(any(unix, windows))'.dependencies]
+vivid_local_control = { version = "0.1.0", path = "local-control", optional = true }
 
 [workspace]
 members = ["python-bindings", "node-bindings"]

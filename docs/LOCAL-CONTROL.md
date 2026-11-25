@@ -7,6 +7,11 @@ It depends on libc on Unix and windows-sys on Windows, independently of GPUI,
 renderers, presenter roles and the Vivid wire codec. Default SDK builds do not
 enable it. Vivido now consumes the same implementation through the SDK.
 
+The presenter also uses this native support crate for Windows TCP readiness
+polling. `wait_tcp_readable` bounds the wait without setting `SO_RCVTIMEO`, so
+idle cancellation checks do not expire a receive operation on a live connection.
+It grants no local-control or Vivid authority.
+
 `LocalListener::bind` refuses an existing endpoint. Unix sockets have mode 0600
 and compare peer credentials with the effective user on both acceptance and
 connection. Applications must protect the containing directory during creation;

@@ -9,6 +9,38 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+/// Waits for TCP input without applying a destructive Winsock receive timeout.
+///
+/// Returns false on timeout. Readiness may also indicate closure or an error;
+/// the caller must read the stream to distinguish these cases. Other readers
+/// can consume readiness before the caller reads.
+///
+/// # Errors
+/// Returns the native error if Winsock cannot poll the stream.
+#[cfg(windows)]
+pub fn wait_tcp_readable(stream: &std::net::TcpStream, timeout: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+    let mut socket = WSAPOLLFD {
+        fd: stream.as_raw_socket() as _,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: the borrowed stream keeps its initialized socket live; the
+    // one-element poll array remains writable throughout the synchronous call.
+    match unsafe { WSAPoll(&mut socket, 1, millis) } {
+        0 => Ok(false),
+        -1 => {
+            // SAFETY: this only reads the calling thread's Winsock error state.
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
+        _ => Ok(true),
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use std::fs;

@@ -27,9 +27,17 @@ pub trait PresenterListener: Send + 'static {
 }
 
 impl Transport {
+    /// Wraps a TCP stream with platform-aware deadlines and cancellation.
+    ///
+    /// # Errors
+    /// Returns an I/O error if configuring or cloning the socket fails.
+    pub fn from_tcp(stream: std::net::TcpStream) -> io::Result<Self> {
+        super::socket::tcp_transport(stream)
+    }
+
     /// Wraps accepted I/O with framing deadlines and connection cancellation.
     ///
-    /// The timeout callback must configure the actual reader handle. On Windows,
+    /// The timeout callback must configure the actual reader's wait. On Windows,
     /// reads use bounded waits to observe cancellation even while the peer remains
     /// connected; timed-out partial records resume without discarding their bytes.
     pub fn new(
@@ -110,8 +118,8 @@ impl Read for DeadlineReader {
 #[cfg(windows)]
 impl DeadlineReader {
     fn read_cancellable(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        // Winsock shutdown on a cloned socket does not wake an already blocked
-        // receive. Bound each read and observe cancellation between attempts.
+        // Winsock shutdown does not wake an already blocked receive. The TCP
+        // backend polls readiness to observe cancellation between bounded waits.
         // Retrying here preserves partial headers/bodies inside read_exact.
         loop {
             if self.cancel.inner.cancelled.load(Ordering::Acquire) {
@@ -259,16 +267,22 @@ mod tests {
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut reader = transport.reader;
+            let mut writer = transport.writer;
             let mut bytes = [0; 2];
             reader.read_exact(&mut bytes).unwrap();
+            writer.write_all(b"ok").unwrap();
             send.send(Ok(bytes)).unwrap();
             let error = reader.read_exact(&mut bytes).unwrap_err();
             send.send(Err(error.kind())).unwrap();
         });
         peer.write_all(b"a").unwrap();
         // Cross a polling timeout with an incomplete record still in read_exact.
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(600));
         peer.write_all(b"b").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut reply = [0; 2];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
         assert_eq!(
             receive.recv_timeout(Duration::from_secs(2)).unwrap(),
             Ok(*b"ab")
