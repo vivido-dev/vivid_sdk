@@ -36,7 +36,7 @@ impl TexturePool {
     pub(super) fn reserve(&self) -> io::Result<Lease> {
         self.0
             .outputs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 if n < MAX_OUTPUTS {
                     n.checked_add(1)
                 } else {
@@ -72,7 +72,7 @@ impl Drop for Lease {
         self.0
             .0
             .outputs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .expect("native texture allocation charge underflow");
     }
 }

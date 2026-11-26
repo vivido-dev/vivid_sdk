@@ -16,7 +16,7 @@ pub(crate) struct Permit(Arc<AtomicUsize>);
 impl Permit {
     fn acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1).filter(|next| *next <= limit)
             })
             .ok()?;

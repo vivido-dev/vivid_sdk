@@ -445,7 +445,7 @@ impl Host {
             if self
                 .state
                 .generation
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
                 .is_err()
             {
                 self.state.closed.store(true, Ordering::SeqCst);

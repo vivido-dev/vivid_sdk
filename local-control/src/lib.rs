@@ -553,7 +553,7 @@ mod platform {
                 r"\\.\pipe\vivid-local-pair-{}-{}",
                 std::process::id(),
                 NEXT_PAIR
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value
                         .checked_add(1))
                     .map_err(|_| io::Error::other("local pair IDs exhausted"))?
             ));

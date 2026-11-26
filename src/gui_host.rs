@@ -76,7 +76,7 @@ impl ResourceBudget {
         }
         self.state
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(amount)
                     .filter(|next| *next <= self.state.limit)
             })

@@ -1126,7 +1126,7 @@ impl Output {
         }
         self.shared
             .gap_silence_samples
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current
                     .checked_add(count as u64)
                     .filter(|n| *n <= self.shared.ring_capacity_samples)
