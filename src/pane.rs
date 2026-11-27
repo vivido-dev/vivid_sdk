@@ -520,6 +520,17 @@ mod tests {
     #[test]
     #[cfg(feature = "presenter")]
     fn cancelling_one_session_preserves_another_owners_tracks_and_nodes() {
+        verify_peer_after_retirement(false);
+    }
+
+    #[test]
+    #[cfg(feature = "presenter")]
+    fn resetting_a_pane_scene_preserves_its_root_and_allows_peer_node_updates() {
+        verify_peer_after_retirement(true);
+    }
+
+    #[cfg(feature = "presenter")]
+    fn verify_peer_after_retirement(reset: bool) {
         use crate::presenter::{
             MediaConfig, PresenterConfig, PresenterListener, SocketListener, VirtualVivid,
         };
@@ -534,18 +545,23 @@ mod tests {
         )
         .unwrap();
         let mut panes = Vec::new();
-        let mut cancels = Vec::new();
+        let mut original_root = None;
+        let connect = |secret: &str| {
+            Session::connect(ProducerConfig {
+                endpoint_control: Some(endpoint.clone()),
+                endpoint_bulk: Some(endpoint.clone()),
+                authentication: ProducerAuthentication::root_hex(secret).unwrap(),
+                ..ProducerConfig::default()
+            })
+            .unwrap()
+        };
         for owner in [1, 2] {
             presenter.update_metrics(owner, 80, 24, (8, 16));
             let secret = presenter.issue_pane_capability(owner).unwrap();
-            let session = Session::connect(ProducerConfig {
-                endpoint_control: Some(endpoint.clone()),
-                endpoint_bulk: Some(endpoint.clone()),
-                authentication: ProducerAuthentication::root_hex(&secret).unwrap(),
-                ..ProducerConfig::default()
-            })
-            .unwrap();
-            cancels.push(session.cancel_handle());
+            let session = connect(&secret);
+            if owner == 1 {
+                original_root = Some(secret);
+            }
             let mut pane = PaneSession::from_session(session).unwrap();
             pane.show_rgba(1, 1, &[255; 4]).unwrap();
             panes.push(pane);
@@ -570,7 +586,12 @@ mod tests {
         let before = status(2);
         let first = status(1);
         assert_eq!(first.tracks[0].track_id, before.tracks[0].track_id);
-        cancels[0]();
+        if reset {
+            presenter.reset_pane_scene(1);
+            assert!(status(1).nodes.is_empty());
+        } else {
+            panes[0].session.cancel_handle()();
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while !status(1).tracks.is_empty() {
             assert!(Instant::now() < deadline);
@@ -580,6 +601,15 @@ mod tests {
         assert_eq!(after.tracks.len(), 1);
         assert_eq!(after.nodes.len(), 1);
         assert_eq!(before.nodes[0].node_id, after.nodes[0].node_id);
+        assert_eq!(before.nodes, after.nodes);
+        assert_eq!(before.tracks, after.tracks);
+        if reset {
+            assert!(panes[0].show_rgba(1, 1, &[0; 4]).is_err());
+            let session = connect(original_root.as_deref().unwrap());
+            let mut replacement = PaneSession::from_session(session).unwrap();
+            replacement.show_rgba(1, 1, &[9; 4]).unwrap();
+            assert_eq!(status(1).tracks[0].track_id, first.tracks[0].track_id);
+        }
         let pane = &mut panes[1];
         let presentation = pane.current.as_ref().unwrap();
         let revision = pane

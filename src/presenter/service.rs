@@ -1734,22 +1734,28 @@ impl VirtualVivid {
         Ok(hex(&bytes))
     }
 
+    /// Retires a pane's Vivid sessions and scenes while preserving its root capability and geometry.
+    ///
+    /// A process whose terminal was reset can authenticate again with its existing root.
+    /// Existing producer connections and delegated leases for this pane are retired atomically.
+    pub fn reset_pane_scene(&self, pane: PaneId) {
+        let mut state = lock(&self.state);
+        retire_pane_sessions(&mut state, pane);
+        state.alternate_panes.remove(&pane);
+        advance_projection(&mut state);
+        self.delivery_changed.notify_all();
+    }
+
     pub fn revoke_pane(&self, pane: PaneId) {
         let mut state = lock(&self.state);
         state.capabilities.remove(&pane);
-        let sessions = state
-            .sessions
-            .iter()
-            .filter_map(|(id, session)| (session.pane == pane).then_some(*id))
-            .collect::<Vec<_>>();
-        for session in sessions {
-            cleanup_session(&mut state, session);
-        }
+        retire_pane_sessions(&mut state, pane);
         state.overlays.remove_pane(pane);
         state.metrics.remove(&pane);
         state.targets.remove(&pane);
         state.alternate_panes.remove(&pane);
         advance_projection(&mut state);
+        self.delivery_changed.notify_all();
     }
 
     /// Registers a controller-minted activation verifier for one delegated inner session.
@@ -9133,6 +9139,18 @@ fn flush_overlay_lane(state: &mut State, session_id: u64) {
 fn flush_overlay_lanes(state: &mut State, sessions: &[u64]) {
     for session_id in sessions {
         flush_overlay_lane(state, *session_id);
+    }
+}
+
+fn retire_pane_sessions(state: &mut State, pane: PaneId) {
+    let owners: Vec<_> = state
+        .sessions
+        .iter()
+        .filter_map(|(id, session)| (session.pane == pane).then_some(*id))
+        .collect();
+    state.leases.retain(|_, lease| lease.pane != pane);
+    for owner in owners {
+        cleanup_session(state, owner);
     }
 }
 
