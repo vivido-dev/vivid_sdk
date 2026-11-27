@@ -70,6 +70,16 @@ fn io_error(error: io::Error) -> Error {
     tagged(class, error)
 }
 
+/// Reads kernel peer credentials for a runtime-owned Unix socket.
+///
+/// # Errors
+/// Returns an error if the descriptor has no readable peer credentials.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[napi]
+pub fn automation_peer_uid(fd: i32) -> Result<u32> {
+    vivid_sdk::local_control::peer_uid(fd).map_err(io_error)
+}
+
 fn value_error(message: impl std::fmt::Display) -> Error {
     tagged(INVALID, message)
 }

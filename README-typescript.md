@@ -181,15 +181,12 @@ Errors are typed: a failed reply throws `AutomationError` carrying the runtime's
 and optional `data`. Discovery follows the CLI's own order, and a named target that has gone away is
 an error, never a silent fall-through to another instance.
 
-Unix only, and one operating-system account of trust: every socket is owner-checked before a byte is
-written, and registries are only read from a plain, owner-only runtime directory with identity
-derived from the session name rather than taken from the registry.
-
-**One difference from the Python client, stated rather than glossed.** Python also checks the
-connected peer's credentials after connecting — `SO_PEERCRED` on Linux, `getpeereid` on macOS.
-Node has no binding for either, so that check does not run here. The pre-connect owner check does,
-and it is the one that decides whether the socket at that path is yours; but a socket whose owner
-changed between the `lstat` and the `connect` would be missed, and Python would catch it.
+Automation connects on Linux and macOS under a single effective user ID. Discovery checks the
+socket file owner and reads named registries from an owner-only runtime directory. Once connected,
+the native addon reads the peer UID from that same open socket using Linux `SO_PEERCRED` or macOS
+`getpeereid`. The UID must match before the client sends the Vivido hello or either vvmux preface.
+A mismatched UID, unavailable credentials, missing runtime descriptor or unsupported platform
+fails with `AutomationError` code `endpoint_unsafe`. Discovery keeps its separate PID/birth checks.
 
 ## Discovery and secrets
 

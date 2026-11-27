@@ -11,6 +11,7 @@ const require = createRequire(import.meta.url);
 
 /** The exact native surface. Shapes only; rules live in the SDK. */
 export interface NativeModule {
+  readonly automationPeerUid?: (fd: number) => number;
   readonly constantTable: () => ConstantEntry[];
   readonly probeEncodedImage: (data: Uint8Array) => EncodedImageInfo;
   readonly connect: (options?: unknown) => Promise<unknown>;

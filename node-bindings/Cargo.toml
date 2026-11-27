@@ -21,7 +21,7 @@ napi-derive = "3.6"
 # Python wheel makes.
 vivid_protocol = { version = "1.5", path = "../../vivid_protocol" }
 zeroize = "1.9"
-vivid_sdk = { version = "1.5", path = "..", features = ["presenter"] }
+vivid_sdk = { version = "1.5", path = "..", features = ["presenter", "local-control"] }
 
 [build-dependencies]
 napi-build = "2.4"

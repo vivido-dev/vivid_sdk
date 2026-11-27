@@ -4,13 +4,13 @@
  * These are control sockets, not the Vivid protocol itself. vivido and vivida serve newline-
  * delimited JSON; vvmux serves length-prefixed structured records. Neither carries media.
  *
- * Unix only, for the same reason the Python client is: these are local sockets guarded by file
- * ownership and process identity, and none of that has a Windows equivalent worth pretending
- * about.
+ * Automation connections on Linux and macOS verify the connected peer against the effective UID.
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, lstatSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, lstatSync } from "node:fs";
+import { once } from "node:events";
+import { native } from "./native.js";
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -60,7 +60,7 @@ export class AutomationError extends Error {
 
 /** The current user's uid, or `null` where the platform has no such notion. */
 function currentUid(): number | null {
-  return typeof process.getuid === "function" ? process.getuid() : null;
+  return typeof process.geteuid === "function" ? process.geteuid() : null;
 }
 
 function sha256Prefix(value: string): string {
@@ -114,33 +114,54 @@ function runtimeDir(product: string): string {
   return root;
 }
 
-/**
- * Connect to a local automation socket.
- *
- * The socket file must belong to this user before a byte is written — the same pre-connect check
- * the CLI makes, because a socket another user planted where discovery looks should be declined
- * rather than talked to.
- *
- * Node cannot read the peer's credentials: there is no `SO_PEERCRED` or `getpeereid` binding in
- * the standard library, so the post-connect check the Python client performs is unavailable
- * here. The pre-connect owner check still runs, and it is the one that decides whether the
- * socket at that path is ours.
- */
-function connectSocket(path: string, timeoutMs?: number): Socket {
+/** Platforms where the addon can verify the connected automation peer. */
+export const SUPPORTED = process.platform === "linux" || process.platform === "darwin";
+
+function requireSupportedPlatform(): void {
+  if (!SUPPORTED) {
+    throw new AutomationError("endpoint_unsafe", "automation peer verification requires Linux or macOS");
+  }
+}
+
+/** Connect and authenticate this socket before exposing it to either protocol. */
+async function connectSocket(path: string, timeoutMs?: number): Promise<Socket> {
   let meta;
   try {
     meta = lstatSync(path);
-  } catch (error) {
+  } catch {
     throw new AutomationError("endpoint_not_found", `no endpoint socket at ${path}`);
   }
-  if (meta.isSymbolicLink() || (currentUid() !== null && meta.uid !== currentUid())) {
-    throw new AutomationError("endpoint_unsafe", `endpoint socket ${path} is not owned by this user`);
+  const owner = currentUid();
+  if (owner === null || !meta.isSocket() || meta.uid !== owner) {
+    throw new AutomationError("endpoint_unsafe", `endpoint ${path} is not a socket owned by this user`);
   }
   const socket = connect({ path });
-  if (timeoutMs !== undefined) {
-    socket.setTimeout(timeoutMs);
+  try {
+    if (timeoutMs !== undefined) socket.setTimeout(timeoutMs);
+    await once(socket, "connect");
+
+    // Node and Bun retain the live Unix descriptor on the connected socket's handle.
+    // Keep lookup and credential query synchronous so close cannot recycle it between them.
+    const fd = (socket as Socket & { _handle?: { fd?: number } })._handle?.fd;
+    let peer: number | undefined;
+    try {
+      if (fd !== undefined && Number.isInteger(fd) && fd >= 0 && fd <= 0x7fff_ffff) {
+        peer = native().automationPeerUid?.(fd);
+      }
+    } catch {
+      throw new AutomationError("endpoint_unsafe", "cannot verify the connected automation peer");
+    }
+    if (peer === undefined) {
+      throw new AutomationError("endpoint_unsafe", "connected automation peer credentials unavailable");
+    }
+    if (peer !== owner) {
+      throw new AutomationError("endpoint_unsafe", "connected automation peer belongs to another user");
+    }
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
   }
-  return socket;
 }
 
 /** Whether this platform can recompute the process-birth record a registry carries. */
@@ -359,6 +380,7 @@ export class VividoSession {
 export async function vividoConnect(
   options: { readonly socket?: string; readonly target?: string; readonly timeoutMs?: number } = {},
 ): Promise<VividoSession> {
+  requireSupportedPlatform();
   let root: string | undefined;
   try {
     root = runtimeDir("vivido");
@@ -369,7 +391,7 @@ export async function vividoConnect(
   }
 
   if (options.socket !== undefined) {
-    return await VividoSession.from(connectSocket(options.socket, options.timeoutMs));
+    return await VividoSession.from(await connectSocket(options.socket, options.timeoutMs));
   }
   const inherited = process.env[SESSION_ENV];
   if (options.target !== undefined || inherited !== undefined) {
@@ -378,7 +400,7 @@ export async function vividoConnect(
     }
     const name = options.target ?? inherited ?? "";
     const registry = namedRegistry(root, name);
-    return await VividoSession.from(connectSocket(String(registry["socket"]), options.timeoutMs));
+    return await VividoSession.from(await connectSocket(String(registry["socket"]), options.timeoutMs));
   }
   return await VividoSession.from(await discover(root, options.timeoutMs));
 }
@@ -459,8 +481,9 @@ async function discover(root: string | undefined, timeoutMs?: number): Promise<S
   const inherited = process.env[SOCKET_ENV];
   if (inherited !== undefined && inherited !== "") {
     try {
-      return connectSocket(inherited, timeoutMs);
-    } catch {
+      return await connectSocket(inherited, timeoutMs);
+    } catch (error) {
+      if (error instanceof AutomationError && error.code === "endpoint_unsafe") throw error;
       // The inherited socket is a preference, not a commitment.
     }
   }
@@ -492,8 +515,9 @@ async function newestWindowed(root: string, timeoutMs?: number): Promise<Socket>
     .reverse();
   for (const candidate of candidates) {
     try {
-      return connectSocket(join(root, candidate), timeoutMs);
-    } catch {
+      return await connectSocket(join(root, candidate), timeoutMs);
+    } catch (error) {
+      if (error instanceof AutomationError && error.code === "endpoint_unsafe") throw error;
       continue;
     }
   }
@@ -653,11 +677,12 @@ export async function vvmuxConnect(
   target = "default",
   options: { readonly timeoutMs?: number } = {},
 ): Promise<VvmuxSession> {
+  requireSupportedPlatform();
   validateSessionName(target);
   const root = runtimeDir("vvmux");
   const digest = sha256Prefix(target);
   const path = join(root, `session-${digest}.sock`);
-  const socket = connectSocket(path, options.timeoutMs);
+  const socket = await connectSocket(path, options.timeoutMs);
   const { socket: negotiated, maximum } = await vvmuxPreface(socket, VVMX_VERSION, path, options.timeoutMs);
   return new VvmuxSession(negotiated, maximum);
 }
@@ -711,7 +736,7 @@ async function vvmuxPreface(
       );
     }
     version = peerVersion;
-    socket = connectSocket(path, timeoutMs);
+    socket = await connectSocket(path, timeoutMs);
   }
   throw new Error("unreachable");
 }
@@ -750,11 +775,3 @@ export const automation = {
   vividoInstances,
   vvmuxConnect,
 } as const;
-
-/** Whether this platform can host these clients at all. */
-export const SUPPORTED = process.platform !== "win32";
-
-if (!SUPPORTED) {
-  // Loading the module is harmless; connecting is refused rather than half-working.
-  void existsSync;
-}

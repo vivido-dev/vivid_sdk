@@ -222,7 +222,7 @@ mod platform {
 
     /// Refuse a peer that is not the effective user running this process.
     fn require_peer_owner(stream: &UnixStream) -> io::Result<()> {
-        let peer = peer_uid(stream)?;
+        let peer = peer_uid(stream.as_raw_fd())?;
         // SAFETY: geteuid has no preconditions.
         let owner = unsafe { libc::geteuid() };
         if peer != owner {
@@ -234,40 +234,57 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-        let mut credential = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: the output buffers have the exact sizes passed to getsockopt.
-        let result = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut credential).cast(),
-                &raw mut length,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
+    /// Reads the effective user ID of a connected Unix socket's peer.
+    ///
+    /// The caller retains ownership of the descriptor and must keep the socket
+    /// open throughout the query to identify the intended connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the kernel cannot identify the peer.
+    pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut credential = libc::ucred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            };
+            let size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let mut length = size;
+            // SAFETY: the kernel validates fd and writes at most length bytes to credential.
+            let result = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&raw mut credential).cast(),
+                    &raw mut length,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete socket peer credentials",
+                ));
+            }
+            Ok(credential.uid)
         }
-        Ok(credential.uid)
-    }
 
-    #[cfg(not(target_os = "linux"))]
-    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        // SAFETY: both out-parameters are valid writable locations for getpeereid.
-        let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut uid: libc::uid_t = 0;
+            let mut gid: libc::gid_t = 0;
+            // SAFETY: getpeereid validates fd and both output pointers are writable.
+            let result = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(uid)
         }
-        Ok(uid)
     }
 }
 
@@ -1002,6 +1019,8 @@ mod platform {
     }
 }
 
+#[cfg(unix)]
+pub use platform::peer_uid;
 pub use platform::{LocalListener, LocalStream};
 
 // Debug omits user content and native resources, and never acquires application locks.
